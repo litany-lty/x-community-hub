@@ -29,6 +29,8 @@
 
 ---
 
+演示预设使用虚构账号和程序生成的数据。作者卡展示项目作者 `@elidlicom` 的公开署名、简介、头像和主页链接。真实授权配置、会话和采集快照保存在运行实例的本地目录。
+
 ## 配置文件说明（`src/main/resources/application.yml`）
 
 密钥通过环境变量或项目根目录的私密 `application-local.yml` 配置，前端不暴露任何 API Key 输入框。`src/main/resources/application.yml` 的凭据默认值为空，不包含本机密钥。
@@ -48,11 +50,26 @@
 
    `application-local.yml` 已加入 `.gitignore`，权限应设为 `0600`；它位于项目根目录，不在 Maven 的资源打包目录内，不会自动进入新构建的 JAR。classpath 配置通过 `spring.config.import=optional:file:./application-local.yml` 从**启动进程的工作目录**读取它。部署时可将私密文件放在实际运行目录，或仅配置 `X_TWITTERAPI_IO_KEY`、`X_OAUTH_CLIENT_ID`、`X_OAUTH_CLIENT_SECRET` 环境变量；环境变量仍可覆盖文件里的默认值。不要将私密文件提交或复制到 `src/main/resources`。此配置修复不会修改已存在的 JAR。
 
-2. **打包与启动**
+2. **打包、测试与启动**
+
+   构建使用 JDK 17 和 Maven，前端回归测试使用 Node.js。本次验证使用 Maven 3.9.12 和 Node.js 24。先运行 `mvn -version`，确认 Maven 使用 Java 17。
+
+   在仓库根目录运行全部 Java 测试并打包，再运行前端回归脚本：
+
    ```bash
-   mvn test package
-   java -jar target/x-community-hub.jar
+   mvn package
+   node src/test/js/auth-state-regression.cjs
    ```
+
+   首次启动可使用演示数据源，检查服务与登录页面。下面的命令适用于 macOS 或 Linux：
+
+   ```bash
+   X_PROVIDER=DEMO java -jar target/x-community-hub.jar
+   ```
+
+   打开 <http://localhost:8080> 查看页面。健康检查地址是 <http://localhost:8080/api/health>。如果端口已占用，可在启动命令前加 `PORT=8081` 并访问新端口。演示模式保留默认的本人登录限制。
+
+   使用真实账号时，先完成上面的 OAuth 和数据源密钥配置，再运行 `java -jar target/x-community-hub.jar`。默认数据源为 TwitterAPI.io，缺少其密钥时，健康接口会返回 HTTP 400 并提示配置密钥。
 
    不要在运行中的 JAR 路径上覆盖打包产物。重新打包前先正常停止对应实例，或将新包复制到 `.local/runtime/` 下独立版本路径后运行；启动工作目录仍保持项目根目录，以复用本地配置、会话和缓存。
 

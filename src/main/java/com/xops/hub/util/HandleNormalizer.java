@@ -17,11 +17,11 @@ public final class HandleNormalizer {
 
     public static String normalize(String input) {
         if (input == null) {
-            throw new IllegalArgumentException("请输入有效的 X 账号（如 @elonmusk 或主页链接）");
+            throw new IllegalArgumentException("请输入有效的 X 账号（如 @demo_creator 或主页链接）");
         }
         String trimmed = input.trim();
         if (trimmed.isEmpty()) {
-            throw new IllegalArgumentException("请输入有效的 X 账号（如 @elonmusk 或主页链接）");
+            throw new IllegalArgumentException("请输入有效的 X 账号（如 @demo_creator 或主页链接）");
         }
 
         Matcher urlMatcher = URL_HANDLE_PATTERN.matcher(trimmed);

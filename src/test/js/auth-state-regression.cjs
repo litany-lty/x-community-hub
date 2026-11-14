@@ -10,6 +10,7 @@ function section(start, end) {
     return source.slice(a, b);
 }
 const resetCode = section('    function cancelReportRequest()', '    // 已精简移除的元素');
+const identityCode = section('    function stableUserId(', '    function getSelfStorageKey(');
 const loadCode = section('    async function loadSelfReport(', '    // 首次加载骨架屏');
 const logoutCode = section('        const doLogout = async () => {', '        $("railLogoutBtn").addEventListener')
     .replace('const doLogout =', 'globalThis.doLogout =');
@@ -17,7 +18,7 @@ const timingCode = section('    function computeNextGoldenWindowHint(', '    fun
     + section('    function timingPeriodDescription(', '    function renderTimingPanel(');
 const noop = () => {};
 function context() {
-    const state = {authStatus: {loggedIn: true, user: {username: 'alice'}}, period: 'HOURS_48', days: 2,
+    const state = {authStatus: {loggedIn: true, user: {id: '1001', username: 'alice'}}, period: 'HOURS_48', days: 2,
         report: null, bundle: null, reportRequestGeneration: 0, authStatusGeneration: 0};
     const element = {classList: {remove: noop}, hidden: false};
     const ctx = {state, LIST_PAGE_SIZE: 50, PERIOD_META: {HOURS_48: {badgePrefix: '48h'}}, Date, Number,
@@ -30,11 +31,11 @@ function context() {
         applyLoadedPeriodReport: r => {state.report = r;}, fetchServerAndAuthStatus: async () => {},
         showToast: msg => {ctx.toast = msg;}};
     vm.createContext(ctx);
-    vm.runInContext(resetCode + loadCode + logoutCode + timingCode, ctx);
+    vm.runInContext(identityCode + resetCode + loadCode + logoutCode + timingCode, ctx);
     return ctx;
 }
-function response(username = 'alice') {
-    const report = {profile: {username}, cacheRemainingSeconds: 100};
+function response(username = 'alice', id = '1001') {
+    const report = {profile: {id, username}, cacheRemainingSeconds: 100};
     return {status: 200, ok: true, body: {month: report, week: report, day: report,
         coveredWindowDays: 30, hasMoreHistoryForTarget: false}};
 }
@@ -56,7 +57,7 @@ function response(username = 'alice') {
     changed.fetch = () => new Promise(r => {release = r;});
     const previous = changed.loadSelfReport();
     changed.resetUserScopedMemoryState();
-    changed.state.authStatus = {loggedIn: true, user: {username: 'bob'}};
+    changed.state.authStatus = {loggedIn: true, user: {id: '1002', username: 'bob'}};
     changed.state.isFetching = true; // a new identity has begun loading
     release(response());
     await previous;
@@ -64,10 +65,23 @@ function response(username = 'alice') {
     assert.equal(changed.state.isFetching, true, 'old finally must not clear newer loading state');
 
     const wrongOwner = context();
-    wrongOwner.fetch = async () => response('bob');
+    wrongOwner.fetch = async () => response('alice', '1002');
     await wrongOwner.loadSelfReport();
     assert.equal(wrongOwner.state.report, null);
     assert.match(wrongOwner.error, /账号不匹配/);
+
+    const ownReport = context();
+    ownReport.fetch = async () => response();
+    await ownReport.loadSelfReport();
+    assert.equal(ownReport.state.report.profile.id, '1001');
+    assert.equal(ownReport.error, undefined);
+
+    const missingIdentity = context();
+    delete missingIdentity.state.authStatus.user.id;
+    missingIdentity.fetch = async () => {assert.fail('missing identity must not issue a request');};
+    await missingIdentity.loadSelfReport();
+    assert.equal(missingIdentity.state.report, null);
+    assert.match(missingIdentity.error, /稳定账号 ID/);
 
     const failed = context();
     failed.fetch = async () => ({status: 500, ok: false});

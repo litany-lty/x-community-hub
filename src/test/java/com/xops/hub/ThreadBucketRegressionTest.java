@@ -14,33 +14,31 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 class ThreadBucketRegressionTest {
     @Test
-    void realObservedBucketsCountThreadFloorsWithoutInflatingMainPostsOrReplies() {
-        var now = Instant.parse("2026-11-14T00:01:09Z");
+    void bucketsCountThreadFloorsWithoutInflatingMainPostsOrReplies() {
+        var now = Instant.parse("2024-04-05T12:00:00Z");
         var tweets = new ArrayList<RawTweet>();
-        // Observed 04:01–06:01: 4 roots + 24 replies + 8 quotes + 2 thread floors.
-        addGroup(tweets, "first", now.minusSeconds(3 * 3600), 4, 24, 8, 2, 1287);
-        // Observed 06:01–08:01: 3 roots + 31 replies + 1 quote + 4 thread floors.
-        addGroup(tweets, "second", now.minusSeconds(3600), 3, 31, 1, 4, 686);
-        var self = new XUserSummary("self-id", "self", "Self", "", "", false, 365, 248, 4878, "2020-01-01");
+        addGroup(tweets, "first", now.minusSeconds(3 * 3600), 1, 2, 1, 3, 91);
+        addGroup(tweets, "second", now.minusSeconds(3600), 2, 1, 0, 1, 37);
+        var self = new XUserSummary("self-id", "self", "Self", "", "", false, 10, 5, 20, "2020-01-01");
         var snapshot = new RawAccountSnapshot(ProviderMode.TWITTERAPI_IO, true, "", now,
                 self, tweets, List.of(), List.of());
         var activity = new CommunityAnalyticsEngine().analyze(snapshot, 2, ZoneId.of("Asia/Shanghai"), false).activity();
-        assertThat(activity.originalPosts()).isEqualTo(7);
-        assertThat(activity.replies()).isEqualTo(55);
+        assertThat(activity.originalPosts()).isEqualTo(3);
+        assertThat(activity.replies()).isEqualTo(3);
         var mapper = new ObjectMapper();
         var first = mapper.valueToTree(activity.trendSeries().get(22));
         var second = mapper.valueToTree(activity.trendSeries().get(23));
-        assertThat(first.path("threadReplies").asInt(-1)).isEqualTo(2);
-        assertThat(second.path("threadReplies").asInt(-1)).isEqualTo(4);
+        assertThat(first.path("threadReplies").asInt(-1)).isEqualTo(3);
+        assertThat(second.path("threadReplies").asInt(-1)).isEqualTo(1);
         for (var bucket : List.of(first, second)) {
             int total = bucket.path("posts").asInt() + bucket.path("replies").asInt()
                     + bucket.path("quotes").asInt() + bucket.path("threadReplies").asInt();
             assertThat(total).isEqualTo(bucket.path("viewSampleCount").asInt());
         }
-        assertThat(first.path("views").asLong()).isEqualTo(1287);
-        assertThat(first.path("viewSampleCount").asInt()).isEqualTo(38);
-        assertThat(second.path("views").asLong()).isEqualTo(686);
-        assertThat(second.path("viewSampleCount").asInt()).isEqualTo(39);
+        assertThat(first.path("views").asLong()).isEqualTo(91);
+        assertThat(first.path("viewSampleCount").asInt()).isEqualTo(7);
+        assertThat(second.path("views").asLong()).isEqualTo(37);
+        assertThat(second.path("viewSampleCount").asInt()).isEqualTo(4);
     }
 
     private static void addGroup(List<RawTweet> tweets, String prefix, Instant at,

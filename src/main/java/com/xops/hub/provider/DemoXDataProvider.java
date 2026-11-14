@@ -92,9 +92,9 @@ public class DemoXDataProvider {
 
     public List<PresetAccount> presetAccounts() {
         return List.of(
-                new PresetAccount("karpathy", "Andrej Karpathy", "AI 深度创作者"),
-                new PresetAccount("levelsio", "Pieter Levels", "独立开发 BuildInPublic"),
-                new PresetAccount("sama", "Sam Altman", "科技高频互动")
+                new PresetAccount("alex_builds", "Alex · 独立开发与出海", "独立开发"),
+                new PresetAccount("maya_web3", "Maya · 社区增长主理人", "社区运营"),
+                new PresetAccount("chen_ai_lab", "Chen · AI 产品实验室", "AI 产品")
         );
     }
 

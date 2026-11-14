@@ -427,9 +427,9 @@ class CommunityAnalyticsAndApiTest {
         assertThat(cachedWeekResp.getBody().fromCache()).isTrue();
         assertThat(cachedWeekResp.getBody().periodCode()).isEqualTo("WEEK");
 
-        // 6. 已登录 @elidlicom 尝试越权传参查询他人账号（如 @sama）必须返回 403 FORBIDDEN
+        // 6. 已登录 @elidlicom 尝试越权传参查询他人账号（如 @other_user）必须返回 403 FORBIDDEN
         ResponseEntity<Map> crossUserResp = restTemplate.exchange(
-                "/api/analyze?username=@sama&period=MONTH",
+                "/api/analyze?username=@other_user&period=MONTH",
                 HttpMethod.GET,
                 new HttpEntity<>(authHeaders),
                 Map.class

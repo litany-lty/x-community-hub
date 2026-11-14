@@ -126,12 +126,12 @@ class HealthIdentityCoverageTest {
     @Test void endedFollowerPagesBelowProfileTotalRemainUncertainAndAreNotReused() throws Exception {
         var followerCalls = new AtomicInteger();
         var server = server(path -> {
-            if (path.contains("/info?")) return "{\"data\":{\"id\":\"self-id\",\"userName\":\"self\",\"followers\":359,\"following\":247}}";
+            if (path.contains("/info?")) return "{\"data\":{\"id\":\"self-id\",\"userName\":\"self\",\"followers\":43,\"following\":29}}";
             if (path.contains("/followers?")) {
                 followerCalls.incrementAndGet();
-                return userPage("followers", 355);
+                return userPage("followers", 40);
             }
-            if (path.contains("/followings?")) return userPage("followings", 247);
+            if (path.contains("/followings?")) return userPage("followings", 29);
             return "{\"tweets\":[],\"has_next_page\":false}";
         });
         var p = properties();
@@ -140,8 +140,8 @@ class HealthIdentityCoverageTest {
         try {
             var provider = new TwitterApiIoProvider(p, mapper, pool);
             var first = provider.syncStore("self", null, 2, true, null);
-            assertThat(first.store().followers()).hasSize(355);
-            assertThat(first.store().followings()).hasSize(247);
+            assertThat(first.store().followers()).hasSize(40);
+            assertThat(first.store().followings()).hasSize(29);
             assertThat(TwitterApiIoProvider.snapshotOf(first.store(), "", false).followersTruncated()).isTrue();
             assertThat(first.store().followingsTruncated()).isFalse();
             var second = provider.syncStore("self", first.store(), 2, true, null);
