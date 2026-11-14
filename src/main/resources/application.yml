@@ -52,10 +52,10 @@ xops:
   max-following-pages: ${X_MAX_FOLLOWING_PAGES:4}
   max-follower-pages: ${X_MAX_FOLLOWER_PAGES:5}
 
-  # 共用外部 API 线程池（低峰期多路并发提速，高峰期有界队列 + 排队超时快速保护，防止请求堆积）
-  api-pool-core-size: ${X_API_POOL_CORE_SIZE:8}
-  api-pool-max-size: ${X_API_POOL_MAX_SIZE:14}
-  api-pool-queue-capacity: ${X_API_POOL_QUEUE_CAPACITY:64}
+  # 共用外部 API 线程池（首次拉取双倍并发加速，低峰期多路并发提速，高峰期有界队列 + 排队超时快速保护）
+  api-pool-core-size: ${X_API_POOL_CORE_SIZE:16}
+  api-pool-max-size: ${X_API_POOL_MAX_SIZE:28}
+  api-pool-queue-capacity: ${X_API_POOL_QUEUE_CAPACITY:128}
   api-queue-timeout-ms: ${X_API_QUEUE_TIMEOUT_MS:4500}
   api-max-parallel-slices: ${X_API_MAX_PARALLEL_SLICES:4}
 

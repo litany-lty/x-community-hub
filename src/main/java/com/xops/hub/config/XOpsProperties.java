@@ -17,9 +17,9 @@ public class XOpsProperties {
     private int maxMentionPages = 600;
     private int maxFollowingPages = 4;
     private int maxFollowerPages = 5;
-    private int apiPoolCoreSize = 8;
-    private int apiPoolMaxSize = 14;
-    private int apiPoolQueueCapacity = 64;
+    private int apiPoolCoreSize = 16;
+    private int apiPoolMaxSize = 28;
+    private int apiPoolQueueCapacity = 128;
     private long apiQueueTimeoutMs = 4500L;
     private int apiMaxParallelSlices = 4;
     private long cacheTtlSeconds = 300;

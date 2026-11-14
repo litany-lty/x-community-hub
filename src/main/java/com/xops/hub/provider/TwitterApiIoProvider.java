@@ -56,6 +56,7 @@ public class TwitterApiIoProvider {
             Pattern.compile("^@([A-Za-z0-9_]{1,15})\\b");
 
     private static final long PAID_INTERVAL_MS = 50L;
+    private static final long INITIAL_FETCH_PAID_INTERVAL_MS = PAID_INTERVAL_MS / 2;
     private static final long FREE_TIER_INTERVAL_MS = 5300L;
     private static final int MAX_429_RETRIES = 3;
     private static final long SNAPSHOT_SOFT_DEADLINE_SECONDS = 15L;
@@ -67,6 +68,7 @@ public class TwitterApiIoProvider {
         int distinct429Windows = 0;
         volatile boolean freeTierSlowMode = false;
         volatile long intervalMs = PAID_INTERVAL_MS;
+        final AtomicInteger activeInitialFetches = new AtomicInteger(0);
 
         synchronized long reserveWaitMs(boolean isLocalMock) {
             if (isLocalMock && distinct429Windows == 0) {
@@ -74,7 +76,10 @@ public class TwitterApiIoProvider {
             }
             long now = System.currentTimeMillis();
             long slot = Math.max(now, nextAllowedAtMs);
-            nextAllowedAtMs = slot + intervalMs;
+            long stepMs = (!freeTierSlowMode && distinct429Windows == 0 && activeInitialFetches.get() > 0)
+                    ? INITIAL_FETCH_PAID_INTERVAL_MS
+                    : intervalMs;
+            nextAllowedAtMs = slot + stepMs;
             return slot - now;
         }
 
@@ -335,6 +340,7 @@ public class TwitterApiIoProvider {
         String encodedUser = URLEncoder.encode(username, StandardCharsets.UTF_8);
         KeyPacer pacer = pacerFor(apiKey);
         boolean warmExisting = existing != null && existing.syncedAtInstant() != null && existing.profile() != null;
+        boolean initialFetch = !warmExisting;
         boolean doHead = headSync || !warmExisting
                 || (lightweightDailyOnly && existing.dailyRefreshStartedAt() <= 0);
         int effectiveHours = lightweightDailyOnly ? Math.min(24, Math.max(1, targetWindowHours)) : Math.max(24, targetWindowHours);
@@ -342,6 +348,10 @@ public class TwitterApiIoProvider {
                 ? Instant.now().plusSeconds(60)
                 : Instant.now().plusSeconds(SNAPSHOT_SOFT_DEADLINE_SECONDS);
         AtomicBoolean degraded = new AtomicBoolean(false);
+        if (initialFetch) {
+            pacer.activeInitialFetches.incrementAndGet();
+        }
+        try {
 
         List<long[]> tweetCoverage = existing != null ? existing.tweetCoverage() : List.of();
         List<long[]> inboundCoverage = existing != null ? existing.inboundCoverage() : List.of();
@@ -389,10 +399,10 @@ public class TwitterApiIoProvider {
                 long headTo = syncTo.getEpochSecond();
 
                 CompletableFuture<StreamFill> tweetsF = startTweetsFillAsync(
-                        baseUrl, encodedUser, profile, tweetCoverage, targetCutoff, cutoff30, headTo, false,
+                        baseUrl, encodedUser, profile, tweetCoverage, targetCutoff, cutoff30, headTo, false, false,
                         apiKey, pacer, pageBudget, deadline, degraded);
                 CompletableFuture<StreamFill> inboundF = startInboundFillAsync(
-                        baseUrl, encodedUser, self, profile.id(), inboundCoverage, targetCutoff, cutoff30, headTo, false,
+                        baseUrl, encodedUser, self, profile.id(), inboundCoverage, targetCutoff, cutoff30, headTo, false, false,
                         apiKey, pacer, pageBudget, deadline, degraded);
                 CompletableFuture<DailyMetricRefreshResult> metricsF = lightweightDailyOnly
                         ? startDailyMetricsRefreshAsync(baseUrl, existing, syncTo, dailyCycleStart, apiKey, pacer, deadline, degraded)
@@ -468,10 +478,10 @@ public class TwitterApiIoProvider {
                 });
 
                 CompletableFuture<StreamFill> tweetsF = startTweetsFillAsync(
-                        baseUrl, encodedUser, existing.profile(), tweetCoverage, targetCutoff, cutoff30, headTo, allowNativeHead,
+                        baseUrl, encodedUser, existing.profile(), tweetCoverage, targetCutoff, cutoff30, headTo, allowNativeHead, false,
                         apiKey, pacer, pageBudget, deadline, degraded);
                 CompletableFuture<StreamFill> inboundF = startInboundFillAsync(
-                        baseUrl, encodedUser, knownSelf, existing.profile().id(), inboundCoverage, targetCutoff, cutoff30, headTo, allowNativeHead,
+                        baseUrl, encodedUser, knownSelf, existing.profile().id(), inboundCoverage, targetCutoff, cutoff30, headTo, allowNativeHead, false,
                         apiKey, pacer, pageBudget, deadline, degraded);
                 CompletableFuture<DailyMetricRefreshResult> metricsF = lightweightDailyOnly
                         ? startDailyMetricsRefreshAsync(baseUrl, existing, syncTo, dailyCycleStart, apiKey, pacer, deadline, degraded)
@@ -488,7 +498,7 @@ public class TwitterApiIoProvider {
                 inbound = inboundF.join();
                 parallelDailyMetrics = metricsF.join();
             } else {
-                // 首次冷启动：先校验账号存在性，随后在共用线程池中多路并发采集动态、互动与关注关系
+                // 首次冷启动：先校验账号存在性，随后在共用线程池中以双倍并发采集动态、互动与关注关系
                 profile = preflightProfile != null ? preflightProfile : parseValidatedUserProfile(
                         getJsonWithRetry(baseUrl + "/twitter/user/info?userName=" + encodedUser, apiKey, pacer), username);
                 syncTo = Instant.now();
@@ -496,17 +506,17 @@ public class TwitterApiIoProvider {
                 graphReusable = false;
                 fetchGraph = true;
                 String self = profile.username();
-                int pageBudget = pacer.freeTierSlowMode ? 3 : (lightweightDailyOnly ? 16 : MAX_STREAM_PAGES_PER_BATCH);
+                int pageBudget = pacer.freeTierSlowMode ? 3 : (lightweightDailyOnly ? 32 : MAX_STREAM_PAGES_PER_BATCH * 2);
                 boolean allowNativeHead = !lightweightDailyOnly;
                 Instant cutoff30 = cutoffForWindowDays(syncTo, 30);
                 Instant targetCutoff = cutoffForWindowHours(syncTo, effectiveHours);
                 long headTo = syncTo.getEpochSecond();
 
                 CompletableFuture<StreamFill> tweetsF = startTweetsFillAsync(
-                        baseUrl, encodedUser, profile, tweetCoverage, targetCutoff, cutoff30, headTo, allowNativeHead,
+                        baseUrl, encodedUser, profile, tweetCoverage, targetCutoff, cutoff30, headTo, allowNativeHead, true,
                         apiKey, pacer, pageBudget, deadline, degraded);
                 CompletableFuture<StreamFill> inboundF = startInboundFillAsync(
-                        baseUrl, encodedUser, self, profile.id(), inboundCoverage, targetCutoff, cutoff30, headTo, allowNativeHead,
+                        baseUrl, encodedUser, self, profile.id(), inboundCoverage, targetCutoff, cutoff30, headTo, allowNativeHead, true,
                         apiKey, pacer, pageBudget, deadline, degraded);
                 CompletableFuture<PagedUserResult> followingsF = profile.followingCount() > 0
                         ? fetchPagedUsersAsync(
@@ -685,19 +695,29 @@ public class TwitterApiIoProvider {
         }
 
         long nowSec = Instant.now().getEpochSecond();
+        int blueLimit = initialFetch ? 200 : 100;
         List<String> missingBlueIds = !lightweightDailyOnly || doHead
-                ? collectUncachedInteractionUserIds(merged, nowSec, 100, lightweightDailyOnly ? nowSec - 86400L : Long.MIN_VALUE)
+                ? collectUncachedInteractionUserIds(merged, nowSec, blueLimit, lightweightDailyOnly ? nowSec - 86400L : Long.MIN_VALUE)
                 : List.of();
         if (!missingBlueIds.isEmpty() && !Instant.now().isAfter(deadline)) {
-            String batchUrl = baseUrl + "/twitter/user/batch_info_by_ids?userIds="
-                    + URLEncoder.encode(String.join(",", missingBlueIds), StandardCharsets.UTF_8);
-            JsonNode batchRoot = getJsonOnceBeforeAsync(
-                    batchUrl, apiKey, pacer, deadline, new AtomicBoolean(false), 8_000, false).join();
-            for (JsonNode uNode : extractArray(batchRoot, "users", "data")) {
-                if (uNode.path("unavailable").asBoolean(false)) continue;
-                XUserSummary enriched = parseUserNode(uNode, "");
-                if (!enriched.username().isBlank()) {
-                    extraUsers.put(enriched.username().toLowerCase(Locale.ROOT), enriched);
+            int blueChunkSize = (initialFetch && !pacer.freeTierSlowMode && missingBlueIds.size() > 25) ? 25 : missingBlueIds.size();
+            List<CompletableFuture<JsonNode>> blueFutures = new ArrayList<>();
+            for (int i = 0; i < missingBlueIds.size(); i += blueChunkSize) {
+                List<String> subIds = missingBlueIds.subList(i, Math.min(i + blueChunkSize, missingBlueIds.size()));
+                String batchUrl = baseUrl + "/twitter/user/batch_info_by_ids?userIds="
+                        + URLEncoder.encode(String.join(",", subIds), StandardCharsets.UTF_8);
+                blueFutures.add(getJsonOnceBeforeAsync(
+                        batchUrl, apiKey, pacer, deadline, new AtomicBoolean(false), 8_000, false));
+            }
+            CompletableFuture.allOf(blueFutures.toArray(CompletableFuture[]::new)).join();
+            for (CompletableFuture<JsonNode> bf : blueFutures) {
+                JsonNode batchRoot = bf.join();
+                for (JsonNode uNode : extractArray(batchRoot, "users", "data")) {
+                    if (uNode.path("unavailable").asBoolean(false)) continue;
+                    XUserSummary enriched = parseUserNode(uNode, "");
+                    if (!enriched.username().isBlank()) {
+                        extraUsers.put(enriched.username().toLowerCase(Locale.ROOT), enriched);
+                    }
                 }
             }
         }
@@ -732,6 +752,11 @@ public class TwitterApiIoProvider {
                 merged.tweets().size(), merged.inbound().size(), degraded.get());
         return new SyncOutcome(merged, progressed, degraded.get(), doHead && graphReusable, pages,
                 pendingDailyMetrics, incompleteDailyMetrics, dailyComplete, dailyMetricBatchFailed);
+        } finally {
+            if (initialFetch) {
+                pacer.activeInitialFetches.decrementAndGet();
+            }
+        }
     }
 
     public static int pendingRelationshipChecks(AccountStore.StoredAccount store) {
@@ -880,7 +905,7 @@ public class TwitterApiIoProvider {
 
     private CompletableFuture<StreamFill> startTweetsFillAsync(
             String baseUrl, String encodedUser, XUserSummary profile, List<long[]> coverage,
-            Instant targetCutoff, Instant cutoff30, long headTo, boolean allowNativeHead,
+            Instant targetCutoff, Instant cutoff30, long headTo, boolean allowNativeHead, boolean initialFetch,
             String apiKey, KeyPacer pacer, int pageBudget, Instant deadline, AtomicBoolean degraded
     ) {
         String self = profile.username();
@@ -888,7 +913,7 @@ public class TwitterApiIoProvider {
                 baseUrl,
                 baseUrl + "/twitter/user/last_tweets?userName=" + encodedUser + "&includeReplies=true",
                 "from:" + self,
-                coverage, targetCutoff, cutoff30, headTo, allowNativeHead,
+                coverage, targetCutoff, cutoff30, headTo, allowNativeHead, initialFetch,
                 apiKey, pacer, pageBudget, deadline, degraded,
                 node -> {
                     RawTweet t = parseRawTweet(node, self);
@@ -1049,7 +1074,7 @@ public class TwitterApiIoProvider {
 
     private CompletableFuture<StreamFill> startInboundFillAsync(
             String baseUrl, String encodedUser, String self, String selfId, List<long[]> coverage,
-            Instant targetCutoff, Instant cutoff30, long headTo, boolean allowNativeHead,
+            Instant targetCutoff, Instant cutoff30, long headTo, boolean allowNativeHead, boolean initialFetch,
             String apiKey, KeyPacer pacer, int pageBudget, Instant deadline, AtomicBoolean degraded
     ) {
         String inboundQuery = "(to:" + self + " OR @" + self
@@ -1059,7 +1084,7 @@ public class TwitterApiIoProvider {
                 baseUrl,
                 baseUrl + "/twitter/user/mentions?userName=" + encodedUser,
                 inboundQuery,
-                coverage, targetCutoff, cutoff30, headTo, allowNativeHead,
+                coverage, targetCutoff, cutoff30, headTo, allowNativeHead, initialFetch,
                 apiKey, pacer, pageBudget, deadline, degraded,
                 node -> {
                     String rawDate = firstNonBlank(node.path("createdAt").asText(""), node.path("created_at").asText(""));
@@ -1095,7 +1120,8 @@ public class TwitterApiIoProvider {
             Map<String, Long> metricsObservedAt,
             List<long[]> newCoverage,
             AtomicInteger pagesLeft,
-            AtomicInteger pagesUsed
+            AtomicInteger pagesUsed,
+            boolean initialFetch
     ) {
     }
 
@@ -1103,7 +1129,7 @@ public class TwitterApiIoProvider {
      * 非阻塞分页与自适应并发时间分片补齐：
      * - 每一页 HTTP 请求独立投递至 {@link SharedApiExecutor}，不在工作线程内阻塞等待其它请求；
      * - 首页先做单次探测（稀疏账号 1 次请求即完成，绝不多花 API 额度）；
-     * - 当探测确认该时间段存在多页高密度数据且线程池处于低峰空闲时，自动把剩余时间窗切分为多路子区间并行拉取；
+     * - 当探测确认该时间段存在多页高密度数据且线程池处于低峰空闲时，自动把剩余时间窗切分为多路子区间并行拉取（首次拉取并发翻倍）；
      * - 高峰期线程池自动将分片度收敛为 1，按请求粒度 FIFO 公平调度。
      */
     private CompletableFuture<StreamFill> fillStreamAsync(
@@ -1115,6 +1141,7 @@ public class TwitterApiIoProvider {
             Instant cutoff30,
             long headTo,
             boolean allowNativeHead,
+            boolean initialFetch,
             String apiKey,
             KeyPacer pacer,
             int pageBudget,
@@ -1133,7 +1160,8 @@ public class TwitterApiIoProvider {
                 new ConcurrentHashMap<>(),
                 Collections.synchronizedList(new ArrayList<>()),
                 new AtomicInteger(pageBudget),
-                new AtomicInteger(0)
+                new AtomicInteger(0),
+                initialFetch
         );
         return fillGapAtAsync(ctx, gaps, 0, headTo, allowNativeHead)
                 .thenApply(v -> new StreamFill(new ArrayList<>(ctx.items()), new ArrayList<>(ctx.newCoverage()),
@@ -1242,14 +1270,15 @@ public class TwitterApiIoProvider {
                 return CompletableFuture.completedFuture(null);
             }
 
-            // 首页探测确认还有后续分页：低峰期按经验密度把剩余 [a, probeTail] 切分为多路并行分片；高峰期自动保持 1 路续翻
+            // 首页探测确认还有后续分页：低峰期按经验密度把剩余 [a, probeTail] 切分为多路并行分片（首次拉取并发翻倍）；高峰期自动保持 1 路续翻
             if (probeTail != null && probeTail.getEpochSecond() < b && probeTail.getEpochSecond() > a + 300) {
                 long remB = probeTail.getEpochSecond();
                 long page1Span = Math.max(60L, b - remB);
                 long remSpan = remB - a;
                 int estPages = (int) Math.min(64L, (remSpan + page1Span - 1) / page1Span);
+                int effectiveEstPages = ctx.initialFetch() ? Math.min(64, Math.max(2, estPages * 2)) : estPages;
                 int shards = sharedExecutor.suggestSliceConcurrency(
-                        remSpan, estPages, ctx.pagesLeft().get(), ctx.pacer().freeTierSlowMode);
+                        remSpan, effectiveEstPages, ctx.pagesLeft().get(), ctx.pacer().freeTierSlowMode, ctx.initialFetch());
                 if (shards >= 2) {
                     ctx.newCoverage().add(new long[]{remB, b});
                     List<CompletableFuture<Void>> shardFutures = new ArrayList<>(shards);

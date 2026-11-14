@@ -236,6 +236,108 @@ class DailyMetricRefreshTest {
         }
     }
 
+    @Test
+    void initialColdStartDoublesSliceConcurrencyComparedWithWarmSync() throws Exception {
+        var defaultProps = new com.xops.hub.config.XOpsProperties();
+        var defaultPool = new com.xops.hub.provider.SharedApiExecutor(defaultProps);
+        try {
+            var poolMetrics = defaultPool.snapshotMetrics();
+            assertThat(poolMetrics.get("corePoolSize")).isEqualTo(16);
+            assertThat(poolMetrics.get("maxPoolSize")).isEqualTo(28);
+            assertThat(poolMetrics.get("maxParallelSlices")).isEqualTo(4);
+            assertThat(poolMetrics.get("initialMaxParallelSlices")).isEqualTo(8);
+
+            assertThat(defaultPool.suggestSliceConcurrency(25 * 3600L, 12, 24, false, false)).isEqualTo(4);
+            assertThat(defaultPool.suggestSliceConcurrency(25 * 3600L, 12, 24, false, true)).isEqualTo(8);
+            assertThat(defaultPool.suggestSliceConcurrency(8 * 3600L, 12, 24, false, false)).isEqualTo(3);
+            assertThat(defaultPool.suggestSliceConcurrency(8 * 3600L, 12, 24, false, true)).isEqualTo(6);
+            assertThat(defaultPool.suggestSliceConcurrency(3 * 3600L, 12, 24, false, false)).isEqualTo(2);
+            assertThat(defaultPool.suggestSliceConcurrency(3 * 3600L, 12, 24, false, true)).isEqualTo(4);
+
+            var tweetSubSlices = new java.util.concurrent.atomic.AtomicInteger();
+            var inboundSubSlices = new java.util.concurrent.atomic.AtomicInteger();
+            var inFlight = new java.util.concurrent.atomic.AtomicInteger();
+            var peakInFlight = new java.util.concurrent.atomic.AtomicInteger();
+
+            var server = com.sun.net.httpserver.HttpServer.create(new java.net.InetSocketAddress("127.0.0.1", 0), 0);
+            var serverExec = java.util.concurrent.Executors.newCachedThreadPool();
+            server.setExecutor(serverExec);
+            server.createContext("/", exchange -> {
+                int cur = inFlight.incrementAndGet();
+                peakInFlight.accumulateAndGet(cur, Math::max);
+                try {
+                    var uri = exchange.getRequestURI();
+                    String body;
+                    if (uri.getPath().endsWith("/info")) {
+                        body = "{\"data\":{\"id\":\"self-id\",\"userName\":\"self\",\"following\":0,\"followers\":0}}";
+                    } else if (uri.getPath().endsWith("/advanced_search")) {
+                        String q = java.net.URLDecoder.decode(uri.getRawQuery(), java.nio.charset.StandardCharsets.UTF_8);
+                        long since = Long.parseLong(q.replaceAll(".*since_time:(\\d+).*", "$1"));
+                        long until = Long.parseLong(q.replaceAll(".*until_time:(\\d+).*", "$1"));
+                        boolean isTweets = q.startsWith("queryType=Latest&query=from:self") || !q.contains("-from:self");
+                        if (until - since > 20 * 3600L) {
+                            Instant tailTs = Instant.ofEpochSecond(until - 2 * 3600L);
+                            body = isTweets
+                                    ? "{\"tweets\":[{\"id\":\"p-top\",\"text\":\"hello\",\"createdAt\":\"" + tailTs
+                                            + "\",\"author\":{\"id\":\"self-id\",\"userName\":\"self\"}}],\"has_next_page\":true,\"next_cursor\":\"c1\"}"
+                                    : "{\"tweets\":[{\"id\":\"m-top\",\"text\":\"@self hi\",\"isReply\":true,\"inReplyToUsername\":\"self\",\"createdAt\":\""
+                                            + tailTs + "\",\"author\":{\"id\":\"peer-1\",\"userName\":\"peer1\"}}],\"has_next_page\":true,\"next_cursor\":\"c1\"}";
+                        } else {
+                            if (isTweets) {
+                                tweetSubSlices.incrementAndGet();
+                            } else {
+                                inboundSubSlices.incrementAndGet();
+                            }
+                            Thread.sleep(60L);
+                            body = "{\"tweets\":[],\"has_next_page\":false}";
+                        }
+                    } else {
+                        body = "{\"tweets\":[],\"users\":[],\"status\":\"success\",\"has_next_page\":false}";
+                    }
+                    byte[] bytes = body.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                    exchange.getResponseHeaders().set("Content-Type", "application/json");
+                    exchange.sendResponseHeaders(200, bytes.length);
+                    try (var out = exchange.getResponseBody()) {
+                        out.write(bytes);
+                    }
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    inFlight.decrementAndGet();
+                }
+            });
+            server.start();
+            try {
+                defaultProps.setDiskCacheDir(temp.toString());
+                defaultProps.setTwitterapiIoKey("local-cold-2x");
+                defaultProps.setTwitterapiIoBaseUrl("http://127.0.0.1:" + server.getAddress().getPort());
+                var provider = new TwitterApiIoProvider(defaultProps, new ObjectMapper().findAndRegisterModules(), defaultPool);
+
+                var cold = provider.syncStoreByHours("self", null, 24, true, true, null, "self-id");
+                assertThat(cold.degraded()).isFalse();
+                assertThat(tweetSubSlices.get()).isEqualTo(8);
+                assertThat(inboundSubSlices.get()).isEqualTo(8);
+                assertThat(peakInFlight.get()).isGreaterThanOrEqualTo(10);
+
+                tweetSubSlices.set(0);
+                inboundSubSlices.set(0);
+                var selfSummary = new XUserSummary("self-id", "self", "Self", "", "", false, 0, 0, 0, "");
+                var warmEmptyCoverage = AccountStore.merge(
+                        null, selfSummary, Instant.now().minusSeconds(7200), List.of(), List.of(), List.of(), List.of(),
+                        new AccountStore.GraphUpdate(List.of(), List.of(), Set.of(), false, false, false, false));
+                var warm = provider.syncStoreByHours("self", warmEmptyCoverage, 24, true, true, null, "self-id");
+                assertThat(warm.degraded()).isFalse();
+                assertThat(tweetSubSlices.get()).isLessThanOrEqualTo(4);
+                assertThat(inboundSubSlices.get()).isLessThanOrEqualTo(4);
+            } finally {
+                server.stop(0);
+                serverExec.shutdownNow();
+            }
+        } finally {
+            defaultPool.shutdown();
+        }
+    }
+
     private ExactFollowProviderTest.Reply ok(String json) { return ExactFollowProviderTest.Reply.ok(json); }
     private String metric(String id, Instant at) {
         String classification = id.equals("old-0") ? ",\"isReply\":true,\"inReplyToUsername\":\"peer\""

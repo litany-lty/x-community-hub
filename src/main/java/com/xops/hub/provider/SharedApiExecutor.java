@@ -79,7 +79,7 @@ public class SharedApiExecutor {
         this.maxSize = Math.max(this.coreSize, properties.getApiPoolMaxSize());
         this.queueCapacity = Math.max(1, properties.getApiPoolQueueCapacity());
         this.queueTimeoutMs = Math.max(0L, properties.getApiQueueTimeoutMs());
-        this.maxParallelSlices = Math.max(1, Math.min(8, properties.getApiMaxParallelSlices()));
+        this.maxParallelSlices = Math.max(1, Math.min(16, properties.getApiMaxParallelSlices()));
 
         int poolId = POOL_SEQ.getAndIncrement();
         AtomicInteger workerSeq = new AtomicInteger(1);
@@ -187,12 +187,23 @@ public class SharedApiExecutor {
 
     /**
      * 根据剩余时间跨度、预估页数与线程池实时水位，动态决定单个数据流的分片并发数：
-     * - 低峰空闲：最多并发 maxParallelSlices 路分片拉取（大幅缩短长窗口首次/续拉耗时）；
-     * - 中等负载：收缩至最多 2 路；
+     * - 低峰空闲：最多并发 maxParallelSlices 路分片拉取（首次冷启动拉取翻倍为 2 * maxParallelSlices）；
+     * - 中等负载：常规收缩至最多 2 路（首次冷启动收缩至最多 4 路）；
      * - 高峰排队：严格降为 1 路串行，避免单用户放大请求数挤压他人。
      */
     public int suggestSliceConcurrency(long remainingSpanSeconds, int estimatedPages, int remainingBudget, boolean slowMode) {
-        if (slowMode || maxParallelSlices <= 1 || estimatedPages <= 1 || remainingBudget <= 1 || remainingSpanSeconds < 1800L) {
+        return suggestSliceConcurrency(remainingSpanSeconds, estimatedPages, remainingBudget, slowMode, false);
+    }
+
+    public int suggestSliceConcurrency(
+            long remainingSpanSeconds,
+            int estimatedPages,
+            int remainingBudget,
+            boolean slowMode,
+            boolean initialFetch
+    ) {
+        int sliceCap = initialFetch ? Math.min(16, maxParallelSlices * 2) : maxParallelSlices;
+        if (slowMode || sliceCap <= 1 || estimatedPages <= 1 || remainingBudget <= 1 || remainingSpanSeconds < 1800L) {
             return 1;
         }
         int queued = workQueue.size();
@@ -200,11 +211,17 @@ public class SharedApiExecutor {
         if (queued >= Math.max(2, queueCapacity / 8) || active >= Math.max(1, maxSize - 2)) {
             return 1;
         }
-        int spanCap = remainingSpanSeconds >= 24 * 3600L ? maxParallelSlices
-                : (remainingSpanSeconds >= 6 * 3600L ? Math.min(maxParallelSlices, 3) : 2);
+        int spanCap;
+        if (initialFetch) {
+            spanCap = remainingSpanSeconds >= 12 * 3600L ? sliceCap
+                    : (remainingSpanSeconds >= 6 * 3600L ? Math.min(sliceCap, 6) : Math.min(sliceCap, 4));
+        } else {
+            spanCap = remainingSpanSeconds >= 24 * 3600L ? sliceCap
+                    : (remainingSpanSeconds >= 6 * 3600L ? Math.min(sliceCap, 3) : 2);
+        }
         int desired = Math.min(spanCap, Math.min(estimatedPages, Math.max(1, remainingBudget / 2)));
         if (queued > 0 || active > maxSize / 2) {
-            return Math.min(2, desired);
+            return Math.min(initialFetch ? 4 : 2, desired);
         }
         return Math.max(1, desired);
     }
@@ -219,6 +236,7 @@ public class SharedApiExecutor {
         m.put("queueCapacity", queueCapacity);
         m.put("queueTimeoutMs", queueTimeoutMs);
         m.put("maxParallelSlices", maxParallelSlices);
+        m.put("initialMaxParallelSlices", Math.min(16, maxParallelSlices * 2));
         m.put("submittedTasks", submittedCount.get());
         m.put("completedTasks", completedCount.get());
         m.put("rejectedTasks", rejectedCount.get());
