@@ -10,8 +10,19 @@
     const PERIOD_META = {
         MONTH: { code: "MONTH", days: 30, badgePrefix: "近 30 天" },
         WEEK: { code: "WEEK", days: 7, badgePrefix: "近 7 天" },
-        HOURS_48: { code: "HOURS_48", days: 2, badgePrefix: "近 48 小时" }
+        HOURS_48: { code: "HOURS_48", days: 2, badgePrefix: "近 48 小时" },
+        HOURS_24: { code: "HOURS_24", days: 1, badgePrefix: "近 24 小时" }
     };
+
+    const AUTHOR_REPO_URL = "https://github.com/litany-lty/x-community-hub";
+    const AUTHOR_BANNER_URL = "/author-banner.webp";
+    const AUTHOR_AVATAR_URL = "/author-avatar.webp";
+    const MEDIA_CACHE_NAME = "xops-media-v1";
+    const MEDIA_CACHE_MAX_ENTRIES = 120;
+    const PROFILE_HEADER_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+    const AUTHOR_DEFAULT_BIO = "Java Dev & AI | Studying Chinese Metaphysics(Dao·道) ䷊";
+    const AUTHOR_COST_STORY =
+        "我目前负债十几个、失业、每个月靠贷款交房租。确实承担不起每个月过多的API费用。现在希望通过X平台解决人生危机。也希望朋友们可以谅解。如果限制让你感到不爽，可以到git仓库看开源代码，本地部署与线上效果一致。";
 
     // X 风格线性图标（统一替代互动指标里的 emoji）
     const ICON_PATHS = {
@@ -28,15 +39,17 @@
     const URL_TOKEN_RE = /https?:\/\/[A-Za-z0-9._~:/?#[\]@!$&'()*+,;=%-]+/gi;
 
     const state = {
-        period: "HOURS_48",
+        period: "HOURS_24",
         storedMode: false,
-        days: 2,
+        days: 1,
         themeIdx: 0,
         activeTab: "activity",
         serverMeta: null,
         authStatus: null,
         report: null,
         bundle: null,
+        dailyCacheStatus: null,
+        accessPolicy: null,
         coveredWindowDays: 0,
         pendingExpandCheck: false,
         pendingRelationshipChecks: 0,
@@ -49,7 +62,7 @@
         cooldownTimerId: null,
         // 模块 2：推友互动筛选与增量分页状态
         selectedPeerUsername: null,
-        peerRelFilter: "ALL",
+        peerRelFilter: "MUTUAL",
         peerSearchQuery: "",
         peerSortBy: "intimacy",
         peerRenderLimit: LIST_PAGE_SIZE,
@@ -69,7 +82,25 @@
         // 使用次数与作者引导弹层状态
         usageCount: 0,
         authorFollowingMarked: false,
-        boundUserId: ""
+        boundUserId: "",
+        // 模块 6：图文定时发布与逾期二次确认状态
+        scheduleJobs: [],
+        schedulePendingCount: 0,
+        scheduleOverdueCount: 0,
+        scheduleFilter: "ALL",
+        scheduleDraftFiles: [],
+        scheduleDraftItems: [],
+        activeScheduleDraftIdx: 0,
+        mediaPickerTargetIdx: 0,
+        composerClientRequestId: "",
+        schedulePollTimerId: null,
+        watchedResendIds: new Set(),
+        pendingConfirmJob: null,
+        rescheduleEditingJobId: null,
+        scheduleServerTz: "Asia/Shanghai",
+        scheduleAccess: null,
+        algoProfileStatus: null,
+        algoConfigOpen: false
     };
 
     function cancelReportRequest() {
@@ -89,13 +120,15 @@
         clearInterval(state.cooldownTimerId);
         state.report = null;
         state.bundle = null;
+        state.dailyCacheStatus = null;
+        state.accessPolicy = null;
         state.coveredWindowDays = 0;
         state.pendingRelationshipChecks = 0;
         state.pendingExpandCheck = false;
         state.cacheExpiresEpochMs = 0;
         state.isFetching = false;
         state.selectedPeerUsername = null;
-        state.peerRelFilter = "ALL";
+        state.peerRelFilter = "MUTUAL";
         state.peerFilterTouched = false;
         state.peerSearchQuery = "";
         state.followSearchQuery = "";
@@ -107,6 +140,28 @@
         state.usageCount = 0;
         state.authorFollowingMarked = false;
         state.boundUserId = "";
+        clearInterval(state.schedulePollTimerId);
+        state.schedulePollTimerId = null;
+        for (const draft of state.scheduleDraftItems || []) {
+            for (const media of (draft && draft.files) || []) {
+                if (media && media.previewUrl && typeof URL !== "undefined" && URL.revokeObjectURL) {
+                    try { URL.revokeObjectURL(media.previewUrl); } catch (_) {}
+                }
+            }
+        }
+        state.scheduleJobs = [];
+        state.schedulePendingCount = 0;
+        state.scheduleOverdueCount = 0;
+        state.scheduleFilter = "ALL";
+        state.scheduleDraftFiles = [];
+        state.scheduleDraftItems = [];
+        state.activeScheduleDraftIdx = 0;
+        state.mediaPickerTargetIdx = 0;
+        state.composerClientRequestId = "";
+        state.watchedResendIds = new Set();
+        state.pendingConfirmJob = null;
+        state.rescheduleEditingJobId = null;
+        state.scheduleAccess = null;
     }
 
     // 已精简移除的元素返回游离占位节点，避免旧渲染逻辑写入时报错
@@ -158,36 +213,260 @@
         });
     }
 
-    function normalizePeriod(rawPeriod, rawDays) {
-        const up = String(rawPeriod || "").trim().toUpperCase();
-        const dNum = Number(rawDays);
-        if (up === "MONTH" || up === "MONTHLY" || up === "30D" || up === "M" || dNum === 30) {
-            return PERIOD_META.MONTH;
+    const mediaObjectUrlMap = new Map();
+    const mediaWarmInFlight = new Map();
+
+    function getProfileHeaderCacheKey(userId) {
+        const cleanId = String(userId || "").trim();
+        return cleanId ? `xops_profile_meta_user_${cleanId}` : "";
+    }
+
+    function saveProfileHeaderCache(userId, profile, personaTag) {
+        const key = getProfileHeaderCacheKey(userId);
+        if (!key || !profile) return;
+        try {
+            const payload = {
+                id: String(userId).trim(),
+                username: String(profile.username || "").trim(),
+                displayName: String(profile.displayName || profile.username || "").trim(),
+                avatarUrl: safeAvatarSrc(profile.avatarUrl),
+                bannerUrl: safeAvatarSrc(profile.bannerUrl),
+                bio: String(profile.bio || "").replace(/[\u200B-\u200D\uFEFF]/g, "").trim(),
+                verified: Boolean(profile.verified),
+                followingCount: Number(profile.followingCount || 0),
+                followersCount: Number(profile.followersCount || 0),
+                totalPostsCount: Number(profile.totalPostsCount || 0),
+                personaTag: String(personaTag || "").trim(),
+                savedAt: Date.now()
+            };
+            localStorage.setItem(key, JSON.stringify(payload));
+            localStorage.setItem("xops_last_uid", payload.id);
+        } catch (_) {}
+    }
+
+    function loadProfileHeaderCache(userId) {
+        const key = getProfileHeaderCacheKey(userId);
+        if (!key) return null;
+        try {
+            const raw = localStorage.getItem(key);
+            if (!raw) return null;
+            const parsed = JSON.parse(raw);
+            if (!parsed || parsed.id !== String(userId).trim()) return null;
+            if (Date.now() - Number(parsed.savedAt || 0) > PROFILE_HEADER_CACHE_TTL_MS) {
+                localStorage.removeItem(key);
+                return null;
+            }
+            return parsed;
+        } catch (_) {
+            return null;
         }
-        if (up === "WEEK" || up === "WEEKLY" || up === "7D" || up === "W" || dNum === 7) {
-            return PERIOD_META.WEEK;
+    }
+
+    function clearProfileHeaderCache(userId) {
+        const key = getProfileHeaderCacheKey(userId);
+        try {
+            if (key) localStorage.removeItem(key);
+            localStorage.removeItem("xops_last_uid");
+        } catch (_) {}
+    }
+
+    function canPersistMediaToCacheStorage(canonical) {
+        if (!canonical) return false;
+        if (canonical.startsWith("/")) return true;
+        return /^https:\/\/(?:pbs|abs)\.twimg\.com\//i.test(canonical);
+    }
+
+    async function trimMediaCacheOverflow(cache) {
+        try {
+            const keys = await cache.keys();
+            if (keys.length > MEDIA_CACHE_MAX_ENTRIES) {
+                const excess = keys.slice(0, keys.length - MEDIA_CACHE_MAX_ENTRIES);
+                await Promise.allSettled(excess.map((req) => cache.delete(req)));
+            }
+        } catch (_) {}
+    }
+
+    async function readCacheStorageMedia(rawUrl) {
+        const canonical = safeAvatarSrc(rawUrl);
+        if (!canonical) return "";
+        if (mediaObjectUrlMap.has(canonical)) {
+            return mediaObjectUrlMap.get(canonical);
+        }
+        if (typeof window === "undefined" || !("caches" in window) || typeof URL === "undefined" || !URL.createObjectURL) {
+            return "";
+        }
+        try {
+            const cache = await window.caches.open(MEDIA_CACHE_NAME);
+            const resp = await cache.match(canonical);
+            if (!resp) return "";
+            const blob = await resp.blob();
+            if (!blob || blob.size === 0) return "";
+            const objUrl = URL.createObjectURL(blob);
+            mediaObjectUrlMap.set(canonical, objUrl);
+            return objUrl;
+        } catch (_) {
+            return "";
+        }
+    }
+
+    function warmMediaAsset(rawUrl) {
+        const canonical = safeAvatarSrc(rawUrl);
+        if (!canonical || !canPersistMediaToCacheStorage(canonical)) return Promise.resolve(null);
+        if (mediaObjectUrlMap.has(canonical)) {
+            return Promise.resolve(mediaObjectUrlMap.get(canonical));
         }
         if (
-            up === "HOURS_48" ||
-            up === "48H" ||
-            up === "DAY" ||
-            up === "DAILY" ||
-            up === "2D" ||
-            up === "1D" ||
-            up === "D" ||
-            dNum === 2 ||
-            dNum === 1
+            typeof window === "undefined" ||
+            !("caches" in window) ||
+            typeof fetch !== "function" ||
+            typeof URL === "undefined" ||
+            !URL.createObjectURL
         ) {
+            return Promise.resolve(null);
+        }
+        if (mediaWarmInFlight.has(canonical)) {
+            return mediaWarmInFlight.get(canonical);
+        }
+        const task = (async () => {
+            try {
+                const cache = await window.caches.open(MEDIA_CACHE_NAME);
+                let resp = await cache.match(canonical);
+                if (!resp) {
+                    const isLocal = canonical.startsWith("/");
+                    const netResp = await fetch(canonical, {
+                        mode: isLocal ? "same-origin" : "cors",
+                        credentials: isLocal ? "same-origin" : "omit",
+                        cache: isLocal ? "default" : "reload",
+                        referrerPolicy: "no-referrer"
+                    });
+                    const ct = netResp.headers.get("content-type") || "";
+                    if (!netResp.ok || (ct && !/^image\//i.test(ct))) {
+                        return null;
+                    }
+                    await cache.put(canonical, netResp.clone());
+                    void trimMediaCacheOverflow(cache);
+                    resp = netResp;
+                }
+                const blob = await resp.blob();
+                if (!blob || blob.size === 0) return null;
+                if (!mediaObjectUrlMap.has(canonical)) {
+                    mediaObjectUrlMap.set(canonical, URL.createObjectURL(blob));
+                }
+                return mediaObjectUrlMap.get(canonical);
+            } catch (_) {
+                return null;
+            } finally {
+                mediaWarmInFlight.delete(canonical);
+            }
+        })();
+        mediaWarmInFlight.set(canonical, task);
+        return task;
+    }
+
+    function resolveCachedMediaSrc(rawUrl, options = {}) {
+        const canonical = safeAvatarSrc(rawUrl);
+        if (!canonical) return "";
+        const hit = mediaObjectUrlMap.get(canonical);
+        if (hit) return hit;
+        if (options.warm === true) {
+            void warmMediaAsset(canonical);
+        }
+        return canonical;
+    }
+
+    async function primeInitialMediaCache() {
+        try {
+            const lastUid = localStorage.getItem("xops_last_uid");
+            const cached = lastUid ? loadProfileHeaderCache(lastUid) : null;
+            const urls = [cached?.avatarUrl, cached?.bannerUrl, AUTHOR_AVATAR_URL, AUTHOR_BANNER_URL].filter(Boolean);
+            await Promise.allSettled(urls.map((u) => readCacheStorageMedia(u)));
+        } catch (_) {}
+    }
+
+    function scheduleMediaBatchWarm(urls) {
+        const queue = [...new Set((urls || []).map((u) => safeAvatarSrc(u)).filter(Boolean))]
+            .filter((u) => canPersistMediaToCacheStorage(u) && !mediaObjectUrlMap.has(u));
+        if (queue.length === 0) return;
+        const run = async () => {
+            const batchSize = 4;
+            for (let i = 0; i < queue.length; i += batchSize) {
+                await Promise.allSettled(queue.slice(i, i + batchSize).map((u) => warmMediaAsset(u)));
+            }
+        };
+        if (typeof window !== "undefined" && typeof window.requestIdleCallback === "function") {
+            window.requestIdleCallback(() => { void run(); }, { timeout: 1200 });
+        } else {
+            setTimeout(() => { void run(); }, 150);
+        }
+    }
+
+    function normalizePeriod(rawPeriod, rawDays) {
+        const up = String(rawPeriod || "").trim().toUpperCase();
+        if (up === "MONTH" || up === "MONTHLY" || up === "30D" || up === "M") {
+            return PERIOD_META.MONTH;
+        }
+        if (up === "WEEK" || up === "WEEKLY" || up === "7D" || up === "W") {
+            return PERIOD_META.WEEK;
+        }
+        if (up === "HOURS_48" || up === "48H" || up === "2D") {
             return PERIOD_META.HOURS_48;
         }
-        // 默认维度为 48 小时动态窗口
-        return PERIOD_META.HOURS_48;
+        if (
+            up === "HOURS_24" ||
+            up === "24H" ||
+            up === "HOURS_8" ||
+            up === "8H" ||
+            up === "DAY" ||
+            up === "DAILY" ||
+            up === "1D" ||
+            up === "D"
+        ) {
+            return PERIOD_META.HOURS_24;
+        }
+        const dNum = Number(rawDays);
+        if (dNum === 30) return PERIOD_META.MONTH;
+        if (dNum === 7) return PERIOD_META.WEEK;
+        if (dNum === 2) return PERIOD_META.HOURS_48;
+        // 默认维度为 24 小时动态窗口
+        return PERIOD_META.HOURS_24;
+    }
+
+    function isPeriodUnlocked(periodCode) {
+        if (!periodCode || periodCode === "HOURS_24") return true;
+        if (state.accessPolicy && Array.isArray(state.accessPolicy.unlockedPeriods)) {
+            return state.accessPolicy.unlockedPeriods.includes(periodCode);
+        }
+        if (state.storedMode && state.bundle) {
+            return Boolean(state.bundle[periodCode]);
+        }
+        return false;
     }
 
     function syncPeriodButtons() {
+        const lockedReasons = (state.accessPolicy && state.accessPolicy.lockedReasons) || {};
+        const hasPolicyOrBundle = Boolean(state.accessPolicy || (state.storedMode && state.bundle));
+        let allUnlocked = hasPolicyOrBundle;
         document.querySelectorAll(".seg-btn[data-period]").forEach((btn) => {
-            btn.classList.toggle("active", btn.dataset.period === state.period);
+            if (!btn.dataset.defaultTitle && btn.title) {
+                btn.dataset.defaultTitle = btn.title;
+            }
+            const pCode = btn.dataset.period;
+            const unlocked = isPeriodUnlocked(pCode);
+            const knownLocked = hasPolicyOrBundle && !unlocked;
+            if (!unlocked) allUnlocked = false;
+            const baseLabel = btn.dataset.label || btn.textContent.replace(/^🔒\s*/, "");
+            btn.classList.toggle("active", pCode === state.period);
+            btn.classList.toggle("is-locked", knownLocked);
+            btn.setAttribute("aria-disabled", knownLocked ? "true" : "false");
+            btn.textContent = knownLocked ? `🔒 ${baseLabel}` : baseLabel;
+            btn.title = knownLocked && lockedReasons[pCode]
+                ? lockedReasons[pCode]
+                : (btn.dataset.defaultTitle || baseLabel);
         });
+        const unlockBtn = document.getElementById("periodUnlockHelpBtn");
+        if (unlockBtn) {
+            unlockBtn.hidden = allUnlocked;
+        }
     }
 
     function escapeHtml(str) {
@@ -198,6 +477,276 @@
             .replace(/>/g, "&gt;")
             .replace(/"/g, "&quot;")
             .replace(/'/g, "&#39;");
+    }
+
+    const DEFAULT_ALGO_PROFILE = {
+        version: "2026.11-phoenix-hm",
+        name: "Phoenix + Home Mixer",
+        updatedAt: "2026-11-15",
+        sourceUrl: "https://github.com/xai-org/x-algorithm/tree/590f3926e5bc",
+        changelog: [
+            "对齐 xai-org/x-algorithm (commit 590f3926e5bc, param.rs 2026-11-12) 真实 vm_ranker / ValueModelWeights 参数（作用于个性化预测概率 P(action)，非原始互动计数乘数）",
+            "接入 BidirectionalFollowReplyWeightBoost (+15.0)：互关账号的原创/引用帖 reply 预测权重由 5.0 提升至 20.0；评论排序同步纳入 focalAuthorReplySeq / favByRootAuthorSeq",
+            "接入 OONRetweetReplyFilter 与 PostFusionMultiplier 精确公式：纯转推与回复在公域过滤丢弃、关注内按 0.75x 折算；同作者单批多帖按 (1-0.25)*0.5^k+0.25 衰减",
+            "接入 Scarecrow 反垃圾规则证据（BBQDuplicateTextProd 重复文本 COPYPASTA_SPAM、bot/6754 低质外链+@非粉丝提及）与 vm-ranker DPP(theta=0.65) 语义去重；剔除主观文案词表猜测"
+        ],
+        upstreamEvidence: {
+            upstreamCommit: "590f3926e5bc",
+            paramSyncedAt: "2026-11-12T16:00:36Z",
+            activeRankerService: "vm_ranker",
+            shareViaCopyLinkWeight: 20.0,
+            replyWeight: 5.0,
+            bidirectionalFollowReplyWeightBoost: 15.0,
+            bidirectionalFollowDwellWeightBoost: 0.0,
+            quoteWeight: 5.0,
+            shareViaDmWeight: 5.0,
+            followAuthorWeight: 4.0,
+            shareWeight: 2.0,
+            retweetWeight: 1.0,
+            favoriteWeight: 0.5,
+            contClickDwellTimeWeight: 0.4,
+            clickWeight: 0.3,
+            openLinkWeight: 0.2,
+            videoOpenWeight: 0.07,
+            photoExpandWeight: 0.05,
+            quotedClickWeight: 0.05,
+            dwellWeight: 0.05,
+            postUnexploredWeight: 0.02,
+            contDwellTimeWeight: 0.004,
+            vqvWeight: 0.0,
+            profileClickWeight: 0.0,
+            minVideoDurationMs: 10000,
+            reportWeight: -234.0,
+            muteAuthorWeight: -58.8,
+            notInterestedWeight: -47.52,
+            blockAuthorWeight: -31.2,
+            notDwelledWeight: -0.02,
+            maxCandidateAgeHours: 48,
+            enableAuthorDiversity: true,
+            authorDiversityDecay: 0.5,
+            authorDiversityFloor: 0.25,
+            oonWeightFactor: 0.75,
+            topicOonWeightFactor: 0.5,
+            oonRescoreInNetworkRepliesRetweets: true,
+            enablePhoenixOonReplies: false,
+            dppEnabled: true,
+            dppTheta: 0.65,
+            dppMaxSelectedRank: 150,
+            coldStartEnabled: true,
+            coldStartFollowerCap: 50000,
+            coldStartImpressionThreshold: 200,
+            coldStartMaxPostAgeSecs: 7200,
+            coldStartSlotMin: 15,
+            coldStartSlotMax: 16,
+            underTheHoodMinAccountAgeDays: 365,
+            underTheHoodMinPriorMonthPosts: 10,
+            underTheHoodPublishLagDays: 10
+        },
+        cadenceAndReach: {
+            minRecommendedGapMinutes: 180,
+            severeRapidFireGapMinutes: 60,
+            linkLossNoticePct: 15,
+            oonFollowerMultiple: 1.0,
+            lowReachFollowerRatio: 0.05
+        },
+        draftChecker: {
+            baseScore: 100,
+            minScore: 15,
+            maxScore: 100,
+            excellentThreshold: 88,
+            goodThreshold: 70,
+            leadingMentionOonFilterPenalty: 28,
+            authorDiversityMaxPenalty: 26,
+            queueCollisionPenalty: 12,
+            exactDuplicateTextPenalty: 35,
+            nearDuplicateTextPenalty: 18,
+            duplicateSimilarityThreshold: 0.65,
+            urlWithNonFollowerMentionPenalty: 18
+        }
+    };
+
+    function getActiveAlgoProfile() {
+        const remote = state.algoProfileStatus && state.algoProfileStatus.profile
+            ? state.algoProfileStatus.profile
+            : null;
+        if (!remote) return DEFAULT_ALGO_PROFILE;
+        return {
+            ...DEFAULT_ALGO_PROFILE,
+            ...remote,
+            upstreamEvidence: {
+                ...DEFAULT_ALGO_PROFILE.upstreamEvidence,
+                ...(remote.upstreamEvidence || {})
+            },
+            cadenceAndReach: {
+                ...DEFAULT_ALGO_PROFILE.cadenceAndReach,
+                ...(remote.cadenceAndReach || {})
+            },
+            draftChecker: {
+                ...DEFAULT_ALGO_PROFILE.draftChecker,
+                ...(remote.draftChecker || {})
+            }
+        };
+    }
+
+    function escapeRegexChars(str) {
+        return String(str || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    }
+
+    async function fetchAlgoProfileStatus() {
+        try {
+            const resp = await fetch("/api/algo/profile", {
+                credentials: "same-origin",
+                cache: "no-store"
+            });
+            if (!resp.ok) return null;
+            const body = await safeParseJson(resp);
+            if (body && body.profile) {
+                state.algoProfileStatus = body;
+                renderAlgoConfigDrawer();
+                evaluatePrePostDraft();
+            }
+            return body;
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function openAlgoConfigDrawer(open) {
+        state.algoConfigOpen = Boolean(open);
+        const drawer = $("algoConfigDrawer");
+        const btn = $("toggleAlgoConfigBtn");
+        if (drawer) drawer.hidden = !state.algoConfigOpen;
+        if (btn) {
+            btn.setAttribute("aria-expanded", String(state.algoConfigOpen));
+            btn.textContent = state.algoConfigOpen ? "收起配置 ▴" : "参数配置 ▾";
+        }
+        if (state.algoConfigOpen) {
+            renderAlgoConfigDrawer();
+        }
+    }
+
+    function renderAlgoConfigDrawer(forceOverwriteEditor = false) {
+        const status = state.algoProfileStatus;
+        const profile = getActiveAlgoProfile();
+        const ah = state.report && state.report.algorithmHealth ? state.report.algorithmHealth : null;
+        const verText = (ah && ah.algoVersion) ? ah.algoVersion : (profile.version || "Phoenix");
+        const nameText = (ah && ah.algoName) ? ah.algoName : (profile.name || "Phoenix + Home Mixer");
+        const isOverride = Boolean(status && status.source === "LOCAL_OVERRIDE");
+
+        const badgeEl = $("algoProfileVersionBadge");
+        if (badgeEl) {
+            badgeEl.textContent = "自定义参数";
+            badgeEl.hidden = !isOverride;
+        }
+        const sideBtn = $("sideAlgoVerBtn");
+        if (sideBtn) {
+            sideBtn.textContent = isOverride ? "自定义" : "参数";
+            sideBtn.title = `当前参数：${nameText} (${verText})`;
+        }
+
+        const metaEl = $("algoConfigMetaLine");
+        if (metaEl) {
+            const srcLabel = status && status.source === "LOCAL_OVERRIDE" ? "本地热覆盖" : "内置基线";
+            const fp = status && status.fingerprint ? status.fingerprint : "-";
+            const updatedAt = profile.updatedAt || "-";
+            const ev = profile.upstreamEvidence || DEFAULT_ALGO_PROFILE.upstreamEvidence;
+            const commitLabel = ev && ev.upstreamCommit ? ` · 上游源码 ${ev.upstreamCommit} (${ev.activeRankerService || "vm_ranker"})` : "";
+            const overridePath = status && status.overridePath ? status.overridePath : "";
+            metaEl.textContent = `生效规则：${nameText} (${verText})${commitLabel} · 更新日期 ${updatedAt} · 来源：${srcLabel} · 指纹 ${fp}${overridePath ? ` · 覆盖文件 ${overridePath}` : ""}`;
+        }
+
+        const logsEl = $("algoChangelogList");
+        if (logsEl) {
+            const logs = Array.isArray(profile.changelog) ? profile.changelog : [];
+            logsEl.innerHTML = logs
+                .map((line) => `<span class="algo-changelog-chip">${escapeHtml(line)}</span>`)
+                .join("");
+        }
+
+        const canManage = Boolean(status && status.canManage);
+        const actionRow = $("algoConfigActionRow");
+        if (actionRow) actionRow.hidden = !canManage;
+
+        const hintEl = $("algoConfigPermHint");
+        if (hintEl) {
+            hintEl.textContent = canManage
+                ? "当前会话具备算法热更新权限：修改下方 JSON 后点击「保存并热生效」，系统将立即无外部 API 开销重算推荐与评分（也可直接修改磁盘覆盖文件自动热加载）。"
+                : "只读视图：仅授权管理员或本地调试模式可修改全局规则；磁盘覆盖文件变更后后端会自动零停机重载。";
+        }
+
+        const editorEl = $("algoProfileJsonInput");
+        if (editorEl) {
+            editorEl.readOnly = !canManage;
+            if (forceOverwriteEditor || document.activeElement !== editorEl) {
+                const rawObj = (status && status.profile) ? status.profile : profile;
+                editorEl.value = JSON.stringify(rawObj, null, 2);
+            }
+        }
+    }
+
+    async function submitAlgoProfileAction(mode) {
+        if (!state.algoProfileStatus || !state.algoProfileStatus.canManage) {
+            showError("仅管理员或本地调试模式可修改全局算法规则");
+            return;
+        }
+        const saveBtn = $("saveAlgoProfileBtn");
+        const reloadBtn = $("reloadAlgoProfileBtn");
+        const resetBtn = $("resetAlgoProfileBtn");
+        const editorEl = $("algoProfileJsonInput");
+
+        let url = "/api/algo/profile";
+        let fetchOpts = { method: "POST", credentials: "same-origin", headers: {} };
+        if (mode === "reload") {
+            url = "/api/algo/profile/reload";
+        } else if (mode === "reset") {
+            url = "/api/algo/profile/reset";
+        } else {
+            let parsed;
+            try {
+                parsed = JSON.parse(editorEl ? editorEl.value : "");
+            } catch (err) {
+                showError(`JSON 语法有误：${err.message}`);
+                return;
+            }
+            if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+                showError("算法配置必须是合法的 JSON 对象");
+                return;
+            }
+            fetchOpts.headers["Content-Type"] = "application/json";
+            fetchOpts.body = JSON.stringify(parsed);
+        }
+
+        [saveBtn, reloadBtn, resetBtn].forEach((b) => {
+            if (b) b.disabled = true;
+        });
+        try {
+            const resp = await fetch(url, fetchOpts);
+            const body = await safeParseJson(resp);
+            if (!resp.ok) {
+                showError((body && body.message) || `操作失败（HTTP ${resp.status}）`);
+                return;
+            }
+            if (body && body.profile) {
+                state.algoProfileStatus = body;
+                renderAlgoConfigDrawer(true);
+                evaluatePrePostDraft();
+            }
+            const okMsg = mode === "reload"
+                ? "已从磁盘重载最新算法规则"
+                : mode === "reset"
+                    ? "已还原内置基线算法规则"
+                    : "算法规则已热生效，正在重算分析指标";
+            showToast(okMsg);
+            if (isLoggedIn()) {
+                await loadSelfReport(false);
+            }
+        } catch (err) {
+            showError((err && err.message) || "请求算法配置接口失败，请稍后重试");
+        } finally {
+            [saveBtn, reloadBtn, resetBtn].forEach((b) => {
+                if (b) b.disabled = false;
+            });
+        }
     }
 
     function fmtNum(n) {
@@ -229,6 +778,20 @@
         if (/^https?:\/\//i.test(s)) return s;
         if (/^\/[a-zA-Z0-9._/-]+$/.test(s)) return s;
         return "";
+    }
+
+    function applyCoverBanner(coverEl, rawBannerUrl) {
+        if (!coverEl) return;
+        const canonical = safeAvatarSrc(rawBannerUrl);
+        const renderSrc = canonical ? resolveCachedMediaSrc(canonical, { warm: true }) : "";
+        if (renderSrc && !/["'()\\\r\n]/.test(renderSrc)) {
+            coverEl.style.backgroundImage =
+                `linear-gradient(180deg, rgba(0, 0, 0, 0.36) 0%, rgba(0, 0, 0, 0.04) 45%, rgba(0, 0, 0, 0.22) 100%), url("${renderSrc}")`;
+            coverEl.classList.add("has-banner");
+        } else {
+            coverEl.style.backgroundImage = "";
+            coverEl.classList.remove("has-banner");
+        }
     }
 
     function firstCodePointUpper(str) {
@@ -290,10 +853,13 @@
         const initial = firstCodePointUpper(user && user.displayName ? user.displayName : uname);
         const hue = Math.abs(hashStr(uname)) % 360;
         const bgStyle = `background: linear-gradient(135deg, hsl(${hue}, 76%, 48%), hsl(${(hue + 48) % 360}, 74%, 38%));`;
-        const validAvatar = user && user.avatarUrl ? safeAvatarSrc(user.avatarUrl) : "";
-        if (validAvatar) {
+        const canonical = user && user.avatarUrl ? safeAvatarSrc(user.avatarUrl) : "";
+        if (canonical) {
+            const shouldWarm = sizeClass === "xl" || canonical.startsWith("/");
+            const renderSrc = resolveCachedMediaSrc(canonical, { warm: shouldWarm });
+            const loadAttr = sizeClass === "xl" ? 'fetchpriority="high"' : 'loading="lazy"';
             return `<div class="avatar-circle ${sizeClass}" style="${bgStyle}">
-                <img src="${escapeHtml(validAvatar)}" alt="${escapeHtml(uname)}" referrerpolicy="no-referrer"
+                <img src="${escapeHtml(renderSrc)}" data-canonical-src="${escapeHtml(canonical)}" alt="${escapeHtml(uname)}" referrerpolicy="no-referrer" decoding="async" ${loadAttr}
                      data-avatar-fallback="${escapeHtml(initial)}" />
             </div>`;
         }
@@ -335,6 +901,10 @@
             showToast("请先使用 X 账号授权登录");
             return;
         }
+        if (state.activeTab === tabId) {
+            window.scrollTo({ top: 0, behavior: "smooth" });
+            return;
+        }
         state.activeTab = tabId;
         $("authenticatedWorkspace").dataset.activeTab = tabId;
         document.querySelectorAll(".nav-item[data-tab]").forEach((btn) => {
@@ -347,7 +917,13 @@
             }
         });
         document.querySelectorAll(".bottom-tab[data-tab]").forEach((btn) => {
-            btn.classList.toggle("active", btn.dataset.tab === tabId);
+            const active = btn.dataset.tab === tabId;
+            btn.classList.toggle("active", active);
+            if (active) {
+                btn.setAttribute("aria-current", "page");
+            } else {
+                btn.removeAttribute("aria-current");
+            }
         });
         window.scrollTo({ top: 0 });
         document.querySelectorAll(".tab-panel").forEach((panel) => {
@@ -365,6 +941,14 @@
         }
         if (tabId === "circle" && state.report) {
             drawShareCardCanvas(state.report);
+        }
+        if (tabId === "schedule") {
+            ensureScheduleDraftInitialized();
+            renderScheduleQuickSlots();
+            syncScheduleComposerStats();
+            loadScheduledTweets(true);
+        } else {
+            refreshSchedulePollingState();
         }
     }
 
@@ -388,7 +972,7 @@
             btn.setAttribute("aria-label", tip);
             const labelEl = btn.querySelector(".theme-btn-text");
             if (labelEl) {
-                labelEl.textContent = id === "cycleThemeBtn" ? `主题 · ${theme.label}` : theme.label;
+                labelEl.textContent = theme.label;
             }
         });
         try {
@@ -403,7 +987,8 @@
         const generation = ++state.authStatusGeneration;
         const [metaResp, authResp] = await Promise.all([
             fetch("/api/meta", { cache: "no-store" }),
-            fetch("/api/auth/x/status", { cache: "no-store" })
+            fetch("/api/auth/x/status", { cache: "no-store" }),
+            primeInitialMediaCache()
         ]);
         if (!authResp.ok) throw new Error(`无法确认登录状态（HTTP ${authResp.status}）`);
         const authStatus = await safeParseJson(authResp);
@@ -447,31 +1032,67 @@
                 resetUserScopedMemoryState();
             }
             state.boundUserId = currentKey;
+            const cachedHeader = loadProfileHeaderCache(currentKey);
+            const effectiveUser = cachedHeader
+                ? {
+                    ...cachedHeader,
+                    ...u,
+                    avatarUrl: u.avatarUrl || cachedHeader.avatarUrl
+                }
+                : u;
             logoutBtn.hidden = false;
-            $("railDisplayName").textContent = u.displayName || u.username;
-            $("railHandle").textContent = "@" + u.username;
-            $("railAvatar").outerHTML = avatarHtml(u, "sm").replace(
+            $("railDisplayName").textContent = effectiveUser.displayName || effectiveUser.username;
+            $("railHandle").textContent = "@" + effectiveUser.username;
+            $("railAvatar").outerHTML = avatarHtml(effectiveUser, "sm").replace(
                 'class="avatar-circle sm"',
                 'class="avatar-circle sm" id="railAvatar"'
             );
+            if (effectiveUser.avatarUrl) {
+                void warmMediaAsset(effectiveUser.avatarUrl);
+            }
 
-            // 首次进入尚未拿到全量报告前，立即预填本人头像、昵称与用户名，消除空白「加载中…」卡顿感
+            // 首次进入尚未拿到全量报告前，立即用本地快照预填横幅、头像、简介与计数，消除首屏布局跳变
             if (!state.report) {
-                $("profileAvatar").outerHTML = avatarHtml(u, "xl").replace(
+                const isAuthorSelf = String(effectiveUser.username || "").replace(/^@+/, "").toLowerCase() === "elidlicom";
+                const earlyBanner = (cachedHeader && cachedHeader.bannerUrl) || (isAuthorSelf ? AUTHOR_BANNER_URL : "");
+                applyCoverBanner($("profileCover"), earlyBanner);
+                const heroEl = $("profileHero");
+                if (heroEl) heroEl.classList.toggle("has-banner", Boolean(earlyBanner));
+
+                $("profileAvatar").outerHTML = avatarHtml(effectiveUser, "xl").replace(
                     'class="avatar-circle xl"',
                     'class="avatar-circle xl" id="profileAvatar"'
                 );
-                $("profileDisplayName").textContent = u.displayName || u.username;
-                $("profileVerifiedIcon").hidden = !u.verified;
-                $("profileHandleText").textContent = "@" + u.username;
-                $("profilePersonaTag").textContent = state.storedMode ? "读取已入库报表" : "同步数据中";
-                $("visitXProfileLink").href = `https://x.com/${encodeURIComponent(u.username)}`;
-                $("profileBio").textContent = state.storedMode ? "正在读取本人已入库数据，不拉取实时数据…" : "正在并发同步您的近期推文、互动推友与关注关系，请稍候数秒…";
-                $("topbarWindowHint").textContent = state.storedMode ? "已入库报表加载中…" : "正在同步本人实时数据…";
+                $("profileDisplayName").textContent = effectiveUser.displayName || effectiveUser.username;
+                $("profileVerifiedIcon").hidden = !effectiveUser.verified;
+                $("profileHandleText").textContent = "@" + effectiveUser.username;
+                $("profilePersonaTag").textContent =
+                    (cachedHeader && cachedHeader.personaTag) || (state.storedMode ? "已入库" : "同步中");
+                $("visitXProfileLink").href = `https://x.com/${encodeURIComponent(effectiveUser.username)}`;
+                if (cachedHeader && cachedHeader.bio) {
+                    $("profileBio").textContent = cachedHeader.bio;
+                    $("profileBio").hidden = false;
+                } else {
+                    $("profileBio").textContent = "";
+                    $("profileBio").hidden = true;
+                }
+                if (cachedHeader) {
+                    $("profileFollowingNum").textContent = fmtNum(cachedHeader.followingCount);
+                    $("profileFollowersNum").textContent = fmtNum(cachedHeader.followersCount);
+                    $("profileTotalTweetsNum").textContent = fmtNum(cachedHeader.totalPostsCount);
+                }
+                $("topbarWindowHint").textContent = state.storedMode ? "读取已入库报表…" : "同步数据中…";
             }
+            syncScheduleAuthBanner();
         } else {
             logoutBtn.hidden = true;
             $("navUnfollowBadge").hidden = true;
+            $("navScheduleBadge").hidden = true;
+            $("mobileScheduleBadge").hidden = true;
+            $("overdueGlobalBanner").hidden = true;
+            $("scheduledTweetsList").innerHTML = "";
+            closeConfirmResendModal();
+            clearScheduleComposerDraft();
             $("railDisplayName").textContent = "未授权登录";
             $("railHandle").textContent = "仅限登录查本人账号";
             $("railAvatar").outerHTML = `<div class="avatar-circle sm" id="railAvatar">X</div>`;
@@ -490,10 +1111,6 @@
 
     function triggerXOAuthLogin() {
         if (isLoggedIn()) {
-            if (state.report && Date.now() < state.cacheExpiresEpochMs) {
-                showToast("数据刚更新过，5 分钟内无需重复刷新");
-                return;
-            }
             loadSelfReport(false);
             return;
         }
@@ -520,23 +1137,6 @@
         clearInterval(state.cooldownTimerId);
         state.cacheExpiresEpochMs = Date.now() + Math.max(0, Number(remainingSeconds || 0)) * 1000;
         updateRefreshButtonState();
-        state.cooldownTimerId = setInterval(updateRefreshButtonState, 1000);
-    }
-
-    function getCacheTtlSeconds() {
-        return (
-            (state.report && state.report.cacheTtlSeconds) ||
-            (state.serverMeta && state.serverMeta.cacheTtlSeconds) ||
-            300
-        );
-    }
-
-    function getCacheDurationLabel() {
-        const sec = getCacheTtlSeconds();
-        if (sec >= 3600 && sec % 3600 === 0) {
-            return `${sec / 3600} 小时`;
-        }
-        return `${Math.max(1, Math.round(sec / 60))} 分钟`;
     }
 
     function updateRefreshButtonState() {
@@ -544,7 +1144,7 @@
         relationshipControls.hidden = state.storedMode || !isLoggedIn() || state.pendingRelationshipChecks <= 0;
         const relationshipBtn = $("continueRelationshipsBtn");
         relationshipBtn.disabled = state.isFetching || state.isLoggingOut;
-        relationshipBtn.textContent = `继续核验关系（${state.pendingRelationshipChecks}）`;
+        relationshipBtn.textContent = `继续核验（${state.pendingRelationshipChecks}）`;
         const btn = $("forceRefreshBtn");
         if (!btn) return;
         const modeUrl = new URL(window.location.href);
@@ -552,37 +1152,30 @@
         if (state.storedMode) modeUrl.searchParams.delete("stored");
         else modeUrl.searchParams.set("stored", "true");
         $("storedReportLink").href = modeUrl.toString();
-        $("storedReportLink").textContent = state.storedMode ? "返回实时报表" : "查看已入库报表";
+        $("storedReportLink").textContent = state.storedMode ? "返回实时" : "已入库报表";
         if (state.storedMode) {
             btn.disabled = state.isFetching || state.isLoggingOut;
-            btn.textContent = state.isFetching ? "读取中…" : "刷新实时数据";
-            btn.title = "退出已入库模式并请求最新数据";
-            btn.classList.remove("can-refresh");
+            btn.textContent = state.isFetching ? "读取中…" : "切回实时";
+            btn.title = "返回实时报表";
+            btn.classList.remove("can-refresh", "is-quota-exhausted", "is-cooled");
             return;
         }
         if (state.isFetching) {
             btn.disabled = true;
-            btn.classList.remove("can-refresh");
-            btn.textContent = "更新中…";
-            btn.title = "正在同步你的账号数据";
+            btn.classList.remove("can-refresh", "is-quota-exhausted", "is-cooled");
+            btn.textContent = "同步中…";
+            btn.title = "正在同步账号数据";
             return;
         }
-        const ttlLabel = getCacheDurationLabel();
-        const remainSec = Math.max(0, Math.ceil((state.cacheExpiresEpochMs - Date.now()) / 1000));
-        const fetchedClock = state.report ? fmtClockTime(state.report.fetchedAt) : "";
-        if (remainSec > 0) {
-            const remainMin = Math.max(1, Math.ceil(remainSec / 60));
-            btn.disabled = true;
-            btn.classList.remove("can-refresh");
-            btn.textContent = fetchedClock ? `更新于 ${fetchedClock}` : "已是最新";
-            btn.title = `数据 ${ttlLabel}内不重复拉取，约 ${remainMin} 分钟后可刷新`;
-        } else {
-            btn.disabled = false;
-            btn.classList.add("can-refresh");
-            btn.textContent = "刷新数据";
-            btn.title = "点击拉取最新数据";
-            clearInterval(state.cooldownTimerId);
-        }
+        const status = state.dailyCacheStatus;
+        const pending = status && (status.canContinue ?? (!status.timelineCovered || !status.inboundCovered || status.pendingMetricPosts > 0));
+        btn.disabled = state.isLoggingOut;
+        btn.classList.remove("is-quota-exhausted", "is-cooled");
+        btn.classList.add("can-refresh");
+        btn.textContent = pending ? "继续补齐" : "检查更新";
+        btn.title = pending
+            ? "继续补齐最近24小时的推文、收到的互动与可补指标，有进展时自动分批继续"
+            : "检查服务端缓存与最近24小时覆盖，满一小时按需更新";
     }
 
 
@@ -613,17 +1206,31 @@
             state.selectedPeerUsername = null;
         }
 
-        // 有待办时默认先看「我没回谁」，若无则看「评论待回复」；用户手动选过筛选后尊重其选择
+        // 有待办时默认先看「我没回谁」，若无则依次看「评论待回复 / 互相评论 / 谁没回我」；用户手动选过筛选后尊重其选择
         if (!state.peerFilterTouched) {
             state.peerRelFilter =
                 Number(body.interactions.inboundHeavyPeers || 0) > 0
                     ? "I_OWE"
                     : Number(body.interactions.unrepliedMyPostPeers || 0) > 0
                       ? "UNREPLIED_POST"
-                      : "ALL";
+                      : Number(body.interactions.balancedMutualPeers || 0) > 0
+                        ? "MUTUAL"
+                        : "THEY_OWE";
         }
 
         renderAll(body);
+        if (state.accessPolicy && typeof state.accessPolicy.scheduledPublishAllowed === "boolean") {
+            state.scheduleAccess = {
+                allowed: Boolean(state.accessPolicy.scheduledPublishAllowed),
+                followsAuthor: Boolean(state.accessPolicy.followsAuthor),
+                authorInteractionRank: state.accessPolicy.authorInteractionRank ?? null,
+                reason: state.accessPolicy.scheduledPublishLockedReason || ""
+            };
+            syncScheduleAuthBanner();
+        }
+        if (state.activeTab === "schedule") {
+            renderScheduleQuickSlots();
+        }
     }
 
     function fmtMonthDay(isoStr) {
@@ -643,13 +1250,13 @@
 
     async function loadSelfReport(options = {}) {
         const continueRelations = !state.storedMode && options?.continueRelations === true;
+        const forceRefresh = !state.storedMode && !continueRelations && (options === true || options?.forceRefresh === true);
         if (state.isLoggingOut) return;
         if (!isLoggedIn()) {
             syncAuthGateAndWorkspaceUI();
             return;
         }
 
-        const withinCacheLock = state.cacheExpiresEpochMs > Date.now();
         const authUname = state.authStatus && state.authStatus.user ? state.authStatus.user.username : "";
         const authUserId = stableUserId(state.authStatus.user);
         if (!authUserId) {
@@ -658,13 +1265,12 @@
         }
         const bundleOwnerId = stableUserId(state.bundle?.[state.period]?.profile);
 
-        // 包含关系（48h ⊆ 7天 ⊆ 30天）+ 严格本人归属校验：仅当内存包属于当前登录账号且已覆盖目标窗口时才直接切换
+        // 仅已入库只读模式复用本人内存包；实时页始终交给服务端检查持久化缓存与覆盖。
         if (
-            !continueRelations && state.bundle &&
+            state.storedMode && state.bundle &&
             state.bundle[state.period] &&
             bundleOwnerId &&
-            bundleOwnerId === authUserId &&
-            (state.storedMode || (state.coveredWindowDays >= state.days && withinCacheLock))
+            bundleOwnerId === authUserId
         ) {
             applyLoadedPeriodReport(state.bundle[state.period]);
             return;
@@ -675,6 +1281,8 @@
             return;
         }
         const requestGeneration = ++state.reportRequestGeneration;
+        const selectedPeriod = state.period;
+        const selectedDays = state.days;
         const requestIsCurrent = () => requestGeneration === state.reportRequestGeneration &&
             !state.isLoggingOut && isLoggedIn() &&
             stableUserId(state.authStatus.user) === authUserId;
@@ -689,37 +1297,28 @@
         const selfHandle = authUname ? `@${authUname}` : "本人账号";
         const startedMs = Date.now();
         let elapsedTimer = null;
-        let coveredDateHint = "";
-        const isExpanding = Boolean(state.bundle && state.coveredWindowDays > 0 && state.coveredWindowDays < state.days);
 
         const updateLoadingProgressText = () => {
             if (!slowHintEl || !requestIsCurrent()) return;
             const sec = Math.max(1, Math.floor((Date.now() - startedMs) / 1000));
-            const pMeta = PERIOD_META[state.period] || PERIOD_META.HOURS_48;
-            if (state.storedMode) {
-                slowHintEl.textContent = `正在读取 ${selfHandle} 的已入库${pMeta.badgePrefix}报表…（${sec} 秒）`;
-            } else if (isExpanding || coveredDateHint) {
-                slowHintEl.textContent =
-                    `正在增量补齐${pMeta.badgePrefix}未加载历史` +
-                    (coveredDateHint ? `（已覆盖至 ${coveredDateHint}）` : "") +
-                    `…（${sec} 秒，已有数据免重复拉取）`;
-            } else {
-                slowHintEl.textContent = `正在加载 ${selfHandle} 的${pMeta.badgePrefix}数据…（${sec} 秒）`;
-            }
+            slowHintEl.textContent = state.storedMode ? `读取已入库报表（${sec}s）…` : `同步中（${sec}s）…`;
             slowHintEl.hidden = false;
         };
 
         const slowTimer = setTimeout(() => {
             updateLoadingProgressText();
             elapsedTimer = setInterval(updateLoadingProgressText, 1000);
-        }, state.report ? 250 : 150);
+        }, 2500);
 
         try {
-            let safetyChunks = 0;
-            while (safetyChunks < 40) {
-                safetyChunks++;
-                const reqDays = state.days || 2;
-                const reqPeriod = state.period || "HOURS_48";
+            let batchLimit = 1;
+            let previousStatus = null;
+            let cycleStartedAt = null;
+            for (let batch = 0; batch < batchLimit; batch++) {
+                // 续批只采最近24小时，显示维度保持用户选择，不付费扩展历史。
+                const reqDays = batch === 0 ? selectedDays || 1 : 1;
+                const reqPeriod = batch === 0 ? selectedPeriod || "HOURS_24" : "HOURS_24";
+                const sendRefresh = forceRefresh && batch === 0;
                 if (!requestIsCurrent()) return;
                 const abortCtrl = new AbortController();
                 state.reportAbortController = abortCtrl;
@@ -728,7 +1327,7 @@
                 let bundleBody;
                 try {
                     resp = await fetch(
-                        `/api/analyze/bundle?period=${encodeURIComponent(reqPeriod)}&targetDays=${encodeURIComponent(reqDays)}${state.storedMode ? "&stored=true" : continueRelations ? "&continueRelations=true" : ""}`,
+                        `/api/analyze/bundle?period=${encodeURIComponent(reqPeriod)}&targetDays=${encodeURIComponent(reqDays)}${state.storedMode ? "&stored=true" : continueRelations ? "&continueRelations=true" : ""}${sendRefresh ? "&refresh=true" : ""}`,
                         {
                             cache: "no-store",
                             signal: abortCtrl.signal
@@ -747,35 +1346,54 @@
                     showError(bundleBody.message || "登录会话已失效，请重新使用 X 账号授权登录");
                     return;
                 }
-                if (!resp.ok || !bundleBody.month || !bundleBody.day) {
+                const nonNullReports = [
+                    bundleBody.hours24,
+                    bundleBody.day,
+                    bundleBody.week,
+                    bundleBody.month
+                ].filter(Boolean);
+                if (!resp.ok || nonNullReports.length === 0) {
                     throw new Error(bundleBody.message || `查询失败（HTTP ${resp.status}）`);
                 }
 
-                const reports = [bundleBody.month, bundleBody.week, bundleBody.day];
-                if (reports.some((report) => stableUserId(report?.profile) !== authUserId)) {
+                if (nonNullReports.some((report) => stableUserId(report?.profile) !== authUserId)) {
                     throw new Error("报表账号与当前登录账号不匹配，请重新加载");
                 }
                 state.bundle = {
-                    MONTH: bundleBody.month,
-                    WEEK: bundleBody.week,
-                    HOURS_48: bundleBody.day
+                    HOURS_24: bundleBody.hours24 || null,
+                    HOURS_48: bundleBody.day || null,
+                    WEEK: bundleBody.week || null,
+                    MONTH: bundleBody.month || null
                 };
-                // 覆盖天数以服务端真实计算为准（两类数据都覆盖到才算），不再用请求天数兜底冒充
+                state.accessPolicy = bundleBody.accessPolicy || null;
+                state.dailyCacheStatus = bundleBody.dailyCacheStatus || null;
                 state.coveredWindowDays = Number(bundleBody.coveredWindowDays ?? 0);
                 state.pendingRelationshipChecks = state.storedMode ? 0 : Math.max(0, Number(bundleBody.pendingRelationshipChecks || 0));
-                if (bundleBody.coveredUntil) {
-                    coveredDateHint = fmtMonthDay(bundleBody.coveredUntil);
-                    updateLoadingProgressText();
-                }
 
-                const targetReport = state.bundle[state.period] || state.bundle.HOURS_48;
+                const targetReport = state.bundle[state.period] || state.bundle.HOURS_24 || nonNullReports[0];
                 startCacheCooldownTicker(targetReport.cacheRemainingSeconds);
                 applyLoadedPeriodReport(targetReport);
+                const status = state.dailyCacheStatus;
+                if (state.storedMode || continueRelations || !status?.canContinue || status.lastAttemptDegraded ||
+                    state.pendingExpandCheck || state.period !== selectedPeriod || state.days !== selectedDays ||
+                    !status.cycleStartedAt) break;
+                if (batch === 0) cycleStartedAt = status.cycleStartedAt;
+                if (status.cycleStartedAt !== cycleStartedAt) break;
 
-                // 若当前所选维度已覆盖完成（或后端游标已到底），立即结束；否则自动从断点游标无缝续拉下一批
-                if (state.storedMode || continueRelations || !bundleBody.hasMoreHistoryForTarget || state.coveredWindowDays >= state.days) {
-                    break;
-                }
+                // 首响应给出明确未试队列后允许一批确认；之后只在实存数据/覆盖/可尝试数推进时继续。
+                const movedEarlier = (next, prev) => Boolean(next && (!prev || Date.parse(next) < Date.parse(prev)));
+                const progressed = !previousStatus ||
+                    status.unattemptedMetricPosts < previousStatus.unattemptedMetricPosts ||
+                    (!previousStatus.timelineCovered && status.timelineCovered) ||
+                    (!previousStatus.inboundCovered && status.inboundCovered) ||
+                    status.recentPosts > previousStatus.recentPosts || status.recentInbound > previousStatus.recentInbound ||
+                    movedEarlier(status.timelineCoveredFrom, previousStatus.timelineCoveredFrom) ||
+                    movedEarlier(status.inboundCoveredFrom, previousStatus.inboundCoveredFrom);
+                if (!progressed) break;
+                previousStatus = status;
+                // 指标接口每批至多50帖；每个未覆盖流预留3批，已知队列变长可扩展，但一次动作最多20批。
+                const streamBatches = (Number(!status.timelineCovered) + Number(!status.inboundCovered)) * 3;
+                batchLimit = Math.min(20, Math.max(batchLimit, batch + 1 + Math.ceil(status.unattemptedMetricPosts / 50) + streamBatches));
             }
         } catch (err) {
             if (!requestIsCurrent()) return;
@@ -787,8 +1405,9 @@
             showError(msg);
             if (!state.report) {
                 showLoadingSkeleton(false);
-                $("profilePersonaTag").textContent = state.storedMode ? "已入库报表不可用" : "同步未完成";
-                $("profileBio").textContent = `${state.storedMode ? "未能读取已入库报表" : "暂未拉取完成"}：${msg}`;
+                $("profilePersonaTag").textContent = state.storedMode ? "已入库不可用" : "同步未完成";
+                $("profileBio").textContent = "";
+                $("profileBio").hidden = true;
                 $("topbarWindowHint").textContent = state.storedMode ? "已入库模式 · 请稍后重试" : "请稍后重试";
             }
         } finally {
@@ -801,9 +1420,9 @@
             if (slowHintEl) slowHintEl.hidden = true;
             $("loadingBar").hidden = true;
             $("authenticatedWorkspace").classList.remove("is-loading");
-            if (!state.storedMode && state.pendingExpandCheck && state.coveredWindowDays < state.days) {
+            if (state.pendingExpandCheck && state.bundle?.[state.period]) {
                 state.pendingExpandCheck = false;
-                loadSelfReport(false);
+                applyLoadedPeriodReport(state.bundle[state.period]);
             }
         }
     }
@@ -857,38 +1476,106 @@
         }
     }
 
+    function syncBodyModalLock() {
+        const ids = ["authorPromptModal", "unlockGuideModal", "confirmResendModal"];
+        const anyOpen = ids.some((id) => {
+            const el = document.getElementById(id);
+            return Boolean(el && !el.hidden);
+        });
+        document.body.classList.toggle("modal-open", anyOpen);
+    }
+
+    function buildFallbackAuthorCardData() {
+        const selfHandle = String(state.authStatus?.user?.username || "").replace(/^@+/, "");
+        const selfIsAuthor = selfHandle.toLowerCase() === "elidlicom";
+        const cachedAuthor = (state.report && state.report.profile && selfIsAuthor)
+            ? state.report.profile
+            : null;
+        return {
+            usageCount: state.usageCount || 0,
+            modalReasonCode: "MANUAL_PREVIEW",
+            modalBadgeText: state.usageCount > 0 ? `作者主页 · 第 ${state.usageCount} 次使用` : "作者主页 · 开源说明",
+            modalTitle: "你好，我是作者 @elidlicom",
+            modalMessage:
+                "每次使用本工作台，后端都会真实付费调用 X / 数据接口。项目免费开放并全量开源，结个善缘，欢迎关注 @elidlicom 交流进展！\n\n" +
+                AUTHOR_COST_STORY,
+            followingAuthor: Boolean(state.accessPolicy?.followsAuthor),
+            selfIsAuthor,
+            authorProfile: {
+                username: "elidlicom",
+                displayName: cachedAuthor?.displayName || "Litany（李丰一）",
+                avatarUrl: "/author-avatar.webp",
+                bannerUrl: AUTHOR_BANNER_URL,
+                bio: cachedAuthor?.bio || AUTHOR_DEFAULT_BIO,
+                verified: cachedAuthor?.verified !== undefined ? Boolean(cachedAuthor.verified) : true,
+                followingCount: cachedAuthor?.followingCount || 0,
+                followersCount: cachedAuthor?.followersCount || 0,
+                totalPostsCount: cachedAuthor?.totalPostsCount || 0
+            },
+            authorProfileUrl: "https://x.com/elidlicom",
+            authorFollowIntentUrl: "https://x.com/intent/follow?screen_name=elidlicom"
+        };
+    }
+
     function openAuthorPromptModal(data) {
         const modal = document.getElementById("authorPromptModal");
         if (!modal || !data) return;
         const rawAuthor = data.authorProfile || {};
+        const cleanAuthorBio = String(rawAuthor.bio || AUTHOR_DEFAULT_BIO)
+            .replace(/[\u200B-\u200D\uFEFF]/g, "")
+            .replace(/\s{2,}/g, " ")
+            .trim() || AUTHOR_DEFAULT_BIO;
         const author = {
             username: rawAuthor.username || "elidlicom",
             displayName: rawAuthor.displayName || "Litany（李丰一）",
             avatarUrl: rawAuthor.avatarUrl || "/author-avatar.webp",
-            bio: rawAuthor.bio || "Java Dev | Studying Chinese Metaphysics(Dao·道) ䷀ · 易道心学创始人 · elidli.com",
+            bannerUrl: rawAuthor.bannerUrl || AUTHOR_BANNER_URL,
+            bio: cleanAuthorBio,
             verified: rawAuthor.verified !== undefined ? Boolean(rawAuthor.verified) : true,
+            followingCount: rawAuthor.followingCount || 0,
             followersCount: rawAuthor.followersCount || 0,
             tweetCount: rawAuthor.totalPostsCount || rawAuthor.tweetCount || 0
         };
         const handle = String(author.username || "elidlicom").replace(/^@+/, "");
-        $("authorModalBadge").textContent =
-            data.modalBadgeText || `第 ${data.usageCount || state.usageCount || 3} 次使用 · 作者说明`;
+        const badgeEl = document.getElementById("authorModalBadge");
+        if (badgeEl) {
+            if (data.modalReasonCode === "MANUAL_PREVIEW") {
+                const countVal = Number(data.usageCount || state.usageCount || 0);
+                badgeEl.textContent = countVal > 0 ? `作者主页 · 第 ${countVal} 次使用` : "作者主页 · 开源说明";
+            } else {
+                badgeEl.textContent = data.modalBadgeText || `第 ${data.usageCount || state.usageCount || 3} 次使用`;
+            }
+        }
         $("authorModalTitle").textContent = data.modalTitle || `你好，我是作者 @${handle}`;
-        $("authorModalMessage").textContent =
-            data.modalMessage || `因为每次使用这个网站服务，我都是真实付费调用 API 的。结个善缘，求关注 @${handle}！`;
+
+        const rawMessage = String(
+            data.modalMessage || `因为每次使用这个网站服务，我都是真实付费调用 API 的。结个善缘，求关注 @${handle}！`
+        ).replace(/\n+开源仓库（可本地部署，与线上一致）：https?:\/\/\S+\s*$/m, "").trim();
+        const msgEl = $("authorModalMessage");
+        msgEl.innerHTML = "";
+        rawMessage.split(/\n{2,}/).map((seg) => seg.trim()).filter(Boolean).forEach((seg) => {
+            const p = document.createElement("p");
+            p.className = "author-note-para";
+            p.textContent = seg;
+            msgEl.appendChild(p);
+        });
+
+        applyCoverBanner($("authorModalCover"), author.bannerUrl);
         $("authorModalAvatarSlot").innerHTML = avatarHtml(author, "xl");
         $("authorModalDisplayName").textContent = author.displayName || handle;
         const verEl = $("authorModalVerified");
         verEl.innerHTML = verifiedSvgHtml(Boolean(author.verified));
         verEl.hidden = !author.verified;
         $("authorModalHandle").textContent = `@${handle}`;
-        $("authorModalBio").textContent =
-            author.bio || "Java Dev | Studying Chinese Metaphysics(Dao·道) ䷀ · 易道心学创始人 · elidli.com";
+        $("authorModalBio").textContent = author.bio;
 
+        const followingCount = Number(author.followingCount || 0);
         const followersCount = Number(author.followersCount || 0);
         const tweetCount = Number(author.tweetCount || 0);
         const statsRow = $("authorModalStatsRow");
-        if (followersCount > 0 || tweetCount > 0) {
+        if (followingCount > 0 || followersCount > 0 || tweetCount > 0) {
+            $("authorModalFollowing").textContent = fmtNum(followingCount);
+            $("authorModalFollowingWrap").hidden = !(followingCount > 0);
             $("authorModalFollowers").textContent = fmtNum(followersCount);
             $("authorModalPosts").textContent = fmtNum(tweetCount);
             statsRow.hidden = false;
@@ -899,32 +1586,109 @@
         const isFollowing = Boolean(data.followingAuthor);
         const isSelf = Boolean(data.selfIsAuthor);
         state.authorFollowingMarked = isFollowing || isSelf;
-        $("authorModalFollowedTag").hidden = !isFollowing;
+        $("authorModalSelfTag").hidden = !isSelf;
+        $("authorModalFollowedTag").hidden = isSelf || !isFollowing;
 
         const safeProfileUrl = safeHttpUrl(data.authorProfileUrl, `https://x.com/${encodeURIComponent(handle)}`);
         const safeFollowUrl = safeHttpUrl(
             data.authorFollowIntentUrl,
             `https://x.com/intent/follow?screen_name=${encodeURIComponent(handle)}`
         );
+        const headerLink = $("authorModalHeaderLink");
+        headerLink.href = safeProfileUrl;
+        headerLink.textContent = `@${handle} ↗`;
+
         const followBtn = $("authorModalFollowBtn");
         followBtn.href = isFollowing || isSelf ? safeProfileUrl : safeFollowUrl;
-        $("authorModalFollowBtnText").textContent = isFollowing
-            ? `已关注 · 访问 @${handle} 主页 ↗`
-            : isSelf
-              ? "查看我的 X 主页 ↗"
+        $("authorModalFollowBtnText").textContent = isSelf
+            ? "查看我的 X 主页 ↗"
+            : isFollowing
+              ? `已关注 · 访问 @${handle} 主页 ↗`
               : `关注 @${handle} ↗`;
 
         const profileLink = $("authorModalProfileLink");
         profileLink.href = safeProfileUrl;
-        profileLink.textContent = `查看 @${handle} 主页 ↗`;
+        profileLink.textContent = "X 主页 ↗";
         profileLink.hidden = isFollowing || isSelf;
+        const repoLink = document.getElementById("authorModalRepoLink");
+        if (repoLink) {
+            repoLink.href = safeHttpUrl(state.accessPolicy?.repoUrl, AUTHOR_REPO_URL);
+        }
         $("authorModalLaterBtn").textContent = isFollowing || isSelf ? "我知道了" : "稍后再说";
         modal.hidden = false;
+        syncBodyModalLock();
     }
 
     function closeAuthorPromptModal() {
         const modal = document.getElementById("authorPromptModal");
         if (modal) modal.hidden = true;
+        syncBodyModalLock();
+    }
+
+    function openUnlockGuideModal(focusPeriodCode = null) {
+        const modal = document.getElementById("unlockGuideModal");
+        if (!modal) return;
+        const p = state.accessPolicy;
+        const statusBox = document.getElementById("unlockGuideStatusBox");
+        if (statusBox) {
+            if (p) {
+                const rankBadge = p.top5FullAccess
+                    ? `互动第 ${Number(p.authorInteractionRank || 1)} 名（前 5 免等待全开）`
+                    : p.top50AutoSync
+                      ? `互动第 ${Number(p.authorInteractionRank || 1)} 名（前 50 每日自动同步）`
+                      : `24h 物理落盘 · 30 天滚动窗口`;
+                const followText = p.followsAuthor ? "已关注作者" : "未关注作者";
+                const quotaText = Number(p.dailyRefreshLimit || 1) > 10
+                    ? "不限刷新"
+                    : `今日剩余刷新 ${Number(p.dailyRefreshRemaining ?? 0)}/${Number(p.dailyRefreshLimit || 1)}`;
+                statusBox.innerHTML =
+                    `<div>已累计 <strong>${Number(p.accumulatedDays || 1)}/30</strong> 天 · ${followText} · ${quotaText}</div>` +
+                    `<div>${rankBadge}</div>`;
+            } else {
+                statusBox.textContent = "默认 24 小时 · 单次加载 24h · 每日物理落盘 · 滚动保留 30 天。";
+            }
+        }
+        const focusEl = document.getElementById("unlockGuideFocusMsg");
+        if (focusEl) {
+            const reason = focusPeriodCode && p?.lockedReasons?.[focusPeriodCode];
+            if (reason) {
+                focusEl.textContent = `未解锁原因：${reason}`;
+                focusEl.hidden = false;
+            } else if (focusPeriodCode && focusPeriodCode !== "HOURS_24") {
+                const label = PERIOD_META[focusPeriodCode]?.badgePrefix || focusPeriodCode;
+                focusEl.textContent = `${label}暂未解锁：每日物理存储 24 小时数据，累计满对应天数后自动开放。`;
+                focusEl.hidden = false;
+            } else {
+                focusEl.hidden = true;
+            }
+        }
+        const storyEl = document.getElementById("unlockGuideAuthorStory");
+        if (storyEl) {
+            storyEl.textContent = (p && p.authorStatement) || AUTHOR_COST_STORY;
+        }
+        const repoEl = document.getElementById("unlockGuideRepoLink");
+        if (repoEl) {
+            repoEl.href = safeHttpUrl(p?.repoUrl, AUTHOR_REPO_URL);
+        }
+        const followEl = document.getElementById("unlockGuideFollowLink");
+        const followTxtEl = document.getElementById("unlockGuideFollowText");
+        if (followEl && followTxtEl) {
+            const followed = Boolean(p?.followsAuthor);
+            followEl.href = followed
+                ? "https://x.com/elidlicom"
+                : "https://x.com/intent/follow?screen_name=elidlicom";
+            followTxtEl.textContent = followed
+                ? "已关注 · 访问 @elidlicom 主页 ↗"
+                : "关注 @elidlicom ↗";
+        }
+        modal.hidden = false;
+        syncBodyModalLock();
+    }
+
+    function closeUnlockGuideModal() {
+        const modal = document.getElementById("unlockGuideModal");
+        if (modal) modal.hidden = true;
+        syncBodyModalLock();
     }
 
     async function checkinWorkspaceUsage() {
@@ -963,6 +1727,31 @@
         renderRightSidebar(report);
     }
 
+    function renderDailyCacheStatus(report) {
+        const el = $("dailyCacheStatusHint");
+        const status = state.dailyCacheStatus;
+        const fmtTime = (value) => new Date(value).toLocaleString("zh-CN", {
+            timeZone: "Asia/Shanghai", hour12: false
+        });
+        const parts = status ? [
+            status.snapshotAt ? `资料快照 ${fmtTime(status.snapshotAt)}` : "",
+            status.latestMetricFetchedAt ? `指标最近采集 ${fmtTime(status.latestMetricFetchedAt)}（近24h，分批读数）`
+                : "指标最近采集时间未确认（近24h）",
+            status.lastCompletedAt ? `最近完整更新 ${fmtTime(status.lastCompletedAt)}` : "尚无完整更新记录",
+            `近24h推文${status.timelineCovered ? "已覆盖" : "待补齐"} ${status.recentPosts} 条`,
+            `收到的互动${status.inboundCovered ? "已覆盖" : "待补齐"} ${status.recentInbound} 条`,
+            status.unattemptedMetricPosts === undefined ? `待补指标 ${status.pendingMetricPosts} 帖`
+                : `可补指标 ${status.unattemptedMetricPosts} 帖 · 本轮暂不可得 ${Math.max(0, status.pendingMetricPosts - status.unattemptedMetricPosts)} 帖`
+        ] : [report.fetchedAt ? `原报表终点 ${fmtTime(report.fetchedAt)}` : ""];
+        el.textContent = parts.filter(Boolean).join(" · ");
+        el.title = [el.textContent, status?.cycleStartedAt ? `本轮采集起点 ${fmtTime(status.cycleStartedAt)}` : ""].filter(Boolean).join(" · ");
+        const pendingMetrics = status
+            ? Number(status.unattemptedMetricPosts ?? status.pendingMetricPosts ?? 0)
+            : 0;
+        const allSynced = Boolean(status && status.timelineCovered && status.inboundCovered && pendingMetrics <= 0);
+        el.hidden = !el.textContent || (!state.storedMode && allSynced);
+    }
+
     function renderProfileHeader(report) {
         const p = report.profile;
         const act = report.activity;
@@ -977,17 +1766,35 @@
             'class="avatar-circle sm" id="railAvatar"'
         );
 
-        // 吸顶栏：仅展示统计起止窗口（采集与缓存刷新时间已由右上角按钮统一展示，避免重复）
+        // 吸顶栏：仅展示统计起止窗口与极简模式标记（窄屏精简日期防截断）
         const hintEl = $("topbarWindowHint");
         const coverageNote = (act.coverageNote || "").trim();
-        const storedHint = state.storedMode ? `已入库 · 报表终点 ${new Date(report.fetchedAt).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false })}（北京时间）` : "";
-        hintEl.textContent = [storedHint, act.windowRangeText, coverageNote, act.metricsNote].filter(Boolean).join(" · ");
-        hintEl.classList.toggle("is-partial", Boolean(coverageNote));
-        hintEl.title = coverageNote
-            ? "所选时间段内的数据尚未全部拉取，以下所有统计只按「实际数据覆盖」这段时间计算"
-            : "所选时间段内的数据已完整拉取";
+        const shortCoverage = /每日累计/.test(coverageNote) ? "" : coverageNote;
+        const storedHint = state.storedMode
+            ? `已入库 ${fmtClockTime(report.fetchedAt)}`
+            : "";
+        const fullHintText = [storedHint, act.windowRangeText, shortCoverage].filter(Boolean).join(" · ");
+        const isNarrowMobile = typeof window !== "undefined" && window.innerWidth <= 720;
+        if (isNarrowMobile && act.windowRangeText) {
+            const compactRange = String(act.windowRangeText).replace(
+                /(\d{1,2})月(\d{1,2})日\s*(\d{2}:\d{2})\s*[-–~]\s*(\d{1,2})月(\d{1,2})日\s*(\d{2}:\d{2})/,
+                "$1/$2 $3 – $4/$5 $6"
+            );
+            hintEl.textContent = [storedHint, compactRange].filter(Boolean).join(" · ");
+        } else {
+            hintEl.textContent = fullHintText;
+        }
+        hintEl.classList.toggle("is-partial", Boolean(coverageNote) && !/每日累计/.test(coverageNote));
+        hintEl.title = [fullHintText, coverageNote].filter(Boolean).join(" · ") || act.windowRangeText || "";
+        renderDailyCacheStatus(report);
 
         // 头像与主页基本资料
+        const isAuthorSelf = String(p.username || "").replace(/^@+/, "").toLowerCase() === "elidlicom";
+        const heroBannerUrl = p.bannerUrl || (isAuthorSelf ? AUTHOR_BANNER_URL : "");
+        applyCoverBanner($("profileCover"), heroBannerUrl);
+        const heroEl = $("profileHero");
+        if (heroEl) heroEl.classList.toggle("has-banner", Boolean(heroBannerUrl));
+
         $("profileAvatar").outerHTML = avatarHtml(p, "xl").replace(
             'class="avatar-circle xl"',
             'class="avatar-circle xl" id="profileAvatar"'
@@ -996,23 +1803,38 @@
         $("profileVerifiedIcon").hidden = !p.verified;
         $("profilePersonaTag").textContent = act.personaTag;
         $("profileHandleText").textContent = "@" + p.username;
-        $("profileBio").textContent = p.bio || "该账号暂未填写个人简介";
+        const cleanBio = (p.bio || "").replace(/[\u200B-\u200D\uFEFF]/g, "").trim();
+        $("profileBio").textContent = cleanBio;
+        $("profileBio").hidden = !cleanBio;
         $("visitXProfileLink").href = `https://x.com/${encodeURIComponent(p.username)}`;
         const hs = Number(act.activityHealthScore || 0);
-        const hsWord = hs >= 75 ? "很好" : hs >= 50 ? "良好" : hs >= 30 ? "一般" : "需加油";
-        $("healthScoreChip").textContent = hs < 0 ? "运营健康 -- · 指标待补充" : `运营健康 ${hs} · ${hsWord}`;
+        $("healthScoreChip").textContent = hs < 0 ? "健康 --" : `健康 ${hs}`;
         $("healthScoreChip").className = `health-score-chip ${hs < 0 ? "" : hs >= 50 ? "judge-good" : "judge-warn"}`;
 
         $("profileFollowingNum").textContent = fmtNum(p.followingCount);
         $("profileFollowersNum").textContent = fmtNum(p.followersCount);
         const followBackRateComplete = audit.followBackRateComplete ??
             (!audit.followersSampleTruncated && !audit.followingsSampleTruncated && Number(audit.unknownFollowBackCount || 0) === 0);
-        $("profileMutualRateNum").textContent = `${followBackRateComplete ? "" : "样本 "}${audit.followBackRatePct}%`;
+        $("profileMutualRateNum").textContent = `${followBackRateComplete ? "" : "~"}${audit.followBackRatePct}%`;
         $("profileMutualRateNum").title = audit.followBackRateLabel || `${followBackRateComplete ? "关注" : "样本"}回关率 ${audit.followBackRatePct}%`;
         $("profileTotalTweetsNum").textContent = fmtNum(p.totalPostsCount);
 
+        const selfId = stableUserId(state.authStatus?.user);
+        if (selfId) {
+            saveProfileHeaderCache(selfId, { ...p, bannerUrl: heroBannerUrl }, act.personaTag);
+        }
+        const topPeerAvatars = ((report.interactions && report.interactions.peerStats) || [])
+            .slice(0, 24)
+            .map((it) => it && it.peer && it.peer.avatarUrl)
+            .filter(Boolean);
+        scheduleMediaBatchWarm([AUTHOR_AVATAR_URL, AUTHOR_BANNER_URL, p.avatarUrl, heroBannerUrl, ...topPeerAvatars]);
+
         const noticeStrip = $("bannerNoticeStrip");
-        const cleanNotice = (report.bannerNotice || "").trim();
+        const rawNotice = (report.bannerNotice || "").trim();
+        const isRoutineStorageBoilerplate =
+            /单次加载\s*24\s*小时/.test(rawNotice) ||
+            (/物理落盘/.test(rawNotice) && /滚动保留/.test(rawNotice));
+        const cleanNotice = isRoutineStorageBoilerplate ? "" : rawNotice;
         noticeStrip.textContent = cleanNotice;
         noticeStrip.hidden = !cleanNotice;
 
@@ -1026,39 +1848,51 @@
     }
 
     /* ==================== 模块 1：发帖与回复活跃度看板 ==================== */
+    function formatActivityTrendSummary(report) {
+        if (!report || !report.activity) return "--";
+        const act = report.activity;
+        const series = act.trendSeries || [];
+        const engagementSamples = series.reduce((sum, bucket) => sum + bucket.engagementSampleCount, 0);
+        const totalEngagements = series.reduce((sum, bucket) => sum + bucket.engagements, 0);
+        const exactNum = (value) => Number(value).toLocaleString("zh-CN");
+        return `总浏览 ${act.viewSampleCount > 0 ? exactNum(act.totalViews) : "--"} · 总互动 ${engagementSamples > 0 ? exactNum(totalEngagements) : "--"}`;
+    }
+
     function renderActivityPanel(report) {
         const act = report.activity;
-        const is48h = report.periodCode === "HOURS_48" || report.periodCode === "DAY";
-        const shortScope = is48h ? "48h " : report.periodCode === "WEEK" ? "近7天" : "近30天";
+        const pCode = report.periodCode || "";
+        const isHourlyWindow = pCode === "HOURS_24" || pCode === "HOURS_48" || pCode === "DAY";
+        const windowHours = pCode === "HOURS_24" ? 24 : 48;
 
         $("kpiPostsTitle").textContent = "原创发帖";
         $("kpiOriginalPosts").textContent = fmtNum(act.originalPosts);
-        if (is48h) {
-            $("kpiDailyPosts").textContent = `日均 ${act.dailyAvgPosts} 条 · 另含 ${act.quotes} 引用`;
-        } else if (act.sampleCapped) {
-            $("kpiDailyPosts").textContent = `覆盖近 ${act.effectiveCoveredDays} 天 · 日均 ${act.dailyAvgPosts} 条（含 ${act.quotes} 引用）`;
+        const quotePart = act.quotes > 0 ? `引用 ${act.quotes}` : "";
+        if (pCode === "HOURS_24") {
+            $("kpiDailyPosts").textContent = quotePart || (act.originalPosts > 0 ? "纯原创" : "暂无原创");
+        } else if (!isHourlyWindow && act.sampleCapped) {
+            $("kpiDailyPosts").textContent = `近 ${act.effectiveCoveredDays}d · 日均 ${act.dailyAvgPosts}${quotePart ? " · " + quotePart : ""}`;
         } else {
-            $("kpiDailyPosts").textContent = `日均 ${act.dailyAvgPosts} 条（另含 ${act.quotes} 条引用）`;
+            $("kpiDailyPosts").textContent = `日均 ${act.dailyAvgPosts}${quotePart ? " · " + quotePart : ""}`;
         }
 
         $("kpiRepliesTitle").textContent = "回复";
         $("kpiReplies").textContent = fmtNum(act.replies);
-        if (is48h) {
+        if (isHourlyWindow) {
             const activeHrs = Number(act.activeUnits || 0);
-            $("kpiDailyReplies").textContent = activeHrs > 0
-                ? `活跃 ${activeHrs} / 48 小时 · 日均 ${act.dailyAvgReplies} 条回复`
-                : "近 48 小时暂无回复互动";
+            $("kpiDailyReplies").textContent = pCode === "HOURS_24"
+                ? (activeHrs > 0 ? `活跃 ${activeHrs}/24h` : "暂无回复")
+                : (activeHrs > 0 ? `活跃 ${activeHrs}/${windowHours}h · 日均 ${act.dailyAvgReplies}` : `日均 ${act.dailyAvgReplies}`);
         } else {
-            $("kpiDailyReplies").textContent = `日均 ${act.dailyAvgReplies} 条评论互动`;
+            $("kpiDailyReplies").textContent = `日均 ${act.dailyAvgReplies}`;
         }
 
         $("kpiReplyRatio").textContent = `${act.replyToPostRatio}x`;
         const ratioJudge =
             act.replyToPostRatio >= 2 && act.replyToPostRatio <= 6
-                ? "✓ 健康（建议 2–6x）"
+                ? "均衡 2–6x"
                 : act.replyToPostRatio > 6
-                    ? "回复很多，可多发原创"
-                    : "偏低，建议 2x 以上";
+                    ? "偏高 · 增原创"
+                    : "偏低 · 增互动";
         $("kpiReplyShare").textContent = ratioJudge;
         $("kpiReplyShare").className = `kpi-sub ${act.replyToPostRatio >= 2 && act.replyToPostRatio <= 6 ? "judge-good" : "judge-warn"}`;
 
@@ -1067,16 +1901,22 @@
         $("kpiAvgEr").textContent = erKnown ? `${act.avgEngagementRatePct}%` : "--";
         $("kpiAvgEr").title = `公开互动率${metricSampleLabel(act, "engagementRateSampleCount")}`;
         const erVal = Number(act.avgEngagementRatePct || 0);
-        const erJudge = erVal >= 3 ? "本站参考：较高（区间 1–3%）" : erVal >= 1 ? "本站参考：区间内（1–3%）" : "本站参考：偏低（区间 1–3%）";
-        $("kpiAvgViews").textContent = `${erKnown ? erJudge : "公开互动率未取得"} · 均浏览 ${viewsKnown ? fmtNum(act.avgViewsPerPost) : "--"}${metricSampleLabel(act, "mainPostViewSampleCount")}`;
+        $("kpiAvgViews").textContent = `均浏览 ${viewsKnown ? fmtNum(act.avgViewsPerPost) : "--"}`;
         $("kpiAvgViews").className = `kpi-sub ${!erKnown ? "" : erVal >= 1 ? "judge-good" : "judge-warn"}`;
 
         $("diagnosisSectionTitle").textContent = "节奏诊断";
-        $("activityAdviceText").textContent = act.summaryAdvice;
-        $("activeDaysBadge").textContent = act.activeProgressLabel;
+        const rawAdvice = String(act.summaryAdvice || "").trim();
+        const strippedAdvice = rawAdvice.includes("——")
+            ? rawAdvice.split("——").slice(1).join("——").trim()
+            : rawAdvice.replace(/^本周期产出[^。；]*[。；]\s*/, "").trim();
+        $("activityAdviceText").textContent = strippedAdvice || rawAdvice;
+        $("activeDaysBadge").textContent = String(act.activeProgressLabel || "")
+            .replace(/\s*\/\s*/g, "/")
+            .replace(/\s*小时$/, "h")
+            .replace(/\s*天$/, "天");
 
-        $("trendChartTitle").textContent = act.chartTitle;
-        $("trendChartSubtitle").textContent = act.chartSubtitle;
+        $("trendChartTitle").textContent = isHourlyWindow ? "逐时分布" : "每日分布";
+        $("trendChartSubtitle").textContent = formatActivityTrendSummary(report);
         $("trendChartSubtitle").classList.remove("is-readout");
 
         const total = Math.max(1, act.totalActions);
@@ -1088,35 +1928,46 @@
         $("actionMixBar").innerHTML = act.totalActions > 0
             ? `
                 <div class="mix-seg" style="width:${pReply}%; background:var(--x-blue)" title="回复 ${act.replies}"></div>
-                <div class="mix-seg" style="width:${pPost}%; background:var(--text-primary)" title="原创推文 ${act.originalPosts}"></div>
-                <div class="mix-seg" style="width:${pQuote}%; background:var(--x-green)" title="引用点评 ${act.quotes}"></div>
-                <div class="mix-seg" style="width:${pRt}%; background:var(--x-amber)" title="纯转推 ${act.retweets}"></div>
+                <div class="mix-seg" style="width:${pPost}%; background:var(--text-primary)" title="原创 ${act.originalPosts}"></div>
+                <div class="mix-seg" style="width:${pQuote}%; background:var(--x-green)" title="引用 ${act.quotes}"></div>
+                <div class="mix-seg" style="width:${pRt}%; background:var(--x-amber)" title="转推 ${act.retweets}"></div>
             `
             : `<div class="mix-seg" style="width:100%; background:var(--border-color)"></div>`;
 
-        $("actionMixLegend").innerHTML = `
-            <span><i class="dot blue"></i>回复 <strong>${act.replies}</strong> (${act.totalActions > 0 ? pReply : "0.0"}%)</span>
-            <span><i class="dot white"></i>原创发帖 <strong>${act.originalPosts}</strong> (${act.totalActions > 0 ? pPost : "0.0"}%)</span>
-            <span><i class="dot green"></i>引用点评 <strong>${act.quotes}</strong> (${act.totalActions > 0 ? pQuote : "0.0"}%)</span>
-            <span><i class="dot amber"></i>纯转推 <strong>${act.retweets}</strong> (${act.totalActions > 0 ? pRt : "0.0"}%)</span>
-        `;
+        const mixItems = [
+            `<span><i class="dot blue"></i>回复 <strong>${act.replies}</strong> (${act.totalActions > 0 ? pReply : "0.0"}%)</span>`,
+            `<span><i class="dot white"></i>原创 <strong>${act.originalPosts}</strong> (${act.totalActions > 0 ? pPost : "0.0"}%)</span>`
+        ];
+        if (act.quotes > 0 || act.totalActions === 0) {
+            mixItems.push(`<span><i class="dot green"></i>引用 <strong>${act.quotes}</strong> (${act.totalActions > 0 ? pQuote : "0.0"}%)</span>`);
+        }
+        if (act.retweets > 0) {
+            mixItems.push(`<span><i class="dot amber"></i>转推 <strong>${act.retweets}</strong> (${pRt}%)</span>`);
+        }
+        $("actionMixLegend").innerHTML = mixItems.join("");
 
         const series = act.trendSeries || [];
-        // 接口分桶保留原始整数；先汇总再显示，不累加 fmtNum 的缩写值。
-        const engagementSamples = series.reduce((sum, bucket) => sum + bucket.engagementSampleCount, 0);
-        const totalEngagements = series.reduce((sum, bucket) => sum + bucket.engagements, 0);
-        const exactNum = (value) => Number(value).toLocaleString("zh-CN");
-        $("activityMetricTotals").textContent = `本周期非纯转推 · 浏览样本 ${exactNum(act.viewSampleCount)} 帖 · 总浏览 ${act.viewSampleCount > 0 ? exactNum(act.totalViews) : "--"} · 互动样本 ${exactNum(engagementSamples)} 帖 · 总互动 ${engagementSamples > 0 ? exactNum(totalEngagements) : "--"}`;
         const maxBucketTotal = Math.max(1, ...series.map((d) => d.posts + d.quotes + d.replies + (d.threadReplies ?? 0)));
-        const labelStep = series.length >= 28 ? 4 : series.length >= 20 ? 3 : 1;
+        const labelStep = series.length >= 40 ? 8 : series.length >= 28 ? 6 : series.length >= 20 ? 4 : 1;
 
         $("dailyTrendChart").innerHTML = series
             .map((d, idx) => {
                 const threadReplies = d.threadReplies ?? 0;
                 const authored = d.posts + d.quotes + threadReplies;
                 const tot = authored + d.replies;
-                const showAxisLabel = idx % labelStep === 0 || idx === series.length - 1;
-                const tip = `${d.fullLabel}｜总动态 ${tot} 条（回复 ${d.replies} · 原创 ${d.posts} · 引用 ${d.quotes} · 串推楼层 ${threadReplies}）｜浏览 ${hasMetricSample(d, "viewSampleCount") ? fmtNum(d.views) : "--"}${metricSampleLabel(d, "viewSampleCount")} · 获赞评转藏 ${hasMetricSample(d, "engagementSampleCount") ? fmtNum(d.engagements) : "--"}${metricSampleLabel(d, "engagementSampleCount")}`;
+                const isLast = idx === series.length - 1;
+                const distToLast = series.length - 1 - idx;
+                const showAxisLabel = isLast || (idx % labelStep === 0 && distToLast >= Math.ceil(labelStep / 2));
+                const breakdownParts = [];
+                if (d.replies > 0) breakdownParts.push(`回复 ${d.replies}`);
+                if (d.posts > 0) breakdownParts.push(`原创 ${d.posts}`);
+                if (d.quotes > 0) breakdownParts.push(`引用 ${d.quotes}`);
+                if (threadReplies > 0) breakdownParts.push(`串推 ${threadReplies}`);
+                const viewSeg = hasMetricSample(d, "viewSampleCount") ? ` · 浏览 ${fmtNum(d.views)}` : "";
+                const engSeg = hasMetricSample(d, "engagementSampleCount") ? ` · 互动 ${fmtNum(d.engagements)}` : "";
+                const tip = tot === 0
+                    ? `${d.fullLabel} · 暂无动态`
+                    : `${d.fullLabel} · ${breakdownParts.join(" / ")}${viewSeg}${engSeg}`;
 
                 if (tot === 0) {
                     return `<div class="day-col" data-tip="${escapeHtml(tip)}" role="button" tabindex="0" title="${escapeHtml(tip)}">
@@ -1148,7 +1999,7 @@
         const mutual = Number(inter.balancedMutualPeers || 0);
 
         $("pillIOweBtn").textContent = `我没回谁 ${iOwe}`;
-        $("pillUnrepliedBtn").textContent = `评论待回复 ${unreplied}`;
+        $("pillUnrepliedBtn").textContent = `待回复 ${unreplied}`;
         $("pillTheyOweBtn").textContent = `谁没回我 ${theyOwe}`;
         $("pillMutualBtn").textContent = `互相评论 ${mutual}`;
 
@@ -1168,10 +2019,8 @@
 
     function renderInteractionsPanel(report) {
         const inter = report.interactions;
-        const dedupCnt = Number(inter.filteredSamePostReplies || 0);
         $("interactionSummaryDesc").textContent =
-            `${inter.totalInteractedPeers} 位推友 · 我去评 ${inter.totalOutboundActions} 帖 · 他来评 ${inter.totalInboundActions} 帖` +
-            (dedupCnt > 0 ? ` · 同一帖子多次回复已合并 ${dedupCnt} 条` : "");
+            `${inter.totalInteractedPeers} 人 · 去评 ${inter.totalOutboundActions} · 来评 ${inter.totalInboundActions}`;
 
         syncInteractionFilterUI(inter);
         renderPeerList(report);
@@ -1191,8 +2040,8 @@
         // 在「评论待回复」筛选下：聚焦别人评论了我但我还没回复的评论，主按钮直达该条评论
         if (activeFilter === "UNREPLIED_POST") {
             return {
-                label: `${Math.max(1, unreplied)} 条评论待回复`,
-                extraTag: item.reciprocityCode === "I_OWE" ? "没去评 TA" : "",
+                label: `待回复 ${Math.max(1, unreplied)}`,
+                extraTag: item.reciprocityCode === "I_OWE" ? "待回访" : "",
                 tone: "amber",
                 actionText: "去回复",
                 actionUrl: replyCommentUrl,
@@ -1203,7 +2052,7 @@
         if (item.reciprocityCode === "I_OWE") {
             return {
                 label: "没去评 TA",
-                extraTag: unreplied > 0 ? `${unreplied} 条评论待回复` : "",
+                extraTag: unreplied > 0 ? `待回 ${unreplied}` : "",
                 tone: "amber",
                 actionText: "去回访",
                 actionUrl: peerLatestPostsUrl(u.username),
@@ -1213,18 +2062,15 @@
         if (item.reciprocityCode === "THEY_OWE") {
             return { label: "TA 没回我", extraTag: "", tone: "pink", actionText: "主页", actionUrl: profileUrl, primary: false };
         }
-        // 互相评论（我去过 TA 推文下评论，TA 也来过我的推文下评论）
-        if (unreplied > 0) {
-            return {
-                label: "互相评论",
-                extraTag: `${unreplied} 条评论待回复`,
-                tone: "green",
-                actionText: "去回复",
-                actionUrl: replyCommentUrl,
-                primary: true
-            };
-        }
-        return { label: "互相评论", extraTag: "", tone: "green", actionText: "去互动", actionUrl: peerLatestPostsUrl(u.username), primary: false };
+        // 互相评论（我去过 TA 推文下评论，TA 也来过我的推文下评论）：列表主按钮统一为去互动
+        return {
+            label: "互相评论",
+            extraTag: unreplied > 0 ? `待回 ${unreplied}` : "",
+            tone: "green",
+            actionText: "去互动",
+            actionUrl: peerLatestPostsUrl(u.username),
+            primary: false
+        };
     }
 
     function followRelationText(item, report) {
@@ -1233,55 +2079,51 @@
             (item.iFollowThem || !audit.followingsSampleTruncated) &&
             (item.theyFollowMe || !audit.followersSampleTruncated);
         const followStateKnown = typeof item.followStateKnown === "boolean" ? item.followStateKnown : Boolean(legacyStateKnown);
-        if (!followStateKnown) return "关注关系待核实";
+        if (!followStateKnown) return "关系待核";
         if (item.iFollowThem && item.theyFollowMe) return "互关";
-        if (item.iFollowThem) return "TA 未回关你";
-        if (item.theyFollowMe) return "TA 关注了你";
+        if (item.iFollowThem) return "TA未回关";
+        if (item.theyFollowMe) return "关注了我";
         return "未互关";
     }
 
-    function buildPeerDetailHtml(report, item, statusMeta) {
+    function buildPeerDetailHtml(report, item) {
         const me = report.profile;
         const peer = item.peer;
         const myRaw = Number(item.myRawCommentCount || 0);
         const peerRaw = Number(item.peerRawCommentCount || 0);
-        const facts = [];
-        facts.push(
-            `我评了 TA 的 <strong>${item.myRepliesToPeer}</strong> 个帖子` +
-                (myRaw > item.myRepliesToPeer ? `（共 ${myRaw} 条回复，同一帖子只算 1 次）` : "")
-        );
-        facts.push(
-            `TA 评了我的 <strong>${item.peerRepliesToMe}</strong> 个帖子` +
-                (peerRaw > item.peerRepliesToMe ? `（共 ${peerRaw} 条回复，同一帖子只算 1 次）` : "")
-        );
+        const chips = [`@${escapeHtml(peer.username)}`];
+        if (myRaw > item.myRepliesToPeer) {
+            chips.push(`共回 TA <strong>${myRaw}</strong> 条`);
+        }
+        if (peerRaw > item.peerRepliesToMe) {
+            chips.push(`共回我 <strong>${peerRaw}</strong> 条`);
+        }
         if (Number(item.unrepliedInMyPostCount || 0) > 0) {
-            facts.push(`我的帖子下还有 <strong>${item.unrepliedInMyPostCount}</strong> 处 TA 的评论没回`);
+            chips.push(`待回复 <strong>${item.unrepliedInMyPostCount}</strong>`);
         }
         if (Number(item.peerInThreadRepliesOnTheirPost || 0) > 0) {
-            facts.push(`TA 在自己的帖子里回过你 ${item.peerInThreadRepliesOnTheirPost} 次（不算来评你）`);
+            chips.push(`帖内回你 ${item.peerInThreadRepliesOnTheirPost}`);
         }
         if (Number(item.myRepliesInMyOwnPost || 0) > 0) {
-            facts.push(`你在自己的帖子里回过 TA ${item.myRepliesInMyOwnPost} 次（不算去评 TA）`);
+            chips.push(`帖内回 TA ${item.myRepliesInMyOwnPost}`);
         }
         if (Number(item.myQuotesOfPeer || 0) + Number(item.peerQuotesOfMe || 0) > 0) {
-            facts.push(`引用：我引用 TA ${item.myQuotesOfPeer} 次，TA 引用我 ${item.peerQuotesOfMe} 次`);
+            chips.push(`引用 我${item.myQuotesOfPeer}/TA${item.peerQuotesOfMe}`);
         }
 
         const replyBtn =
             Number(item.unrepliedInMyPostCount || 0) > 0 && item.latestUnrepliedTweetUrl
-                ? `<a class="x-blue-pill sm" href="${escapeHtml(safeHttpUrl(item.latestUnrepliedTweetUrl, peerDialogueUrl(me.username, peer.username)))}" target="_blank" rel="noopener noreferrer">去回复 TA 的评论 ↗</a>`
+                ? `<a class="x-blue-pill sm" href="${escapeHtml(safeHttpUrl(item.latestUnrepliedTweetUrl, peerDialogueUrl(me.username, peer.username)))}" target="_blank" rel="noopener noreferrer">回复评论 ↗</a>`
                 : "";
 
         return `<div class="peer-detail" data-peer-detail="${escapeHtml(peer.username)}">
-            <div class="peer-detail-handle">@${escapeHtml(peer.username)} · ${escapeHtml(followRelationText(item, report))}</div>
-            ${item.relationshipPortrait ? `<div class="peer-detail-summary">${escapeHtml(item.relationshipPortrait)}</div>` : ""}
-            <ul class="peer-detail-facts">${facts.map((f) => `<li>${f}</li>`).join("")}</ul>
+            <div class="peer-detail-chips">${chips.map((c) => `<span class="peer-detail-chip">${c}</span>`).join("")}</div>
             ${item.recentSnippet ? `<div class="snippet-quote">${escapeHtml(item.recentSnippet)}</div>` : ""}
             <div class="peer-detail-actions">
                 ${replyBtn}
-                <a class="x-outline-pill sm" href="${escapeHtml(peerLatestPostsUrl(peer.username))}" target="_blank" rel="noopener noreferrer">去评 TA 最新推文 ↗</a>
-                <a class="x-outline-pill sm" href="${escapeHtml(peerDialogueUrl(me.username, peer.username))}" target="_blank" rel="noopener noreferrer">查看双方对话 ↗</a>
-                <a class="x-outline-pill sm" href="https://x.com/${encodeURIComponent(peer.username)}" target="_blank" rel="noopener noreferrer">TA 的主页 ↗</a>
+                <a class="x-outline-pill sm" href="${escapeHtml(peerLatestPostsUrl(peer.username))}" target="_blank" rel="noopener noreferrer">最新推文 ↗</a>
+                <a class="x-outline-pill sm" href="${escapeHtml(peerDialogueUrl(me.username, peer.username))}" target="_blank" rel="noopener noreferrer">对话 ↗</a>
+                <a class="x-outline-pill sm" href="https://x.com/${encodeURIComponent(peer.username)}" target="_blank" rel="noopener noreferrer">主页 ↗</a>
             </div>
         </div>`;
     }
@@ -1298,8 +2140,17 @@
 
     function widerPeriodActions() {
         const acts = [];
-        if (state.period !== "WEEK" && state.period !== "MONTH") acts.push({ text: "看近 7 天", action: "period:WEEK" });
-        if (state.period !== "MONTH") acts.push({ text: "看近 30 天", action: "period:MONTH" });
+        const order = ["HOURS_24", "HOURS_48", "WEEK", "MONTH"];
+        const idx = order.indexOf(state.period);
+        for (let i = Math.max(0, idx + 1); i < order.length; i++) {
+            const pCode = order[i];
+            if (isPeriodUnlocked(pCode) && PERIOD_META[pCode]) {
+                acts.push({ text: `看${PERIOD_META[pCode].badgePrefix}`, action: `period:${pCode}` });
+            }
+        }
+        if (acts.length === 0 && state.period !== "MONTH") {
+            acts.push({ text: "解锁说明", action: "unlockGuide:open" });
+        }
         return acts;
     }
 
@@ -1307,14 +2158,15 @@
         const listEl = $("peerInteractionList");
         let list = [...(report.interactions.peerStats || [])];
 
-        if (state.peerRelFilter !== "ALL") {
-            list = list.filter((p) => {
-                if (state.peerRelFilter === "UNREPLIED_POST") {
-                    return Number(p.unrepliedInMyPostCount || 0) > 0;
-                }
-                return p.reciprocityCode === state.peerRelFilter;
-            });
-        }
+        const activeFilter = ["I_OWE", "UNREPLIED_POST", "THEY_OWE", "MUTUAL"].includes(state.peerRelFilter)
+            ? state.peerRelFilter
+            : "MUTUAL";
+        list = list.filter((p) => {
+            if (activeFilter === "UNREPLIED_POST") {
+                return Number(p.unrepliedInMyPostCount || 0) > 0;
+            }
+            return p.reciprocityCode === activeFilter;
+        });
         if (state.peerSearchQuery) {
             const q = state.peerSearchQuery.replace(/^@/, "").toLowerCase();
             list = list.filter(
@@ -1324,52 +2176,61 @@
             );
         }
 
-        const effectiveSort =
-            state.peerSortBy !== "intimacy"
-                ? state.peerSortBy
-                : state.peerRelFilter === "I_OWE" || state.peerRelFilter === "UNREPLIED_POST"
-                    ? "iOweFirst"
-                    : state.peerRelFilter === "THEY_OWE"
-                        ? "theyOweFirst"
-                        : "intimacy";
-
+        const effectiveSort = state.peerSortBy || "intimacy";
         list.sort((a, b) => {
+            const totalA = (a.myRepliesToPeer || 0) + (a.peerRepliesToMe || 0);
+            const totalB = (b.myRepliesToPeer || 0) + (b.peerRepliesToMe || 0);
+            const blueDiff = (b.peer?.verified ? 1 : 0) - (a.peer?.verified ? 1 : 0);
             switch (effectiveSort) {
                 case "iOweFirst":
                     return (
                         (b.unrepliedInMyPostCount || 0) - (a.unrepliedInMyPostCount || 0) ||
                         (b.peerRepliesToMe - b.myRepliesToPeer) - (a.peerRepliesToMe - a.myRepliesToPeer) ||
-                        b.peerRepliesToMe - a.peerRepliesToMe
+                        b.peerRepliesToMe - a.peerRepliesToMe ||
+                        blueDiff
                     );
                 case "theyOweFirst":
                     return (
                         (b.myRepliesToPeer - b.peerRepliesToMe) - (a.myRepliesToPeer - a.peerRepliesToMe) ||
-                        b.myRepliesToPeer - a.myRepliesToPeer
+                        b.myRepliesToPeer - a.myRepliesToPeer ||
+                        blueDiff
                     );
                 case "outbound":
-                    return b.myRepliesToPeer - a.myRepliesToPeer || b.totalInteractions - a.totalInteractions;
+                    return b.myRepliesToPeer - a.myRepliesToPeer || totalB - totalA || blueDiff;
                 case "inbound":
-                    return b.peerRepliesToMe - a.peerRepliesToMe || b.totalInteractions - a.totalInteractions;
+                    return b.peerRepliesToMe - a.peerRepliesToMe || totalB - totalA || blueDiff;
                 default:
-                    return b.intimacyScore - a.intimacyScore;
+                    return (
+                        blueDiff ||
+                        totalB - totalA ||
+                        (b.peerRepliesToMe || 0) - (a.peerRepliesToMe || 0) ||
+                        (b.intimacyScore || 0) - (a.intimacyScore || 0)
+                    );
             }
         });
 
         if (list.length === 0) {
             const filterEmptyMsg = {
-                I_OWE: "来你推文下评论过的人，你都去评论过 TA 的推文了",
-                UNREPLIED_POST: "别人给你的评论都已回复",
-                THEY_OWE: "你去评论过推文的人，都来评论过你的推文",
-                MUTUAL: "当前时间段内还没有互相评论推文的人"
+                I_OWE: "暂无待回访推友",
+                UNREPLIED_POST: "主推评论均已回复",
+                THEY_OWE: "暂无单向未回推友",
+                MUTUAL: "当前窗口暂无双向互评推友"
             };
             const msg = state.peerSearchQuery
                 ? `没有找到「${state.peerSearchQuery}」`
-                : filterEmptyMsg[state.peerRelFilter] || "这个时间段内还没有互动记录";
+                : filterEmptyMsg[activeFilter] || "这个时间段内还没有互动记录";
+            const inter = report.interactions || {};
+            const altActions = [];
+            if (activeFilter !== "I_OWE" && Number(inter.inboundHeavyPeers || 0) > 0) {
+                altActions.push({ text: "看我没回谁", action: "peerFilter:I_OWE" });
+            } else if (activeFilter !== "THEY_OWE" && Number(inter.outboundHeavyPeers || 0) > 0) {
+                altActions.push({ text: "看谁没回我", action: "peerFilter:THEY_OWE" });
+            } else if (activeFilter !== "MUTUAL" && Number(inter.balancedMutualPeers || 0) > 0) {
+                altActions.push({ text: "看互相评论", action: "peerFilter:MUTUAL" });
+            }
             const acts = state.peerSearchQuery
                 ? [{ text: "清空搜索", action: "clearPeerSearch" }]
-                : state.peerRelFilter !== "ALL"
-                    ? [{ text: "查看全部", action: "peerFilter:ALL" }, ...widerPeriodActions()]
-                    : widerPeriodActions();
+                : [...altActions, ...widerPeriodActions()];
             listEl.innerHTML = emptyStateHtml(msg, acts);
             return;
         }
@@ -1385,6 +2246,13 @@
                 const isOpen = expandedKey === u.username.toLowerCase();
                 const meta = getPeerStatusMeta(item, meUsername, state.peerRelFilter);
                 const actionCls = meta.primary ? "x-blue-pill sm" : "x-outline-pill sm";
+                const redundantPrimaryTag =
+                    (activeFilter === "MUTUAL" && meta.label === "互相评论") ||
+                    (activeFilter === "THEY_OWE" && meta.label === "TA 没回我") ||
+                    (activeFilter === "I_OWE" && meta.label === "没去评 TA");
+                const mainTagHtml = redundantPrimaryTag
+                    ? ""
+                    : `<span class="mini-tag ${meta.tone}">${escapeHtml(meta.label)}</span>`;
                 const extraTagHtml = meta.extraTag
                     ? `<span class="mini-tag amber">${escapeHtml(meta.extraTag)}</span>`
                     : "";
@@ -1396,24 +2264,24 @@
                                 <span class="peer-name">${escapeHtml(u.displayName)}</span>
                                 ${verifiedSvgHtml(u.verified)}
                                 <span class="user-handle-muted">@${escapeHtml(u.username)}</span>
-                                <span class="mini-tag ${meta.tone}">${escapeHtml(meta.label)}</span>
+                                ${mainTagHtml}
                                 ${extraTagHtml}
                             </div>
                             <div class="peer-row-sub">
-                                我去评 <strong>${item.myRepliesToPeer}</strong> 帖 · TA 来评 <strong>${item.peerRepliesToMe}</strong> 帖 · ${escapeHtml(followRelationText(item, report))}
+                                去评 <strong>${item.myRepliesToPeer}</strong> · 来评 <strong>${item.peerRepliesToMe}</strong> · ${escapeHtml(followRelationText(item, report))}
                             </div>
                         </div>
                         <a class="${actionCls} peer-ext-link" href="${escapeHtml(meta.actionUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(meta.actionText)} ↗</a>
                         <svg class="peer-chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="M3.543 8.96l1.414-1.42L12 14.59l7.043-7.05 1.414 1.42L12 17.41 3.543 8.96z"/></svg>
                     </div>
-                    ${isOpen ? buildPeerDetailHtml(report, item, meta) : ""}
+                    ${isOpen ? buildPeerDetailHtml(report, item) : ""}
                 </div>`;
             })
             .join("");
 
         const loadMoreHtml = remainPeers > 0
             ? `<div class="list-load-more-row">
-                   <button type="button" class="x-outline-pill sm" id="loadMorePeersBtn">再显示 ${Math.min(remainPeers, LIST_LOAD_STEP)} 人（还有 ${remainPeers} 人）</button>
+                   <button type="button" class="x-outline-pill sm" id="loadMorePeersBtn">加载更多（余 ${remainPeers}）</button>
                </div>`
             : "";
 
@@ -1520,14 +2388,15 @@
 
         const graphIncomplete = audit.followersSampleTruncated || audit.followingsSampleTruncated;
         const limitations = [];
-        if (audit.followersSampleTruncated) limitations.push(`粉丝名单未完整（已采样 ${fmtNum(audit.followersSampleCount)} 位）`);
-        if (audit.followingsSampleTruncated) limitations.push("关注名单未完整");
+        if (audit.followersSampleTruncated) limitations.push(`粉丝采样 ${fmtNum(audit.followersSampleCount)}`);
+        if (audit.followingsSampleTruncated) limitations.push("关注未全量");
         const unknownFollowBackCount = Number(audit.unknownFollowBackCount || 0);
         const unknownFollowingCount = Number(audit.unknownFollowingCount || 0);
-        const hasUnknownRelations = unknownFollowBackCount > 0 || unknownFollowingCount > 0;
-        if (graphIncomplete || hasUnknownRelations) limitations.push(`回关状态尚待核实 ${fmtNum(unknownFollowBackCount)} 位、我方关注状态尚待核实 ${fmtNum(unknownFollowingCount)} 位；已核实未回关账号正常显示，未知关系不列入确定未回关或清理建议`);
-        $("followScopeNote").textContent = limitations.join("；");
-        $("followScopeNote").hidden = !graphIncomplete && !hasUnknownRelations;
+        const totalUnknown = unknownFollowBackCount + unknownFollowingCount;
+        const hasUnknownRelations = totalUnknown > 0;
+        if (hasUnknownRelations) limitations.push(`待核验 ${fmtNum(totalUnknown)} 人`);
+        $("followScopeNote").textContent = limitations.join(" · ");
+        $("followScopeNote").hidden = limitations.length === 0;
 
         const tabBtns = $("followStateTabs").querySelectorAll(".seg-tab");
         tabBtns[0].textContent = `TA未回关 ${audit.notFollowingBackCount}`;
@@ -1543,10 +2412,10 @@
             const emptyMsg = state.followSearchQuery
                 ? `没有找到「${state.followSearchQuery}」`
                 : state.followStateTab === "NOT_FOLLOWING_BACK"
-                    ? "这个分类下没有账号"
+                    ? "当前分类暂无账号"
                     : state.followStateTab === "FAN_ONLY"
-                        ? (graphIncomplete ? "已确认样本中暂无待回关账号；未采全关系仍未知" : "关注你的人你都回关了")
-                        : "暂无互关数据";
+                        ? (graphIncomplete ? "已采样粉丝均已回关" : "关注你的人均已回关")
+                        : "暂无互关账号";
             const emptyActs = state.followSearchQuery
                 ? [{ text: "清空搜索", action: "clearFollowSearch" }]
                 : state.followStateTab === "NOT_FOLLOWING_BACK" && state.unfollowCategory !== "ALL"
@@ -1586,6 +2455,11 @@
                     sideBtn = `<button type="button" class="mini-mark-btn ${isKept ? "is-active" : ""}" data-wl-toggle="${escapeHtml(u.username)}" title="${isKept ? "取消保留" : "保留后不再出现在「建议取关」里"}">${isKept ? "已保留" : "保留"}</button>`;
                 }
 
+                const hasPeriodInteract = Number(item.myRepliesToThem || 0) + Number(item.theirRepliesToMe || 0) > 0;
+                const interactSeg = hasPeriodInteract
+                    ? `去评 <strong>${item.myRepliesToThem}</strong> · 来评 <strong>${item.theirRepliesToMe}</strong>`
+                    : "无互动";
+
                 return `<div class="x-user-row">
                     ${avatarHtml(u, "md")}
                     <div class="user-row-main">
@@ -1593,10 +2467,10 @@
                             <span class="peer-name">${escapeHtml(u.displayName)}</span>
                             ${verifiedSvgHtml(u.verified)}
                             <span class="user-handle-muted">@${escapeHtml(u.username)}</span>
-                            <span class="mini-tag ${tagClass}" title="${escapeHtml(item.recommendation || "")}">${isKept ? "已保留" : isOpened ? "已打开·待刷新确认" : escapeHtml(item.auditLabel)}</span>
+                            <span class="mini-tag ${tagClass}" title="${escapeHtml(item.recommendation || "")}">${isKept ? "已保留" : isOpened ? "待确认" : escapeHtml(item.auditLabel)}</span>
                         </div>
                         <div class="peer-row-sub">
-                            粉丝 ${fmtNum(u.followersCount)} · 我去评 <strong>${item.myRepliesToThem}</strong> 帖 · TA 来评 <strong>${item.theirRepliesToMe}</strong> 帖
+                            粉丝 ${fmtNum(u.followersCount)} · ${interactSeg}
                         </div>
                         ${u.bio ? `<div class="bio-one-line">${escapeHtml(u.bio)}</div>` : ""}
                     </div>
@@ -1610,7 +2484,7 @@
 
         const loadMoreHtml = remainItems > 0
             ? `<div class="list-load-more-row">
-                   <button type="button" class="x-outline-pill sm" id="loadMoreFollowBtn">再显示 ${Math.min(remainItems, LIST_LOAD_STEP)} 人（还有 ${remainItems} 人）</button>
+                   <button type="button" class="x-outline-pill sm" id="loadMoreFollowBtn">加载更多（余 ${remainItems}）</button>
                </div>`
             : "";
 
@@ -1638,7 +2512,7 @@
             if (!isGoAction) return;
             link.addEventListener("click", () => {
                 state.openedFollowSet.add(link.dataset.openFollow.toLowerCase());
-                showToast("已打开 X 页面；完成操作后刷新数据确认，待办暂时保留");
+                showToast("已打开 X 主页，操作后刷新即可同步");
                 setTimeout(() => renderFollowAuditPanel(report), 0);
             });
         });
@@ -1746,14 +2620,14 @@
             }
 
             if (activeNowLabel) {
-                return `🟢 当前正处于黄金档【${activeNowLabel}】· 适合立即发主推`;
+                return `🟢 当前正处于黄金档 ${activeNowLabel}`;
             }
             if (bestSlotLabel && Number.isFinite(bestWaitMin)) {
                 const waitH = Math.floor(bestWaitMin / 60);
                 const waitM = bestWaitMin % 60;
                 return waitH >= 24
-                    ? `⏰ 距下一黄金档【${bestSlotLabel}】约 ${Math.floor(waitH / 24)} 天 ${waitH % 24} 小时`
-                    : `⏰ 距下一黄金档【${bestSlotLabel}】还有 ${waitH} 小时 ${waitM} 分`;
+                    ? `⏰ 下档 ${bestSlotLabel} · ${Math.floor(waitH / 24)}天${waitH % 24}h`
+                    : `⏰ 下档 ${bestSlotLabel} · ${waitH}h${waitM}m`;
             }
         } catch (_) {}
         return "";
@@ -1761,16 +2635,19 @@
 
     function timingPeriodDescription() {
         const timezone = state.report?.contentTiming?.timezone || "Asia/Shanghai";
-        return `按已采集浏览与公开互动率计算（${timezone === "Asia/Shanghai" ? "北京时间" : timezone}） · 点按格子看详情`;
+        return timezone === "Asia/Shanghai" ? "北京时间" : timezone;
     }
 
     function renderTimingPanel(report) {
         const ct = report.contentTiming;
         const slots = ct.goldenSlots || [];
-        const ranks = ["第 1 推荐时段", "第 2 推荐时段", "第 3 推荐时段"];
+        const ranks = ["#1", "#2", "#3"];
 
-        $("timingPeriodDesc").textContent = timingPeriodDescription();
-        $("timingPeriodDesc").classList.remove("is-readout");
+        const periodDescEl = $("timingPeriodDesc");
+        const tzText = timingPeriodDescription();
+        periodDescEl.textContent = tzText;
+        periodDescEl.classList.remove("is-readout");
+        periodDescEl.hidden = tzText === "北京时间";
 
         const nextBadge = $("nextGoldenWindowBadge");
         if (nextBadge) {
@@ -1782,14 +2659,14 @@
         $("goldenSlotsGrid").innerHTML = slots.length
             ? slots
                   .map(
-                      (s, i) => `<div class="golden-card">
-                      <div class="golden-rank">${ranks[i] || "推荐时段"}</div>
+                      (s, i) => `<div class="golden-card" data-golden-slot="${escapeHtml(s.label)}" role="button" tabindex="0" title="点击将该黄金时段填入定时发布">
+                      <div class="golden-rank">${ranks[i] || `#${i + 1}`} <span class="golden-sched-hint">定时 ›</span></div>
                       <div class="golden-time">${escapeHtml(s.label)}</div>
-                      <div class="golden-meta">平均公开互动率 <strong>${s.avgEngagementRatePct}%</strong> · 场均浏览 ${fmtNum(s.avgViews)}（样本 ${s.postCount} 帖）</div>
+                      <div class="golden-meta">互动率 <strong>${s.avgEngagementRatePct}%</strong> · 均浏览 ${fmtNum(s.avgViews)} · ${s.postCount} 帖</div>
                   </div>`
                   )
                   .join("")
-            : emptyStateHtml("暂无可比较的浏览与公开互动样本，暂时算不出黄金时段", widerPeriodActions());
+            : emptyStateHtml("样本不足，暂无黄金时段", widerPeriodActions());
 
         const rowsHtml = [];
         const cells = ct.heatmapCells || [];
@@ -1803,7 +2680,10 @@
                     const bg = c.postCount > 0 ? `rgba(29, 155, 240, ${alpha.toFixed(2)})` : "rgba(113,118,123,0.10)";
                     const color = c.intensity > 0.52 ? "#ffffff" : "var(--text-secondary)";
                     const cellEr = hasMetricSample(c, "engagementRateSampleCount") ? `${c.avgEngagementRatePct}%` : "--";
-                    const tip = `${c.dayLabel} ${String(c.hour).padStart(2, "0")}:00–${String(c.hour + 3).padStart(2, "0")}:00｜发帖 ${c.postCount} 条 · 平均公开互动率 ${cellEr}${metricSampleLabel(c, "engagementRateSampleCount")} · 场均浏览 ${hasMetricSample(c, "viewSampleCount") ? fmtNum(c.avgViews) : "--"}${metricSampleLabel(c, "viewSampleCount")}`;
+                    const slotRange = `${String(c.hour).padStart(2, "0")}:00–${String(c.hour + 3).padStart(2, "0")}:00`;
+                    const tip = c.postCount > 0
+                        ? `${c.dayLabel} ${slotRange} · ${c.postCount} 帖 · 互动率 ${cellEr}${hasMetricSample(c, "viewSampleCount") ? ` · 均浏览 ${fmtNum(c.avgViews)}` : ""}`
+                        : `${c.dayLabel} ${slotRange} · 暂无发帖`;
                     return `<div class="hm-cell" data-tip="${escapeHtml(tip)}" role="button" tabindex="0" style="background:${bg}; color:${color}" title="${escapeHtml(tip)}">
                         ${c.postCount > 0 ? cellEr : "·"}
                     </div>`;
@@ -1813,24 +2693,60 @@
         }
         $("heatmapGridRows").innerHTML = rowsHtml.join("");
 
-        $("formatCardsGrid").innerHTML = (ct.formatStats || [])
-            .map(
-                (f) => `<div class="format-card">
-                <div class="format-title">${escapeHtml(f.formatLabel)}</div>
-                <div class="format-er">${hasMetricSample(f, "engagementRateSampleCount") ? `${f.avgEngagementRatePct}%` : "--"} <span style="font-size:12px; font-weight:500; color:var(--text-secondary)">平均公开互动率${metricSampleLabel(f, "engagementRateSampleCount")}</span></div>
-                <div class="golden-meta">本周期 ${f.postCount} 帖 · 场均浏览 ${hasMetricSample(f, "viewSampleCount") ? fmtNum(f.avgViews) : "--"}${metricSampleLabel(f, "viewSampleCount")}</div>
-                <div class="golden-meta">场均获赞 ${hasMetricSample(f, "likeSampleCount") ? f.avgLikes : "--"}${metricSampleLabel(f, "likeSampleCount")} · 场均评论 ${hasMetricSample(f, "replySampleCount") ? f.avgReplies : "--"}${metricSampleLabel(f, "replySampleCount")}</div>
-            </div>`
-            )
+        const formatStats = ct.formatStats || [];
+        const knownFormatStats = formatStats.filter(
+            (f) => (Number(f.algoScoreSampleCount) > 0 && Number(f.avgAlgoScore) > 0)
+                || (Number(f.viewSampleCount) > 0 && Number(f.avgViews) > 0)
+        );
+        const bestFormat = knownFormatStats.length >= 2
+            ? [...knownFormatStats].sort((a, b) =>
+                (Number(b.avgAlgoScore || 0) - Number(a.avgAlgoScore || 0))
+                || (Number(b.avgViews || 0) - Number(a.avgViews || 0))
+            )[0]
+            : null;
+        const bestFormatCode = bestFormat ? bestFormat.formatCode : "";
+
+        $("formatCardsGrid").innerHTML = formatStats
+            .map((f) => {
+                const isWinner = Boolean(bestFormatCode && f.formatCode === bestFormatCode && f.postCount > 0);
+                const bmKnown = hasMetricSample(f, "bookmarkSampleCount");
+                return `<div class="format-card${isWinner ? " is-winning-format" : ""}">
+                    <div class="format-head-row">
+                        <div class="format-title">${escapeHtml(f.formatLabel)}</div>
+                        ${isWinner ? `<span class="mini-tag green format-win-badge">表现最佳</span>` : ""}
+                    </div>
+                    <div class="format-er">${hasMetricSample(f, "engagementRateSampleCount") ? `${f.avgEngagementRatePct}%` : "--"} <span style="font-size:11.5px; font-weight:500; color:var(--text-secondary)">互动率</span></div>
+                    <div class="golden-meta">${f.postCount} 帖 · 均浏览 ${hasMetricSample(f, "viewSampleCount") ? fmtNum(f.avgViews) : "--"}</div>
+                    <div class="golden-meta">赞 ${hasMetricSample(f, "likeSampleCount") ? f.avgLikes : "--"} · 评 ${hasMetricSample(f, "replySampleCount") ? f.avgReplies : "--"} · 藏 ${bmKnown ? f.avgBookmarks : "--"}</div>
+                </div>`;
+            })
             .join("");
 
         renderAlgoPoolAndSimulator(report);
         renderTopTweetsList(report);
     }
 
+    function opsActionButtonLabel(actionTarget) {
+        const target = String(actionTarget || "");
+        if (target.includes("UNREPLIED_POST")) return "去回复 ›";
+        if (target.includes("I_OWE")) return "去回访 ›";
+        if (target.includes("tab:schedule") || target.includes("goldenSlot:")) return "去排期 ›";
+        if (target.includes("focusDraft:1")) return "去体检 ›";
+        if (target.includes("tab:interactions")) return "去互动 ›";
+        if (target.includes("scrollId:formatCardsGrid")) return "看对比 ›";
+        if (target.includes("scrollId:topTweetsList")) return "看推文 ›";
+        if (target.includes("scrollId:algoCalibrationPanel")) return "看明细 ›";
+        return "查看 ›";
+    }
+
     function renderAlgoPoolAndSimulator(report) {
         const ah = report.algorithmHealth;
         if (!ah) return;
+
+        const profile = getActiveAlgoProfile();
+        const cr = profile.cadenceAndReach || DEFAULT_ALGO_PROFILE.cadenceAndReach;
+        const minGapMin = Math.max(15, Number(cr.minRecommendedGapMinutes || 180));
+        const minGapHrsLabel = Math.round((minGapMin / 60) * 10) / 10;
 
         const evaluated = ah.viewSampleCount ?? ah.evaluatedPostCount;
         const viewsKnown = hasMetricSample(ah, "viewSampleCount");
@@ -1841,49 +2757,811 @@
 
         const poolsEl = $("algoReachPoolsGrid");
         if (poolsEl) {
+            const oonMult = Number(cr.oonFollowerMultiple || 1.0);
+            const oonMultPct = Math.round(oonMult * 100);
+            const lowRatioPct = Math.round(Number(cr.lowReachFollowerRatio || 0.05) * 100);
+            const oonSubLabel = oonMult === 1 ? "浏览 ≥ 粉丝数" : `浏览 ≥ ${oonMult}倍粉丝`;
             poolsEl.innerHTML = `
                 <div class="format-card pool-card oon">
-                    <div class="format-title">浏览超过粉丝数</div>
-                    <div class="format-er" style="color:var(--x-green)">${viewsKnown ? ah.outOfNetworkPostCount : "--"} 帖 <span style="font-size:12px; font-weight:600; color:var(--text-secondary)">(${oonPct}${viewsKnown ? "%" : ""})</span></div>
-                    <div class="golden-meta">单帖浏览大于粉丝数；不能确定观看者或推荐来源</div>
+                    <div class="format-title">破圈推文</div>
+                    <div class="format-er" style="color:var(--x-green)">${viewsKnown ? ah.outOfNetworkPostCount : "--"}<span class="pool-pct">(${oonPct}${viewsKnown ? "%" : ""})</span></div>
+                    <div class="golden-meta">${escapeHtml(oonSubLabel)}</div>
                 </div>
                 <div class="format-card pool-card innet">
-                    <div class="format-title">浏览为粉丝数的 5%–100%</div>
-                    <div class="format-er" style="color:var(--x-blue)">${viewsKnown ? ah.inNetworkPostCount : "--"} 帖 <span style="font-size:12px; font-weight:600; color:var(--text-secondary)">(${inNetPct}${viewsKnown ? "%" : ""})</span></div>
-                    <div class="golden-meta">按浏览/粉丝数分组，不代表观看者都是粉丝</div>
+                    <div class="format-title">常规触达</div>
+                    <div class="format-er" style="color:var(--x-blue)">${viewsKnown ? ah.inNetworkPostCount : "--"}<span class="pool-pct">(${inNetPct}${viewsKnown ? "%" : ""})</span></div>
+                    <div class="golden-meta">粉丝数 ${lowRatioPct}%–${oonMultPct}%</div>
                 </div>
                 <div class="format-card pool-card low">
-                    <div class="format-title">浏览偏低（&lt;5% 粉丝）</div>
-                    <div class="format-er" style="color:${ah.lowReachPostCount > 0 ? "var(--x-amber)" : "var(--text-primary)"}">${viewsKnown ? ah.lowReachPostCount : "--"} 帖 <span style="font-size:12px; font-weight:600; color:var(--text-secondary)">(${lowPct}${viewsKnown ? "%" : ""})</span></div>
-                    <div class="golden-meta">仅表示浏览相对粉丝数较低，原因尚不能确定</div>
+                    <div class="format-title">低曝光</div>
+                    <div class="format-er" style="color:${ah.lowReachPostCount > 0 ? "var(--x-amber)" : "var(--text-primary)"}">${viewsKnown ? ah.lowReachPostCount : "--"}<span class="pool-pct">(${lowPct}${viewsKnown ? "%" : ""})</span></div>
+                    <div class="golden-meta">低于粉丝数 ${lowRatioPct}%</div>
                 </div>
             `;
         }
 
+        const calEl = $("algoCalibrationPanel");
+        if (calEl) {
+            const cal = ah.calibration || null;
+            if (cal && (cal.samplePostCount > 0 || (cal.replyTemplateRisk && cal.replyTemplateRisk.evaluatedReplyCount > 0))) {
+                const replyBoostMult = (Number(cal.inferredEffectiveReplyWeight || 5) / 5).toFixed(1);
+                const mutualVal = cal.mutualShareKnown ? `${cal.mutualCommenterSharePct}%` : "--";
+                const mutualSub = cal.mutualShareKnown
+                    ? `评论加成 ×${replyBoostMult}`
+                    : "待积累评论";
+                const baseSub = cal.samplePostCount > 0
+                    ? `约 ${cal.medianFollowerReachMultiple} 倍粉丝数`
+                    : "待积累主推";
+                const coldVal = cal.coldStartEligibleAccount
+                    ? (cal.samplePostCount > 0 ? `${cal.coldStartPassRatePct}%` : "--")
+                    : "已豁免";
+                const coldSub = cal.coldStartEligibleAccount
+                    ? `${cal.coldStartPassCount}/${cal.samplePostCount} 帖点赞 ≥1.5%`
+                    : "粉丝超 5 万";
+                const rtr = cal.replyTemplateRisk || {};
+                const rtrVal = rtr.copyPastaRiskTriggered
+                    ? `重复 ${rtr.maxClusterSize} 条`
+                    : "良好";
+                const rtrSub = rtr.copyPastaRiskTriggered
+                    ? "减少重复话术"
+                    : "无刷屏重复";
+
+                const extraLines = [];
+                if (Array.isArray(cal.domainStats) && cal.domainStats.length > 0) {
+                    const domBadges = cal.domainStats.slice(0, 4).map((d) => {
+                        const sign = d.vsNativePct > 0 ? `+${d.vsNativePct}%` : `${d.vsNativePct}%`;
+                        const warn = d.shortenerDomain ? "⚠️短链 " : "";
+                        return `${warn}${escapeHtml(d.domain)} · 均 ${fmtNum(d.avgViews)} (${sign})`;
+                    });
+                    extraLines.push(`<div class="algo-cal-extra-line"><strong>常用外链</strong>：${domBadges.join(" ｜ ")}</div>`);
+                }
+                if (Array.isArray(cal.residualAnomalies) && cal.residualAnomalies.length > 0) {
+                    const anomLinks = cal.residualAnomalies.map((a) =>
+                        `<a href="${escapeHtml(safeHttpUrl(a.tweetUrl, "https://x.com"))}" target="_blank" rel="noopener noreferrer">${escapeHtml(a.createdLabel)}「${escapeHtml(a.textPreview)}」(${fmtNum(a.actualViews)} 浏览) ↗</a>`
+                    );
+                    extraLines.push(`<div class="algo-cal-extra-line"><strong>互动高但曝光偏低</strong>：${anomLinks.join(" ； ")}</div>`);
+                }
+
+                calEl.innerHTML = `
+                    <div class="algo-cal-grid">
+                        <div class="algo-cal-card">
+                            <span class="algo-cal-label">日常单帖浏览</span>
+                            <span class="algo-cal-val">${cal.samplePostCount > 0 ? fmtNum(cal.medianViews) : "--"}</span>
+                            <span class="algo-cal-sub">${escapeHtml(baseSub)}</span>
+                        </div>
+                        <div class="algo-cal-card">
+                            <span class="algo-cal-label">互关评论占比</span>
+                            <span class="algo-cal-val" style="color:var(--x-blue)">${escapeHtml(mutualVal)}</span>
+                            <span class="algo-cal-sub">${escapeHtml(mutualSub)}</span>
+                        </div>
+                        <div class="algo-cal-card">
+                            <span class="algo-cal-label">新帖冷启动达标</span>
+                            <span class="algo-cal-val" style="color:var(--x-green)">${escapeHtml(coldVal)}</span>
+                            <span class="algo-cal-sub">${escapeHtml(coldSub)}</span>
+                        </div>
+                        <div class="algo-cal-card">
+                            <span class="algo-cal-label">回复原创度</span>
+                            <span class="algo-cal-val" style="color:${rtr.copyPastaRiskTriggered ? "var(--x-amber)" : "var(--x-green)"}">${escapeHtml(rtrVal)}</span>
+                            <span class="algo-cal-sub">${escapeHtml(rtrSub)}</span>
+                        </div>
+                    </div>
+                    ${extraLines.join("")}
+                `;
+                calEl.hidden = false;
+            } else {
+                calEl.innerHTML = "";
+                calEl.hidden = true;
+            }
+        }
+
+        const playbookEl = $("algoOpsPlaybookList");
+        if (playbookEl) {
+            const rawOps = Array.isArray(ah.opsRecommendations) ? ah.opsRecommendations : [];
+            const cards = [];
+            for (const item of rawOps) {
+                if (!item) continue;
+                if (item.code === "CLEAN_LOW_SIGNAL_FOLLOWS" || item.code === "LOYAL_FAN_FOLLOWBACK") {
+                    continue; // 关系清理与回关类建议保留在总览待办清单，内容页聚焦内容/时段/曝光策略
+                }
+                const title = item.title || "";
+                const detail = item.detail || "";
+                const prio = String(item.priority || "MEDIUM").toUpperCase();
+                const prioClass = prio === "HIGH" ? "prio-high" : prio === "LOW" ? "prio-low" : "prio-medium";
+                const prioLabel = prio === "HIGH" ? "优先" : "建议";
+                const actionHtml = item.externalUrl
+                    ? `<a class="algo-ops-go" href="${escapeHtml(safeHttpUrl(item.externalUrl, "https://x.com"))}" target="_blank" rel="noopener noreferrer">前往 ↗</a>`
+                    : `<button type="button" class="algo-ops-go" data-go="${escapeHtml(item.actionTarget || "tab:timing")}">${escapeHtml(opsActionButtonLabel(item.actionTarget))}</button>`;
+                cards.push(`
+                    <div class="algo-ops-item">
+                        <div class="algo-ops-main">
+                            <div class="algo-ops-title-row">
+                                <span class="algo-ops-badge ${prioClass}">${prioLabel}</span>
+                                <span class="algo-ops-title">${escapeHtml(title)}</span>
+                            </div>
+                            ${detail ? `<div class="algo-ops-detail">${escapeHtml(detail)}</div>` : ""}
+                        </div>
+                        ${actionHtml}
+                    </div>
+                `);
+            }
+            playbookEl.innerHTML = cards.join("");
+            playbookEl.hidden = cards.length === 0;
+        }
+
         const tipsBox = $("algoPlainTipsBox");
         if (tipsBox) {
-            tipsBox.innerHTML = `
-                <div class="algo-tip-line">浏览分组${metricSampleLabel(ah, "viewSampleCount")} ${escapeHtml(ah.metricsNote || "")}</div>
-                <div class="algo-tip-line">${escapeHtml(ah.diversityAdvice)}</div>
-                <div class="algo-tip-line">${escapeHtml(ah.contentRuleAdvice)}</div>
-            `;
+            tipsBox.innerHTML = "";
+            tipsBox.hidden = true;
         }
 
         const timingHintEl = $("draftLiveTimingHint");
         if (timingHintEl) {
             if (ah.latestMainPostAt) {
                 const gapHrs = Math.max(0, (Date.now() - new Date(ah.latestMainPostAt).getTime()) / 3600000);
-                if (gapHrs < 3) {
-                    timingHintEl.textContent = `⏱️ 注意：距你上一条主推仅过去 ${gapHrs.toFixed(1)} 小时；本站按 3 小时作间隔参考，不代表平台折叠或降权`;
+                if (gapHrs < minGapHrsLabel) {
+                    timingHintEl.textContent = `距上条仅 ${gapHrs.toFixed(1)}h，建议间隔 ≥${minGapHrsLabel}h`;
+                    timingHintEl.hidden = false;
                 } else {
-                    timingHintEl.textContent = `✅ 距你上一条主推已间隔 ${gapHrs >= 24 ? Math.floor(gapHrs / 24) + " 天" : gapHrs.toFixed(1) + " 小时"}· 粘贴草稿可查看本站规则评分，不能据此判断平台分发`;
+                    timingHintEl.textContent = "";
+                    timingHintEl.hidden = true;
                 }
             } else {
-                timingHintEl.textContent = "粘贴草稿，按本站规则检查间隔、外链、篇幅与提问；评分不预测推荐流量";
+                timingHintEl.textContent = "";
+                timingHintEl.hidden = true;
             }
         }
 
+        renderAlgoConfigDrawer();
         evaluatePrePostDraft();
+    }
+
+    const KNOWN_SHORTENER_DOMAINS = new Set([
+        "bit.ly", "tinyurl.com", "t.cn", "is.gd", "cutt.ly", "buff.ly",
+        "ow.ly", "rebrand.ly", "shorturl.at", "rb.gy", "soo.gd"
+    ]);
+
+    function extractPrimaryDraftDomain(urls) {
+        let sawTco = false;
+        for (const u of (urls || [])) {
+            const m = /^https?:\/\/([^/\s:?#]+)/i.exec(String(u || ""));
+            if (!m) continue;
+            let host = m[1].toLowerCase();
+            if (host.startsWith("www.")) host = host.slice(4);
+            if (host.startsWith("mobile.")) host = host.slice(7);
+            if (host === "x.com" || host === "twitter.com") continue;
+            if (host === "t.co") {
+                sawTco = true;
+                continue;
+            }
+            return host;
+        }
+        return sawTco ? "t.co" : "";
+    }
+
+    function buildCalibrationShingleArray(cleanText) {
+        if (!cleanText) return [];
+        const norm = String(cleanText).toLowerCase();
+        const set = new Set();
+        const words = norm.match(/[a-z0-9_]{2,}/g) || [];
+        for (const w of words) {
+            if (set.size >= 64) break;
+            set.add(`w:${w}`);
+        }
+        const compact = norm.replace(/[^a-z0-9\u4e00-\u9fff]/g, "");
+        const chars = Array.from(compact);
+        if (chars.length === 1 && set.size < 64) {
+            set.add(`c:${chars[0]}`);
+        } else {
+            for (let i = 0; i < chars.length - 1 && set.size < 64; i++) {
+                if (/[\u4e00-\u9fff]/.test(chars[i]) || /[\u4e00-\u9fff]/.test(chars[i + 1])) {
+                    set.add(`g:${chars[i]}${chars[i + 1]}`);
+                }
+            }
+        }
+        return Array.from(set);
+    }
+
+    function interpolateCorpusViewsAtPercentile(sortedViews, pct) {
+        if (!sortedViews.length) return 0;
+        const clamped = Math.max(0, Math.min(100, Number(pct) || 0)) / 100;
+        const pos = clamped * (sortedViews.length - 1);
+        const lo = Math.floor(pos);
+        const hi = Math.ceil(pos);
+        if (lo === hi) return sortedViews[lo];
+        return Math.round(sortedViews[lo] * (hi - pos) + sortedViews[hi] * (pos - lo));
+    }
+
+    function predictDraftFromCorpus(cal, draftFeat, pipelineMult, followersCount) {
+        if (!cal || !cal.predictionUnlocked || !Array.isArray(cal.corpusSamples) || cal.corpusSamples.length < (cal.minRequiredSamples || 6)) {
+            return {
+                unlocked: false,
+                sampleCount: cal ? Number(cal.samplePostCount || 0) : 0,
+                minRequired: cal ? Number(cal.minRequiredSamples || 6) : 6
+            };
+        }
+        const qSet = new Set(draftFeat.shingles || []);
+        const priorWeight = 1.6;
+        let wSum = priorWeight;
+        let wySum = priorWeight * 50.0;
+
+        const scoredNeighbors = [];
+        for (const s of cal.corpusSamples) {
+            if (!s) continue;
+            const sShingles = Array.isArray(s.shingles) ? s.shingles : [];
+            let inter = 0;
+            for (const tok of sShingles) {
+                if (qSet.has(tok)) inter++;
+            }
+            const union = qSet.size + sShingles.length - inter;
+            const jaccard = union > 0 ? inter / union : 0.0;
+            const fmtMatch = draftFeat.formatCode === s.formatCode ? 1.0 : 0.0;
+            const extMatch = Boolean(draftFeat.hasExternalLink) === Boolean(s.hasExternalLink) ? 1.0 : 0.0;
+            const domainMatch = (draftFeat.hasExternalLink && draftFeat.externalDomain && draftFeat.externalDomain === s.externalDomain) ? 1.0 : 0.0;
+            const listMatch = Boolean(draftFeat.structuredList) === Boolean(s.structuredList) ? 1.0 : 0.0;
+            const qMatch = Boolean(draftFeat.hasQuestion) === Boolean(s.hasQuestion) ? 1.0 : 0.0;
+            const slotMatch = Boolean(draftFeat.activeSlotHit) === Boolean(s.activeSlotHit) ? 1.0 : 0.0;
+            const lenDiff = Math.abs(Math.log1p(Math.max(0, draftFeat.cleanCharLen)) - Math.log1p(Math.max(0, Number(s.cleanCharLen || 0))));
+
+            const z = 2.6 * jaccard
+                + 0.85 * fmtMatch
+                + 0.35 * extMatch
+                + 0.55 * domainMatch
+                + 0.30 * listMatch
+                + 0.25 * qMatch
+                + 0.20 * slotMatch
+                - 0.30 * Math.min(2.5, lenDiff);
+            const w = Math.max(0.05, Math.exp(z) - 0.85);
+            wSum += w;
+            wySum += w * Number(s.rankPercentile || 50);
+            scoredNeighbors.push({ sample: s, weight: w, jaccard });
+        }
+
+        const rawMeanPct = wySum / wSum;
+        let varNum = priorWeight * Math.pow(50.0 - rawMeanPct, 2);
+        for (const sn of scoredNeighbors) {
+            varNum += sn.weight * Math.pow(Number(sn.sample.rankPercentile || 50) - rawMeanPct, 2);
+        }
+        const std = Math.sqrt(varNum / wSum);
+        const halfBand = Math.max(10, Math.min(22, Math.round(std * 0.9)));
+
+        const rawLowPct = Math.max(5, Math.min(92, Math.round(rawMeanPct - halfBand)));
+        const rawHighPct = Math.max(rawLowPct + 6, Math.min(99, Math.round(rawMeanPct + halfBand)));
+
+        const safePipeMult = Math.max(0.15, Math.min(1.0, Number(pipelineMult) || 1.0));
+        const effCenterPct = rawMeanPct * safePipeMult;
+        const effLowPct = Math.max(3, Math.min(90, Math.round(effCenterPct - halfBand * safePipeMult)));
+        const effHighPct = Math.max(effLowPct + 5, Math.min(99, Math.round(effCenterPct + halfBand * safePipeMult)));
+
+        const sortedViews = scoredNeighbors
+            .map((sn) => Math.max(0, Number(sn.sample.viewCount || 0)))
+            .sort((a, b) => a - b);
+        const rawLowViews = interpolateCorpusViewsAtPercentile(sortedViews, rawLowPct);
+        const rawHighViews = interpolateCorpusViewsAtPercentile(sortedViews, rawHighPct);
+        const expViewsLow = Math.max(1, Math.round(rawLowViews * safePipeMult));
+        const expViewsHigh = Math.max(expViewsLow, Math.round(rawHighViews * safePipeMult));
+
+        const fCnt = Number(followersCount);
+        const multLow = Number.isFinite(fCnt) && fCnt > 0 ? (expViewsLow / fCnt).toFixed(2) : null;
+        const multHigh = Number.isFinite(fCnt) && fCnt > 0 ? (expViewsHigh / fCnt).toFixed(2) : null;
+
+        scoredNeighbors.sort((a, b) => b.weight - a.weight);
+        const topNeighbors = scoredNeighbors.slice(0, 3).map((sn) => ({
+            id: sn.sample.id,
+            createdLabel: sn.sample.createdLabel,
+            formatCode: sn.sample.formatCode,
+            textPreview: sn.sample.textPreview,
+            viewCount: sn.sample.viewCount,
+            rankPercentile: sn.sample.rankPercentile,
+            realizedVmUtilityPer1k: sn.sample.realizedVmUtilityPer1k,
+            tweetUrl: sn.sample.tweetUrl,
+            jaccardPct: Math.round(sn.jaccard * 100)
+        }));
+
+        return {
+            unlocked: true,
+            sampleCount: Number(cal.samplePostCount || scoredNeighbors.length),
+            loocvBandHitRatePct: cal.loocvBandHitRatePct,
+            loocvMaePercentile: cal.loocvMaePercentile,
+            rawLowPct,
+            rawHighPct,
+            effLowPct,
+            effHighPct,
+            pipelineDiscounted: safePipeMult < 0.98,
+            pipelineMult: safePipeMult,
+            expViewsLow,
+            expViewsHigh,
+            multLow,
+            multHigh,
+            topNeighbors
+        };
+    }
+
+    function computeUpstreamDiversityMult(ev, sameAuthorBatchIdx) {
+        const enabled = ev && ev.enableAuthorDiversity !== false;
+        const k = Math.max(0, Math.floor(Number(sameAuthorBatchIdx) || 0));
+        if (!enabled || k <= 0) return 1.0;
+        const floor = Number.isFinite(Number(ev.authorDiversityFloor)) ? Number(ev.authorDiversityFloor) : 0.25;
+        const decay = Number.isFinite(Number(ev.authorDiversityDecay)) ? Number(ev.authorDiversityDecay) : 0.5;
+        return (1.0 - floor) * Math.pow(decay, k) + floor;
+    }
+
+    function normalizeForDuplicateCheck(raw) {
+        return String(raw || "")
+            .replace(URL_TOKEN_RE, " ")
+            .toLowerCase()
+            .replace(/[\s\p{P}\p{S}]+/gu, " ")
+            .trim();
+    }
+
+    function buildDuplicateShingleSet(normText) {
+        const set = new Set();
+        if (!normText) return set;
+        const wordTokens = normText.match(/[a-z0-9_]{2,}/g) || [];
+        for (const w of wordTokens) set.add(`w:${w}`);
+        const cjkCompact = normText.replace(/[^a-z0-9\u4e00-\u9fff]/g, "");
+        const chars = Array.from(cjkCompact);
+        if (chars.length === 1) {
+            set.add(`c:${chars[0]}`);
+        } else {
+            for (let i = 0; i < chars.length - 1; i++) {
+                const a = chars[i];
+                const b = chars[i + 1];
+                if (/[\u4e00-\u9fff]/.test(a) || /[\u4e00-\u9fff]/.test(b)) {
+                    set.add(`g:${a}${b}`);
+                }
+            }
+        }
+        return set;
+    }
+
+    function evaluateCorpusSimilarity(cleanText, skipDraftIdx) {
+        const normDraft = normalizeForDuplicateCheck(cleanText);
+        if (!normDraft || Array.from(normDraft).length < 8) {
+            return { maxSim: 0, exactMatch: false, sourceLabel: "" };
+        }
+        const draftSet = buildDuplicateShingleSet(normDraft);
+        const candidates = [];
+        const topPosts = state.report && state.report.contentTiming && Array.isArray(state.report.contentTiming.topPosts)
+            ? state.report.contentTiming.topPosts
+            : [];
+        for (const p of topPosts) {
+            if (p && p.text) candidates.push({ text: p.text, label: "近期已发样本推文" });
+        }
+        for (const j of (state.scheduleJobs || [])) {
+            if (j && j.status === "SCHEDULED" && j.text) {
+                candidates.push({ text: j.text, label: "待发定时队列推文" });
+            }
+        }
+        (state.scheduleDraftItems || []).forEach((it, idx) => {
+            if (idx !== skipDraftIdx && it && it.text && it.text.trim()) {
+                candidates.push({ text: it.text, label: `排期草稿 #${idx + 1}` });
+            }
+        });
+
+        let maxSim = 0;
+        let bestLabel = "";
+        let exactMatch = false;
+        for (const cand of candidates) {
+            const normCand = normalizeForDuplicateCheck(cand.text);
+            if (!normCand) continue;
+            if (normCand === normDraft) {
+                return { maxSim: 1.0, exactMatch: true, sourceLabel: cand.label };
+            }
+            const candSet = buildDuplicateShingleSet(normCand);
+            if (!draftSet.size || !candSet.size) continue;
+            let inter = 0;
+            for (const tok of draftSet) {
+                if (candSet.has(tok)) inter++;
+            }
+            const union = draftSet.size + candSet.size - inter;
+            const sim = union > 0 ? inter / union : 0;
+            if (sim > maxSim) {
+                maxSim = sim;
+                bestLabel = cand.label;
+                if (sim >= 0.96) exactMatch = true;
+            }
+        }
+        return { maxSim, exactMatch, sourceLabel: bestLabel };
+    }
+
+    function inspectMentionFollowerRelation(handles) {
+        if (!handles.length) return { nonConfirmed: [], confirmedNonFollower: [] };
+        const confirmedFollowers = new Set();
+        const confirmedNonFollowers = new Set();
+        const selfHandle = state.report && state.report.profile && state.report.profile.username
+            ? String(state.report.profile.username).toLowerCase()
+            : "";
+        if (selfHandle) confirmedFollowers.add(selfHandle);
+
+        const fa = state.report && state.report.followAudit ? state.report.followAudit : null;
+        if (fa) {
+            for (const item of (fa.fansNotFollowedBackList || [])) {
+                if (item && item.user && item.user.username) confirmedFollowers.add(String(item.user.username).toLowerCase());
+            }
+            for (const item of (fa.mutualList || [])) {
+                if (item && item.user && item.user.username) confirmedFollowers.add(String(item.user.username).toLowerCase());
+            }
+            for (const item of (fa.notFollowingBackList || [])) {
+                if (item && item.user && item.user.username && item.theyFollowMe === false && item.relationState !== "UNKNOWN") {
+                    confirmedNonFollowers.add(String(item.user.username).toLowerCase());
+                }
+            }
+        }
+        const inter = state.report && state.report.interactions ? state.report.interactions : null;
+        if (inter && Array.isArray(inter.peerStats)) {
+            for (const p of inter.peerStats) {
+                const h = p && p.peer && p.peer.username ? String(p.peer.username).toLowerCase() : "";
+                if (!h) continue;
+                if (p.theyFollowMe) {
+                    confirmedFollowers.add(h);
+                } else if (p.theyFollowMe === false && !confirmedFollowers.has(h)) {
+                    confirmedNonFollowers.add(h);
+                }
+            }
+        }
+
+        const nonConfirmed = [];
+        const confirmedNonFollower = [];
+        for (const rawH of handles) {
+            const h = rawH.toLowerCase();
+            if (!confirmedFollowers.has(h)) {
+                nonConfirmed.push(rawH);
+                if (confirmedNonFollowers.has(h)) {
+                    confirmedNonFollower.push(rawH);
+                }
+            }
+        }
+        return { nonConfirmed, confirmedNonFollower };
+    }
+
+    function analyzeDraftByXAlgo(rawText, options = {}) {
+        const text = String(rawText || "").trim();
+        const hasMedia = Boolean(options.hasMedia);
+        const isThreadOpt = Boolean(options.isThread);
+        const plannedEpochMs = Number(options.plannedEpochMs);
+        const hasPlannedTime = Number.isFinite(plannedEpochMs);
+        const skipDraftIdx = Number.isInteger(options.skipDraftIdx) ? options.skipDraftIdx : -1;
+
+        const ah = state.report ? state.report.algorithmHealth : null;
+        const ct = state.report ? state.report.contentTiming : null;
+        const slots = ct && Array.isArray(ct.goldenSlots) ? ct.goldenSlots : [];
+
+        const profile = getActiveAlgoProfile();
+        const ev = profile.upstreamEvidence || DEFAULT_ALGO_PROFILE.upstreamEvidence;
+        const cr = profile.cadenceAndReach || DEFAULT_ALGO_PROFILE.cadenceAndReach;
+        const dc = profile.draftChecker || DEFAULT_ALGO_PROFILE.draftChecker;
+
+        const minGapMin = Math.max(15, Number(cr.minRecommendedGapMinutes || 180));
+        const severeGapMin = Math.max(5, Math.min(minGapMin, Number(cr.severeRapidFireGapMinutes || 60)));
+        const minGapHrsLabel = Math.round((minGapMin / 60) * 10) / 10;
+        const ageWindowHrs = Math.max(1, Number(ev.maxCandidateAgeHours || 48));
+
+        let score = Number(dc.baseScore ?? 100);
+        const checks = [];
+        const sampleNotes = [];
+        const rewrites = [];
+
+        // 1. 候选类型与陌生人推荐资格
+        const leadingAt = /^@[A-Za-z0-9_]{1,15}\b/.test(text);
+        const oonFactor = Number(ev.oonWeightFactor ?? 0.75);
+        const replyBaseW = Number(ev.replyWeight ?? 5.0);
+        const replyMutualW = replyBaseW + Number(ev.bidirectionalFollowReplyWeightBoost ?? 15.0);
+        if (leadingAt) {
+            const leadPen = Number(dc.leadingMentionOonFilterPenalty ?? 28);
+            score -= leadPen;
+            checks.push(
+                `开头带 @用户名 会被当作对话回复，无法进入陌生人推荐流`
+            );
+            rewrites.push(`把开头的 @用户名 移到句中，否则会被当作回复，陌生人刷不到。`);
+        } else {
+            checks.push(
+                `陌生人推荐正常：原创主推可正常进入推荐流，互关好友评论权重提升至 ${(replyMutualW / Math.max(1, replyBaseW)).toFixed(0)} 倍`
+            );
+        }
+
+        // 2. 48h 候选窗口与连续发帖间隔
+        const refEpochMs = hasPlannedTime ? plannedEpochMs : Date.now();
+        const ageCutoffMs = refEpochMs - ageWindowHrs * 3600_000;
+        const recentEpochs = [];
+        if (ct && Array.isArray(ct.topPosts)) {
+            for (const p of ct.topPosts) {
+                const ms = p && p.createdAt ? new Date(p.createdAt).getTime() : NaN;
+                if (Number.isFinite(ms) && ms >= ageCutoffMs && ms <= refEpochMs) {
+                    recentEpochs.push(ms);
+                }
+            }
+        }
+        if (ah && ah.latestMainPostAt) {
+            const latestMs = new Date(ah.latestMainPostAt).getTime();
+            if (Number.isFinite(latestMs) && latestMs >= ageCutoffMs && latestMs <= refEpochMs) {
+                if (!recentEpochs.some((e) => Math.abs(e - latestMs) < 60_000)) {
+                    recentEpochs.push(latestMs);
+                }
+            }
+        }
+        const active48hCount = recentEpochs.length;
+        const multSecond = computeUpstreamDiversityMult(ev, 1);
+        const multThird = computeUpstreamDiversityMult(ev, 2);
+
+        let gapMin = Infinity;
+        if (ah && ah.latestMainPostAt) {
+            const latestMs = new Date(ah.latestMainPostAt).getTime();
+            if (Number.isFinite(latestMs)) {
+                gapMin = Math.max(0, Math.round(Math.abs(refEpochMs - latestMs) / 60_000));
+            }
+        }
+        const severeGap = gapMin < severeGapMin;
+        const mildGap = !severeGap && gapMin < minGapMin;
+        const maxDivPen = Number(dc.authorDiversityMaxPenalty ?? 26);
+        let effectiveDivMult = 1.0;
+
+        if (severeGap) {
+            effectiveDivMult = active48hCount >= 2 ? multThird : multSecond;
+            score -= maxDivPen;
+            checks.push(
+                `距上一条推文仅 ${gapMin} 分钟，连续发帖会使第 2 条推荐权重折损至 ${Math.round(multSecond * 100)}%`
+            );
+            rewrites.push(`距上一条推文仅 ${gapMin} 分钟，建议延后至满 ${minGapHrsLabel} 小时再发，避免连发曝光折损。`);
+        } else if (mildGap) {
+            const mildPen = Math.max(6, Math.round(maxDivPen * 0.5));
+            effectiveDivMult = multSecond;
+            score -= mildPen;
+            checks.push(
+                `距上一条推文 ${(gapMin / 60).toFixed(1)} 小时，略低于建议间隔 ${minGapHrsLabel} 小时`
+            );
+            rewrites.push(`若非实时热点，建议距上一条推文满 ${minGapHrsLabel} 小时后再发。`);
+        } else {
+            checks.push(
+                `发布间隔充足（距上一条已满 ${minGapHrsLabel} 小时）`
+            );
+        }
+
+        // 检查与本地定时队列/多条草稿的时间碰撞
+        const queuedEpochs = getQueuedScheduledEpochsMs();
+        const peerEpochs = hasPlannedTime
+            ? [
+                  ...queuedEpochs,
+                  ...(state.scheduleDraftItems || [])
+                      .map((it, i) => (i === skipDraftIdx ? NaN : parseDraftItemEpochMs(it)))
+                      .filter((v) => Number.isFinite(v))
+              ]
+            : queuedEpochs;
+        const nearestQueueDiffMin = peerEpochs.reduce((best, qMs) => {
+            const diffMin = Math.abs(qMs - refEpochMs) / 60_000;
+            return diffMin < best ? diffMin : best;
+        }, Infinity);
+        const hasQueueConflict = Number.isFinite(nearestQueueDiffMin) && nearestQueueDiffMin < minGapMin;
+        if (hasQueueConflict) {
+            const qPen = Number(dc.queueCollisionPenalty ?? 12);
+            effectiveDivMult = Math.min(effectiveDivMult, multSecond);
+            score -= qPen;
+            const diffStr = nearestQueueDiffMin < 60
+                ? `${Math.round(nearestQueueDiffMin)} 分钟`
+                : `${(nearestQueueDiffMin / 60).toFixed(1)} 小时`;
+            checks.push(
+                `前后 ${diffStr} 内已有定时推文，间隔偏近`
+            );
+            rewrites.push(`与定时队列中的推文仅隔 ${diffStr}，建议拉开至少 ${minGapHrsLabel} 小时。`);
+        }
+
+        // 3. 重复文本与相似度检查
+        const cleanText = text.replace(URL_TOKEN_RE, "").trim();
+        const simTh = Number(dc.duplicateSimilarityThreshold ?? ev.dppTheta ?? 0.65);
+        const dupEval = evaluateCorpusSimilarity(cleanText, skipDraftIdx);
+        const simPct = Math.round(dupEval.maxSim * 100);
+        if (dupEval.exactMatch) {
+            const exactPen = Number(dc.exactDuplicateTextPenalty ?? 35);
+            score -= exactPen;
+            checks.push(
+                `正文与「${escapeHtml(dupEval.sourceLabel)}」完全重复（${simPct}%），容易触发重复刷屏限流`
+            );
+            rewrites.push(`正文与「${dupEval.sourceLabel}」重复，请换一套表述再发，切勿原样重发。`);
+        } else if (dupEval.maxSim >= simTh && Array.from(cleanText).length >= 16) {
+            const nearPen = Number(dc.nearDuplicateTextPenalty ?? 18);
+            score -= nearPen;
+            checks.push(
+                `正文与「${escapeHtml(dupEval.sourceLabel)}」相似度较高（${simPct}%）`
+            );
+            rewrites.push(`与「${dupEval.sourceLabel}」相似度 ${simPct}%，建议拉开切入角度与措辞。`);
+        } else {
+            checks.push(
+                `内容原创度良好（与近期推文最高重合 ${simPct}%）`
+            );
+        }
+
+        // 4. 外链、短链信誉与 @非粉丝提及检查
+        const urls = text.match(URL_TOKEN_RE) || [];
+        const hasExtLink = urls.some((u) => !/^https?:\/\/((www|mobile)\.)?(x\.com|twitter\.com)(\/|$)/i.test(u));
+        const draftDomain = hasExtLink ? extractPrimaryDraftDomain(urls) : "";
+        const isShortenerUrl = Boolean(draftDomain && KNOWN_SHORTENER_DOMAINS.has(draftDomain));
+        const rawMentions = text.match(/(?:^|[^\w])@([A-Za-z0-9_]{1,15})/g) || [];
+        const mentionHandles = Array.from(
+            new Set(rawMentions.map((m) => m.replace(/^[^@]*@/, "")).filter(Boolean))
+        );
+        const mentionRel = inspectMentionFollowerRelation(mentionHandles);
+        const riskyUrlMention = hasExtLink && mentionRel.nonConfirmed.length > 0;
+
+        if (riskyUrlMention) {
+            const urlMentionPen = Number(dc.urlWithNonFollowerMentionPenalty ?? 18);
+            score -= urlMentionPen;
+            const handleTags = mentionRel.nonConfirmed.slice(0, 3).map((h) => `@${escapeHtml(h)}`).join("、");
+            checks.push(
+                `同时包含外部链接并提及未关注你的人（${handleTags}），易触发垃圾外链风控`
+            );
+            rewrites.push(`避免在同一条推文里同时放外链并 @未关注你的账号（${mentionRel.nonConfirmed.slice(0, 3).map((h) => "@" + h).join("、")}），可去掉 @ 或把链接放首评。`);
+        } else if (isShortenerUrl) {
+            const shortPen = 12;
+            score -= shortPen;
+            checks.push(
+                `包含第三方跳转短链 ${escapeHtml(draftDomain)}，容易触发低信誉链接风控`
+            );
+            rewrites.push(`请将短链 ${draftDomain} 替换为原始完整链接（X 会自动缩短且保留站点信誉）。`);
+        } else if (hasExtLink) {
+            checks.push(
+                `包含普通外链（${escapeHtml(draftDomain || "外链")}），链接本身不扣分，曝光主要取决于点击后的停留阅读`
+            );
+        } else {
+            checks.push(
+                `无外链或异常提及风险`
+            );
+        }
+
+        // 5. 串推首条完整性检查
+        const autoThread = isThreadOpt || /(^|\n)\s*\d+\/\d*\b|🧵|\bThread\b/i.test(text);
+        const nonEmptyLines = cleanText.split(/\n+/).map((l) => l.trim()).filter(Boolean);
+        const leadLineChars = Array.from(nonEmptyLines[0] || "").length;
+        if (autoThread && leadLineChars > 0 && leadLineChars < 16) {
+            checks.push(
+                `串推首行仅 ${leadLineChars} 字，单次刷新只展示串推里的 1 条，首条过短不利于吸引展开`
+            );
+            rewrites.push(`串推首条仅 ${leadLineChars} 字，建议在第一条直接亮出核心结论，吸引点击展开。`);
+        }
+
+        const cal = ah && ah.calibration ? ah.calibration : null;
+        const replyBoostRatio = cal && Number.isFinite(Number(cal.inferredEffectiveReplyWeight))
+            ? (Number(cal.inferredEffectiveReplyWeight) / Math.max(1, replyBaseW)).toFixed(1)
+            : (replyMutualW / Math.max(1, replyBaseW)).toFixed(1);
+        checks.push(
+            `本账号互动参考：评论权重加成约 ×${replyBoostRatio}${hasMedia ? ` · 配图或满 ${Math.round(Number(ev.minVideoDurationMs || 10000) / 1000)} 秒视频可增加停留` : ""}`
+        );
+
+        // 6. 本账号同域名与外链历史表现参考（仅在确实相关时给出简短提示）
+        if (hasExtLink && draftDomain && cal && Array.isArray(cal.domainStats)) {
+            const matchedDom = cal.domainStats.find((d) => d && d.domain === draftDomain);
+            if (matchedDom) {
+                const sign = matchedDom.vsNativePct > 0 ? `+${matchedDom.vsNativePct}%` : `${matchedDom.vsNativePct}%`;
+                sampleNotes.push(
+                    `过往发过 ${matchedDom.postCount} 条 ${escapeHtml(matchedDom.domain)} 链接，平均 ${fmtNum(matchedDom.avgViews)} 浏览（较无外链推文 ${sign}）`
+                );
+            }
+        }
+        const linkLossNoticePct = Number(cr.linkLossNoticePct ?? 15);
+        const effLinkLossPct = ah ? Number(ah.linkViewLossPct ?? ah.linkLossPct) : NaN;
+        if (hasExtLink && ah && ah.linkComparisonAvailable && effLinkLossPct >= linkLossNoticePct) {
+            const extAvg = ah.externalLinkAvgViews ?? ah.extLinkAvgViews;
+            const natAvg = ah.nativePostAvgViews ?? ah.nativeAvgViews;
+            sampleNotes.push(
+                `近期带外链推文均浏览偏低 ${effLinkLossPct}%（${fmtNum(extAvg)} vs ${fmtNum(natAvg)}），可尝试把链接放在首条自评`
+            );
+        }
+        let slotHitNow = false;
+        if (!hasPlannedTime && slots.length > 0) {
+            const slotHint = computeNextGoldenWindowHint(slots);
+            slotHitNow = Boolean(slotHint && slotHint.startsWith("🟢"));
+            if (slotHitNow) {
+                sampleNotes.push(`当前正处于你的高活跃黄金时段`);
+            }
+        }
+
+        // 7. 基于本账号历史校准样本的核回归内容分位与触达区间预判
+        const structuredList = nonEmptyLines.length >= 3 || /(^|\n)\s*(?:[-•*✅💡⚠️🔹▶️]|\d+[\.、\)）])\s+/m.test(text);
+        const hasQuestion = /[?？]/.test(text);
+        const draftFormatCode = autoThread ? "THREAD" : (hasMedia ? "MEDIA" : "TEXT");
+        const pipelineReachMult = leadingAt ? 0.25 : effectiveDivMult;
+        const followersCount = state.report && state.report.profile ? Number(state.report.profile.followersCount) : NaN;
+        const empiricalPrediction = predictDraftFromCorpus(
+            cal,
+            {
+                formatCode: draftFormatCode,
+                cleanCharLen: Array.from(cleanText).length,
+                structuredList,
+                hasQuestion,
+                hasExternalLink: hasExtLink,
+                externalDomain: draftDomain,
+                activeSlotHit: slotHitNow,
+                shingles: buildCalibrationShingleArray(cleanText)
+            },
+            pipelineReachMult,
+            followersCount
+        );
+
+        const oonDimScore = leadingAt ? 20 : 100;
+        const oonDimVal = leadingAt ? "开头@受限" : "正常";
+        const divDimScore = Math.max(20, Math.round(effectiveDivMult * 100) - (hasQueueConflict ? 12 : 0));
+        const divDimVal = hasQueueConflict
+            ? "排期冲突"
+            : severeGap
+                ? "间隔过近"
+                : mildGap
+                    ? "间隔偏近"
+                    : "充足";
+        const dedupDimScore = dupEval.exactMatch
+            ? 15
+            : (dupEval.maxSim >= simTh && Array.from(cleanText).length >= 16 ? 55 : 100);
+        const dedupDimVal = dupEval.exactMatch
+            ? "内容重复"
+            : (dupEval.maxSim >= simTh && Array.from(cleanText).length >= 16 ? `相似 ${simPct}%` : "原创");
+        const safetyDimScore = riskyUrlMention ? 56 : (isShortenerUrl ? 68 : 100);
+        const safetyDimVal = riskyUrlMention ? "外链+@非粉" : (isShortenerUrl ? "短链风险" : (hasExtLink ? "普通外链" : "无风险"));
+
+        const dimList = [
+            { key: "oon", label: "陌生人推荐", score: oonDimScore, valLabel: oonDimVal },
+            { key: "diversity", label: "发布间隔", score: divDimScore, valLabel: divDimVal },
+            { key: "dedup", label: "内容原创度", score: dedupDimScore, valLabel: dedupDimVal },
+            { key: "safety", label: "外链与提及", score: safetyDimScore, valLabel: safetyDimVal }
+        ];
+
+        const minScore = Number(dc.minScore ?? 15);
+        const maxScore = Number(dc.maxScore ?? 100);
+        const finalScore = Math.max(minScore, Math.min(maxScore, Math.round(score)));
+        const excTh = Number(dc.excellentThreshold ?? 88);
+        const goodTh = Number(dc.goodThreshold ?? 70);
+        const gradeLabel = finalScore >= excTh ? "可直接发" : finalScore >= goodTh ? "建议微调" : "存在限流风险";
+        const scoreColor = finalScore >= excTh ? "var(--x-green)" : finalScore >= goodTh ? "var(--x-blue)" : "var(--x-amber)";
+        const tone = finalScore >= excTh ? "green" : finalScore >= goodTh ? "blue" : "amber";
+
+        const summaryRiskTag = leadingAt
+            ? "开头@受限"
+            : dupEval.exactMatch
+                ? "内容重复"
+                : (dupEval.maxSim >= simTh && Array.from(cleanText).length >= 16)
+                    ? "与旧帖相似"
+                    : riskyUrlMention
+                        ? "外链+@非粉"
+                        : isShortenerUrl
+                            ? "短链风险"
+                            : hasQueueConflict
+                                ? "排期过近"
+                                : severeGap
+                                    ? "连发过近"
+                                    : "";
+
+        return {
+            text,
+            finalScore,
+            gradeLabel,
+            scoreColor,
+            tone,
+            algoVersion: `${profile.version || DEFAULT_ALGO_PROFILE.version} · ${ev.upstreamCommit || "590f3926e5bc"}`,
+            checks,
+            sampleNotes,
+            empiricalPrediction,
+            rewrites: rewrites.slice(0, 4),
+            dimensions: dimList,
+            summaryRiskTag,
+            hasExtLink
+        };
+    }
+
+    function loadDraftIntoSimulator(text, opts = {}) {
+        const inputEl = $("draftSimulatorInput");
+        if (!inputEl) return;
+        switchTab("timing");
+        inputEl.value = String(text || "");
+        const mediaChk = $("draftHasMediaCheck");
+        if (mediaChk && typeof opts.hasMedia === "boolean") {
+            mediaChk.checked = opts.hasMedia;
+        }
+        const threadChk = $("draftIsThreadCheck");
+        if (threadChk && typeof opts.isThread === "boolean") {
+            threadChk.checked = opts.isThread;
+        }
+        evaluatePrePostDraft();
+        const card = $("prePostSimulatorCard");
+        if (card) {
+            card.scrollIntoView({ behavior: "smooth", block: "center" });
+        }
+        inputEl.focus();
     }
 
     function evaluatePrePostDraft() {
@@ -1898,98 +3576,79 @@
         }
 
         const hasMedia = Boolean($("draftHasMediaCheck") && $("draftHasMediaCheck").checked);
-        const ah = state.report ? state.report.algorithmHealth : null;
-        const slots = state.report && state.report.contentTiming ? state.report.contentTiming.goldenSlots : [];
+        const isThread = Boolean($("draftIsThreadCheck") && $("draftIsThreadCheck").checked);
+        const res = analyzeDraftByXAlgo(text, { hasMedia, isThread });
 
-        let score = 56;
-        const checks = [];
+        const dimsHtml = res.dimensions
+            .map((d) => {
+                const chipCls = d.score >= 80 ? "is-good" : d.score >= 55 ? "is-mid" : "is-warn";
+                return `<div class="draft-dim-chip ${chipCls}">
+                    <span class="draft-dim-name">${escapeHtml(d.label)}</span>
+                    <span class="draft-dim-val">${escapeHtml(d.valLabel || String(d.score))}</span>
+                </div>`;
+            })
+            .join("");
 
-        // 1. 同作者连发间隔检测（AuthorDiversityScorer）
-        if (ah && ah.latestMainPostAt) {
-            const gapMin = Math.max(0, Math.round((Date.now() - new Date(ah.latestMainPostAt).getTime()) / 60000));
-            if (gapMin < 60) {
-                score -= 18;
-                checks.push(`⚠️ <strong>连发过密（-18分）</strong>：距上一条主推仅 ${gapMin} 分钟，本站按间隔扣分，可考虑稍后发布；无法据此确定算法折叠或曝光变化`);
-            } else if (gapMin < 180) {
-                score -= 8;
-                checks.push(`💡 <strong>间隔偏近（-8分）</strong>：距上一条主推 ${(gapMin / 60).toFixed(1)} 小时，本站以 3 小时作发布节奏参考，并非平台权重阈值`);
-            } else {
-                score += 12;
-                checks.push(`✅ <strong>发帖间隔健康（+12分）</strong>：距上一条主推已超 3 小时，符合本站间隔参考，不保证平台分发效果`);
+        const rewritesHtml = res.rewrites.length
+            ? `<div class="draft-ops-advice-box">
+                    <ul class="draft-ops-rewrite-list">
+                        ${res.rewrites.map((tip) => `<li>${escapeHtml(tip)}</li>`).join("")}
+                    </ul>
+                </div>`
+            : "";
+
+        const sampleRefHtml = Array.isArray(res.sampleNotes) && res.sampleNotes.length
+            ? `<div class="draft-sample-ref-inline">
+                    ${res.sampleNotes.slice(0, 2).map((n) => `<div class="draft-context-note">${n}</div>`).join("")}
+                </div>`
+            : "";
+
+        let inlineForecastHtml = "";
+        let nnBlockHtml = "";
+        const ep = res.empiricalPrediction;
+        if (ep && ep.unlocked) {
+            const discountHint = ep.pipelineDiscounted ? ` <span class="draft-forecast-discount">（改完问题后可更高）</span>` : "";
+            inlineForecastHtml = `<span class="draft-inline-forecast">预计 <strong>${fmtNum(ep.expViewsLow)}–${fmtNum(ep.expViewsHigh)}</strong> 浏览${discountHint}</span>`;
+            if (Array.isArray(ep.topNeighbors) && ep.topNeighbors.length) {
+                nnBlockHtml = `
+                    <div class="draft-nn-block">
+                        <div class="draft-nn-head">相似旧帖</div>
+                        <div class="draft-nn-rows">
+                            ${ep.topNeighbors.map((nn) => `
+                                <a class="draft-nn-row" href="${escapeHtml(safeHttpUrl(nn.tweetUrl, "https://x.com"))}" target="_blank" rel="noopener noreferrer">
+                                    <span class="draft-nn-date">${escapeHtml(nn.createdLabel)}</span>
+                                    <span class="draft-nn-title">${escapeHtml(nn.textPreview)} ↗</span>
+                                    <strong class="draft-nn-views">${fmtNum(nn.viewCount)} 浏览</strong>
+                                </a>
+                            `).join("")}
+                        </div>
+                    </div>
+                `;
             }
-        } else {
-            score += 10;
-            checks.push(`✅ <strong>发帖间隔未知（本站基础分 +10）</strong>：当前没有上一条主推时间可供比较，不能确认是否存在密集连发`);
+        } else if (ep) {
+            inlineForecastHtml = `<span class="draft-inline-forecast is-muted">满 ${ep.minRequired} 条主推解锁浏览预估（${ep.sampleCount}/${ep.minRequired}）</span>`;
         }
-
-        // 2. 外部链接跳出检测（严格匹配 ASCII URL 字符集，避免吞掉紧随其后的中文标点或正文）
-        const urls = text.match(URL_TOKEN_RE) || [];
-        const hasExtLink = urls.some((u) => !/^https?:\/\/((www|mobile)\.)?(x\.com|twitter\.com)(\/|$)/i.test(u));
-        if (hasExtLink) {
-            score -= 16;
-            checks.push(`⚠️ <strong>检测到网页外链（-16分）</strong>：本站规则对外链扣分；可比较正文或评论区放链接的效果，当前不能确认外链导致降权`);
-        } else {
-            score += 10;
-            checks.push(`✅ <strong>未检测到站外链接（+10分）</strong>：符合本站外链检查规则，不代表获得平台推荐加权`);
-        }
-
-        // 3. 阅读停留时长评估（Dwell Time，按 Unicode 码点计数兼容 Emoji）
-        const cleanLen = Array.from(text.replace(URL_TOKEN_RE, "").trim()).length;
-        const lineCount = text.split(/\n+/).filter(Boolean).length;
-        if (cleanLen >= 220) {
-            score += 14 + (hasMedia ? 4 : 0);
-            checks.push(`✅ <strong>长文篇幅参考（+${14 + (hasMedia ? 4 : 0)}分）</strong>：约 ${cleanLen} 字长推；本站未测量真实阅读停留；记得把最抓人的结论放前 2 行吸引点开「显示更多」`);
-        } else if (cleanLen >= 45 || (cleanLen >= 20 && hasMedia)) {
-            const pts = 10 + (lineCount >= 2 ? 3 : 0) + (hasMedia ? 4 : 0);
-            score += pts;
-            checks.push(`✅ <strong>篇幅与排版参考（+${pts}分）</strong>：${cleanLen} 字${lineCount >= 2 ? "分段清晰" : ""}${hasMedia ? "且带图/视频" : ""}；本站未测量完读或停留表现`);
-        } else {
-            score -= 8;
-            checks.push(`💡 <strong>内容篇幅偏短（-8分）</strong>：仅 ${cleanLen} 字且未勾选配图，无法据此推断停留时间或推荐结果，可考虑补充 1–2 句具体细节或配图`);
-        }
-
-        // 4. 评论与收藏钩子检测（高权重动作）
-        const hasQuestionOrHook = /[?？]|怎么看|如何看|你觉得|大家觉得|聊聊|哪一个|收藏|建议先马|清单|复盘|总结/.test(text);
-        if (hasQuestionOrHook) {
-            score += 10;
-            checks.push(`✅ <strong>自带评论/收藏钩子（+10分）</strong>：检测到提问或收藏相关表达；互动效果仍需发布后观察`);
-        } else {
-            score += 2;
-            checks.push(`💡 <strong>可加一句互动提问</strong>：可在末尾邀请推友表达看法，是否增加互动需观察`);
-        }
-
-        // 5. 黄金发帖时段匹配
-        const slotHint = computeNextGoldenWindowHint(slots || []);
-        if (slotHint.startsWith("🟢")) {
-            score += 6;
-            checks.push(`✅ <strong>命中你的黄金时段（+6分）</strong>：${escapeHtml(slotHint.replace(/^🟢\s*/, ""))}`);
-        } else if (slotHint) {
-            checks.push(`⏰ <strong>发布时间参考</strong>：${escapeHtml(slotHint.replace(/^⏰\s*/, ""))}`);
-        }
-
-        const finalScore = Math.max(18, Math.min(98, Math.round(score)));
-        const gradeLabel = finalScore >= 82 ? "🔥 本站规则评分较高"
-            : finalScore >= 65 ? "⚡ 本站规则评分中等"
-            : "🛠️ 建议按下方提示微调后再发";
-        const scoreColor = finalScore >= 82 ? "var(--x-green)" : finalScore >= 65 ? "var(--x-blue)" : "var(--x-amber)";
 
         outEl.hidden = false;
         outEl.innerHTML = `
             <div class="draft-score-head">
                 <div class="draft-score-title-group">
-                    <span class="draft-score-num" style="color:${scoreColor}">草稿规则分 ${finalScore} / 100（不预测平台推荐）</span>
-                    <span class="mini-tag">${gradeLabel}</span>
+                    <span class="draft-score-num" style="color:${res.scoreColor}">${res.finalScore} 分</span>
+                    <span class="mini-tag ${res.tone}">${res.gradeLabel}</span>
+                    ${inlineForecastHtml}
                 </div>
                 <div class="draft-score-actions">
                     <button type="button" class="x-outline-pill sm" id="clearDraftSimBtn">清空</button>
-                    <a class="x-blue-pill sm" href="https://x.com/intent/tweet?text=${encodeURIComponent(text)}" target="_blank" rel="noopener noreferrer">
-                        带草稿发推 ↗
+                    <button type="button" class="x-outline-pill sm" id="sendDraftToScheduleBtn">转入定时</button>
+                    <a class="x-blue-pill sm" href="https://x.com/intent/tweet?text=${encodeURIComponent(res.text)}" target="_blank" rel="noopener noreferrer">
+                        发推 ↗
                     </a>
                 </div>
             </div>
-            <ul class="draft-check-list">
-                ${checks.map((c) => `<li>${c}</li>`).join("")}
-            </ul>
+            <div class="draft-algo-dims">${dimsHtml}</div>
+            ${rewritesHtml}
+            ${sampleRefHtml}
+            ${nnBlockHtml}
         `;
 
         const clrBtn = $("clearDraftSimBtn");
@@ -1997,6 +3656,12 @@
             clrBtn.addEventListener("click", () => {
                 inputEl.value = "";
                 outEl.hidden = true;
+            });
+        }
+        const toSchedBtn = $("sendDraftToScheduleBtn");
+        if (toSchedBtn) {
+            toSchedBtn.addEventListener("click", () => {
+                sendTextDraftToSchedule(res.text);
             });
         }
     }
@@ -2057,34 +3722,28 @@
                               ? `<span class="mini-tag green">图文/视频</span>`
                               : t.kind === "QUOTE"
                                   ? `<span class="mini-tag amber">引用</span>`
-                                  : `<span class="mini-tag">短推</span>`;
+                                  : "";
                       const bmBadge =
-                          t.bookmarkCount > 0 && postMetricsKnown(t, ["bookmarks", "views"]) && t.viewCount > 0
-                              ? `<span class="mini-tag amber" title="书签收藏占公开浏览比例，不能据此确定阅读停留或内容质量">收藏率 ${t.bookmarkRatePct || 0}%</span>`
+                          t.bookmarkCount >= 2 && postMetricsKnown(t, ["bookmarks", "views"]) && t.viewCount > 0 && Number(t.bookmarkRatePct || 0) >= 0.4
+                              ? `<span class="mini-tag amber" title="收藏占浏览比例">收藏 ${t.bookmarkRatePct || 0}%</span>`
                               : "";
-                      const aScore = erKnown && typeof t.algoScore === "number" && t.algoScore >= 0 ? t.algoScore : null;
-                      const algoColor = aScore === null ? "blue" : aScore >= 78 ? "green" : aScore >= 58 ? "blue" : "amber";
-                      const algoTip = `${t.algoTierLabel || "本站规则分"}：根据公开互动、浏览/粉丝比与本站间隔/外链规则评分，不代表平台推荐或真实停留`;
-                      const signalsHtml =
-                          t.algoSignals && t.algoSignals.length
-                              ? `<div class="tweet-algo-signals">
-                                    <span class="algo-explain-prefix">样本观察：</span>
-                                    ${t.algoSignals.map((sig) => `<span class="algo-sig-chip">${escapeHtml(sig)}</span>`).join("")}
-                                 </div>`
-                              : "";
+                      const cleanSignals = (t.algoSignals || []).filter(
+                          (sig) => sig && !/其他浏览量样本|缺失指标/.test(sig)
+                      );
+                      const signalsHtml = cleanSignals.length
+                          ? `<div class="tweet-algo-signals">
+                                ${cleanSignals.map((sig) => `<span class="algo-sig-chip">${escapeHtml(sig)}</span>`).join("")}
+                             </div>`
+                          : "";
                       return `<article class="x-tweet-card">
                           <div class="tweet-top-meta">
-                              <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
-                                  ${avatarHtml(p, "sm")}
-                                  <strong style="color:var(--text-primary)">${escapeHtml(p.displayName)}</strong>
-                                  <span>@${escapeHtml(p.username)} · ${escapeHtml(t.createdLabel)}</span>
+                              <div class="tweet-meta-left">
+                                  <span>${escapeHtml(t.createdLabel)}</span>
                                   ${tagBadge}
                               </div>
-                              <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
-                                  <span class="mini-tag ${algoColor}" title="${escapeHtml(algoTip)}">本站规则分 ${aScore ?? "--"}</span>
+                              <div class="tweet-meta-right">
                                   ${bmBadge}
-                                  <span class="mini-tag blue">总互动 ${engagementKnown ? fmtNum(t.totalEngagements) : "--"}</span>
-                                  <span class="mini-tag pink">公开互动率 ${rateKnown ? `${t.engagementRatePct}%` : "--"}</span>
+                                  <span class="mini-tag pink">${rateKnown ? `互动率 ${t.engagementRatePct}%` : "--"}</span>
                               </div>
                           </div>
                           <div class="tweet-text">${escapeHtml(t.text)}</div>
@@ -2094,13 +3753,17 @@
                               <span class="tweet-metric-item" title="转推与引用">${iconSvg("retweet")} ${metric("reposts", t.retweetCount)}</span>
                               <span class="tweet-metric-item" title="点赞数">${iconSvg("like")} ${metric("likes", t.likeCount)}</span>
                               <span class="tweet-metric-item" title="书签收藏">${iconSvg("bookmark")} ${metric("bookmarks", t.bookmarkCount)}</span>
-                              <span class="tweet-metric-item" title="公开浏览计数">${iconSvg("views")} ${metric("views", t.viewCount)}</span>
-                              <a href="${escapeHtml(safeHttpUrl(t.tweetUrl, `https://x.com/${encodeURIComponent(p.username)}`))}" target="_blank" rel="noopener noreferrer">查看原推 ↗</a>
+                              <span class="tweet-metric-item" title="浏览量">${iconSvg("views")} ${metric("views", t.viewCount)}</span>
+                              <button type="button" class="tweet-draft-check-btn" data-top-post-id="${escapeHtml(t.id)}" title="放入草稿体检">体检</button>
+                              <a class="tweet-orig-link" href="${escapeHtml(safeHttpUrl(t.tweetUrl, `https://x.com/${encodeURIComponent(p.username)}`))}" target="_blank" rel="noopener noreferrer">原推 ↗</a>
                           </div>
                       </article>`;
                   })
                   .join("")
-            : emptyStateHtml("这个类型下暂无推文", widerPeriodActions());
+            : emptyStateHtml("当前类型暂无推文", widerPeriodActions());
+        $("topTweetsList").querySelectorAll(".tweet-text").forEach((el) => {
+            el.addEventListener("click", () => el.classList.toggle("is-expanded"));
+        });
     }
 
     /* ==================== 模块 5：核心铁粉圈层 & Canvas 高清晒单战报卡 ==================== */
@@ -2121,8 +3784,9 @@
     }
 
     function ensureCanvasAvatarLoaded(avatarUrl) {
-        if (!avatarUrl) return null;
-        const cached = state.avatarImgCache[avatarUrl];
+        const canonical = safeAvatarSrc(avatarUrl);
+        if (!canonical) return null;
+        const cached = state.avatarImgCache[canonical];
         if (cached === "ERROR") return null;
         if (cached && cached.complete && cached.naturalWidth > 0) {
             return cached;
@@ -2131,18 +3795,27 @@
             const img = new Image();
             img.crossOrigin = "anonymous";
             img.referrerPolicy = "no-referrer";
-            state.avatarImgCache[avatarUrl] = img;
+            state.avatarImgCache[canonical] = img;
             img.onload = () => {
                 if (state.report) {
                     drawShareCardCanvas(state.report);
                 }
             };
             img.onerror = () => {
-                state.avatarImgCache[avatarUrl] = "ERROR";
+                state.avatarImgCache[canonical] = "ERROR";
             };
-            // 附加轻量参数避免复用无 CORS 响应头的浏览器图片缓存导致 Canvas 污染
-            const sep = avatarUrl.includes("?") ? "&" : "?";
-            img.src = `${avatarUrl}${sep}xops_cors=1`;
+            const blobHit = mediaObjectUrlMap.get(canonical);
+            if (blobHit) {
+                img.src = blobHit;
+            } else {
+                warmMediaAsset(canonical)
+                    .then((warmedBlob) => {
+                        img.src = warmedBlob || canonical;
+                    })
+                    .catch(() => {
+                        img.src = canonical;
+                    });
+            }
         }
         return null;
     }
@@ -2164,9 +3837,9 @@
         $("shareCardSectionTitle").textContent = sc.reportTitle || "运营战报卡";
         syncSharePrivacyBtnUI(report);
 
-        renderCircleGrid("coreFansGrid", ic.coreFans, "green", "这段时间还没有常来评论的铁粉");
-        renderCircleGrid("activeMutualsGrid", ic.activeMutuals, "blue", "这段时间暂无双向互评伙伴");
-        renderCircleGrid("needWarmupPeersGrid", ic.needWarmupPeers, "amber", "这段时间暂无待回访推友");
+        renderCircleGrid("coreFansGrid", ic.coreFans, "green", "暂无常评铁粉");
+        renderCircleGrid("activeMutualsGrid", ic.activeMutuals, "blue", "暂无双向互评伙伴");
+        renderCircleGrid("needWarmupPeersGrid", ic.needWarmupPeers, "amber", "暂无待回访推友");
 
         drawShareCardCanvas(report);
     }
@@ -2190,11 +3863,11 @@
                         ${verifiedSvgHtml(m.user.verified)}
                         <span class="mini-tag ${badgeColor}">${escapeHtml(m.badge)}</span>
                     </div>
-                    <div class="user-handle-muted">@${escapeHtml(m.user.username)} ${m.mutualFollow ? "· 互相关注" : ""}</div>
+                    <div class="user-handle-muted">@${escapeHtml(m.user.username)}${m.mutualFollow ? " · 互关" : ""}</div>
                     <div class="circle-reason">${escapeHtml(m.highlightReason)}</div>
                     <div class="circle-card-actions">
-                        <a class="x-outline-pill sm" href="${escapeHtml(peerLatestPostsUrl(m.user.username))}" target="_blank" rel="noopener noreferrer" title="直达 TA 最新原创主推去评论">去评最新推文 ↗</a>
-                        ${myUsername ? `<a class="x-outline-pill sm" href="${escapeHtml(peerDialogueUrl(myUsername, m.user.username))}" target="_blank" rel="noopener noreferrer" title="查看你们双方的历史互动对话">双方对话 ↗</a>` : ""}
+                        <a class="x-outline-pill sm" href="${escapeHtml(peerLatestPostsUrl(m.user.username))}" target="_blank" rel="noopener noreferrer" title="直达 TA 最新原创主推去评论">去回评 ↗</a>
+                        ${myUsername ? `<a class="x-outline-pill sm" href="${escapeHtml(peerDialogueUrl(myUsername, m.user.username))}" target="_blank" rel="noopener noreferrer" title="查看双方历史互动对话">对话 ↗</a>` : ""}
                     </div>
                 </div>
             </div>`
@@ -2464,19 +4137,38 @@
         const ah = report.algorithmHealth;
 
         if (ah) {
+            const levelKey = (ah.healthLevel || "GOOD").toLowerCase();
+            const shortStatusTitle =
+                levelKey === "alert"
+                    ? "近期浏览偏低"
+                    : levelKey === "warn"
+                        ? (ah.rapidFirePostCount > 0 ? `${ah.rapidFirePostCount} 条推文连发过密` : `带外链浏览偏低 ${ah.linkViewLossPct}%`)
+                        : levelKey === "unknown"
+                            ? "暂无主推数据"
+                            : "曝光表现正常";
             const bannerEl = $("sideAlgoStatusBanner");
             if (bannerEl) {
-                bannerEl.textContent = ah.healthTitle;
-                bannerEl.className = `algo-status-banner level-${(ah.healthLevel || "GOOD").toLowerCase()}`;
+                bannerEl.textContent = shortStatusTitle;
+                bannerEl.className = `algo-status-banner level-${levelKey}`;
             }
-            if ($("sideAlgoSummaryText")) {
-                $("sideAlgoSummaryText").textContent = ah.healthSummary;
+            const summaryEl = $("sideAlgoSummaryText");
+            if (summaryEl) {
+                if (levelKey === "alert") {
+                    summaryEl.textContent = "近 7 天平均浏览回落，可检查题材或账号状态";
+                    summaryEl.hidden = false;
+                } else {
+                    summaryEl.textContent = "";
+                    summaryEl.hidden = true;
+                }
             }
             if ($("sideOonRateVal")) {
                 const sampleCount = ah.viewSampleCount ?? ah.evaluatedPostCount;
                 $("sideOonRateVal").textContent = sampleCount > 0
-                    ? `${ah.outOfNetworkRatePct}% (${ah.outOfNetworkPostCount}/${sampleCount}帖)`
-                    : ah.evaluatedPostCount > 0 ? "浏览未取得" : "暂无主推";
+                    ? `${ah.outOfNetworkRatePct}%`
+                    : "--";
+                $("sideOonRateVal").title = sampleCount > 0
+                    ? `${ah.outOfNetworkPostCount}/${sampleCount} 条推文浏览达到粉丝数`
+                    : "";
             }
             if ($("sideRapidFireVal")) {
                 $("sideRapidFireVal").textContent = ah.rapidFirePostCount > 0
@@ -2487,16 +4179,28 @@
                 const canCompare = ah.linkComparisonAvailable ??
                     (hasMetricSample(ah, "externalLinkViewSampleCount") && hasMetricSample(ah, "nativeViewSampleCount"));
                 $("sideExtLinkVal").textContent = canCompare && ah.linkViewLossPct >= 15
-                    ? `浏览低 ${ah.linkViewLossPct}%`
+                    ? `偏低 ${ah.linkViewLossPct}%`
                     : ah.externalLinkPostCount > 0
-                        ? `${ah.externalLinkPostCount} 帖含外链${canCompare ? "" : " · 浏览对比未取得"}`
-                        : "无外链样本";
+                        ? (canCompare ? "正常" : `${ah.externalLinkPostCount} 帖`)
+                        : "无外链";
             }
             if ($("underTheHoodBtn") && ah.underTheHoodUrl) {
                 $("underTheHoodBtn").href = safeHttpUrl(ah.underTheHoodUrl, "https://x.com/i/jf/under_the_hood");
             }
+            const stripEl = document.getElementById("mobileAlgoHealthStrip");
+            if (stripEl) {
+                stripEl.className = `mobile-algo-strip level-${levelKey}`;
+            }
+            const mobileRefLink = document.getElementById("mobileAlgoRefLink");
+            if (mobileRefLink) {
+                if (ah.underTheHoodUrl) {
+                    mobileRefLink.href = safeHttpUrl(ah.underTheHoodUrl, "https://x.com/i/jf/under_the_hood");
+                }
+                mobileRefLink.hidden = levelKey === "good";
+            }
             if ($("mobileAlgoStatusText")) {
-                $("mobileAlgoStatusText").textContent = `${ah.healthTitle} · ${ah.healthSummary}`;
+                $("mobileAlgoStatusText").textContent = shortStatusTitle;
+                $("mobileAlgoStatusText").title = ah.healthSummary || "";
             }
         }
 
@@ -2504,36 +4208,60 @@
 
         // 每条行动都可点击直达对应页面/筛选（go）或外部链接（href）
         const todo = [];
-        const unrepliedPeers = Number(inter.unrepliedMyPostPeers || 0);
-        const iOwePeers = Number(inter.inboundHeavyPeers || 0);
-        if (unrepliedPeers > 0) {
-            todo.push({ text: `${unrepliedPeers} 人评论了你还没回复`, go: "peerFilter:UNREPLIED_POST", tone: "amber" });
-        }
-        if (iOwePeers > 0) {
-            todo.push({ text: `${iOwePeers} 人来评过你，你还没去评 TA 推文`, go: "peerFilter:I_OWE", tone: "amber" });
-        }
-        if (ah && ah.exposureCliffDrop) {
-            todo.push({ text: "近期浏览明显下滑，可查看官方分发信息；原因待确认", href: safeHttpUrl(ah.underTheHoodUrl, "https://x.com/i/jf/under_the_hood") });
-        }
-        if (ah && ah.linkViewLossPct >= 20) {
-            todo.push({ text: `外链样本浏览低 ${ah.linkViewLossPct}%，可对照内容与发布时间，原因待确认`, go: "tab:timing" });
-        } else if (ah && ah.rapidFirePostCount > 0) {
-            todo.push({ text: `${ah.rapidFirePostCount} 条推文发得太密（间隔不足 3 小时）`, go: "tab:timing" });
-        }
         const effectiveUnfollow = computeEffectiveSuggestUnfollowCount(report);
-        if (effectiveUnfollow > 0) {
-            todo.push({ text: `${effectiveUnfollow} 个账号不回关也不互动，可考虑取关`, go: "followTab:NOT_FOLLOWING_BACK|followCat:SUGGEST_CLEAN" });
-        }
-        if (audit.fansNotFollowedBackCount > 0) {
-            todo.push({ text: `${audit.fansNotFollowedBackCount} 位粉丝你还没回关`, go: "followTab:FAN_ONLY" });
-        }
-        if (ct.goldenSlots && ct.goldenSlots.length > 0) {
-            todo.push({ text: `下一条推文建议在 ${ct.goldenSlots[0].label} 发`, go: "tab:timing" });
-        }
-        if (act.originalPosts === 0) {
-            todo.push({ text: "这段时间还没发原创推文，发一条吧", href: "https://x.com/compose/post" });
-        } else if (act.replyToPostRatio < 1.5) {
-            todo.push({ text: "回复偏少，每天多评论 10 条同领域推文", go: "tab:activity" });
+        if (ah && Array.isArray(ah.opsRecommendations) && ah.opsRecommendations.length > 0) {
+            for (const item of ah.opsRecommendations) {
+                if (!item) continue;
+                let title = item.title || item.detail || "";
+                if (item.code === "CLEAN_LOW_SIGNAL_FOLLOWS") {
+                    if (effectiveUnfollow <= 0) continue;
+                    title = `${effectiveUnfollow} 个低互动未回关可清理`;
+                }
+                const prio = String(item.priority || "MEDIUM").toUpperCase();
+                if (item.externalUrl) {
+                    todo.push({
+                        text: title,
+                        href: safeHttpUrl(item.externalUrl, "https://x.com")
+                    });
+                } else {
+                    todo.push({
+                        text: title,
+                        go: item.actionTarget || "tab:timing",
+                        tone: prio === "HIGH" ? "amber" : ""
+                    });
+                }
+            }
+        } else {
+            const unrepliedPeers = Number(inter.unrepliedMyPostPeers || 0);
+            const iOwePeers = Number(inter.inboundHeavyPeers || 0);
+            if (unrepliedPeers > 0) {
+                todo.push({ text: `${unrepliedPeers} 条主推评论待回`, go: "peerFilter:UNREPLIED_POST", tone: "amber" });
+            }
+            if (iOwePeers > 0) {
+                todo.push({ text: `${iOwePeers} 位互动推友待回访`, go: "peerFilter:I_OWE", tone: "amber" });
+            }
+            if (ah && ah.exposureCliffDrop) {
+                todo.push({ text: "近期曝光下滑 · 分发自检", href: safeHttpUrl(ah.underTheHoodUrl, "https://x.com/i/jf/under_the_hood") });
+            }
+            if (ah && ah.linkViewLossPct >= 20) {
+                todo.push({ text: `外链帖浏览低 ${ah.linkViewLossPct}%`, go: "tab:timing|focusDraft:1" });
+            } else if (ah && ah.rapidFirePostCount > 0) {
+                todo.push({ text: `${ah.rapidFirePostCount} 条推文间隔 <3h`, go: "tab:schedule" });
+            }
+            if (effectiveUnfollow > 0) {
+                todo.push({ text: `${effectiveUnfollow} 个低互动未回关可清理`, go: "followTab:NOT_FOLLOWING_BACK|followCat:SUGGEST_CLEAN" });
+            }
+            if (audit.fansNotFollowedBackCount > 0) {
+                todo.push({ text: `${audit.fansNotFollowedBackCount} 位粉丝待回关`, go: "followTab:FAN_ONLY" });
+            }
+            if (ct.goldenSlots && ct.goldenSlots.length > 0) {
+                todo.push({ text: `黄金档 · ${ct.goldenSlots[0].label}`, go: "tab:schedule|goldenSlot:0" });
+            }
+            if (act.originalPosts === 0) {
+                todo.push({ text: "本期尚无原创 · 去发推", href: "https://x.com/compose/post" });
+            } else if (act.replyToPostRatio < 1.5) {
+                todo.push({ text: "回复比偏低 · 补充评论互动", go: "tab:interactions" });
+            }
         }
         const renderTodoItem = (t) =>
             t.href
@@ -2570,7 +4298,7 @@
                       <div class="mini-peer-left">
                           ${avatarHtml(p.peer, "sm")}
                           <div style="min-width:0">
-                              <div class="mini-peer-name">${escapeHtml(p.peer.displayName)}</div>
+                              <div class="mini-peer-name">${escapeHtml(p.peer.displayName)}${verifiedSvgHtml(p.peer.verified)}</div>
                               <div class="user-handle-muted" style="font-size:12px">${escapeHtml(meta.label)}</div>
                           </div>
                       </div>
@@ -2582,6 +4310,1436 @@
                   ? `<button type="button" class="side-more-link" data-go="peerFilter:I_OWE">查看全部 ${owePeers.length} 人</button>`
                   : "")
             : `<div class="user-handle-muted">没有需要回访的人</div>`;
+    }
+
+    /* ==================== 模块 6：图文定时发布与逾期二次确认 ==================== */
+    function newClientRequestId() {
+        if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+            return crypto.randomUUID();
+        }
+        return "req-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
+    }
+
+    function computeWeightedTweetLength(text) {
+        const raw = String(text || "");
+        if (!raw) return 0;
+        const normalized = raw.replace(URL_TOKEN_RE, "x".repeat(23));
+        let len = 0;
+        for (const ch of normalized) {
+            const cp = ch.codePointAt(0);
+            const isNarrow =
+                cp <= 0x10ff &&
+                !(cp >= 0x2000 && cp <= 0x200d) &&
+                !(cp >= 0x2010 && cp <= 0x201f) &&
+                !(cp >= 0x2032 && cp <= 0x2037);
+            len += isNarrow ? 1 : 2;
+        }
+        return len;
+    }
+
+    function validateAndMergeScheduleFiles(existingFiles, incomingFiles) {
+        const list = [...(existingFiles || [])];
+        const incoming = Array.from(incomingFiles || []).filter(Boolean);
+        const allowedMimes = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
+        const extMime = (name) => {
+            const lower = String(name || "").toLowerCase();
+            if (lower.endsWith(".png")) return "image/png";
+            if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
+            if (lower.endsWith(".webp")) return "image/webp";
+            if (lower.endsWith(".gif")) return "image/gif";
+            return "";
+        };
+
+        for (const f of incoming) {
+            const mime = allowedMimes.has(f.type) ? f.type : extMime(f.name);
+            if (!allowedMimes.has(mime)) {
+                return { ok: false, files: list, error: "仅支持 PNG、JPG、WEBP 或 GIF 格式图片" };
+            }
+            const isGif = mime === "image/gif";
+            const maxBytes = isGif ? 15 * 1024 * 1024 : 5 * 1024 * 1024;
+            if (Number(f.size || 0) <= 0) {
+                return { ok: false, files: list, error: "图片文件为空，请重新选择" };
+            }
+            if (Number(f.size || 0) > maxBytes) {
+                return { ok: false, files: list, error: `图片体积超出限制（${isGif ? "GIF 最大 15MB" : "单张静态图最大 5MB"}）` };
+            }
+            const existingHasGif = list.some((it) => it.mime === "image/gif");
+            if (isGif && list.length > 0) {
+                return { ok: false, files: list, error: "GIF 动图每次仅支持 1 张，且不可与其他图片混发" };
+            }
+            if (existingHasGif) {
+                return { ok: false, files: list, error: "已添加 GIF 动图，不能再添加其他图片" };
+            }
+            if (list.length >= 4) {
+                return { ok: false, files: list, error: "单条定时推文最多附带 4 张静态图片" };
+            }
+            list.push({
+                file: f,
+                name: f.name || (isGif ? "animation.gif" : "image.png"),
+                size: Number(f.size || 0),
+                mime,
+                previewUrl: typeof URL !== "undefined" && URL.createObjectURL ? URL.createObjectURL(f) : ""
+            });
+        }
+        return { ok: true, files: list, error: "" };
+    }
+
+    function getTzDateParts(epochMs, timezone) {
+        const parts = new Intl.DateTimeFormat("en-US", {
+            timeZone: timezone || "Asia/Shanghai",
+            weekday: "short",
+            year: "numeric",
+            month: "2-digit",
+            day: "2-digit",
+            hour: "2-digit",
+            minute: "2-digit",
+            second: "2-digit",
+            hour12: false
+        }).formatToParts(new Date(epochMs));
+        const val = (t) => (parts.find((p) => p.type === t) || {}).value || "";
+        const wkMap = { Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6, Sun: 7 };
+        return {
+            year: Number(val("year")),
+            month: Number(val("month")),
+            day: Number(val("day")),
+            weekday: wkMap[val("weekday")] || 1,
+            hour: Number(val("hour")) % 24,
+            minute: Number(val("minute")),
+            second: Number(val("second"))
+        };
+    }
+
+    function zonedWallClockToEpochMs(year, month, day, hour, minute, timezone) {
+        const nominalUtc = Date.UTC(year, month - 1, day, hour, minute, 0, 0);
+        let guess = nominalUtc;
+        for (let i = 0; i < 2; i++) {
+            const p = getTzDateParts(guess, timezone);
+            const wallUtc = Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, 0, 0);
+            guess += nominalUtc - wallUtc;
+        }
+        return guess;
+    }
+
+    function computeNextGoldenSlotTimestampMs(slotLabel, timezone, nowMs = Date.now()) {
+        const m = String(slotLabel || "").match(/^(周[一二三四五六日])\s+(\d{2}):00[–-](\d{2}):00$/);
+        if (!m) return null;
+        const dayMap = { "周一": 1, "周二": 2, "周三": 3, "周四": 4, "周五": 5, "周六": 6, "周日": 7 };
+        const targetWk = dayMap[m[1]];
+        const startHour = Number(m[2]);
+        const tz = timezone || "Asia/Shanghai";
+        const nowParts = getTzDateParts(nowMs, tz);
+        let daysAhead = (targetWk - nowParts.weekday + 7) % 7;
+        if (daysAhead === 0 && startHour * 60 <= nowParts.hour * 60 + nowParts.minute + 5) {
+            daysAhead = 7;
+        }
+        let targetMs = zonedWallClockToEpochMs(
+            nowParts.year,
+            nowParts.month,
+            nowParts.day + daysAhead,
+            startHour,
+            0,
+            tz
+        );
+        if (targetMs <= nowMs + 60_000) {
+            targetMs = zonedWallClockToEpochMs(
+                nowParts.year,
+                nowParts.month,
+                nowParts.day + daysAhead + 7,
+                startHour,
+                0,
+                tz
+            );
+        }
+        return targetMs;
+    }
+
+    function formatEpochToDatetimeLocalValue(epochMs) {
+        const d = new Date(epochMs);
+        if (Number.isNaN(d.getTime())) return "";
+        const pad = (n) => String(n).padStart(2, "0");
+        return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    }
+
+    const MIN_SCHEDULE_INTERVAL_MS = 3_600_000;
+    const MAX_BATCH_SCHEDULE_ITEMS = 20;
+
+    function computeNextAvailableScheduleMs(preferredMs, occupiedEpochsMs = [], minIntervalMs = MIN_SCHEDULE_INTERVAL_MS) {
+        let candidate = Math.ceil(Number(preferredMs) / 60_000) * 60_000;
+        if (!Number.isFinite(candidate)) {
+            candidate = Math.ceil((Date.now() + 30 * 60_000) / 60_000) * 60_000;
+        }
+        const sortedOccupied = (occupiedEpochsMs || [])
+            .map((v) => Number(v))
+            .filter((v) => Number.isFinite(v))
+            .sort((a, b) => a - b);
+        let bumped = true;
+        let guard = 0;
+        while (bumped && guard < 200) {
+            bumped = false;
+            guard++;
+            for (const occ of sortedOccupied) {
+                if (Math.abs(candidate - occ) < minIntervalMs) {
+                    candidate = Math.ceil((occ + minIntervalMs) / 60_000) * 60_000;
+                    bumped = true;
+                    break;
+                }
+            }
+        }
+        return candidate;
+    }
+
+    function validateBatchScheduleEpochs(draftEpochsMs, queuedEpochsMs = [], nowMs = Date.now(), minIntervalMs = MIN_SCHEDULE_INTERVAL_MS) {
+        const epochs = (draftEpochsMs || []).map((v) => Number(v));
+        const conflictSet = new Set();
+        let firstError = "";
+        const recordErr = (idx, msg) => {
+            conflictSet.add(idx);
+            if (!firstError) firstError = msg;
+        };
+
+        for (let i = 0; i < epochs.length; i++) {
+            if (!Number.isFinite(epochs[i]) || epochs[i] < nowMs + 15_000) {
+                recordErr(
+                    i,
+                    epochs.length > 1
+                        ? `第 ${i + 1} 条推文定时时间需晚于当前时间至少 15 秒`
+                        : "定时发布时间需晚于当前时间至少 15 秒"
+                );
+            }
+        }
+
+        for (let i = 0; i < epochs.length; i++) {
+            if (!Number.isFinite(epochs[i])) continue;
+            for (let j = i + 1; j < epochs.length; j++) {
+                if (!Number.isFinite(epochs[j])) continue;
+                if (Math.abs(epochs[i] - epochs[j]) < minIntervalMs) {
+                    conflictSet.add(i);
+                    recordErr(
+                        j,
+                        `第 ${i + 1} 条与第 ${j + 1} 条定时推文间隔不足 1 小时（每条推文之间必须至少间隔 1 小时）`
+                    );
+                }
+            }
+        }
+
+        const validQueued = (queuedEpochsMs || []).map((v) => Number(v)).filter((v) => Number.isFinite(v));
+        for (let i = 0; i < epochs.length; i++) {
+            if (!Number.isFinite(epochs[i])) continue;
+            for (const qMs of validQueued) {
+                if (Math.abs(epochs[i] - qMs) < minIntervalMs) {
+                    recordErr(
+                        i,
+                        epochs.length > 1
+                            ? `第 ${i + 1} 条与队列中待发布推文间隔不足 1 小时（每条推文之间必须至少间隔 1 小时）`
+                            : "与队列中待发布推文时间间隔不足 1 小时（每条推文之间必须至少间隔 1 小时）"
+                    );
+                    break;
+                }
+            }
+        }
+
+        const conflictIndices = [...conflictSet].sort((a, b) => a - b);
+        return {
+            ok: conflictIndices.length === 0,
+            conflictIndices,
+            error: firstError
+        };
+    }
+
+    function alignBatchScheduleEpochs(draftEpochsMs, queuedEpochsMs = [], nowMs = Date.now(), minIntervalMs = MIN_SCHEDULE_INTERVAL_MS) {
+        const minLeadMs = Math.ceil((nowMs + 5 * 60_000) / 60_000) * 60_000;
+        const occupied = (queuedEpochsMs || []).map((v) => Number(v)).filter((v) => Number.isFinite(v));
+        const aligned = [];
+        for (let i = 0; i < (draftEpochsMs || []).length; i++) {
+            const raw = Number(draftEpochsMs[i]);
+            let target = Number.isFinite(raw) && raw >= nowMs + 60_000 ? raw : minLeadMs;
+            if (i > 0 && target < aligned[i - 1] + minIntervalMs) {
+                target = aligned[i - 1] + minIntervalMs;
+            }
+            const resolved = computeNextAvailableScheduleMs(target, [...occupied, ...aligned], minIntervalMs);
+            aligned.push(resolved);
+        }
+        return aligned;
+    }
+
+    function formatScheduleEpochLabel(epochMs) {
+        if (!epochMs) return "--";
+        try {
+            const tz = state.scheduleServerTz || state.report?.contentTiming?.timezone || "Asia/Shanghai";
+            return new Date(epochMs).toLocaleString("zh-CN", {
+                timeZone: tz,
+                month: "2-digit",
+                day: "2-digit",
+                hour: "2-digit",
+                minute: "2-digit",
+                hour12: false
+            });
+        } catch (_) {
+            return new Date(epochMs).toLocaleString();
+        }
+    }
+
+    function rotateComposerRequestId() {
+        state.composerClientRequestId = newClientRequestId();
+    }
+
+    function getQueuedScheduledEpochsMs(excludeJobId = null) {
+        const nowMs = Date.now();
+        return (state.scheduleJobs || [])
+            .filter((j) => j && j.status === "SCHEDULED" && j.id !== excludeJobId && Number(j.scheduledAtEpochMs) > nowMs)
+            .map((j) => Number(j.scheduledAtEpochMs))
+            .filter((v) => Number.isFinite(v));
+    }
+
+    function parseDraftItemEpochMs(item) {
+        const raw = item?.scheduledAtValue || "";
+        return raw ? new Date(raw).getTime() : NaN;
+    }
+
+    function createScheduleDraftItem(text = "", epochMs = null, files = [], timeTouched = false) {
+        const resolvedMs = Number.isFinite(epochMs)
+            ? epochMs
+            : computeNextAvailableScheduleMs(Date.now() + 30 * 60_000, getQueuedScheduledEpochsMs());
+        return {
+            draftId: newClientRequestId(),
+            text: String(text || ""),
+            scheduledAtValue: formatEpochToDatetimeLocalValue(resolvedMs),
+            files: Array.isArray(files) ? files : [],
+            timeTouched: Boolean(timeTouched)
+        };
+    }
+
+    function ensureScheduleDraftInitialized() {
+        if (!Array.isArray(state.scheduleDraftItems) || state.scheduleDraftItems.length === 0) {
+            state.scheduleDraftItems = [createScheduleDraftItem("", null, [], false)];
+            state.activeScheduleDraftIdx = 0;
+            rotateComposerRequestId();
+            renderScheduleDraftItems();
+        } else {
+            const listEl = document.getElementById("scheduleDraftItemsList");
+            if (listEl && listEl.children.length !== state.scheduleDraftItems.length) {
+                renderScheduleDraftItems();
+            } else {
+                syncScheduleDraftConflictUI();
+            }
+        }
+    }
+
+    function addNextScheduleDraftItem() {
+        ensureScheduleDraftInitialized();
+        if (state.scheduleDraftItems.length >= MAX_BATCH_SCHEDULE_ITEMS) {
+            showToast(`单次最多同时预设 ${MAX_BATCH_SCHEDULE_ITEMS} 条定时推文`);
+            return;
+        }
+        const existingEpochs = state.scheduleDraftItems
+            .map((it) => parseDraftItemEpochMs(it))
+            .filter((v) => Number.isFinite(v));
+        const lastEpoch = existingEpochs.length
+            ? existingEpochs[existingEpochs.length - 1]
+            : Date.now() + 30 * 60_000;
+        const basePreferred = Math.max(lastEpoch + MIN_SCHEDULE_INTERVAL_MS, Date.now() + 5 * 60_000);
+        const nextMs = computeNextAvailableScheduleMs(
+            basePreferred,
+            [...getQueuedScheduledEpochsMs(), ...existingEpochs],
+            MIN_SCHEDULE_INTERVAL_MS
+        );
+        state.scheduleDraftItems.push(createScheduleDraftItem("", nextMs, [], true));
+        state.activeScheduleDraftIdx = state.scheduleDraftItems.length - 1;
+        rotateComposerRequestId();
+        renderScheduleDraftItems();
+        syncScheduleAuthBanner();
+        const newTa = document.querySelector(`#scheduleDraftItemsList [data-draft-textarea="${state.activeScheduleDraftIdx}"]`);
+        newTa?.focus();
+    }
+
+    function removeScheduleDraftItem(idx) {
+        if (!Array.isArray(state.scheduleDraftItems) || state.scheduleDraftItems.length <= 1) {
+            clearScheduleComposerDraft();
+            return;
+        }
+        if (idx < 0 || idx >= state.scheduleDraftItems.length) return;
+        const [removed] = state.scheduleDraftItems.splice(idx, 1);
+        for (const media of removed?.files || []) {
+            if (media?.previewUrl && typeof URL !== "undefined" && URL.revokeObjectURL) {
+                try { URL.revokeObjectURL(media.previewUrl); } catch (_) {}
+            }
+        }
+        state.activeScheduleDraftIdx = Math.max(0, Math.min(state.activeScheduleDraftIdx, state.scheduleDraftItems.length - 1));
+        rotateComposerRequestId();
+        renderScheduleDraftItems();
+        syncScheduleAuthBanner();
+    }
+
+    function cascadeSubsequentDraftEpochs(fromIdx) {
+        const items = state.scheduleDraftItems || [];
+        if (fromIdx < 0 || fromIdx >= items.length - 1) return;
+        const baseMs = parseDraftItemEpochMs(items[fromIdx]);
+        if (!Number.isFinite(baseMs)) return;
+        const queued = getQueuedScheduledEpochsMs();
+        let prevMs = baseMs;
+        for (let k = fromIdx + 1; k < items.length; k++) {
+            const curMs = parseDraftItemEpochMs(items[k]);
+            if (!Number.isFinite(curMs) || curMs < prevMs + MIN_SCHEDULE_INTERVAL_MS) {
+                const earlier = items
+                    .slice(0, k)
+                    .map((it) => parseDraftItemEpochMs(it))
+                    .filter((v) => Number.isFinite(v));
+                const bumpedMs = computeNextAvailableScheduleMs(
+                    prevMs + MIN_SCHEDULE_INTERVAL_MS,
+                    [...queued, ...earlier],
+                    MIN_SCHEDULE_INTERVAL_MS
+                );
+                items[k].scheduledAtValue = formatEpochToDatetimeLocalValue(bumpedMs);
+                items[k].timeTouched = true;
+                const domInput = document.querySelector(`#scheduleDraftItemsList [data-draft-time="${k}"]`);
+                if (domInput) domInput.value = items[k].scheduledAtValue;
+                prevMs = bumpedMs;
+            } else {
+                prevMs = curMs;
+            }
+        }
+    }
+
+    function applyEpochToActiveScheduleDraft(epochMs) {
+        if (!Number.isFinite(epochMs)) return;
+        ensureScheduleDraftInitialized();
+        const idx = Math.max(0, Math.min(state.activeScheduleDraftIdx || 0, state.scheduleDraftItems.length - 1));
+        const item = state.scheduleDraftItems[idx];
+        item.scheduledAtValue = formatEpochToDatetimeLocalValue(epochMs);
+        item.timeTouched = true;
+        const inputEl = document.querySelector(`#scheduleDraftItemsList [data-draft-time="${idx}"]`);
+        if (inputEl) inputEl.value = item.scheduledAtValue;
+        cascadeSubsequentDraftEpochs(idx);
+        rotateComposerRequestId();
+        syncScheduleDraftConflictUI();
+        syncScheduleQuickSlotSelection();
+    }
+
+    function hasScheduleAccessDecision() {
+        return Boolean(
+            state.scheduleAccess
+            || (state.accessPolicy && typeof state.accessPolicy.scheduledPublishAllowed === "boolean")
+        );
+    }
+
+    function isScheduleEligible() {
+        if (state.scheduleAccess) {
+            return Boolean(state.scheduleAccess.allowed);
+        }
+        if (state.accessPolicy && typeof state.accessPolicy.scheduledPublishAllowed === "boolean") {
+            return Boolean(state.accessPolicy.scheduledPublishAllowed);
+        }
+        return true;
+    }
+
+    function getScheduleLockedReason() {
+        return (
+            state.scheduleAccess?.reason
+            || state.accessPolicy?.scheduledPublishLockedReason
+            || "定时发布仅限与 @elidlicom 互动频率前 100 的推友可用。"
+        );
+    }
+
+    const STEPUP_SCHEDULE_DRAFT_KEY = "xops_stepup_schedule_draft";
+
+    function saveScheduleDraftForStepUpAuth() {
+        if (!isLoggedIn()) return;
+        const userId = stableUserId(state.authStatus?.user);
+        if (!userId) return;
+        const items = (state.scheduleDraftItems || []).map((it) => ({
+            text: String(it.text || ""),
+            scheduledAtValue: String(it.scheduledAtValue || "")
+        }));
+        const hasAnyContent = items.some((it) => it.text.trim() || it.scheduledAtValue);
+        if (!hasAnyContent) return;
+        try {
+            sessionStorage.setItem(
+                STEPUP_SCHEDULE_DRAFT_KEY,
+                JSON.stringify({ userId, items, savedAt: Date.now() })
+            );
+        } catch (_) {}
+    }
+
+    function restoreScheduleDraftAfterStepUpAuth() {
+        let raw = null;
+        try {
+            raw = sessionStorage.getItem(STEPUP_SCHEDULE_DRAFT_KEY);
+            sessionStorage.removeItem(STEPUP_SCHEDULE_DRAFT_KEY);
+        } catch (_) {}
+        if (!raw || !isLoggedIn()) return;
+        try {
+            const parsed = JSON.parse(raw);
+            const currentUserId = stableUserId(state.authStatus?.user);
+            if (!parsed || parsed.userId !== currentUserId) return;
+            if (!parsed.savedAt || Date.now() - Number(parsed.savedAt) > 30 * 60_000) return;
+            if (Array.isArray(parsed.items) && parsed.items.length > 0) {
+                state.scheduleDraftItems = parsed.items.slice(0, MAX_BATCH_SCHEDULE_ITEMS).map((it) => {
+                    const ms = it?.scheduledAtValue ? new Date(it.scheduledAtValue).getTime() : NaN;
+                    const draft = createScheduleDraftItem(it?.text || "", Number.isFinite(ms) ? ms : null, [], true);
+                    if (typeof it?.scheduledAtValue === "string" && it.scheduledAtValue) {
+                        draft.scheduledAtValue = it.scheduledAtValue;
+                    }
+                    return draft;
+                });
+                state.activeScheduleDraftIdx = 0;
+            } else if (typeof parsed.text === "string" || typeof parsed.timeValue === "string") {
+                const draft = createScheduleDraftItem(parsed.text || "", null, [], true);
+                if (typeof parsed.timeValue === "string" && parsed.timeValue) {
+                    draft.scheduledAtValue = parsed.timeValue;
+                }
+                state.scheduleDraftItems = [draft];
+                state.activeScheduleDraftIdx = 0;
+            }
+            rotateComposerRequestId();
+            renderScheduleDraftItems();
+            syncScheduleAuthBanner();
+        } catch (_) {}
+    }
+
+    function triggerXPublishAuth() {
+        if (!isLoggedIn()) {
+            triggerXOAuthLogin();
+            return;
+        }
+        if (hasScheduleAccessDecision() && !isScheduleEligible()) {
+            syncScheduleAuthBanner();
+            showError(getScheduleLockedReason());
+            return;
+        }
+        const oauthConfigured = Boolean(
+            (state.authStatus && state.authStatus.oauthConfigured) ||
+            (state.serverMeta && state.serverMeta.oauthConfigured)
+        );
+        if (!oauthConfigured) {
+            showError("服务端尚未在 application.yml 中配置 xops.oauth-client-id，暂无法发起二次授权");
+            return;
+        }
+        saveScheduleDraftForStepUpAuth();
+        window.location.href = "/api/auth/x/authorize-publish";
+    }
+
+    function syncScheduleAuthBanner() {
+        const loggedIn = isLoggedIn();
+        const decided = hasScheduleAccessDecision();
+        const eligible = isScheduleEligible();
+        const locked = loggedIn && decided && !eligible;
+
+        const eligCard = document.getElementById("scheduleEligibilityCard");
+        if (eligCard) {
+            eligCard.hidden = !locked;
+            if (locked) {
+                const descEl = document.getElementById("scheduleEligibilityDesc");
+                const rawReason = getScheduleLockedReason();
+                const isGenericTop100Msg = /^定时发布仅限与\s*@?elidlicom\s*互动频率前\s*100/.test(rawReason.trim());
+                if (descEl) {
+                    descEl.textContent = isGenericTop100Msg ? "" : rawReason;
+                    descEl.hidden = isGenericTop100Msg;
+                }
+                const rank = state.scheduleAccess?.authorInteractionRank ?? state.accessPolicy?.authorInteractionRank ?? null;
+                const rankText = rank === 0
+                    ? "✓ 作者本人"
+                    : rank != null && rank >= 1 && rank <= 100
+                        ? `✓ 互动第 ${rank} 名`
+                        : rank != null && rank > 100
+                            ? `当前第 ${rank} 名（需前 100）`
+                            : "未进入互动前 100";
+                const metaEl = document.getElementById("scheduleEligibilityMeta");
+                if (metaEl) {
+                    metaEl.innerHTML =
+                        `<span class="mini-tag ${rank !== null && rank <= 100 ? "green" : "amber"}">${escapeHtml(rankText)}</span>`;
+                }
+                const actionLink = document.getElementById("scheduleEligibilityActionLink");
+                if (actionLink) {
+                    actionLink.href = "https://x.com/elidlicom";
+                    actionLink.textContent = "去互动 ↗";
+                }
+            }
+        }
+
+        const writeOk = Boolean(state.authStatus?.writeAuthorized && state.authStatus?.mediaWriteAuthorized);
+        const offlineOk = state.authStatus?.offlineRefreshable !== false;
+        const card = document.getElementById("scheduleWriteAuthCard");
+        if (card) {
+            card.hidden = !loggedIn || locked || (writeOk && offlineOk);
+            const titleEl = document.getElementById("scheduleWriteAuthTitle");
+            const descEl = document.getElementById("scheduleWriteAuthDesc");
+            const btnEl = document.getElementById("triggerPublishAuthBtn");
+            if (!writeOk) {
+                if (titleEl) titleEl.textContent = "需开启发推授权";
+                if (descEl) {
+                    descEl.textContent = "单独授予发推、传图与自动续期权限。";
+                }
+                if (btnEl) btnEl.textContent = "去授权";
+            } else if (!offlineOk) {
+                if (titleEl) titleEl.textContent = "升级长效离线授权";
+                if (descEl) {
+                    descEl.textContent = "当前令牌约 2 小时过期，升级后自动续期。";
+                }
+                if (btnEl) btnEl.textContent = "去升级";
+            }
+        }
+
+        const composeCard = document.getElementById("scheduleComposeCard");
+        if (composeCard) {
+            composeCard.classList.toggle("is-locked-card", locked);
+        }
+        const draftItems = state.scheduleDraftItems || [];
+        const draftCount = draftItems.length;
+        ["alignScheduleGapBtn", "clearScheduleDraftBtn", "createScheduleBtn"].forEach((id) => {
+            const el = document.getElementById(id);
+            if (el) el.disabled = locked;
+        });
+        const addItemBtn = document.getElementById("addScheduleDraftItemBtn");
+        if (addItemBtn) {
+            addItemBtn.disabled = locked || draftCount >= MAX_BATCH_SCHEDULE_ITEMS;
+        }
+        const listEl = document.getElementById("scheduleDraftItemsList");
+        if (listEl) {
+            listEl.querySelectorAll("textarea, input, button").forEach((ctrl) => {
+                ctrl.disabled = locked;
+            });
+        }
+        const createBtn = document.getElementById("createScheduleBtn");
+        if (createBtn) {
+            const hasFiles = draftItems.some((it) => (it.files || []).length > 0);
+            if (!locked && !writeOk && !hasFiles) {
+                createBtn.textContent = "二次授权并去定时";
+            } else if (draftCount > 1) {
+                createBtn.textContent = `批量加入队列（${draftCount} 条）`;
+            } else {
+                createBtn.textContent = "加入定时队列";
+            }
+        }
+    }
+
+    function formatGapDurationShort(diffMs) {
+        const absMin = Math.round(Math.abs(diffMs) / 60_000);
+        if (absMin < 60) return `${absMin}m`;
+        const h = Math.floor(absMin / 60);
+        const m = absMin % 60;
+        return m === 0 ? `${h}h` : `${h}h ${m}m`;
+    }
+
+    function syncSingleDraftItemStats(idx) {
+        const item = (state.scheduleDraftItems || [])[idx];
+        if (!item) return;
+        const text = item.text || "";
+        const weighted = computeWeightedTweetLength(text);
+        const counter = document.querySelector(`#scheduleDraftItemsList [data-draft-counter="${idx}"]`);
+        if (counter) {
+            counter.textContent = weighted > 280
+                ? `${weighted}/280 · 长推`
+                : `${weighted}/280`;
+        }
+        const linkHint = document.querySelector(`#scheduleDraftItemsList [data-draft-link-hint="${idx}"]`);
+        if (linkHint) {
+            const hasUrl = URL_TOKEN_RE.test(text);
+            URL_TOKEN_RE.lastIndex = 0;
+            if (hasUrl) {
+                linkHint.hidden = false;
+                linkHint.textContent = "含外链";
+            } else {
+                linkHint.hidden = true;
+            }
+        }
+        const algoChip = document.querySelector(`#scheduleDraftItemsList [data-draft-algo-chip="${idx}"]`);
+        const algoBtn = document.querySelector(`#scheduleDraftItemsList [data-draft-action="check-algo"][data-draft-idx="${idx}"]`);
+        if (text.trim()) {
+            const res = analyzeDraftByXAlgo(text, {
+                hasMedia: (item.files || []).length > 0,
+                isThread: weighted > 280,
+                plannedEpochMs: parseDraftItemEpochMs(item),
+                skipDraftIdx: idx
+            });
+            if (algoChip) {
+                if (res.summaryRiskTag) {
+                    algoChip.className = `mini-tag ${res.tone}`;
+                    algoChip.textContent = `⚠️ ${res.summaryRiskTag}`;
+                    algoChip.title = res.rewrites.length ? res.rewrites[0] : "";
+                    algoChip.hidden = false;
+                } else {
+                    algoChip.hidden = true;
+                }
+            }
+            if (algoBtn) algoBtn.hidden = false;
+        } else {
+            if (algoChip) algoChip.hidden = true;
+            if (algoBtn) algoBtn.hidden = true;
+        }
+    }
+
+    function syncScheduleComposerStats() {
+        const items = state.scheduleDraftItems || [];
+        for (let i = 0; i < items.length; i++) {
+            syncSingleDraftItemStats(i);
+        }
+        syncScheduleDraftConflictUI();
+    }
+
+    function syncScheduleDraftConflictUI() {
+        const items = state.scheduleDraftItems || [];
+        const listEl = document.getElementById("scheduleDraftItemsList");
+        if (!listEl || !items.length) return;
+
+        const isSingle = items.length === 1;
+        listEl.classList.toggle("is-single", isSingle);
+
+        const epochs = items.map((it) => parseDraftItemEpochMs(it));
+        const queued = getQueuedScheduledEpochsMs();
+        const nowMs = Date.now();
+        const validation = validateBatchScheduleEpochs(epochs, queued, nowMs, MIN_SCHEDULE_INTERVAL_MS);
+        const conflictSet = new Set(validation.conflictIndices);
+
+        items.forEach((_, idx) => {
+            const cardEl = listEl.querySelector(`[data-draft-idx="${idx}"].schedule-draft-item`);
+            const headEl = listEl.querySelector(`[data-draft-head="${idx}"]`);
+            const gapTag = listEl.querySelector(`[data-draft-gap-tag="${idx}"]`);
+            const timeInput = listEl.querySelector(`[data-draft-time="${idx}"]`);
+            const hasConflict = conflictSet.has(idx);
+
+            if (cardEl) {
+                cardEl.classList.toggle("is-active", !isSingle && idx === state.activeScheduleDraftIdx);
+                cardEl.classList.toggle("has-conflict", hasConflict);
+            }
+            if (timeInput) {
+                timeInput.classList.toggle("is-conflict", hasConflict);
+            }
+
+            let tagText = "";
+            let tagClass = "schedule-gap-tag";
+            const curMs = epochs[idx];
+            if (!Number.isFinite(curMs) || curMs < nowMs + 15_000) {
+                tagText = "需设为未来时间";
+                tagClass += " is-conflict";
+            } else {
+                const nearQueue = queued.find((qMs) => Math.abs(curMs - qMs) < MIN_SCHEDULE_INTERVAL_MS);
+                if (nearQueue !== undefined) {
+                    tagText = `距队列 ${formatGapDurationShort(curMs - nearQueue)}（需 ≥1h）`;
+                    tagClass += " is-conflict";
+                } else if (idx > 0 && Number.isFinite(epochs[idx - 1])) {
+                    const diffPrev = curMs - epochs[idx - 1];
+                    if (Math.abs(diffPrev) < MIN_SCHEDULE_INTERVAL_MS) {
+                        tagText = `距 #${idx} ${formatGapDurationShort(diffPrev)}（需 ≥1h）`;
+                        tagClass += " is-conflict";
+                    } else if (diffPrev >= MIN_SCHEDULE_INTERVAL_MS) {
+                        tagText = `距 #${idx} +${formatGapDurationShort(diffPrev)}`;
+                        tagClass += " is-ok";
+                    } else {
+                        tagText = `早于 #${idx} ${formatGapDurationShort(diffPrev)}`;
+                        tagClass += " is-ok";
+                    }
+                } else if (hasConflict) {
+                    tagText = "间隔需 ≥1h";
+                    tagClass += " is-conflict";
+                }
+            }
+
+            if (gapTag) {
+                gapTag.className = tagClass;
+                gapTag.textContent = tagText;
+                gapTag.hidden = !tagText;
+            }
+            if (headEl) {
+                headEl.hidden = isSingle && !tagText;
+            }
+        });
+
+        const alignBtn = document.getElementById("alignScheduleGapBtn");
+        if (alignBtn) {
+            alignBtn.hidden = validation.ok;
+        }
+    }
+
+    function renderScheduleDraftItems() {
+        const listEl = document.getElementById("scheduleDraftItemsList");
+        if (!listEl) return;
+        const items = state.scheduleDraftItems || [];
+        const isSingle = items.length === 1;
+        listEl.classList.toggle("is-single", isSingle);
+        listEl.innerHTML = items
+            .map((item, idx) => {
+                const files = item.files || [];
+                const mediaHtml = files
+                    .map((m, mIdx) => {
+                        const sizeKb = Math.max(1, Math.round(m.size / 1024));
+                        return `<div class="schedule-media-thumb">
+                            <img src="${escapeHtml(m.previewUrl)}" alt="${escapeHtml(m.name)}" />
+                            <button type="button" class="schedule-media-remove" data-draft-action="remove-media" data-draft-idx="${idx}" data-remove-media-idx="${mIdx}" title="移除图片" aria-label="移除图片">×</button>
+                            <span class="schedule-media-caption">${sizeKb >= 1024 ? (sizeKb / 1024).toFixed(1) + "MB" : sizeKb + "KB"}</span>
+                        </div>`;
+                    })
+                    .join("");
+                const placeholder = isSingle
+                    ? "输入定时推文内容…"
+                    : `第 ${idx + 1} 条推文内容…`;
+                return `<div class="schedule-draft-item ${!isSingle && idx === state.activeScheduleDraftIdx ? "is-active" : ""}" data-draft-idx="${idx}">
+                    <div class="schedule-draft-item-head" data-draft-head="${idx}" ${isSingle ? "hidden" : ""}>
+                        <div class="schedule-draft-head-left">
+                            <span class="schedule-seq-pill">#${idx + 1}</span>
+                            <span class="schedule-gap-tag" data-draft-gap-tag="${idx}" hidden></span>
+                        </div>
+                        <div class="schedule-draft-head-right">
+                            ${!isSingle ? `<button type="button" class="schedule-draft-remove-btn" data-draft-action="remove-item" data-draft-idx="${idx}" title="移除第 ${idx + 1} 条" aria-label="移除第 ${idx + 1} 条">×</button>` : ""}
+                        </div>
+                    </div>
+                    <textarea
+                        class="sim-textarea schedule-textarea"
+                        data-draft-textarea="${idx}"
+                        rows="${isSingle ? 4 : 3}"
+                        maxlength="25000"
+                        placeholder="${placeholder}"
+                    >${escapeHtml(item.text || "")}</textarea>
+                    <div class="schedule-media-grid" data-draft-media-grid="${idx}" ${files.length ? "" : "hidden"}>${mediaHtml}</div>
+                    <div class="schedule-draft-item-foot">
+                        <div class="schedule-compose-left">
+                            <button type="button" class="x-outline-pill sm" data-draft-action="add-media" data-draft-idx="${idx}">添加图片</button>
+                            <span class="muted-meta" data-draft-counter="${idx}">0 / 280</span>
+                            <span class="mini-tag amber" data-draft-link-hint="${idx}" hidden></span>
+                            <span class="mini-tag" data-draft-algo-chip="${idx}" hidden></span>
+                            <button type="button" class="x-outline-pill sm" data-draft-action="check-algo" data-draft-idx="${idx}" hidden>体检</button>
+                        </div>
+                        <div class="schedule-compose-right">
+                            <input type="datetime-local" class="schedule-time-input" data-draft-time="${idx}" aria-label="第 ${idx + 1} 条定时发布时间" value="${escapeHtml(item.scheduledAtValue || "")}" />
+                        </div>
+                    </div>
+                </div>`;
+            })
+            .join("");
+        syncScheduleComposerStats();
+        syncScheduleAuthBanner();
+        syncScheduleQuickSlotSelection();
+    }
+
+    function clearScheduleComposerDraft() {
+        for (const draft of state.scheduleDraftItems || []) {
+            for (const item of draft.files || []) {
+                if (item.previewUrl && typeof URL !== "undefined" && URL.revokeObjectURL) {
+                    try { URL.revokeObjectURL(item.previewUrl); } catch (_) {}
+                }
+            }
+        }
+        state.scheduleDraftFiles = [];
+        state.scheduleDraftItems = [createScheduleDraftItem("", null, [], false)];
+        state.activeScheduleDraftIdx = 0;
+        state.mediaPickerTargetIdx = 0;
+        const fi = document.getElementById("scheduleMediaFileInput");
+        if (fi) fi.value = "";
+        rotateComposerRequestId();
+        renderScheduleDraftItems();
+        syncScheduleAuthBanner();
+    }
+
+    function appendFilesToScheduleDraft(fileList, targetIdx = state.activeScheduleDraftIdx) {
+        ensureScheduleDraftInitialized();
+        const idx = Math.max(0, Math.min(Number(targetIdx) || 0, state.scheduleDraftItems.length - 1));
+        const draft = state.scheduleDraftItems[idx];
+        const res = validateAndMergeScheduleFiles(draft.files || [], fileList);
+        if (!res.ok) {
+            showToast(res.error);
+            return;
+        }
+        if (res.files.length !== (draft.files || []).length) {
+            draft.files = res.files;
+            state.activeScheduleDraftIdx = idx;
+            rotateComposerRequestId();
+            renderScheduleDraftItems();
+            syncScheduleAuthBanner();
+        }
+    }
+
+    function renderScheduleQuickSlots() {
+        const wrap = $("scheduleQuickSlotChips");
+        if (!wrap) return;
+        const tz = state.scheduleServerTz || state.report?.contentTiming?.timezone || "Asia/Shanghai";
+        const nowMs = Date.now();
+        const presets = [
+            { label: "+30m", epochMs: Math.ceil((nowMs + 30 * 60_000) / 60_000) * 60_000 }
+        ];
+        const pNow = getTzDateParts(nowMs, tz);
+        const tonight20 = zonedWallClockToEpochMs(pNow.year, pNow.month, pNow.day, 20, 0, tz);
+        if (tonight20 > nowMs + 60_000) {
+            presets.push({ label: "今晚 20:00", epochMs: tonight20 });
+        }
+        const tomorrow09 = zonedWallClockToEpochMs(pNow.year, pNow.month, pNow.day + 1, 9, 0, tz);
+        presets.push({ label: "明早 09:00", epochMs: tomorrow09 });
+
+        const slots = (state.report?.contentTiming?.goldenSlots || []).slice(0, 3);
+        slots.forEach((s) => {
+            const ms = computeNextGoldenSlotTimestampMs(s.label, tz, nowMs);
+            if (ms) {
+                const compactSlot = String(s.label || "").replace(/[–-]\d{2}:00$/, "").trim();
+                presets.push({ label: `★ ${compactSlot}`, title: `黄金档 · ${s.label}`, epochMs: ms, isGolden: true });
+            }
+        });
+
+        wrap.innerHTML = presets
+            .map(
+                (p) => `<button type="button" class="pill-chip ${p.isGolden ? "golden-preset" : ""}" data-quick-epoch="${p.epochMs}" ${p.title ? `title="${escapeHtml(p.title)}"` : ""}>${escapeHtml(p.label)}</button>`
+            )
+            .join("");
+        syncScheduleQuickSlotSelection();
+    }
+
+    function syncScheduleQuickSlotSelection() {
+        const wrap = document.getElementById("scheduleQuickSlotChips");
+        if (!wrap) return;
+        const idx = Math.max(0, Math.min(state.activeScheduleDraftIdx || 0, (state.scheduleDraftItems || []).length - 1));
+        const activeVal = state.scheduleDraftItems && state.scheduleDraftItems[idx]
+            ? String(state.scheduleDraftItems[idx].scheduledAtValue || "")
+            : "";
+        wrap.querySelectorAll("[data-quick-epoch]").forEach((chip) => {
+            const ms = Number(chip.dataset.quickEpoch);
+            const match = Boolean(activeVal) && Number.isFinite(ms) && formatEpochToDatetimeLocalValue(ms) === activeVal;
+            chip.classList.toggle("active", match);
+        });
+    }
+
+    function sendTextDraftToSchedule(text, attachedFiles = []) {
+        if (hasScheduleAccessDecision() && !isScheduleEligible()) {
+            switchTab("schedule");
+            syncScheduleAuthBanner();
+            showError(getScheduleLockedReason());
+            return false;
+        }
+        clearScheduleComposerDraft();
+        const first = state.scheduleDraftItems[0];
+        first.text = String(text || "");
+        const slots = state.report?.contentTiming?.goldenSlots || [];
+        if (slots.length) {
+            const tz = state.scheduleServerTz || state.report?.contentTiming?.timezone || "Asia/Shanghai";
+            const bestMs = computeNextGoldenSlotTimestampMs(slots[0].label, tz, Date.now());
+            if (bestMs) {
+                const conflictFreeMs = computeNextAvailableScheduleMs(bestMs, getQueuedScheduledEpochsMs(), MIN_SCHEDULE_INTERVAL_MS);
+                first.scheduledAtValue = formatEpochToDatetimeLocalValue(conflictFreeMs);
+                first.timeTouched = true;
+            }
+        }
+        if (attachedFiles.length) {
+            appendFilesToScheduleDraft(attachedFiles, 0);
+        } else {
+            renderScheduleDraftItems();
+        }
+        rotateComposerRequestId();
+        switchTab("schedule");
+    }
+
+    function canvasToPngFile(canvas, fileName) {
+        let dataUrl;
+        try {
+            dataUrl = canvas.toDataURL("image/png");
+        } catch (_) {
+            if (state.report) {
+                drawShareCardCanvas(state.report, true);
+            }
+            dataUrl = canvas.toDataURL("image/png");
+        }
+        const commaIdx = dataUrl.indexOf(",");
+        const binary = atob(dataUrl.slice(commaIdx + 1));
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) {
+            bytes[i] = binary.charCodeAt(i);
+        }
+        return new File([bytes], fileName, { type: "image/png" });
+    }
+
+    function statusMetaForScheduledJob(status) {
+        switch (status) {
+            case "SCHEDULED":
+                return { label: "待发布", cls: "blue" };
+            case "OVERDUE_CONFIRM_REQUIRED":
+                return { label: "逾期待确认", cls: "amber" };
+            case "RESEND_QUEUED":
+                return { label: "已确认·排队补发", cls: "blue" };
+            case "SENDING":
+                return { label: "正在发送…", cls: "blue" };
+            case "PUBLISHED":
+                return { label: "已发布", cls: "green" };
+            case "FAILED":
+                return { label: "发送失败", cls: "danger" };
+            case "CANCELLED":
+                return { label: "已取消", cls: "" };
+            default:
+                return { label: status || "--", cls: "" };
+        }
+    }
+
+    function updateScheduleBadgesAndBanner() {
+        const overdue = Number(state.scheduleOverdueCount || 0);
+        const pending = Number(state.schedulePendingCount || 0);
+        const badgeCount = overdue > 0 ? overdue : pending;
+
+        const navBadge = $("navScheduleBadge");
+        const mobBadge = $("mobileScheduleBadge");
+        [navBadge, mobBadge].forEach((b) => {
+            if (!b) return;
+            if (badgeCount > 0) {
+                b.textContent = badgeCount > 99 ? "99+" : String(badgeCount);
+                b.hidden = false;
+                b.style.background = overdue > 0 ? "var(--x-amber)" : "var(--x-blue)";
+                b.style.color = overdue > 0 ? "#0f1419" : "#ffffff";
+            } else {
+                b.hidden = true;
+            }
+        });
+
+        const banner = $("overdueGlobalBanner");
+        const bannerText = $("overdueGlobalText");
+        if (banner && bannerText) {
+            if (isLoggedIn() && overdue > 0) {
+                bannerText.textContent = `${overdue} 条定时逾期待确认`;
+                banner.hidden = false;
+            } else {
+                banner.hidden = true;
+            }
+        }
+    }
+
+    function renderScheduledTweetsList() {
+        const listEl = $("scheduledTweetsList");
+        if (!listEl) return;
+        const all = state.scheduleJobs || [];
+        const overdueConfirmable = all.filter((j) => j.status === "OVERDUE_CONFIRM_REQUIRED" && !j.uncertainDelivery);
+        const batchBtn = $("batchConfirmOverdueBtn");
+        if (batchBtn) {
+            batchBtn.hidden = overdueConfirmable.length < 2;
+            batchBtn.textContent = `批量补发 (${overdueConfirmable.length})`;
+        }
+
+        const actionNeededCount = all.filter((j) => j.status === "OVERDUE_CONFIRM_REQUIRED" || j.status === "FAILED").length;
+        const scheduledCount = all.filter((j) => j.status === "SCHEDULED" || j.status === "RESEND_QUEUED" || j.status === "SENDING").length;
+        const publishedCount = all.filter((j) => j.status === "PUBLISHED").length;
+        const pillWrap = document.getElementById("scheduleStatusFilterPills");
+        if (pillWrap) {
+            const labelMap = {
+                ALL: all.length > 0 ? `全部 ${all.length}` : "全部",
+                ACTION_NEEDED: actionNeededCount > 0 ? `待处理 ${actionNeededCount}` : "待处理",
+                SCHEDULED: scheduledCount > 0 ? `待发布 ${scheduledCount}` : "待发布",
+                PUBLISHED: publishedCount > 0 ? `已发布 ${publishedCount}` : "已发布"
+            };
+            pillWrap.querySelectorAll(".pill-chip[data-sfilter]").forEach((btn) => {
+                const key = btn.dataset.sfilter;
+                if (labelMap[key]) btn.textContent = labelMap[key];
+            });
+        }
+
+        const filtered = all.filter((j) => {
+            if (state.scheduleFilter === "ACTION_NEEDED") {
+                return j.status === "OVERDUE_CONFIRM_REQUIRED" || j.status === "FAILED";
+            }
+            if (state.scheduleFilter === "SCHEDULED") {
+                return j.status === "SCHEDULED" || j.status === "RESEND_QUEUED" || j.status === "SENDING";
+            }
+            if (state.scheduleFilter === "PUBLISHED") {
+                return j.status === "PUBLISHED";
+            }
+            return true;
+        });
+
+        if (!filtered.length) {
+            listEl.innerHTML = emptyStateHtml("暂无定时记录", []);
+            return;
+        }
+
+        listEl.innerHTML = filtered
+            .map((job) => {
+                const st = statusMetaForScheduledJob(job.status);
+                const mediaHtml = (job.media || []).length
+                    ? `<div class="schedule-job-media">${job.media
+                          .map(
+                              (a) =>
+                                  `<img src="/api/scheduled-tweets/${encodeURIComponent(job.id)}/media/${encodeURIComponent(a.assetId)}" alt="${escapeHtml(a.fileName || "image")}" loading="lazy" />`
+                          )
+                          .join("")}</div>`
+                    : "";
+
+                let alertHtml = "";
+                if (job.status === "OVERDUE_CONFIRM_REQUIRED") {
+                    const cls = job.uncertainDelivery ? "is-danger" : "is-overdue";
+                    alertHtml = `<div class="schedule-job-alert ${cls}">${escapeHtml(job.lastError || "已超过预定时间，确认后自动补发")}</div>`;
+                } else if (job.status === "FAILED" && job.lastError) {
+                    alertHtml = `<div class="schedule-job-alert is-danger">${escapeHtml(job.lastError)}</div>`;
+                }
+
+                const canEditTime =
+                    job.status === "SCHEDULED" ||
+                    job.status === "OVERDUE_CONFIRM_REQUIRED" ||
+                    job.status === "FAILED" ||
+                    job.status === "CANCELLED";
+                const showRescheduleBox = state.rescheduleEditingJobId === job.id && canEditTime;
+                const rescheduleBoxHtml = showRescheduleBox
+                    ? `<div class="schedule-reschedule-box">
+                        <input type="datetime-local" class="x-mini-input" data-resched-input="${escapeHtml(job.id)}" value="${escapeHtml(formatEpochToDatetimeLocalValue(Math.max(job.scheduledAtEpochMs || 0, Date.now() + 15 * 60_000)))}" />
+                        <button type="button" class="x-blue-pill sm" data-job-action="save-reschedule" data-job-id="${escapeHtml(job.id)}">保存</button>
+                        <button type="button" class="x-outline-pill sm" data-job-action="close-reschedule" data-job-id="${escapeHtml(job.id)}">取消</button>
+                    </div>`
+                    : "";
+
+                const actions = [];
+                if (job.status === "OVERDUE_CONFIRM_REQUIRED") {
+                    actions.push(`<button type="button" class="x-blue-pill sm" data-job-action="open-confirm" data-job-id="${escapeHtml(job.id)}">确认补发</button>`);
+                } else if (job.status === "FAILED") {
+                    actions.push(`<button type="button" class="x-blue-pill sm" data-job-action="open-confirm" data-job-id="${escapeHtml(job.id)}">确认重发</button>`);
+                }
+                if (canEditTime) {
+                    actions.push(`<button type="button" class="x-outline-pill sm" data-job-action="toggle-reschedule" data-job-id="${escapeHtml(job.id)}">改期</button>`);
+                }
+                if (job.status === "SCHEDULED" || job.status === "OVERDUE_CONFIRM_REQUIRED") {
+                    actions.push(`<button type="button" class="x-outline-pill sm" data-job-action="cancel" data-job-id="${escapeHtml(job.id)}">取消</button>`);
+                }
+                if (job.status === "PUBLISHED" && job.publishedTweetUrl) {
+                    actions.push(`<a class="x-outline-pill sm" href="${escapeHtml(safeHttpUrl(job.publishedTweetUrl))}" target="_blank" rel="noopener noreferrer">原推 ↗</a>`);
+                }
+                if (job.status !== "SENDING" && job.status !== "RESEND_QUEUED") {
+                    actions.push(`<button type="button" class="x-outline-pill sm" data-job-action="delete" data-job-id="${escapeHtml(job.id)}">删除</button>`);
+                }
+
+                const timePrefix = job.status === "PUBLISHED" && job.publishedAtEpochMs
+                    ? formatScheduleEpochLabel(job.publishedAtEpochMs)
+                    : formatScheduleEpochLabel(job.scheduledAtEpochMs);
+                const timeTitle = job.status === "PUBLISHED" && job.publishedAtEpochMs
+                    ? `原定 ${formatScheduleEpochLabel(job.scheduledAtEpochMs)}`
+                    : "";
+
+                return `<article class="schedule-job-card">
+                    <div class="schedule-job-head">
+                        <span class="mini-tag ${st.cls}">${escapeHtml(st.label)}</span>
+                        <span class="schedule-job-time" ${timeTitle ? `title="${escapeHtml(timeTitle)}"` : ""}>${escapeHtml(timePrefix)}</span>
+                    </div>
+                    <div class="schedule-job-text">${job.text ? escapeHtml(job.text) : "<span class=\"user-handle-muted\">图片推文</span>"}</div>
+                    ${mediaHtml}
+                    ${alertHtml}
+                    ${rescheduleBoxHtml}
+                    <div class="schedule-job-actions">${actions.join("")}</div>
+                </article>`;
+            })
+            .join("");
+    }
+
+    function openConfirmResendModal(job) {
+        if (!job) return;
+        state.pendingConfirmJob = job;
+        $("confirmResendReason").textContent = job.lastError || "该推文已超过预定发布窗口，需要你二次确认后再发送。";
+        $("confirmResendMeta").textContent = `原定发布时间：${formatScheduleEpochLabel(job.scheduledAtEpochMs)} · 附件 ${(job.media || []).length} 张`;
+        $("confirmResendTextPreview").textContent = job.text && job.text.trim() ? job.text : "（无正文，仅图片推文）";
+
+        const uncertainBox = $("confirmResendUncertainBox");
+        uncertainBox.hidden = !job.uncertainDelivery;
+        const profLink = $("confirmResendProfileLink");
+        if (profLink && state.authStatus?.user?.username) {
+            profLink.href = `https://x.com/${encodeURIComponent(state.authStatus.user.username)}`;
+        }
+
+        const mediaBox = $("confirmResendMediaPreview");
+        if (job.media && job.media.length) {
+            mediaBox.hidden = false;
+            mediaBox.innerHTML = job.media
+                .map(
+                    (a) => `<img src="/api/scheduled-tweets/${encodeURIComponent(job.id)}/media/${encodeURIComponent(a.assetId)}" alt="${escapeHtml(a.fileName || "image")}" />`
+                )
+                .join("");
+        } else {
+            mediaBox.hidden = true;
+            mediaBox.innerHTML = "";
+        }
+        $("confirmResendSubmitBtn").disabled = false;
+        $("confirmResendModal").hidden = false;
+        syncBodyModalLock();
+    }
+
+    function closeConfirmResendModal() {
+        const modal = document.getElementById("confirmResendModal");
+        if (modal) modal.hidden = true;
+        state.pendingConfirmJob = null;
+        syncBodyModalLock();
+    }
+
+    function refreshSchedulePollingState() {
+        clearInterval(state.schedulePollTimerId);
+        state.schedulePollTimerId = null;
+        if (!isLoggedIn()) return;
+        const hasFastWatch =
+            state.watchedResendIds.size > 0 ||
+            (state.scheduleJobs || []).some((j) => j.status === "RESEND_QUEUED" || j.status === "SENDING");
+        if (!hasFastWatch && state.activeTab !== "schedule") return;
+        const intervalMs = hasFastWatch ? 2500 : 15000;
+        state.schedulePollTimerId = setInterval(() => {
+            if (!isLoggedIn()) {
+                clearInterval(state.schedulePollTimerId);
+                state.schedulePollTimerId = null;
+                return;
+            }
+            loadScheduledTweets(true);
+        }, intervalMs);
+    }
+
+    async function loadScheduledTweets(silent = false) {
+        if (!isLoggedIn()) return;
+        const reqUserId = stableUserId(state.authStatus?.user);
+        try {
+            const resp = await fetch("/api/scheduled-tweets", { cache: "no-store" });
+            const body = await safeParseJson(resp);
+            if (!isLoggedIn() || stableUserId(state.authStatus?.user) !== reqUserId) return;
+            if (!resp.ok) {
+                if (!silent) showError(body.message || `获取定时任务失败（HTTP ${resp.status}）`);
+                return;
+            }
+            state.scheduleJobs = Array.isArray(body.items) ? body.items : [];
+            state.schedulePendingCount = Number(body.pendingCount || 0);
+            state.scheduleOverdueCount = Number(body.overdueConfirmCount || 0);
+            if (body.timezone) state.scheduleServerTz = body.timezone;
+            if (state.authStatus) {
+                state.authStatus.writeAuthorized = Boolean(body.writeAuthorized);
+                state.authStatus.mediaWriteAuthorized = Boolean(body.mediaWriteAuthorized);
+                if (typeof body.offlineRefreshable === "boolean") {
+                    state.authStatus.offlineRefreshable = body.offlineRefreshable;
+                }
+            }
+            state.scheduleAccess = {
+                allowed: body.scheduleAccessAllowed !== false,
+                followsAuthor: Boolean(body.followsAuthor),
+                authorInteractionRank: body.authorInteractionRank ?? null,
+                reason: body.scheduleLockedReason || ""
+            };
+
+            for (const watchedId of Array.from(state.watchedResendIds)) {
+                const match = state.scheduleJobs.find((j) => j.id === watchedId);
+                if (!match) {
+                    state.watchedResendIds.delete(watchedId);
+                } else if (match.status === "PUBLISHED") {
+                    state.watchedResendIds.delete(watchedId);
+                    showToast("定时推文已自动补发成功！");
+                } else if (match.status === "FAILED" || match.status === "OVERDUE_CONFIRM_REQUIRED") {
+                    state.watchedResendIds.delete(watchedId);
+                    showError(match.lastError || "定时推文补发未完成，请核对后重试");
+                }
+            }
+
+            if (
+                Array.isArray(state.scheduleDraftItems)
+                && state.scheduleDraftItems.length === 1
+                && !state.scheduleDraftItems[0].timeTouched
+                && !state.scheduleDraftItems[0].text.trim()
+                && !(state.scheduleDraftItems[0].files || []).length
+            ) {
+                const curEpoch = parseDraftItemEpochMs(state.scheduleDraftItems[0]);
+                const adjusted = computeNextAvailableScheduleMs(
+                    Number.isFinite(curEpoch) ? curEpoch : Date.now() + 30 * 60_000,
+                    getQueuedScheduledEpochsMs(),
+                    MIN_SCHEDULE_INTERVAL_MS
+                );
+                if (adjusted !== curEpoch) {
+                    state.scheduleDraftItems[0].scheduledAtValue = formatEpochToDatetimeLocalValue(adjusted);
+                    const domInput = document.querySelector('#scheduleDraftItemsList [data-draft-time="0"]');
+                    if (domInput) domInput.value = state.scheduleDraftItems[0].scheduledAtValue;
+                }
+            }
+            syncScheduleAuthBanner();
+            syncScheduleDraftConflictUI();
+            updateScheduleBadgesAndBanner();
+            renderScheduledTweetsList();
+            refreshSchedulePollingState();
+        } catch (err) {
+            if (!silent) showError(err.message || "加载定时推文列表失败");
+        }
+    }
+
+    async function submitCreateScheduledTweet() {
+        if (!isLoggedIn()) return;
+        if (hasScheduleAccessDecision() && !isScheduleEligible()) {
+            syncScheduleAuthBanner();
+            showError(getScheduleLockedReason());
+            return;
+        }
+        ensureScheduleDraftInitialized();
+        const items = state.scheduleDraftItems || [];
+        items.forEach((it, idx) => {
+            const taEl = document.querySelector(`#scheduleDraftItemsList [data-draft-textarea="${idx}"]`);
+            if (taEl) it.text = taEl.value || "";
+            const tiEl = document.querySelector(`#scheduleDraftItemsList [data-draft-time="${idx}"]`);
+            if (tiEl) it.scheduledAtValue = tiEl.value || "";
+        });
+
+        for (let i = 0; i < items.length; i++) {
+            const text = items[i].text || "";
+            const files = items[i].files || [];
+            if (!text.trim() && files.length === 0) {
+                showError(
+                    items.length > 1
+                        ? `第 ${i + 1} 条推文内容为空，请输入正文或添加图片（或移除该条）`
+                        : "请输入推文正文或至少添加 1 张图片"
+                );
+                document.querySelector(`#scheduleDraftItemsList [data-draft-textarea="${i}"]`)?.focus();
+                return;
+            }
+        }
+
+        const draftEpochs = items.map((it) => parseDraftItemEpochMs(it));
+        const validation = validateBatchScheduleEpochs(
+            draftEpochs,
+            getQueuedScheduledEpochsMs(),
+            Date.now(),
+            MIN_SCHEDULE_INTERVAL_MS
+        );
+        syncScheduleDraftConflictUI();
+        if (!validation.ok) {
+            showError(validation.error || "请检查定时时间，每条推文之间必须至少间隔 1 小时");
+            return;
+        }
+
+        const anyHasFiles = items.some((it) => (it.files || []).length > 0);
+        const needsWrite = !state.authStatus?.writeAuthorized;
+        const needsMedia = anyHasFiles && !state.authStatus?.mediaWriteAuthorized;
+        if (needsWrite || needsMedia) {
+            saveScheduleDraftForStepUpAuth();
+            if (anyHasFiles) {
+                document.getElementById("scheduleWriteAuthCard")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+                showError("请先点击上方「前往 X 授权」开通图文发布权限（返回后各条推文正文与时间会自动保留，本地图片需重新添加）");
+                return;
+            }
+            triggerXPublishAuth();
+            return;
+        }
+        if (!state.composerClientRequestId) {
+            rotateComposerRequestId();
+        }
+
+        const btn = $("createScheduleBtn");
+        btn.disabled = true;
+        btn.textContent = "提交中…";
+        try {
+            let resp;
+            if (items.length === 1) {
+                const fd = new FormData();
+                fd.append("text", items[0].text || "");
+                fd.append("scheduledAtEpochMs", String(draftEpochs[0]));
+                fd.append("clientRequestId", state.composerClientRequestId);
+                for (const media of items[0].files || []) {
+                    fd.append("files", media.file, media.name);
+                }
+                resp = await fetch("/api/scheduled-tweets", {
+                    method: "POST",
+                    body: fd
+                });
+            } else {
+                const fd = new FormData();
+                const metas = items.map((it, idx) => ({
+                    text: it.text || "",
+                    scheduledAtEpochMs: draftEpochs[idx],
+                    clientRequestId: `${state.composerClientRequestId}_${idx}`
+                }));
+                fd.append("itemsJson", JSON.stringify(metas));
+                items.forEach((it, idx) => {
+                    for (const media of it.files || []) {
+                        fd.append(`files_${idx}`, media.file, media.name);
+                    }
+                });
+                resp = await fetch("/api/scheduled-tweets/batch", {
+                    method: "POST",
+                    body: fd
+                });
+            }
+            const body = await safeParseJson(resp);
+            if (!resp.ok) {
+                throw new Error(body.message || `创建定时推文失败（HTTP ${resp.status}）`);
+            }
+            const submittedCount = items.length;
+            await loadScheduledTweets(true);
+            clearScheduleComposerDraft();
+            showToast(submittedCount > 1 ? `已批量加入 ${submittedCount} 条定时推文` : "已加入定时发布队列");
+        } catch (err) {
+            showError(err.message || "提交定时推文失败");
+        } finally {
+            btn.disabled = false;
+            syncScheduleAuthBanner();
+        }
+    }
+
+    async function submitConfirmResend(job) {
+        if (!job) return;
+        if (hasScheduleAccessDecision() && !isScheduleEligible()) {
+            showError(getScheduleLockedReason());
+            return;
+        }
+        const needsWrite = !state.authStatus?.writeAuthorized;
+        const needsMedia = (job.media || []).length > 0 && !state.authStatus?.mediaWriteAuthorized;
+        if (needsWrite || needsMedia) {
+            closeConfirmResendModal();
+            switchTab("schedule");
+            document.getElementById("scheduleWriteAuthCard")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+            showError("当前尚未开通或已过期定时发布授权，请先点击「前往 X 二次授权」完成后再确认补发");
+            return;
+        }
+        const submitBtn = $("confirmResendSubmitBtn");
+        submitBtn.disabled = true;
+        try {
+            const resp = await fetch(`/api/scheduled-tweets/${encodeURIComponent(job.id)}/confirm-resend`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ confirmToken: job.confirmToken })
+            });
+            const body = await safeParseJson(resp);
+            if (!resp.ok) {
+                throw new Error(body.message || `确认补发失败（HTTP ${resp.status}）`);
+            }
+            state.watchedResendIds.add(job.id);
+            closeConfirmResendModal();
+            showToast("已二次确认，正在自动补发…");
+            await loadScheduledTweets(true);
+        } catch (err) {
+            showError(err.message || "确认补发失败");
+            submitBtn.disabled = false;
+            await loadScheduledTweets(true);
+        }
+    }
+
+    async function submitBatchConfirmOverdue() {
+        if (hasScheduleAccessDecision() && !isScheduleEligible()) {
+            showError(getScheduleLockedReason());
+            return;
+        }
+        const eligible = (state.scheduleJobs || []).filter(
+            (j) => j.status === "OVERDUE_CONFIRM_REQUIRED" && !j.uncertainDelivery && j.confirmToken
+        );
+        if (!eligible.length) {
+            showToast("没有可批量确认的逾期推文");
+            return;
+        }
+        const hasAnyMedia = eligible.some((j) => (j.media || []).length > 0);
+        if (!state.authStatus?.writeAuthorized || (hasAnyMedia && !state.authStatus?.mediaWriteAuthorized)) {
+            switchTab("schedule");
+            document.getElementById("scheduleWriteAuthCard")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+            showError("当前尚未开通或已过期定时发布授权，请先点击「前往 X 二次授权」完成后再批量确认补发");
+            return;
+        }
+        const hasUncertain = (state.scheduleJobs || []).some(
+            (j) => j.status === "OVERDUE_CONFIRM_REQUIRED" && j.uncertainDelivery
+        );
+        const btn = $("batchConfirmOverdueBtn");
+        btn.disabled = true;
+        try {
+            const resp = await fetch("/api/scheduled-tweets/batch-confirm-resend", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    items: eligible.map((j) => ({ id: j.id, confirmToken: j.confirmToken }))
+                })
+            });
+            const body = await safeParseJson(resp);
+            if (!resp.ok) {
+                throw new Error(body.message || `批量确认失败（HTTP ${resp.status}）`);
+            }
+            eligible.forEach((j) => state.watchedResendIds.add(j.id));
+            showToast(
+                hasUncertain
+                    ? `已确认 ${eligible.length} 条逾期推文补发（状态存疑条目需单独核对后确认）`
+                    : `已确认 ${eligible.length} 条逾期推文，正在自动补发…`
+            );
+            await loadScheduledTweets(true);
+        } catch (err) {
+            showError(err.message || "批量确认失败");
+        } finally {
+            btn.disabled = false;
+        }
     }
 
     /* ==================== 事件绑定与初始化 ==================== */
@@ -2619,6 +5777,13 @@
             (e) => {
                 const t = e.target;
                 if (t && t.tagName === "IMG" && t.hasAttribute("data-avatar-fallback")) {
+                    const canonical = t.dataset ? t.dataset.canonicalSrc : "";
+                    if (canonical && String(t.src || "").startsWith("blob:") && t.dataset.retriedCanonical !== "1") {
+                        t.dataset.retriedCanonical = "1";
+                        mediaObjectUrlMap.delete(canonical);
+                        t.src = canonical;
+                        return;
+                    }
                     const fb = t.getAttribute("data-avatar-fallback") || "X";
                     const parent = t.parentElement;
                     t.remove();
@@ -2646,38 +5811,74 @@
             }
         });
 
-        // 手机端与桌面端点按柱状图/热力图格子即可查看对应时段明细（再点取消）
+        // 手机端支持点按与横向滑动扫读柱状图/热力图时段明细（再点取消）
         const bindTapReadout = (containerId, cellSelector, readoutId, getDefaultText) => {
             const box = document.getElementById(containerId);
             if (!box) return;
-            const handleActivate = (e) => {
-                const cell = e.target && e.target.closest ? e.target.closest(cellSelector) : null;
+            let scrubbedInGesture = false;
+            const applyCellSelection = (cell, toggleIfSame) => {
                 if (!cell || !cell.dataset.tip) return;
                 const wasSelected = cell.classList.contains("is-selected");
+                if (wasSelected && !toggleIfSame) return;
                 box.querySelectorAll(cellSelector).forEach((el) => el.classList.remove("is-selected"));
                 const out = $(readoutId);
-                if (wasSelected) {
-                    out.textContent = getDefaultText();
+                if (wasSelected && toggleIfSame) {
+                    const defTxt = getDefaultText();
+                    out.textContent = defTxt;
                     out.classList.remove("is-readout");
+                    out.hidden = !defTxt || (readoutId === "timingPeriodDesc" && defTxt === "北京时间");
                 } else {
                     cell.classList.add("is-selected");
+                    out.hidden = false;
                     out.textContent = cell.dataset.tip;
                     out.classList.add("is-readout");
                 }
             };
-            box.addEventListener("click", handleActivate);
+            box.addEventListener("touchstart", () => {
+                scrubbedInGesture = false;
+            }, { passive: true });
+            box.addEventListener("touchmove", (e) => {
+                if (!e.touches || e.touches.length !== 1) return;
+                const t = e.touches[0];
+                const hit = document.elementFromPoint(t.clientX, t.clientY);
+                const cell = hit && hit.closest ? hit.closest(cellSelector) : null;
+                if (cell && box.contains(cell)) {
+                    scrubbedInGesture = true;
+                    applyCellSelection(cell, false);
+                }
+            }, { passive: true });
+            box.addEventListener("click", (e) => {
+                if (scrubbedInGesture) {
+                    scrubbedInGesture = false;
+                    return;
+                }
+                const cell = e.target && e.target.closest ? e.target.closest(cellSelector) : null;
+                applyCellSelection(cell, true);
+            });
             box.addEventListener("keydown", (e) => {
                 if (e.key === "Enter" || e.key === " ") {
                     e.preventDefault();
-                    handleActivate(e);
+                    const cell = e.target && e.target.closest ? e.target.closest(cellSelector) : null;
+                    applyCellSelection(cell, true);
                 }
             });
         };
+        const mobileAlgoTextEl = document.getElementById("mobileAlgoStatusText");
+        if (mobileAlgoTextEl) {
+            const openTimingDiag = () => switchTab("timing");
+            mobileAlgoTextEl.addEventListener("click", openTimingDiag);
+            mobileAlgoTextEl.addEventListener("keydown", (e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    openTimingDiag();
+                }
+            });
+        }
         bindTapReadout(
             "dailyTrendChart",
             ".day-col[data-tip]",
             "trendChartSubtitle",
-            () => (state.report && state.report.activity ? state.report.activity.chartSubtitle : "点按或悬停柱体查看明细")
+            () => formatActivityTrendSummary(state.report)
         );
         bindTapReadout(
             "heatmapGridRows",
@@ -2687,32 +5888,61 @@
         );
 
         $("gateLoginBtn").addEventListener("click", triggerXOAuthLogin);
+        const profileBioEl = document.getElementById("profileBio");
+        if (profileBioEl) {
+            profileBioEl.addEventListener("click", () => {
+                profileBioEl.classList.toggle("is-expanded");
+            });
+        }
         const errCloseBtn = document.getElementById("errorToastCloseBtn");
         if (errCloseBtn) {
             errCloseBtn.addEventListener("click", hideError);
         }
 
-        const railHandleEl = document.getElementById("railHandle");
-        if (railHandleEl) {
-            railHandleEl.style.cursor = "pointer";
-            railHandleEl.addEventListener("click", async () => {
-                if (state.storedMode) return;
-                if (!isLoggedIn()) return;
-                const userId = stableUserId(state.authStatus.user);
-                const generation = state.authStatusGeneration;
-                try {
-                    const resp = await fetch("/api/usage/author-card", { cache: "no-store" });
-                    if (resp.ok) {
-                        const data = await safeParseJson(resp);
-                        if (generation !== state.authStatusGeneration || state.isLoggingOut || !isLoggedIn() ||
-                            stableUserId(state.authStatus.user) !== userId) return;
-                        if (data && data.authorProfile) {
-                            openAuthorPromptModal(data);
-                        }
+        const triggerOpenAuthorCard = async () => {
+            if (!isLoggedIn() || state.storedMode) {
+                openAuthorPromptModal(buildFallbackAuthorCardData());
+                return;
+            }
+            const userId = stableUserId(state.authStatus.user);
+            const generation = state.authStatusGeneration;
+            try {
+                const resp = await fetch("/api/usage/author-card", { cache: "no-store" });
+                if (resp.ok) {
+                    const data = await safeParseJson(resp);
+                    if (generation !== state.authStatusGeneration || state.isLoggingOut || !isLoggedIn() ||
+                        stableUserId(state.authStatus.user) !== userId) return;
+                    if (data && data.authorProfile) {
+                        openAuthorPromptModal(data);
+                        return;
                     }
-                } catch (_) {}
+                }
+            } catch (_) {}
+            openAuthorPromptModal(buildFallbackAuthorCardData());
+        };
+
+        ["openAuthorStoryBtn", "heroAuthorInfoBtn", "railAuthorBtn", "gateAuthorBtn"].forEach((btnId) => {
+            const el = document.getElementById(btnId);
+            if (el) {
+                el.addEventListener("click", triggerOpenAuthorCard);
+            }
+        });
+
+        const periodUnlockHelpBtn = document.getElementById("periodUnlockHelpBtn");
+        if (periodUnlockHelpBtn) {
+            periodUnlockHelpBtn.addEventListener("click", () => openUnlockGuideModal(null));
+        }
+
+        const unlockGuideModalEl = document.getElementById("unlockGuideModal");
+        if (unlockGuideModalEl) {
+            unlockGuideModalEl.addEventListener("click", (e) => {
+                if (e.target === unlockGuideModalEl) {
+                    closeUnlockGuideModal();
+                }
             });
         }
+        document.getElementById("unlockGuideCloseBtn")?.addEventListener("click", closeUnlockGuideModal);
+        document.getElementById("unlockGuideLaterBtn")?.addEventListener("click", closeUnlockGuideModal);
 
         const authorModalEl = document.getElementById("authorPromptModal");
         if (authorModalEl) {
@@ -2743,16 +5973,23 @@
         const doLogout = async () => {
             if (state.isLoggingOut) return;
             state.isLoggingOut = true;
+            const prevUserId = stableUserId(state.authStatus?.user) || state.boundUserId;
             cancelReportRequest();
             state.authStatusGeneration++;
             try {
                 const resp = await fetch("/api/auth/x/logout", { method: "POST" });
                 if (!resp.ok) throw new Error(`退出失败（HTTP ${resp.status}），请重试`);
+                clearProfileHeaderCache(prevUserId);
                 await fetchServerAndAuthStatus();
                 if (isLoggedIn()) throw new Error("退出未生效，当前账号仍保持登录，请重试");
                 resetUserScopedMemoryState();
                 state.boundUserId = "";
+                state.period = "HOURS_24";
+                state.days = 1;
+                if (typeof syncPeriodButtons === "function") syncPeriodButtons();
                 closeAuthorPromptModal();
+                if (typeof closeUnlockGuideModal === "function") closeUnlockGuideModal();
+                if (typeof closeConfirmResendModal === "function") closeConfirmResendModal();
                 if ($("peerSearchInput")) $("peerSearchInput").value = "";
                 if ($("followFilterInput")) $("followFilterInput").value = "";
                 if ($("draftSimulatorInput")) $("draftSimulatorInput").value = "";
@@ -2771,9 +6008,19 @@
             $("topbarLogoutBtn").addEventListener("click", doLogout);
         }
 
-        // 全局无侵入键盘快捷键（Esc 关闭作者弹层/错误提示/清空搜索框；1-5 切模块，M/W/D 秒切 30天/7天/48h）
+        // 全局无侵入键盘快捷键（Esc 关闭弹窗/错误提示/清空搜索框；1-6 切模块，M/W/D/T 秒切 30天/7天/48h/24h）
         document.addEventListener("keydown", (e) => {
             if (e.key === "Escape") {
+                const confirmModal = document.getElementById("confirmResendModal");
+                if (confirmModal && !confirmModal.hidden) {
+                    closeConfirmResendModal();
+                    return;
+                }
+                const unlockModal = document.getElementById("unlockGuideModal");
+                if (unlockModal && !unlockModal.hidden) {
+                    closeUnlockGuideModal();
+                    return;
+                }
                 const authorModal = document.getElementById("authorPromptModal");
                 if (authorModal && !authorModal.hidden) {
                     closeAuthorPromptModal();
@@ -2782,6 +6029,10 @@
                 const errEl = document.getElementById("errorToast");
                 if (errEl && !errEl.hidden) {
                     hideError();
+                    return;
+                }
+                if (state.algoConfigOpen) {
+                    openAlgoConfigDrawer(false);
                     return;
                 }
                 const activeEl = e.target;
@@ -2812,16 +6063,44 @@
                 "2": "interactions",
                 "3": "follow-audit",
                 "4": "timing",
-                "5": "circle"
+                "5": "circle",
+                "6": "schedule"
             };
             if (tabKeyMap[e.key]) {
                 switchTab(tabKeyMap[e.key]);
                 return;
             }
+            const periodOrder = ["HOURS_24", "HOURS_48", "WEEK", "MONTH"];
+            if (e.key === "[" || e.key === "]") {
+                const unlockedOrder = periodOrder.filter((c) => isPeriodUnlocked(c));
+                if (unlockedOrder.length > 1) {
+                    const curIdx = Math.max(0, unlockedOrder.indexOf(state.period));
+                    const nextIdx = e.key === "]"
+                        ? (curIdx + 1) % unlockedOrder.length
+                        : (curIdx - 1 + unlockedOrder.length) % unlockedOrder.length;
+                    const pMeta = PERIOD_META[unlockedOrder[nextIdx]];
+                    if (pMeta && state.period !== pMeta.code) {
+                        state.period = pMeta.code;
+                        state.days = pMeta.days;
+                        syncPeriodButtons();
+                        loadSelfReport(false);
+                        showToast(`已切换至${pMeta.badgePrefix}`);
+                    }
+                }
+                return;
+            }
             const up = String(e.key || "").toUpperCase();
-            if (up === "M" || up === "W" || up === "D") {
-                const pCode = up === "M" ? "MONTH" : up === "W" ? "WEEK" : "HOURS_48";
+            if (up === "T" || up === "D" || up === "W" || up === "M") {
+                const pCode = up === "M" ? "MONTH" : up === "W" ? "WEEK" : up === "D" ? "HOURS_48" : "HOURS_24";
                 const pMeta = PERIOD_META[pCode];
+                if (pMeta && !isPeriodUnlocked(pMeta.code)) {
+                    if (state.isFetching && !state.accessPolicy && !state.storedMode) {
+                        showToast("正在同步账号权限与报表数据，请稍候…");
+                        return;
+                    }
+                    openUnlockGuideModal(pMeta.code);
+                    return;
+                }
                 if (pMeta && state.period !== pMeta.code) {
                     state.period = pMeta.code;
                     state.days = pMeta.days;
@@ -2837,17 +6116,21 @@
                 window.location.href = $("storedReportLink").href;
                 return;
             }
-            // 有效缓存期内不重新拉取，完全到期后交由服务端判断更新
-            if (Date.now() < state.cacheExpiresEpochMs) {
-                return;
-            }
             loadSelfReport(true);
         });
 
-        // 月 / 周 / 日 三维度一键切换
+        // 24h / 48h / 7天 / 30天 四维度切换与锁定引导
         document.querySelectorAll(".seg-btn[data-period]").forEach((btn) => {
             btn.addEventListener("click", () => {
                 const pMeta = normalizePeriod(btn.dataset.period, btn.dataset.days);
+                if (!isPeriodUnlocked(pMeta.code)) {
+                    if (state.isFetching && !state.accessPolicy && !state.storedMode) {
+                        showToast("正在同步账号权限与报表数据，请稍候…");
+                        return;
+                    }
+                    openUnlockGuideModal(pMeta.code);
+                    return;
+                }
                 state.period = pMeta.code;
                 state.days = pMeta.days;
                 syncPeriodButtons();
@@ -2873,7 +6156,7 @@
         });
 
         const applyPeerRelFilter = (filterCode) => {
-            state.peerRelFilter = filterCode || "ALL";
+            state.peerRelFilter = filterCode && filterCode !== "ALL" ? filterCode : "MUTUAL";
             state.peerFilterTouched = true;
             state.peerRenderLimit = LIST_PAGE_SIZE;
             if (state.report) {
@@ -2891,10 +6174,14 @@
             const el = e.target && e.target.closest ? e.target.closest("[data-go]") : null;
             if (!el || !isLoggedIn()) return;
             e.preventDefault();
-            for (const part of String(el.dataset.go || "").split("|")) {
+            const rawGo = String(el.dataset.go || "");
+            const hasInPageTarget = rawGo.includes("scrollId:") || rawGo.includes("focusDraft:") || rawGo.includes("openAlgoConfig:");
+            for (const part of rawGo.split("|")) {
                 const [kind, val] = part.split(":");
                 if (kind === "tab" && val) {
-                    switchTab(val);
+                    if (!(hasInPageTarget && state.activeTab === val)) {
+                        switchTab(val);
+                    }
                 } else if (kind === "peerFilter") {
                     switchTab("interactions");
                     applyPeerRelFilter(val);
@@ -2908,6 +6195,8 @@
                 } else if (kind === "period" && val) {
                     const segBtn = document.querySelector(`.seg-btn[data-period="${val}"]`);
                     if (segBtn) segBtn.click();
+                } else if (kind === "unlockGuide") {
+                    openUnlockGuideModal(val && val !== "open" ? val : null);
                 } else if (kind === "clearPeerSearch") {
                     $("peerSearchInput").value = "";
                     state.peerSearchQuery = "";
@@ -2916,6 +6205,49 @@
                     $("followFilterInput").value = "";
                     state.followSearchQuery = "";
                     if (state.report) renderFollowAuditPanel(state.report);
+                } else if (kind === "focusDraft") {
+                    const inp = $("draftSimulatorInput");
+                    if (inp) {
+                        inp.scrollIntoView({ behavior: "smooth", block: "center" });
+                        inp.focus();
+                    }
+                } else if (kind === "scrollId" && val) {
+                    const targetEl = document.getElementById(val);
+                    if (targetEl) {
+                        targetEl.scrollIntoView({ behavior: "smooth", block: "center" });
+                        targetEl.classList.remove("is-target-flash");
+                        void targetEl.offsetWidth;
+                        targetEl.classList.add("is-target-flash");
+                        setTimeout(() => targetEl.classList.remove("is-target-flash"), 1400);
+                    }
+                } else if (kind === "goldenSlot") {
+                    const slots = state.report?.contentTiming?.goldenSlots || [];
+                    const slotIdx = Math.max(0, Number(val) || 0);
+                    const picked = slots[slotIdx] || slots[0];
+                    if (hasScheduleAccessDecision() && !isScheduleEligible()) {
+                        switchTab("schedule");
+                        syncScheduleAuthBanner();
+                        showError(getScheduleLockedReason());
+                    } else if (picked && picked.label) {
+                        const tz = state.scheduleServerTz || state.report?.contentTiming?.timezone || "Asia/Shanghai";
+                        const targetMs = computeNextGoldenSlotTimestampMs(picked.label, tz, Date.now());
+                        if (state.activeTab !== "schedule") switchTab("schedule");
+                        if (targetMs) {
+                            const adjustedMs = computeNextAvailableScheduleMs(
+                                targetMs,
+                                getQueuedScheduledEpochsMs(),
+                                MIN_SCHEDULE_INTERVAL_MS
+                            );
+                            applyEpochToActiveScheduleDraft(adjustedMs);
+                        }
+                        const activeIdx = state.activeScheduleDraftIdx || 0;
+                        document.querySelector(`#scheduleDraftItemsList [data-draft-textarea="${activeIdx}"]`)?.focus();
+                        showToast(`已填入黄金时段 ${picked.label}`);
+                    }
+                } else if (kind === "openAlgoConfig") {
+                    openAlgoConfigDrawer(true);
+                    const sec = $("algoPoolSection");
+                    if (sec) sec.scrollIntoView({ behavior: "smooth", block: "start" });
                 }
             }
         });
@@ -2991,6 +6323,43 @@
         if (draftMediaChk) {
             draftMediaChk.addEventListener("change", () => evaluatePrePostDraft());
         }
+        const draftThreadChk = $("draftIsThreadCheck");
+        if (draftThreadChk) {
+            draftThreadChk.addEventListener("change", () => evaluatePrePostDraft());
+        }
+        const topTweetsListEl = $("topTweetsList");
+        if (topTweetsListEl) {
+            topTweetsListEl.addEventListener("click", (e) => {
+                const btn = e.target && e.target.closest ? e.target.closest("[data-top-post-id]") : null;
+                if (!btn) return;
+                const postId = btn.dataset.topPostId;
+                const posts = state.report?.contentTiming?.topPosts || [];
+                const post = posts.find((item) => String(item.id) === String(postId));
+                if (!post) return;
+                loadDraftIntoSimulator(post.text || "", {
+                    hasMedia: Boolean(post.hasMedia),
+                    isThread: Boolean(post.isThread)
+                });
+            });
+        }
+        const toggleAlgoBtn = $("toggleAlgoConfigBtn");
+        if (toggleAlgoBtn) {
+            toggleAlgoBtn.addEventListener("click", () => {
+                openAlgoConfigDrawer(!state.algoConfigOpen);
+            });
+        }
+        const saveAlgoBtn = $("saveAlgoProfileBtn");
+        if (saveAlgoBtn) {
+            saveAlgoBtn.addEventListener("click", () => submitAlgoProfileAction("save"));
+        }
+        const reloadAlgoBtn = $("reloadAlgoProfileBtn");
+        if (reloadAlgoBtn) {
+            reloadAlgoBtn.addEventListener("click", () => submitAlgoProfileAction("reload"));
+        }
+        const resetAlgoBtn = $("resetAlgoProfileBtn");
+        if (resetAlgoBtn) {
+            resetAlgoBtn.addEventListener("click", () => submitAlgoProfileAction("reset"));
+        }
 
         // 模块 5：战报图隐私指标切换、2x PNG 下载与文案复制
         const privacyToggleBtn = $("toggleSharePrivacyBtn");
@@ -3036,6 +6405,354 @@
                 showToast("复制失败，请手动选中复制");
             }
         });
+
+        // 模块 6：战报图一键定时 & 图文定时工作台交互事件
+        $("scheduleShareCardBtn")?.addEventListener("click", () => {
+            if (!state.report) return;
+            if (hasScheduleAccessDecision() && !isScheduleEligible()) {
+                switchTab("schedule");
+                syncScheduleAuthBanner();
+                showError(getScheduleLockedReason());
+                return;
+            }
+            drawShareCardCanvas(state.report);
+            const canvas = $("shareCardCanvas");
+            const fileName = `x-ops-${state.period.toLowerCase()}-${state.report.profile.username}.png`;
+            const file = canvasToPngFile(canvas, fileName);
+            if (sendTextDraftToSchedule(getEffectiveShareTweetText(state.report), [file]) !== false) {
+                showToast("已将战报图与文案填入定时发布草稿");
+            }
+        });
+
+        $("goOverdueScheduleBtn")?.addEventListener("click", () => {
+            state.scheduleFilter = "ACTION_NEEDED";
+            document.querySelectorAll("#scheduleStatusFilterPills .pill-chip").forEach((c) => {
+                c.classList.toggle("active", c.dataset.sfilter === "ACTION_NEEDED");
+            });
+            switchTab("schedule");
+        });
+
+        $("addScheduleDraftItemBtn")?.addEventListener("click", () => {
+            if (hasScheduleAccessDecision() && !isScheduleEligible()) {
+                showError(getScheduleLockedReason());
+                return;
+            }
+            addNextScheduleDraftItem();
+        });
+
+        $("alignScheduleGapBtn")?.addEventListener("click", () => {
+            ensureScheduleDraftInitialized();
+            const rawEpochs = state.scheduleDraftItems.map((it) => parseDraftItemEpochMs(it));
+            const aligned = alignBatchScheduleEpochs(
+                rawEpochs,
+                getQueuedScheduledEpochsMs(),
+                Date.now(),
+                MIN_SCHEDULE_INTERVAL_MS
+            );
+            state.scheduleDraftItems.forEach((it, idx) => {
+                it.scheduledAtValue = formatEpochToDatetimeLocalValue(aligned[idx]);
+                it.timeTouched = true;
+                const domInput = document.querySelector(`#scheduleDraftItemsList [data-draft-time="${idx}"]`);
+                if (domInput) domInput.value = it.scheduledAtValue;
+            });
+            rotateComposerRequestId();
+            syncScheduleDraftConflictUI();
+            showToast("已按 1 小时间隔顺延对齐");
+        });
+
+        $("scheduleMediaFileInput")?.addEventListener("change", (e) => {
+            if (e.target.files && e.target.files.length) {
+                appendFilesToScheduleDraft(e.target.files, state.mediaPickerTargetIdx);
+                e.target.value = "";
+            }
+        });
+
+        const draftListEl = document.getElementById("scheduleDraftItemsList");
+        if (draftListEl) {
+            draftListEl.addEventListener("focusin", (e) => {
+                const card = e.target && e.target.closest ? e.target.closest("[data-draft-idx]") : null;
+                if (!card) return;
+                const idx = Number(card.dataset.draftIdx);
+                if (!Number.isInteger(idx) || idx < 0 || idx >= (state.scheduleDraftItems || []).length) return;
+                state.activeScheduleDraftIdx = idx;
+                const isSingle = state.scheduleDraftItems.length === 1;
+                draftListEl.querySelectorAll(".schedule-draft-item").forEach((el) => {
+                    el.classList.toggle("is-active", !isSingle && Number(el.dataset.draftIdx) === idx);
+                });
+            });
+
+            draftListEl.addEventListener("input", (e) => {
+                const ta = e.target && e.target.matches && e.target.matches("[data-draft-textarea]") ? e.target : null;
+                if (!ta) return;
+                const idx = Number(ta.dataset.draftTextarea);
+                const item = (state.scheduleDraftItems || [])[idx];
+                if (!item) return;
+                item.text = ta.value || "";
+                rotateComposerRequestId();
+                syncSingleDraftItemStats(idx);
+            });
+
+            draftListEl.addEventListener("change", (e) => {
+                const ti = e.target && e.target.matches && e.target.matches("[data-draft-time]") ? e.target : null;
+                if (!ti) return;
+                const idx = Number(ti.dataset.draftTime);
+                const item = (state.scheduleDraftItems || [])[idx];
+                if (!item) return;
+                item.scheduledAtValue = ti.value || "";
+                item.timeTouched = true;
+                cascadeSubsequentDraftEpochs(idx);
+                rotateComposerRequestId();
+                syncScheduleDraftConflictUI();
+            });
+
+            draftListEl.addEventListener("keydown", (e) => {
+                const ta = e.target && e.target.matches && e.target.matches("[data-draft-textarea]") ? e.target : null;
+                if (ta && (e.metaKey || e.ctrlKey) && e.key === "Enter") {
+                    e.preventDefault();
+                    submitCreateScheduledTweet();
+                }
+            });
+
+            draftListEl.addEventListener("paste", (e) => {
+                const ta = e.target && e.target.matches && e.target.matches("[data-draft-textarea]") ? e.target : null;
+                if (!ta) return;
+                const idx = Number(ta.dataset.draftTextarea);
+                const items = e.clipboardData && e.clipboardData.items ? Array.from(e.clipboardData.items) : [];
+                const pastedImages = items
+                    .filter((it) => it.kind === "file" && it.type && it.type.startsWith("image/"))
+                    .map((it) => it.getAsFile())
+                    .filter(Boolean);
+                if (pastedImages.length) {
+                    e.preventDefault();
+                    appendFilesToScheduleDraft(pastedImages, idx);
+                }
+            });
+
+            draftListEl.addEventListener("click", (e) => {
+                const btn = e.target && e.target.closest ? e.target.closest("[data-draft-action]") : null;
+                if (!btn) return;
+                const action = btn.dataset.draftAction;
+                const idx = Number(btn.dataset.draftIdx);
+                if (!Number.isInteger(idx) || idx < 0 || idx >= (state.scheduleDraftItems || []).length) return;
+
+                if (action === "add-media") {
+                    state.activeScheduleDraftIdx = idx;
+                    state.mediaPickerTargetIdx = idx;
+                    $("scheduleMediaFileInput").click();
+                } else if (action === "remove-media") {
+                    const mIdx = Number(btn.dataset.removeMediaIdx);
+                    const files = state.scheduleDraftItems[idx].files || [];
+                    if (!Number.isInteger(mIdx) || mIdx < 0 || mIdx >= files.length) return;
+                    const [removed] = files.splice(mIdx, 1);
+                    if (removed && removed.previewUrl && typeof URL !== "undefined" && URL.revokeObjectURL) {
+                        try { URL.revokeObjectURL(removed.previewUrl); } catch (_) {}
+                    }
+                    rotateComposerRequestId();
+                    renderScheduleDraftItems();
+                    syncScheduleAuthBanner();
+                } else if (action === "remove-item") {
+                    removeScheduleDraftItem(idx);
+                } else if (action === "check-algo") {
+                    const draftItem = (state.scheduleDraftItems || [])[idx];
+                    if (!draftItem) return;
+                    loadDraftIntoSimulator(draftItem.text || "", {
+                        hasMedia: (draftItem.files || []).length > 0,
+                        isThread: computeWeightedTweetLength(draftItem.text || "") > 280
+                    });
+                }
+            });
+        }
+
+        $("clearScheduleDraftBtn")?.addEventListener("click", () => {
+            clearScheduleComposerDraft();
+        });
+
+        const goldenSlotsGridEl = document.getElementById("goldenSlotsGrid");
+        if (goldenSlotsGridEl) {
+            const activateGoldenSlot = (e) => {
+                const card = e.target && e.target.closest ? e.target.closest(".golden-card[data-golden-slot]") : null;
+                if (!card || !isLoggedIn()) return;
+                const slotLabel = card.dataset.goldenSlot;
+                if (hasScheduleAccessDecision() && !isScheduleEligible()) {
+                    switchTab("schedule");
+                    syncScheduleAuthBanner();
+                    showError(getScheduleLockedReason());
+                    return;
+                }
+                const tz = state.scheduleServerTz || state.report?.contentTiming?.timezone || "Asia/Shanghai";
+                const targetMs = computeNextGoldenSlotTimestampMs(slotLabel, tz, Date.now());
+                switchTab("schedule");
+                if (targetMs) {
+                    const adjustedMs = computeNextAvailableScheduleMs(
+                        targetMs,
+                        getQueuedScheduledEpochsMs(),
+                        MIN_SCHEDULE_INTERVAL_MS
+                    );
+                    applyEpochToActiveScheduleDraft(adjustedMs);
+                }
+                const activeIdx = state.activeScheduleDraftIdx || 0;
+                document.querySelector(`#scheduleDraftItemsList [data-draft-textarea="${activeIdx}"]`)?.focus();
+                showToast(`已填入黄金时段 ${slotLabel}`);
+            };
+            goldenSlotsGridEl.addEventListener("click", activateGoldenSlot);
+            goldenSlotsGridEl.addEventListener("keydown", (e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    activateGoldenSlot(e);
+                }
+            });
+        }
+
+        const schedComposeCard = document.getElementById("scheduleComposeCard");
+        if (schedComposeCard) {
+            let dragDepth = 0;
+            schedComposeCard.addEventListener("dragenter", (e) => {
+                if (!e.dataTransfer || !Array.from(e.dataTransfer.types || []).includes("Files")) return;
+                e.preventDefault();
+                dragDepth++;
+                schedComposeCard.classList.add("is-dragover");
+            });
+            schedComposeCard.addEventListener("dragover", (e) => {
+                if (!e.dataTransfer || !Array.from(e.dataTransfer.types || []).includes("Files")) return;
+                e.preventDefault();
+                e.dataTransfer.dropEffect = "copy";
+                schedComposeCard.classList.add("is-dragover");
+            });
+            schedComposeCard.addEventListener("dragleave", () => {
+                dragDepth = Math.max(0, dragDepth - 1);
+                if (dragDepth === 0) schedComposeCard.classList.remove("is-dragover");
+            });
+            schedComposeCard.addEventListener("drop", (e) => {
+                dragDepth = 0;
+                schedComposeCard.classList.remove("is-dragover");
+                if (!e.dataTransfer || !e.dataTransfer.files || !e.dataTransfer.files.length) return;
+                e.preventDefault();
+                if (hasScheduleAccessDecision() && !isScheduleEligible()) {
+                    showError(getScheduleLockedReason());
+                    return;
+                }
+                const dropCard = e.target && e.target.closest ? e.target.closest("[data-draft-idx]") : null;
+                const dropIdx = dropCard ? Number(dropCard.dataset.draftIdx) : state.activeScheduleDraftIdx;
+                appendFilesToScheduleDraft(e.dataTransfer.files, dropIdx);
+            });
+        }
+
+        $("scheduleQuickSlotChips")?.addEventListener("click", (e) => {
+            const chip = e.target && e.target.closest ? e.target.closest("[data-quick-epoch]") : null;
+            if (!chip) return;
+            const ms = Number(chip.dataset.quickEpoch);
+            if (Number.isFinite(ms)) {
+                applyEpochToActiveScheduleDraft(ms);
+            }
+        });
+
+        $("createScheduleBtn")?.addEventListener("click", submitCreateScheduledTweet);
+        $("triggerPublishAuthBtn")?.addEventListener("click", triggerXPublishAuth);
+        $("refreshScheduleListBtn")?.addEventListener("click", () => loadScheduledTweets(false));
+        $("batchConfirmOverdueBtn")?.addEventListener("click", submitBatchConfirmOverdue);
+
+        $("scheduleStatusFilterPills")?.querySelectorAll(".pill-chip").forEach((chip) => {
+            chip.addEventListener("click", () => {
+                state.scheduleFilter = chip.dataset.sfilter || "ALL";
+                $("scheduleStatusFilterPills").querySelectorAll(".pill-chip").forEach((c) => {
+                    c.classList.toggle("active", c === chip);
+                });
+                renderScheduledTweetsList();
+            });
+        });
+
+        $("scheduledTweetsList")?.addEventListener("click", async (e) => {
+            const btn = e.target && e.target.closest ? e.target.closest("[data-job-action]") : null;
+            if (!btn) return;
+            const action = btn.dataset.jobAction;
+            const jobId = btn.dataset.jobId;
+            const job = (state.scheduleJobs || []).find((j) => j.id === jobId);
+            if (!job) return;
+
+            if (action === "open-confirm") {
+                if (hasScheduleAccessDecision() && !isScheduleEligible()) {
+                    showError(getScheduleLockedReason());
+                    return;
+                }
+                openConfirmResendModal(job);
+            } else if (action === "toggle-reschedule") {
+                state.rescheduleEditingJobId = state.rescheduleEditingJobId === jobId ? null : jobId;
+                renderScheduledTweetsList();
+            } else if (action === "close-reschedule") {
+                state.rescheduleEditingJobId = null;
+                renderScheduledTweetsList();
+            } else if (action === "save-reschedule") {
+                if (hasScheduleAccessDecision() && !isScheduleEligible()) {
+                    showError(getScheduleLockedReason());
+                    return;
+                }
+                const input = document.querySelector(`[data-resched-input="${CSS.escape(jobId)}"]`);
+                const nextMs = input && input.value ? new Date(input.value).getTime() : NaN;
+                if (!Number.isFinite(nextMs) || nextMs < Date.now() + 15_000) {
+                    showError("新定时时间需晚于当前时间至少 15 秒");
+                    return;
+                }
+                const otherQueued = getQueuedScheduledEpochsMs(jobId);
+                if (otherQueued.some((qMs) => Math.abs(nextMs - qMs) < MIN_SCHEDULE_INTERVAL_MS)) {
+                    showError("改期时间与队列中其他待发布推文间隔不足 1 小时（每条推文之间必须至少间隔 1 小时）");
+                    return;
+                }
+                btn.disabled = true;
+                try {
+                    const resp = await fetch(`/api/scheduled-tweets/${encodeURIComponent(jobId)}/reschedule`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ scheduledAtEpochMs: nextMs })
+                    });
+                    const body = await safeParseJson(resp);
+                    if (!resp.ok) throw new Error(body.message || `改期失败（HTTP ${resp.status}）`);
+                    state.rescheduleEditingJobId = null;
+                    showToast("已重新排期");
+                    await loadScheduledTweets(true);
+                } catch (err) {
+                    showError(err.message || "改期失败");
+                    btn.disabled = false;
+                }
+            } else if (action === "cancel") {
+                btn.disabled = true;
+                try {
+                    const resp = await fetch(`/api/scheduled-tweets/${encodeURIComponent(jobId)}/cancel`, { method: "POST" });
+                    const body = await safeParseJson(resp);
+                    if (!resp.ok) throw new Error(body.message || `取消失败（HTTP ${resp.status}）`);
+                    showToast("已取消该定时任务");
+                    await loadScheduledTweets(true);
+                } catch (err) {
+                    showError(err.message || "取消失败");
+                    btn.disabled = false;
+                }
+            } else if (action === "delete") {
+                btn.disabled = true;
+                try {
+                    const resp = await fetch(`/api/scheduled-tweets/${encodeURIComponent(jobId)}`, { method: "DELETE" });
+                    const body = await safeParseJson(resp);
+                    if (!resp.ok) throw new Error(body.message || `删除失败（HTTP ${resp.status}）`);
+                    showToast("已删除定时记录");
+                    await loadScheduledTweets(true);
+                } catch (err) {
+                    showError(err.message || "删除失败");
+                    btn.disabled = false;
+                }
+            }
+        });
+
+        const confirmModal = document.getElementById("confirmResendModal");
+        if (confirmModal) {
+            confirmModal.addEventListener("click", (e) => {
+                if (e.target === confirmModal) closeConfirmResendModal();
+            });
+        }
+        $("confirmResendCloseBtn")?.addEventListener("click", closeConfirmResendModal);
+        $("confirmResendCancelBtn")?.addEventListener("click", closeConfirmResendModal);
+        $("confirmResendSubmitBtn")?.addEventListener("click", () => {
+            if (state.pendingConfirmJob) {
+                submitConfirmResend(state.pendingConfirmJob);
+            }
+        });
     }
 
     async function init() {
@@ -3054,8 +6771,10 @@
         state.storedMode = urlParams.get("stored") === "true";
         const urlPeriod = urlParams.get("period");
         const urlDays = urlParams.get("days");
+        const urlTab = urlParams.get("tab");
         const authResult = urlParams.get("auth");
         const authErr = urlParams.get("auth_error");
+        const publishAuthErr = urlParams.get("publish_auth_error");
 
         if (urlPeriod || urlDays) {
             const pMeta = normalizePeriod(urlPeriod, urlDays);
@@ -3066,14 +6785,23 @@
         bindEvents();
 
         try {
-            await fetchServerAndAuthStatus();
+            await Promise.all([
+                fetchServerAndAuthStatus(),
+                fetchAlgoProfileStatus()
+            ]);
         } catch (_) {
             showError("无法连接后端服务，请稍后刷新重试");
             return;
         }
 
-        if (authResult === "ok") {
+        if (authResult === "publish_ok") {
+            showToast("定时发布二次授权已开通！长效离线刷新已启用");
+            cleanAuthQueryParams();
+        } else if (authResult === "ok") {
             showToast("X 授权登录成功！已进入您本人的专属运营工作台");
+            cleanAuthQueryParams();
+        } else if (publishAuthErr) {
+            showError(publishAuthErr);
             cleanAuthQueryParams();
         } else if (authErr) {
             showError(authErr);
@@ -3081,6 +6809,16 @@
         }
 
         if (isLoggedIn()) {
+            const validTabs = new Set(["activity", "interactions", "follow-audit", "timing", "circle", "schedule"]);
+            if (urlTab === "schedule" || authResult === "publish_ok" || publishAuthErr) {
+                switchTab("schedule");
+                restoreScheduleDraftAfterStepUpAuth();
+            } else if (urlTab && validTabs.has(urlTab)) {
+                switchTab(urlTab);
+            }
+            if (state.activeTab !== "schedule") {
+                void loadScheduledTweets(true);
+            }
             await loadSelfReport(false);
             if (!state.storedMode && isLoggedIn()) {
                 await checkinWorkspaceUsage();
@@ -3092,6 +6830,8 @@
         const u = new URL(window.location.href);
         u.searchParams.delete("auth");
         u.searchParams.delete("auth_error");
+        u.searchParams.delete("publish_auth_error");
+        u.searchParams.delete("tab");
         u.searchParams.delete("user");
         window.history.replaceState({}, "", u.toString());
     }

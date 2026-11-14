@@ -13,14 +13,17 @@ import com.xops.hub.model.RawSnapshotModels.RelationshipEntry;
 import com.xops.hub.model.RawSnapshotModels.TweetKind;
 import com.xops.hub.model.RawSnapshotModels.XUserSummary;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
-import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -28,6 +31,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 
@@ -43,6 +47,12 @@ public final class AccountStore {
     public static final Duration RETENTION = Duration.ofHours(721);
     private static final int REPLY_TEXT_MAX = 120;
     private static final int BIO_MAX = 100;
+    private static final int MAX_READ_CACHE_ENTRIES = 64;
+
+    private record CachedDiskStore(byte[] gzBytes, StoredAccount store) {
+    }
+
+    private static final ConcurrentHashMap<Path, CachedDiskStore> READ_CACHE = new ConcurrentHashMap<>();
 
     private AccountStore() {
     }
@@ -59,10 +69,16 @@ public final class AccountStore {
             @JsonProperty("b") String bio,
             @JsonProperty("id") String id,
             @JsonProperty("p") int totalPosts,
-            @JsonProperty("j") String joinedDate
+            @JsonProperty("j") String joinedDate,
+            @JsonProperty("va") long verifiedAt
     ) {
+        public StoredUser(String displayName, String avatarUrl, boolean verified, int followers, int following, String bio,
+                String id, int totalPosts, String joinedDate) {
+            this(displayName, avatarUrl, verified, followers, following, bio, id, totalPosts, joinedDate, 0L);
+        }
+
         public StoredUser(String displayName, String avatarUrl, boolean verified, int followers, int following, String bio) {
-            this(displayName, avatarUrl, verified, followers, following, bio, null, 0, null);
+            this(displayName, avatarUrl, verified, followers, following, bio, null, 0, null, 0L);
         }
     }
 
@@ -81,10 +97,17 @@ public final class AccountStore {
             @JsonProperty("r") String inReplyToId,
             @JsonProperty("mt") long metricsFetchedAt,
             @JsonProperty("ma") long metricsAttemptedAt,
-            @JsonProperty("um") @JsonInclude(JsonInclude.Include.ALWAYS) Set<String> unavailableMetrics
+            @JsonProperty("um") @JsonInclude(JsonInclude.Include.ALWAYS) Set<String> unavailableMetrics,
+            @JsonProperty("mo") boolean metricsTimeObserved
     ) {
         public StoredTweet {
             unavailableMetrics = unavailableMetrics == null ? RawTweet.ALL_METRICS : Set.copyOf(unavailableMetrics);
+        }
+        public StoredTweet(String id, long createdAt, char kind, String text, String target, List<String> mentions,
+                int flags, long[] stats, String conversationId, String inReplyToId, long metricsFetchedAt, long metricsAttemptedAt,
+                Set<String> unavailableMetrics) {
+            this(id, createdAt, kind, text, target, mentions, flags, stats, conversationId, inReplyToId,
+                    metricsFetchedAt, metricsAttemptedAt, unavailableMetrics, false);
         }
         public StoredTweet(String id, long createdAt, char kind, String text, String target, List<String> mentions,
                 int flags, long[] stats, String conversationId, String inReplyToId, long metricsFetchedAt, long metricsAttemptedAt) {
@@ -133,8 +156,20 @@ public final class AccountStore {
             @JsonProperty("gy") boolean followingsTruncated,
             @JsonProperty("gf") boolean graphRefreshFailed,
             @JsonProperty("re") List<RelationshipEvidence> relationshipEvidence,
-            @JsonProperty("ra") Map<String, Long> relationshipAttemptedAt
+            @JsonProperty("ra") Map<String, Long> relationshipAttemptedAt,
+            @JsonProperty("ds") long dailyRefreshStartedAt,
+            @JsonProperty("df") long dailyRefreshedAt
     ) {
+        public StoredAccount(int version, XUserSummary profile, long syncedAt, Map<String, StoredUser> users,
+                List<StoredTweet> tweets, List<StoredInbound> inbound, List<long[]> tweetCoverage,
+                List<long[]> inboundCoverage, List<String> followings, List<String> followers,
+                List<String> explicitFollowedBy, long graphFetchedAt, boolean followersTruncated,
+                boolean followingsTruncated, boolean graphRefreshFailed, List<RelationshipEvidence> relationshipEvidence,
+                Map<String, Long> relationshipAttemptedAt) {
+            this(version, profile, syncedAt, users, tweets, inbound, tweetCoverage, inboundCoverage,
+                    followings, followers, explicitFollowedBy, graphFetchedAt, followersTruncated,
+                    followingsTruncated, graphRefreshFailed, relationshipEvidence, relationshipAttemptedAt, 0, 0);
+        }
         public StoredAccount(int version, XUserSummary profile, long syncedAt, Map<String, StoredUser> users,
                 List<StoredTweet> tweets, List<StoredInbound> inbound, List<long[]> tweetCoverage,
                 List<long[]> inboundCoverage, List<String> followings, List<String> followers,
@@ -273,6 +308,16 @@ public final class AccountStore {
             List<long[]> newInboundCoverage,
             GraphUpdate graph
     ) {
+        return merge(base, profile, syncedAt, newTweets, newInbound, newTweetCoverage, newInboundCoverage, graph, Map.of());
+    }
+
+    /** Stream coverage keeps its anchor; per-record metric timestamps describe when the response was observed. */
+    public static StoredAccount merge(
+            StoredAccount base, XUserSummary profile, Instant syncedAt,
+            List<RawTweet> newTweets, List<InboundInteraction> newInbound,
+            List<long[]> newTweetCoverage, List<long[]> newInboundCoverage, GraphUpdate graph,
+            Map<String, Long> metricsObservedAt
+    ) {
         StoredAccount b = base != null ? base : empty();
         if (b.profile() != null) {
             if (profile == null || b.profile().id() == null || b.profile().id().isBlank()
@@ -288,6 +333,7 @@ public final class AccountStore {
         String selfKey = profile != null ? key(profile.username()) : (b.profile() != null ? key(b.profile().username()) : "");
         long minKeep = syncedAt.minus(RETENTION).getEpochSecond();
 
+        long syncEpoch = syncedAt.getEpochSecond();
         Map<String, StoredUser> users = new LinkedHashMap<>(b.users());
         Map<String, StoredTweet> tweets = new LinkedHashMap<>();
         for (StoredTweet t : b.tweets()) {
@@ -298,9 +344,9 @@ public final class AccountStore {
                 continue;
             }
             if (t.targetUser() != null) {
-                putUser(users, t.targetUser());
+                putUser(users, t.targetUser(), syncEpoch);
             }
-            StoredTweet next = toStored(t, syncedAt.getEpochSecond());
+            StoredTweet next = toStored(t, metricsObservedAt.getOrDefault(t.id(), syncEpoch), metricsObservedAt.containsKey(t.id()));
             StoredTweet previous = tweets.get(t.id());
             if (previous != null && !next.unavailableMetrics().isEmpty()) {
                 long[] stats = next.stats() != null ? next.stats().clone() : new long[5];
@@ -315,7 +361,7 @@ public final class AccountStore {
                 }
                 next = new StoredTweet(next.id(), next.createdAt(), next.kind(), next.text(), next.target(), next.mentions(),
                         next.flags(), stats, next.conversationId(), next.inReplyToId(), previous.metricsFetchedAt(),
-                        next.metricsAttemptedAt(), unavailable);
+                        next.metricsAttemptedAt(), unavailable, previous.metricsTimeObserved());
             }
             tweets.put(t.id(), next);
         }
@@ -327,7 +373,7 @@ public final class AccountStore {
             if (i == null || i.peer() == null || i.createdAt() == null) {
                 continue;
             }
-            putUser(users, i.peer());
+            putUser(users, i.peer(), syncEpoch);
             String id = (i.tweetId() == null || i.tweetId().isBlank())
                     ? ("x" + i.createdAt().getEpochSecond() + key(i.peer().username()))
                     : i.tweetId();
@@ -362,7 +408,7 @@ public final class AccountStore {
             if (!graph.followingsFailed()) {
                 followings = new ArrayList<>();
                 for (XUserSummary u : graph.followings()) {
-                    putUser(users, u);
+                    putUser(users, u, syncEpoch);
                     followings.add(key(u.username()));
                 }
                 explicitBack = new ArrayList<>(graph.explicitFollowedBy());
@@ -379,7 +425,7 @@ public final class AccountStore {
                         followersTruncated = true;
                         continue;
                     }
-                    putUser(users, u);
+                    putUser(users, u, syncEpoch);
                     followers.add(key(u.username()));
                 }
             }
@@ -394,6 +440,18 @@ public final class AccountStore {
         });
         keptInbound.forEach(i -> referenced.add(i.peer()));
         users.keySet().retainAll(referenced);
+
+        List<RelationshipEvidence> rawEvidence = graph != null ? graph.relationshipEvidence() : b.relationshipEvidence();
+        List<RelationshipEvidence> keptEvidence = rawEvidence.stream()
+                .filter(e -> e != null && e.checkedAt() >= minKeep)
+                .toList();
+        Map<String, Long> rawAttempted = graph != null ? graph.relationshipAttemptedAt() : b.relationshipAttemptedAt();
+        Map<String, Long> keptAttempted = new LinkedHashMap<>();
+        rawAttempted.forEach((k, ts) -> {
+            if (k != null && ts != null && ts >= minKeep) {
+                keptAttempted.put(k, ts);
+            }
+        });
 
         long syncedAtEpoch = Math.max(b.syncedAt(), syncedAt.getEpochSecond());
         return new StoredAccount(
@@ -410,8 +468,80 @@ public final class AccountStore {
                 explicitBack,
                 graphAt,
                 followersTruncated, followingsTruncated, graphRefreshFailed,
-                graph != null ? graph.relationshipEvidence() : b.relationshipEvidence(),
-                graph != null ? graph.relationshipAttemptedAt() : b.relationshipAttemptedAt()
+                keptEvidence,
+                keptAttempted,
+                b.dailyRefreshStartedAt(), b.dailyRefreshedAt()
+        );
+    }
+
+    /**
+     * 按给定基准时间动态裁剪保留近 30 天（721 小时）滚动窗口数据，自动淘汰过期动态、互动、覆盖区间与不再被引用的推友字典。
+     */
+    public static StoredAccount pruneToRollingWindow(StoredAccount s, Instant referenceNow) {
+        if (s == null) {
+            return null;
+        }
+        Instant ref = referenceNow != null
+                ? referenceNow
+                : (s.syncedAtInstant() != null ? s.syncedAtInstant() : Instant.now());
+        long minKeep = ref.minus(RETENTION).getEpochSecond();
+
+        boolean hasStaleTweet = s.tweets().stream().anyMatch(t -> t.createdAt() < minKeep);
+        boolean hasStaleInbound = s.inbound().stream().anyMatch(i -> i.createdAt() < minKeep);
+        boolean hasStaleTc = s.tweetCoverage().stream().anyMatch(iv -> iv != null && iv.length == 2 && iv[0] < minKeep);
+        boolean hasStaleIc = s.inboundCoverage().stream().anyMatch(iv -> iv != null && iv.length == 2 && iv[0] < minKeep);
+        boolean hasStaleEvidence = s.relationshipEvidence().stream().anyMatch(e -> e == null || e.checkedAt() < minKeep);
+        boolean hasStaleAttempt = s.relationshipAttemptedAt().values().stream().anyMatch(ts -> ts == null || ts < minKeep);
+        if (!hasStaleTweet && !hasStaleInbound && !hasStaleTc && !hasStaleIc && !hasStaleEvidence && !hasStaleAttempt) {
+            return s;
+        }
+
+        List<StoredTweet> keptTweets = s.tweets().stream()
+                .filter(t -> t.createdAt() >= minKeep)
+                .sorted(Comparator.comparingLong(StoredTweet::createdAt).reversed())
+                .toList();
+        List<StoredInbound> keptInbound = s.inbound().stream()
+                .filter(i -> i.createdAt() >= minKeep)
+                .sorted(Comparator.comparingLong(StoredInbound::createdAt).reversed())
+                .toList();
+        List<RelationshipEvidence> keptEvidence = s.relationshipEvidence().stream()
+                .filter(e -> e != null && e.checkedAt() >= minKeep)
+                .toList();
+        Map<String, Long> keptAttempted = new LinkedHashMap<>();
+        s.relationshipAttemptedAt().forEach((k, ts) -> {
+            if (k != null && ts != null && ts >= minKeep) {
+                keptAttempted.put(k, ts);
+            }
+        });
+
+        Map<String, StoredUser> users = new LinkedHashMap<>(s.users());
+        Set<String> referenced = new HashSet<>(s.followings());
+        referenced.addAll(s.followers());
+        keptTweets.forEach(t -> {
+            if (t.target() != null) referenced.add(t.target());
+        });
+        keptInbound.forEach(i -> referenced.add(i.peer()));
+        users.keySet().retainAll(referenced);
+
+        return new StoredAccount(
+                s.version(),
+                s.profile(),
+                s.syncedAt(),
+                users,
+                new ArrayList<>(keptTweets),
+                new ArrayList<>(keptInbound),
+                clipIntervals(s.tweetCoverage(), minKeep),
+                clipIntervals(s.inboundCoverage(), minKeep),
+                s.followings(),
+                s.followers(),
+                s.explicitFollowedBy(),
+                s.graphFetchedAt(),
+                s.followersTruncated(),
+                s.followingsTruncated(),
+                s.graphRefreshFailed(),
+                keptEvidence,
+                keptAttempted,
+                s.dailyRefreshStartedAt(), s.dailyRefreshedAt()
         );
     }
 
@@ -420,24 +550,67 @@ public final class AccountStore {
         Set<String> attempted = new HashSet<>(ids);
         List<StoredTweet> tweets = s.tweets().stream().map(t -> !attempted.contains(t.id()) ? t :
                 new StoredTweet(t.id(), t.createdAt(), t.kind(), t.text(), t.target(), t.mentions(), t.flags(),
-                        t.stats(), t.conversationId(), t.inReplyToId(), t.metricsFetchedAt(), attemptedAt.getEpochSecond(), t.unavailableMetrics())).toList();
+                        t.stats(), t.conversationId(), t.inReplyToId(), t.metricsFetchedAt(), attemptedAt.getEpochSecond(),
+                        t.unavailableMetrics(), t.metricsTimeObserved())).toList();
         return new StoredAccount(s.version(), s.profile(), s.syncedAt(), s.users(), tweets, s.inbound(),
                 s.tweetCoverage(), s.inboundCoverage(), s.followings(), s.followers(), s.explicitFollowedBy(),
-                s.graphFetchedAt(), s.followersTruncated(), s.followingsTruncated(), s.graphRefreshFailed(), s.relationshipEvidence(), s.relationshipAttemptedAt());
+                s.graphFetchedAt(), s.followersTruncated(), s.followingsTruncated(), s.graphRefreshFailed(), s.relationshipEvidence(), s.relationshipAttemptedAt(), s.dailyRefreshStartedAt(), s.dailyRefreshedAt());
+    }
+
+    /** 剔除上游已确认删除/不可见的推文记录，避免已删推文持续污染 24h 计数并阻塞完整刷新标记。 */
+    public static StoredAccount withoutTweets(StoredAccount s, Collection<String> deletedIds) {
+        if (s == null || deletedIds == null || deletedIds.isEmpty()) {
+            return s;
+        }
+        Set<String> removed = deletedIds instanceof Set<String> set ? set : new HashSet<>(deletedIds);
+        List<StoredTweet> keptTweets = s.tweets().stream()
+                .filter(t -> !removed.contains(t.id()))
+                .toList();
+        if (keptTweets.size() == s.tweets().size()) {
+            return s;
+        }
+        Map<String, StoredUser> users = new LinkedHashMap<>(s.users());
+        Set<String> referenced = new HashSet<>(s.followings());
+        referenced.addAll(s.followers());
+        keptTweets.forEach(t -> {
+            if (t.target() != null) referenced.add(t.target());
+        });
+        s.inbound().forEach(i -> referenced.add(i.peer()));
+        users.keySet().retainAll(referenced);
+        return new StoredAccount(s.version(), s.profile(), s.syncedAt(), users, new ArrayList<>(keptTweets), s.inbound(),
+                s.tweetCoverage(), s.inboundCoverage(), s.followings(), s.followers(), s.explicitFollowedBy(),
+                s.graphFetchedAt(), s.followersTruncated(), s.followingsTruncated(), s.graphRefreshFailed(),
+                s.relationshipEvidence(), s.relationshipAttemptedAt(), s.dailyRefreshStartedAt(), s.dailyRefreshedAt());
     }
 
     /** 整次同步失败时，保留历史数据，但逐人核验不能继续作为本轮确认结果。 */
     public static StoredAccount withoutRelationshipEvidence(StoredAccount s) {
         return new StoredAccount(s.version(), s.profile(), s.syncedAt(), s.users(), s.tweets(), s.inbound(),
                 s.tweetCoverage(), s.inboundCoverage(), s.followings(), s.followers(), s.explicitFollowedBy(),
-                s.graphFetchedAt(), s.followersTruncated(), s.followingsTruncated(), s.graphRefreshFailed(), List.of(), s.relationshipAttemptedAt());
+                s.graphFetchedAt(), s.followersTruncated(), s.followingsTruncated(), s.graphRefreshFailed(), List.of(), s.relationshipAttemptedAt(), s.dailyRefreshStartedAt(), s.dailyRefreshedAt());
     }
 
     public static StoredAccount withRelationshipEvidence(StoredAccount s, List<RelationshipEvidence> evidence,
             Map<String, Long> attemptedAt) {
         return new StoredAccount(s.version(), s.profile(), s.syncedAt(), s.users(), s.tweets(), s.inbound(),
                 s.tweetCoverage(), s.inboundCoverage(), s.followings(), s.followers(), s.explicitFollowedBy(),
-                s.graphFetchedAt(), s.followersTruncated(), s.followingsTruncated(), s.graphRefreshFailed(), evidence, attemptedAt);
+                s.graphFetchedAt(), s.followersTruncated(), s.followingsTruncated(), s.graphRefreshFailed(), evidence, attemptedAt, s.dailyRefreshStartedAt(), s.dailyRefreshedAt());
+    }
+
+    /** The completed timestamp advances only after both daily streams and their metric refresh finish. */
+    public static StoredAccount withDailyRefreshState(StoredAccount s, long startedAt, long completedAt) {
+        return new StoredAccount(s.version(), s.profile(), s.syncedAt(), s.users(), s.tweets(), s.inbound(),
+                s.tweetCoverage(), s.inboundCoverage(), s.followings(), s.followers(), s.explicitFollowedBy(),
+                s.graphFetchedAt(), s.followersTruncated(), s.followingsTruncated(), s.graphRefreshFailed(),
+                s.relationshipEvidence(), s.relationshipAttemptedAt(), startedAt, completedAt);
+    }
+
+    /** Keep observed rows while replacing coverage claims whose source cannot be proven. */
+    public static StoredAccount withCoverage(StoredAccount s, List<long[]> tweets, List<long[]> inbound) {
+        return new StoredAccount(s.version(), s.profile(), s.syncedAt(), s.users(), s.tweets(), s.inbound(),
+                tweets, inbound, s.followings(), s.followers(), s.explicitFollowedBy(),
+                s.graphFetchedAt(), s.followersTruncated(), s.followingsTruncated(), s.graphRefreshFailed(),
+                s.relationshipEvidence(), s.relationshipAttemptedAt(), s.dailyRefreshStartedAt(), s.dailyRefreshedAt());
     }
 
     public record GraphUpdate(
@@ -561,35 +734,70 @@ public final class AccountStore {
         if (file == null || !Files.isRegularFile(file)) {
             return null;
         }
-        try (InputStream in = new GZIPInputStream(Files.newInputStream(file))) {
-            StoredAccount s = mapper.readValue(in, StoredAccount.class);
-            return s != null && s.version() == VERSION ? s : null;
+        Path cacheKey = file.toAbsolutePath().normalize();
+        try {
+            byte[] gz = Files.readAllBytes(file);
+            CachedDiskStore cached = READ_CACHE.get(cacheKey);
+            if (cached != null && Arrays.equals(cached.gzBytes(), gz)) {
+                return cached.store();
+            }
+            try (InputStream in = new GZIPInputStream(new ByteArrayInputStream(gz))) {
+                StoredAccount s = mapper.readValue(in, StoredAccount.class);
+                StoredAccount valid = s != null && s.version() == VERSION ? s : null;
+                if (valid != null) {
+                    cacheDiskStore(cacheKey, gz, valid);
+                } else {
+                    READ_CACHE.remove(cacheKey);
+                }
+                return valid;
+            }
         } catch (Exception e) {
             return null;
         }
     }
 
     public static void write(Path file, StoredAccount s, ObjectMapper mapper) throws java.io.IOException {
+        StoredAccount normalized = s != null && s.syncedAtInstant() != null
+                ? pruneToRollingWindow(s, s.syncedAtInstant())
+                : s;
+        ByteArrayOutputStream buf = new ByteArrayOutputStream(32_768);
+        try (GZIPOutputStream out = new GZIPOutputStream(buf)) {
+            mapper.writeValue(out, normalized);
+        }
+        byte[] gz = buf.toByteArray();
         Files.createDirectories(file.getParent());
         Path tmp = file.resolveSibling(file.getFileName() + "."
                 + java.util.concurrent.ThreadLocalRandom.current().nextLong(1_000_000_000L) + ".tmp");
         try {
-            try (OutputStream out = new GZIPOutputStream(Files.newOutputStream(tmp))) {
-                mapper.writeValue(out, s);
-            }
+            Files.write(tmp, gz);
             try {
                 Files.move(tmp, file, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
             } catch (Exception e) {
                 Files.move(tmp, file, StandardCopyOption.REPLACE_EXISTING);
+            }
+            if (normalized != null && normalized.version() == VERSION) {
+                cacheDiskStore(file.toAbsolutePath().normalize(), gz, normalized);
+            } else {
+                READ_CACHE.remove(file.toAbsolutePath().normalize());
             }
         } finally {
             Files.deleteIfExists(tmp);
         }
     }
 
+    private static void cacheDiskStore(Path key, byte[] gzBytes, StoredAccount store) {
+        if (READ_CACHE.size() >= MAX_READ_CACHE_ENTRIES && !READ_CACHE.containsKey(key)) {
+            var it = READ_CACHE.keySet().iterator();
+            if (it.hasNext()) {
+                READ_CACHE.remove(it.next());
+            }
+        }
+        READ_CACHE.put(key, new CachedDiskStore(gzBytes, store));
+    }
+
     // ==================== 字段转换 ====================
 
-    private static StoredTweet toStored(RawTweet t, long metricsFetchedAt) {
+    private static StoredTweet toStored(RawTweet t, long metricsFetchedAt, boolean metricsTimeObserved) {
         char k = switch (t.kind()) {
             case POST -> 'P';
             case REPLY -> 'R';
@@ -620,7 +828,7 @@ public final class AccountStore {
                 allZero ? null : stats,
                 cv.equals(t.id()) ? null : (cv.isEmpty() ? "-" : cv),
                 emptyToNull(nz(t.inReplyToId())), t.unavailableMetrics().isEmpty() ? metricsFetchedAt : 0,
-                metricsFetchedAt, t.unavailableMetrics()
+                metricsFetchedAt, t.unavailableMetrics(), metricsTimeObserved && t.unavailableMetrics().isEmpty()
         );
     }
 
@@ -670,29 +878,88 @@ public final class AccountStore {
         );
     }
 
-    private static void putUser(Map<String, StoredUser> users, XUserSummary u) {
+    private static void putUser(Map<String, StoredUser> users, XUserSummary u, long nowEpoch) {
         if (u == null || u.username() == null || u.username().isBlank()) {
             return;
         }
         String k = key(u.username());
         StoredUser prev = users.get(k);
+        boolean sameAccount = prev == null || emptyToNull(u.id()) == null || prev.id() == null
+                || u.id().equals(prev.id());
+        boolean nextVerified = u.verified();
+        long nextVerifiedAt = u.verified() ? nowEpoch : 0L;
+        if (prev != null && sameAccount) {
+            boolean within15Days = prev.verifiedAt() > 0L && nowEpoch - prev.verifiedAt() < BlueVerifiedCache.TTL_SECONDS;
+            if (prev.verified() && (within15Days || prev.verifiedAt() == 0L)) {
+                // 蓝V以第一次为主，15天内不被无蓝V字段的列表接口覆盖
+                nextVerified = true;
+                nextVerifiedAt = prev.verifiedAt() > 0L ? prev.verifiedAt() : nowEpoch;
+            } else if (within15Days) {
+                nextVerified = prev.verified();
+                nextVerifiedAt = prev.verifiedAt();
+            } else if (!prev.verified() && prev.verifiedAt() == 0L && u.verified()) {
+                nextVerified = true;
+                nextVerifiedAt = nowEpoch;
+            }
+        }
+
         StoredUser next = new StoredUser(
                 emptyToNull(u.displayName() != null && !u.displayName().equals(u.username()) ? u.displayName() : null),
                 emptyToNull(u.avatarUrl()),
-                u.verified(),
+                nextVerified,
                 Math.max(0, u.followersCount()),
                 Math.max(0, u.followingCount()),
                 emptyToNull(clip(u.bio(), BIO_MAX)),
-                emptyToNull(u.id()), u.totalPostsCount(), emptyToNull(u.joinedDate())
+                emptyToNull(u.id()), u.totalPostsCount(), emptyToNull(u.joinedDate()),
+                nextVerifiedAt
         );
         // 只用信息更完整的资料覆盖（推文里附带的用户信息有时比关注列表更简略）
-        if (prev == null || (next.id() != null && !next.id().equals(prev.id())) || richness(next) >= richness(prev)) {
-            if (prev != null && next.id() == null) {
+        if (prev == null || !sameAccount || richness(next) >= richness(prev)) {
+            if (prev != null && sameAccount && next.id() == null) {
                 next = new StoredUser(next.displayName(), next.avatarUrl(), next.verified(), next.followers(), next.following(),
-                        next.bio(), prev.id(), next.totalPosts(), next.joinedDate());
+                        next.bio(), prev.id(), next.totalPosts(), next.joinedDate(), next.verifiedAt());
             }
             users.put(k, next);
+        } else if (prev.verified() != nextVerified || prev.verifiedAt() != nextVerifiedAt) {
+            users.put(k, new StoredUser(prev.displayName(), prev.avatarUrl(), nextVerified, prev.followers(),
+                    prev.following(), prev.bio(), prev.id(), prev.totalPosts(), prev.joinedDate(), nextVerifiedAt));
         }
+    }
+
+    /** 用全局 15 天蓝V缓存及批量补充的用户资料回填账户字典（以第一次观测为主，满 15 天刷新）。 */
+    public static StoredAccount applyBlueVerifiedCache(
+            StoredAccount s,
+            Map<String, XUserSummary> extraUsersByHandle,
+            BlueVerifiedCache cache,
+            long nowEpoch
+    ) {
+        if (s == null) {
+            return null;
+        }
+        Map<String, StoredUser> users = new LinkedHashMap<>(s.users());
+        if (extraUsersByHandle != null) {
+            extraUsersByHandle.values().forEach(u -> putUser(users, u, nowEpoch));
+        }
+        if (cache != null) {
+            for (Map.Entry<String, StoredUser> entry : new ArrayList<>(users.entrySet())) {
+                StoredUser u = entry.getValue();
+                if (u == null) continue;
+                BlueVerifiedCache.Entry cached = cache.resolveValidEntry(u.id(), entry.getKey(), nowEpoch);
+                if (cached != null) {
+                    boolean keepFirst = u.verifiedAt() > 0L && nowEpoch - u.verifiedAt() < BlueVerifiedCache.TTL_SECONDS;
+                    boolean resolvedV = keepFirst ? u.verified() : cached.verified();
+                    long resolvedAt = keepFirst ? u.verifiedAt() : cached.firstObservedAt();
+                    if (u.verified() != resolvedV || u.verifiedAt() != resolvedAt) {
+                        users.put(entry.getKey(), new StoredUser(u.displayName(), u.avatarUrl(), resolvedV, u.followers(),
+                                u.following(), u.bio(), u.id(), u.totalPosts(), u.joinedDate(), resolvedAt));
+                    }
+                }
+            }
+        }
+        return new StoredAccount(s.version(), s.profile(), s.syncedAt(), users, s.tweets(), s.inbound(),
+                s.tweetCoverage(), s.inboundCoverage(), s.followings(), s.followers(), s.explicitFollowedBy(),
+                s.graphFetchedAt(), s.followersTruncated(), s.followingsTruncated(), s.graphRefreshFailed(),
+                s.relationshipEvidence(), s.relationshipAttemptedAt(), s.dailyRefreshStartedAt(), s.dailyRefreshedAt());
     }
 
     private static int richness(StoredUser u) {

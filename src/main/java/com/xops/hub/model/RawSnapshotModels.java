@@ -1,6 +1,7 @@
 package com.xops.hub.model;
 
 import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 
 import java.time.Instant;
 import java.util.List;
@@ -43,6 +44,7 @@ public final class RawSnapshotModels {
         MENTION_ME
     }
 
+    @JsonIgnoreProperties(ignoreUnknown = true)
     public record XUserSummary(
             String id,
             String username,
@@ -53,8 +55,27 @@ public final class RawSnapshotModels {
             int followersCount,
             int followingCount,
             int totalPostsCount,
-            String joinedDate
+            String joinedDate,
+            String bannerUrl
     ) {
+        public XUserSummary {
+            bannerUrl = bannerUrl == null ? "" : bannerUrl;
+        }
+
+        public XUserSummary(
+                String id,
+                String username,
+                String displayName,
+                String avatarUrl,
+                String bio,
+                boolean verified,
+                int followersCount,
+                int followingCount,
+                int totalPostsCount,
+                String joinedDate
+        ) {
+            this(id, username, displayName, avatarUrl, bio, verified, followersCount, followingCount, totalPostsCount, joinedDate, "");
+        }
     }
 
     public record RawTweet(

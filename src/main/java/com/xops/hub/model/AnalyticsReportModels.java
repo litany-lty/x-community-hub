@@ -1,7 +1,9 @@
 package com.xops.hub.model;
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 public final class AnalyticsReportModels {
@@ -219,8 +221,34 @@ public final class AnalyticsReportModels {
             int viewSampleCount,
             int likeSampleCount,
             int replySampleCount,
-            int engagementRateSampleCount
+            int engagementRateSampleCount,
+            double avgBookmarks,
+            int bookmarkSampleCount,
+            int avgAlgoScore,
+            int algoScoreSampleCount,
+            String algoAdvice
     ) {
+        public ContentFormatStat {
+            algoAdvice = algoAdvice == null ? "" : algoAdvice;
+        }
+
+        public ContentFormatStat(
+                String formatCode,
+                String formatLabel,
+                int postCount,
+                long avgViews,
+                double avgLikes,
+                double avgReplies,
+                double avgEngagementRatePct,
+                int viewSampleCount,
+                int likeSampleCount,
+                int replySampleCount,
+                int engagementRateSampleCount
+        ) {
+            this(formatCode, formatLabel, postCount, avgViews, avgLikes, avgReplies, avgEngagementRatePct,
+                    viewSampleCount, likeSampleCount, replySampleCount, engagementRateSampleCount,
+                    0.0, 0, 0, 0, "");
+        }
     }
 
     public record TopPostCard(
@@ -252,7 +280,129 @@ public final class AnalyticsReportModels {
     ) {
     }
 
+    // 运营推荐动作条目（由当前生效的 X 算法规则与本周期真实样本生成）
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public record OpsRecommendationItem(
+            String code,
+            String priority,
+            String signalTag,
+            String title,
+            String detail,
+            String actionTarget,
+            String externalUrl
+    ) {
+    }
+
+    // 基于本账号历史公开样本反推的算法校准、LOOCV 回测、残差异常与规则检查 V2 数据包
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public record CalibrationPostSample(
+            String id,
+            String createdLabel,
+            String formatCode,
+            int cleanCharLen,
+            boolean structuredList,
+            boolean hasQuestion,
+            boolean hasExternalLink,
+            String externalDomain,
+            boolean authorEngaged,
+            boolean activeSlotHit,
+            long viewCount,
+            double followerReachMultiple,
+            double realizedVmUtilityPer1k,
+            int rankPercentile,
+            List<String> shingles,
+            String textPreview,
+            String tweetUrl
+    ) {
+        public CalibrationPostSample {
+            shingles = shingles == null ? List.of() : List.copyOf(shingles);
+            externalDomain = externalDomain == null ? "" : externalDomain;
+            textPreview = textPreview == null ? "" : textPreview;
+            tweetUrl = tweetUrl == null ? "" : tweetUrl;
+        }
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public record ResidualAnomalyPost(
+            String id,
+            String createdLabel,
+            String textPreview,
+            long actualViews,
+            long expectedViewsFloor,
+            double realizedVmUtilityPer1k,
+            String tweetUrl,
+            String reasonHint
+    ) {
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public record DomainReachStat(
+            String domain,
+            int postCount,
+            long avgViews,
+            int vsNativePct,
+            boolean shortenerDomain
+    ) {
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public record ReplyTemplateRiskSummary(
+            int evaluatedReplyCount,
+            int duplicateReplyCount,
+            int maxClusterSize,
+            boolean copyPastaRiskTriggered,
+            String sampleTemplateText
+    ) {
+        public static ReplyTemplateRiskSummary empty() {
+            return new ReplyTemplateRiskSummary(0, 0, 0, false, "");
+        }
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public record EmpiricalAlgoCalibration(
+            int samplePostCount,
+            int minRequiredSamples,
+            boolean predictionUnlocked,
+            boolean mutualShareKnown,
+            double mutualCommenterSharePct,
+            double inferredEffectiveReplyWeight,
+            long p25Views,
+            long medianViews,
+            long p75Views,
+            double medianFollowerReachMultiple,
+            double medianVmUtilityPer1k,
+            boolean coldStartEligibleAccount,
+            int coldStartPassCount,
+            double coldStartPassRatePct,
+            double loocvMaePercentile,
+            double loocvBandHitRatePct,
+            int loocvHalfBandWidth,
+            List<ResidualAnomalyPost> residualAnomalies,
+            List<DomainReachStat> domainStats,
+            ReplyTemplateRiskSummary replyTemplateRisk,
+            List<CalibrationPostSample> corpusSamples
+    ) {
+        public EmpiricalAlgoCalibration {
+            residualAnomalies = residualAnomalies == null ? List.of() : List.copyOf(residualAnomalies);
+            domainStats = domainStats == null ? List.of() : List.copyOf(domainStats);
+            replyTemplateRisk = replyTemplateRisk == null ? ReplyTemplateRiskSummary.empty() : replyTemplateRisk;
+            corpusSamples = corpusSamples == null ? List.of() : List.copyOf(corpusSamples);
+        }
+
+        public static EmpiricalAlgoCalibration empty() {
+            return new EmpiricalAlgoCalibration(
+                    0, 6, false,
+                    false, 0.0, 5.0,
+                    0L, 0L, 0L, 0.0, 0.0,
+                    false, 0, 0.0,
+                    0.0, 0.0, 16,
+                    List.of(), List.of(), ReplyTemplateRiskSummary.empty(), List.of()
+            );
+        }
+    }
+
     // X 开源推荐算法（xai-org/x-algorithm）分发健康度与限流自检摘要
+    @JsonIgnoreProperties(ignoreUnknown = true)
     public record AlgorithmHealthSummary(
             String healthLevel,
             String healthTitle,
@@ -284,8 +434,70 @@ public final class AnalyticsReportModels {
             int controversySampleCount,
             boolean recentComparisonAvailable,
             boolean linkComparisonAvailable,
-            String metricsNote
+            String metricsNote,
+            String algoVersion,
+            String algoName,
+            int authorEngagedPostCount,
+            List<OpsRecommendationItem> opsRecommendations,
+            EmpiricalAlgoCalibration calibration
     ) {
+        public AlgorithmHealthSummary {
+            algoVersion = algoVersion == null ? "" : algoVersion;
+            algoName = algoName == null ? "" : algoName;
+            opsRecommendations = opsRecommendations == null ? List.of() : List.copyOf(opsRecommendations);
+            calibration = calibration == null ? EmpiricalAlgoCalibration.empty() : calibration;
+        }
+
+        public AlgorithmHealthSummary(
+                String healthLevel, String healthTitle, String healthSummary,
+                int evaluatedPostCount, int outOfNetworkPostCount, int inNetworkPostCount,
+                int lowReachPostCount, double outOfNetworkRatePct, int rapidFirePostCount,
+                Instant latestMainPostAt, String diversityAdvice, int externalLinkPostCount,
+                long externalLinkAvgViews, long nativePostAvgViews, int linkViewLossPct,
+                int controversyRiskPostCount, String contentRuleAdvice, boolean exposureCliffDrop,
+                int recentVsBaselinePct, boolean underTheHoodEligible, String underTheHoodHint,
+                String underTheHoodUrl, int viewSampleCount, int externalLinkViewSampleCount,
+                int nativeViewSampleCount, int recentViewSampleCount, int baselineViewSampleCount,
+                int controversySampleCount, boolean recentComparisonAvailable,
+                boolean linkComparisonAvailable, String metricsNote,
+                String algoVersion, String algoName, int authorEngagedPostCount,
+                List<OpsRecommendationItem> opsRecommendations
+        ) {
+            this(healthLevel, healthTitle, healthSummary, evaluatedPostCount, outOfNetworkPostCount,
+                    inNetworkPostCount, lowReachPostCount, outOfNetworkRatePct, rapidFirePostCount,
+                    latestMainPostAt, diversityAdvice, externalLinkPostCount, externalLinkAvgViews,
+                    nativePostAvgViews, linkViewLossPct, controversyRiskPostCount, contentRuleAdvice,
+                    exposureCliffDrop, recentVsBaselinePct, underTheHoodEligible, underTheHoodHint,
+                    underTheHoodUrl, viewSampleCount, externalLinkViewSampleCount, nativeViewSampleCount,
+                    recentViewSampleCount, baselineViewSampleCount, controversySampleCount,
+                    recentComparisonAvailable, linkComparisonAvailable, metricsNote,
+                    algoVersion, algoName, authorEngagedPostCount, opsRecommendations,
+                    EmpiricalAlgoCalibration.empty());
+        }
+
+        public AlgorithmHealthSummary(
+                String healthLevel, String healthTitle, String healthSummary,
+                int evaluatedPostCount, int outOfNetworkPostCount, int inNetworkPostCount,
+                int lowReachPostCount, double outOfNetworkRatePct, int rapidFirePostCount,
+                Instant latestMainPostAt, String diversityAdvice, int externalLinkPostCount,
+                long externalLinkAvgViews, long nativePostAvgViews, int linkViewLossPct,
+                int controversyRiskPostCount, String contentRuleAdvice, boolean exposureCliffDrop,
+                int recentVsBaselinePct, boolean underTheHoodEligible, String underTheHoodHint,
+                String underTheHoodUrl, int viewSampleCount, int externalLinkViewSampleCount,
+                int nativeViewSampleCount, int recentViewSampleCount, int baselineViewSampleCount,
+                int controversySampleCount, boolean recentComparisonAvailable,
+                boolean linkComparisonAvailable, String metricsNote
+        ) {
+            this(healthLevel, healthTitle, healthSummary, evaluatedPostCount, outOfNetworkPostCount,
+                    inNetworkPostCount, lowReachPostCount, outOfNetworkRatePct, rapidFirePostCount,
+                    latestMainPostAt, diversityAdvice, externalLinkPostCount, externalLinkAvgViews,
+                    nativePostAvgViews, linkViewLossPct, controversyRiskPostCount, contentRuleAdvice,
+                    exposureCliffDrop, recentVsBaselinePct, underTheHoodEligible, underTheHoodHint,
+                    underTheHoodUrl, viewSampleCount, externalLinkViewSampleCount, nativeViewSampleCount,
+                    recentViewSampleCount, baselineViewSampleCount, controversySampleCount,
+                    recentComparisonAvailable, linkComparisonAvailable, metricsNote,
+                    "", "", 0, List.of(), EmpiricalAlgoCalibration.empty());
+        }
     }
 
     public record ContentTimingOverview(
@@ -362,6 +574,37 @@ public final class AnalyticsReportModels {
     ) {
     }
 
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public record AccessPolicy(
+            int accumulatedDays,
+            boolean followsAuthor,
+            String authorHandle,
+            Integer authorInteractionRank,
+            boolean top5FullAccess,
+            boolean top50AutoSync,
+            List<String> unlockedPeriods,
+            Map<String, String> lockedReasons,
+            int dailyRefreshLimit,
+            int dailyRefreshUsed,
+            int dailyRefreshRemaining,
+            String quotaDate,
+            boolean accumulatedSummaryMode,
+            String accumulationNote,
+            String authorStatement,
+            String repoUrl,
+            boolean scheduledPublishAllowed,
+            String scheduledPublishLockedReason
+    ) {
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public record DailyCacheStatus(
+            Instant snapshotAt, Instant cycleStartedAt, Instant lastCompletedAt,
+            boolean timelineCovered, boolean inboundCovered, int recentPosts, int recentInbound, int pendingMetricPosts,
+            int unattemptedMetricPosts, boolean canContinue, boolean lastAttemptDegraded,
+            Instant timelineCoveredFrom, Instant inboundCoveredFrom, Instant latestMetricFetchedAt
+    ) {}
+
     public record MultiPeriodDashboardBundle(
             CommunityDashboardReport month,
             CommunityDashboardReport week,
@@ -369,8 +612,23 @@ public final class AnalyticsReportModels {
             int coveredWindowDays,
             boolean hasMoreHistoryForTarget,
             Instant coveredUntil,
-            int pendingRelationshipChecks
+            int pendingRelationshipChecks,
+            CommunityDashboardReport hours24,
+            AccessPolicy accessPolicy,
+            DailyCacheStatus dailyCacheStatus
     ) {
+        public MultiPeriodDashboardBundle(CommunityDashboardReport month, CommunityDashboardReport week,
+                CommunityDashboardReport day, int coveredWindowDays, boolean hasMoreHistoryForTarget,
+                Instant coveredUntil, int pendingRelationshipChecks, CommunityDashboardReport hours24, AccessPolicy accessPolicy) {
+            this(month, week, day, coveredWindowDays, hasMoreHistoryForTarget, coveredUntil, pendingRelationshipChecks,
+                    hours24, accessPolicy, null);
+        }
+
+        public MultiPeriodDashboardBundle withDailyCacheStatus(DailyCacheStatus status) {
+            return new MultiPeriodDashboardBundle(month, week, day, coveredWindowDays, hasMoreHistoryForTarget,
+                    coveredUntil, pendingRelationshipChecks, hours24, accessPolicy, status);
+        }
+
         @com.fasterxml.jackson.annotation.JsonCreator
         public MultiPeriodDashboardBundle {
             // 0 表示尚无完整窗口的证据；旧数据缺失该字段也保持未知，不能补成完整 30 天。
@@ -379,9 +637,17 @@ public final class AnalyticsReportModels {
 
         public MultiPeriodDashboardBundle(
                 CommunityDashboardReport month, CommunityDashboardReport week, CommunityDashboardReport day,
+                int coveredWindowDays, boolean hasMoreHistoryForTarget, Instant coveredUntil,
+                int pendingRelationshipChecks
+        ) {
+            this(month, week, day, coveredWindowDays, hasMoreHistoryForTarget, coveredUntil, pendingRelationshipChecks, null, null);
+        }
+
+        public MultiPeriodDashboardBundle(
+                CommunityDashboardReport month, CommunityDashboardReport week, CommunityDashboardReport day,
                 int coveredWindowDays, boolean hasMoreHistoryForTarget, Instant coveredUntil
         ) {
-            this(month, week, day, coveredWindowDays, hasMoreHistoryForTarget, coveredUntil, 0);
+            this(month, week, day, coveredWindowDays, hasMoreHistoryForTarget, coveredUntil, 0, null, null);
         }
 
         public MultiPeriodDashboardBundle(
@@ -389,7 +655,7 @@ public final class AnalyticsReportModels {
                 CommunityDashboardReport week,
                 CommunityDashboardReport day
         ) {
-            this(month, week, day, 0, false, null, 0);
+            this(month, week, day, 0, false, null, 0, null, null);
         }
     }
 
@@ -423,8 +689,30 @@ public final class AnalyticsReportModels {
             boolean oauthConfigured,
             String suggestedCallbackUrl,
             boolean loggedIn,
-            AuthenticatedXUser user
+            AuthenticatedXUser user,
+            boolean writeAuthorized,
+            boolean mediaWriteAuthorized,
+            boolean offlineRefreshable
     ) {
+        public AuthStatusResponse(
+                boolean oauthConfigured,
+                String suggestedCallbackUrl,
+                boolean loggedIn,
+                AuthenticatedXUser user,
+                boolean writeAuthorized,
+                boolean mediaWriteAuthorized
+        ) {
+            this(oauthConfigured, suggestedCallbackUrl, loggedIn, user, writeAuthorized, mediaWriteAuthorized, false);
+        }
+
+        public AuthStatusResponse(
+                boolean oauthConfigured,
+                String suggestedCallbackUrl,
+                boolean loggedIn,
+                AuthenticatedXUser user
+        ) {
+            this(oauthConfigured, suggestedCallbackUrl, loggedIn, user, false, false, false);
+        }
     }
 
     public record UsageCheckinResponse(

@@ -6,6 +6,8 @@
     <meta name="theme-color" id="metaThemeColor" content="#000000" />
     <title>X 社区运营工作台 · Community Ops Hub</title>
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%23000'/%3E%3Cpath fill='%23fff' d='M17.53 3h2.93l-6.4 7.32L21.6 21h-5.9l-4.62-6.04L5.8 21H2.86l6.85-7.83L2.48 3h6.05l4.18 5.52L17.53 3zm-1.03 16.24h1.62L7.65 4.67H5.9l10.6 14.57z'/%3E%3C/svg%3E" />
+    <link rel="preconnect" href="https://pbs.twimg.com" crossorigin />
+    <link rel="dns-prefetch" href="https://pbs.twimg.com" />
     <script>
         try {
             var t = localStorage.getItem("xops_theme");
@@ -16,7 +18,7 @@
             }
         } catch (_) {}
     </script>
-    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/styles.css?v=20261115j" />
 </head>
 <body>
 <div class="x-shell">
@@ -59,13 +61,23 @@
                     <svg viewBox="0 0 24 24" class="nav-icon"><path d="M12 2l2.9 6.26L22 9.27l-5 4.87 1.18 6.86L12 17.77 5.82 21 7 14.14 2 9.27l7.1-1.01L12 2z"/></svg>
                     <span class="nav-label">战报</span>
                 </button>
+
+                <button class="nav-item" data-tab="schedule" type="button">
+                    <svg viewBox="0 0 24 24" class="nav-icon"><path d="M7 2v2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2h-2V2h-2v2H9V2H7zm12 8H5v10h14V10zm-5.5 2v3.7l2.9 1.7-.75 1.3L12 16.5V12h1.5z"/></svg>
+                    <span class="nav-label">定时</span>
+                    <span class="nav-badge" id="navScheduleBadge" hidden title="逾期待确认或待发布推文数">0</span>
+                </button>
             </nav>
 
             <div class="rail-actions">
-                <div class="rail-utility-row single-col">
+                <div class="rail-utility-row">
                     <button class="utility-btn icon-only" id="cycleThemeBtn" type="button" title="切换主题" aria-label="切换主题">
                         <svg viewBox="0 0 24 24" class="sm-icon" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.389 5.389 0 0 1-4.4 2.26 5.403 5.403 0 0 1-3.14-9.8c-.44-.06-.9-.1-1.36-.1z"/></svg>
                         <span class="theme-btn-text">主题</span>
+                    </button>
+                    <button class="utility-btn" id="railAuthorBtn" type="button" title="查看作者 @elidlicom 主页介绍与开源说明" aria-label="查看作者信息">
+                        <svg viewBox="0 0 24 24" class="sm-icon" aria-hidden="true"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 4a3 3 0 1 1 0 6 3 3 0 0 1 0-6zm0 14a7.96 7.96 0 0 1-6-2.72c.03-1.99 4-3.08 6-3.08 1.99 0 5.97 1.09 6 3.08A7.96 7.96 0 0 1 12 20z"/></svg>
+                        <span class="rail-author-btn-text">作者信息</span>
                     </button>
                 </div>
             </div>
@@ -104,19 +116,16 @@
                         <span class="theme-btn-text">纯黑</span>
                     </button>
                 </div>
-                <h1 class="auth-gate-title">登录 X 账号授权，查看您的专属运营报表</h1>
-                <p class="auth-gate-desc">
-                    仅可查看你本人账号，默认展示「48小时动态窗口」，可切换 7 天 / 30 天。
-                </p>
+                <h1 class="auth-gate-title">X 运营工作台</h1>
 
                 <div class="auth-policy-grid">
                     <div class="auth-policy-item">
-                        <div class="policy-head">仅限本人</div>
-                        <p>X 官方 OAuth 授权，只读 <code>users.read</code> / <code>tweet.read</code>，不发帖、不改关注、不读私信。</p>
+                        <div class="policy-head">默认只读 · 按需二次授权</div>
+                        <p>登录仅读本人公开数据；定时发推与传图在使用时单独授权。</p>
                     </div>
                     <div class="auth-policy-item">
-                        <div class="policy-head">30 天入库 · 5 分钟缓存</div>
-                        <p>近 30 天数据保存在服务器，每次只拉取新增部分；5 分钟内重复打开直接读缓存。</p>
+                        <div class="policy-head">单次 24h · 30天滚动落盘</div>
+                        <p>默认加载近 24 小时并每日物理存储，滚动保留 30 天解锁 48h / 7天 / 30天。</p>
                     </div>
                 </div>
 
@@ -127,14 +136,16 @@
                     </button>
                 </div>
 
+                <div class="auth-gate-footer">
+                    <button type="button" class="gate-author-btn" id="gateAuthorBtn">作者 @elidlicom · 个人介绍与开源说明</button>
+                </div>
+
                 <!-- 若服务端 application.yml 尚未填写 oauth-client-id，向站长展示纯只读指引 -->
                 <div id="oauthAdminSetupHint" class="oauth-setup-hint" hidden>
-                    <div class="oauth-setup-title">服务端待配置 X OAuth 2.0 Client ID</div>
+                    <div class="oauth-setup-title">待配置 X OAuth 2.0 Client ID</div>
                     <p>
-                        当前服务端配置文件 <code>application.yml</code> 的 <code>xops.oauth-client-id</code> 为空，暂无法跳转 X 授权页。请在
-                        <a href="https://developer.x.com/en/portal/dashboard" target="_blank" rel="noopener noreferrer">X Developer Portal ↗</a>
-                        开启 OAuth 2.0（Type 选 Web App），将 Callback URI 设为
-                        <code id="gateCallbackUriText">http://localhost:8080/api/auth/x/callback</code>，并将 Client ID 与 Client Secret 写入
+                        在 <a href="https://developer.x.com/en/portal/dashboard" target="_blank" rel="noopener noreferrer">X Developer Portal ↗</a>
+                        将 Callback URI 设为 <code id="gateCallbackUriText">http://localhost:8080/api/auth/x/callback</code>，填写
                         <code>application.yml</code> 后重启服务。
                     </p>
                 </div>
@@ -143,33 +154,48 @@
 
         <!-- ==================== 已登录状态：本人专属运营工作台 ==================== -->
         <div id="authenticatedWorkspace" data-active-tab="activity" hidden>
-            <!-- 吸顶栏：动态窗口切换 + 缓存状态 -->
+            <!-- 吸顶栏：时间窗口 + 状态与模式入口（两行自解释布局） -->
             <header class="sticky-topbar">
                 <div class="self-topbar-row">
-                    <div class="window-seg" role="group" aria-label="统计时间范围">
-                        <button type="button" class="seg-btn active" data-period="HOURS_48" data-days="2" title="近 48 小时（按当前时间往前滚动）">48小时</button>
-                        <button type="button" class="seg-btn" data-period="WEEK" data-days="7" title="近 7 天（按当前时间往前滚动）">7天</button>
-                        <button type="button" class="seg-btn" data-period="MONTH" data-days="30" title="近 30 天（按当前时间往前滚动）">30天</button>
+                    <div class="window-seg-wrap">
+                        <div class="window-seg" role="group" aria-label="统计时间范围">
+                            <button type="button" class="seg-btn active" data-period="HOURS_24" data-days="1" data-label="24小时" title="近 24 小时">24小时</button>
+                            <button type="button" class="seg-btn" data-period="HOURS_48" data-days="2" data-label="48小时" title="近 48 小时">48小时</button>
+                            <button type="button" class="seg-btn" data-period="WEEK" data-days="7" data-label="7天" title="近 7 天">7天</button>
+                            <button type="button" class="seg-btn" data-period="MONTH" data-days="30" data-label="30天" title="近 30 天">30天</button>
+                        </div>
+                        <button type="button" class="unlock-info-btn" id="periodUnlockHelpBtn" title="时间维度解锁进度与规则">解锁</button>
                     </div>
 
                     <div class="topbar-actions">
-                        <button type="button" class="refresh-status-btn" id="forceRefreshBtn" disabled title="数据 5 分钟内不重复拉取">更新中…</button>
+                        <button type="button" class="refresh-status-btn" id="forceRefreshBtn" title="数据同步状态">同步中…</button>
                         <button type="button" class="icon-circle-btn topbar-theme-only" id="topbarThemeBtn" title="切换主题" aria-label="切换主题">
                             <svg viewBox="0 0 24 24" class="sm-icon" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.389 5.389 0 0 1-4.4 2.26 5.403 5.403 0 0 1-3.14-9.8c-.44-.06-.9-.1-1.36-.1z"/></svg>
                         </button>
                         <button type="button" class="mini-logout-btn topbar-logout-only" id="topbarLogoutBtn" title="退出登录">退出</button>
                     </div>
                 </div>
-                <div class="window-range-hint" id="topbarWindowHint">统计窗口加载中…</div>
-                <div class="window-range-hint"><a id="storedReportLink" href="?stored=true">查看已入库报表</a></div>
+                <div class="topbar-meta-row">
+                    <div class="window-range-hint" id="topbarWindowHint">加载中…</div>
+                    <div class="window-range-hint topbar-sub-links">
+                        <a id="storedReportLink" href="?stored=true">已入库报表</a>
+                        <span class="sub-link-dot" aria-hidden="true">·</span>
+                        <button type="button" class="link-inline-btn topbar-author-chip" id="openAuthorStoryBtn">作者信息</button>
+                    </div>
+                </div>
+                <div class="window-range-hint" id="dailyCacheStatusHint" hidden></div>
             </header>
 
             <!-- 加载进度条与提示 -->
             <div id="loadingBar" class="loading-progress" hidden>
                 <div class="loading-progress-inner"></div>
             </div>
-            <div id="loadingSlowHint" class="notice-strip" style="margin:10px 16px;" hidden>
-                正在同步数据…
+            <div id="loadingSlowHint" class="notice-strip loading-slow-strip" hidden>
+                同步中…
+            </div>
+            <div id="overdueGlobalBanner" class="notice-strip overdue-banner" hidden>
+                <span id="overdueGlobalText">逾期待确认</span>
+                <button type="button" class="x-blue-pill sm" id="goOverdueScheduleBtn">查看补发</button>
             </div>
 
             <!-- X 原生风格个人主页头部 -->
@@ -180,9 +206,10 @@
                     <div class="profile-avatar-row">
                         <div class="avatar-circle xl" id="profileAvatar">X</div>
                         <div class="profile-cta-group">
-                            <span class="health-score-chip" id="healthScoreChip" title="0–100，综合发帖稳定度、回复比、公开互动率计算；50 以上为良好">运营健康 --</span>
+                            <span class="health-score-chip" id="healthScoreChip" title="0–100，综合发帖稳定度、回复比、公开互动率">健康 --</span>
+                            <button type="button" class="x-outline-pill author-hero-pill" id="heroAuthorInfoBtn" title="查看作者 @elidlicom 介绍与开源说明">作者信息</button>
                             <a class="x-outline-pill" id="visitXProfileLink" href="https://x.com" target="_blank" rel="noopener noreferrer">
-                                访问 X 主页 ↗
+                                X 主页 ↗
                             </a>
                         </div>
                     </div>
@@ -198,13 +225,13 @@
                         <div class="profile-handle-line" id="profileHandleText">@username</div>
                     </div>
 
-                    <p class="profile-bio" id="profileBio">--</p>
+                    <p class="profile-bio" id="profileBio" hidden></p>
 
                     <div class="profile-stats-row">
-                        <div class="stat-inline"><strong id="profileFollowingNum">0</strong> <span>正在关注</span></div>
+                        <div class="stat-inline"><strong id="profileFollowingNum">0</strong> <span>关注</span></div>
                         <div class="stat-inline"><strong id="profileFollowersNum">0</strong> <span>关注者</span></div>
-                        <div class="stat-inline" title="我关注的人当中回关我的比例"><strong id="profileMutualRateNum">0%</strong> <span>关注回关率</span></div>
-                        <div class="stat-inline"><strong id="profileTotalTweetsNum">0</strong> <span>历史总推文</span></div>
+                        <div class="stat-inline" title="我关注的人当中回关我的比例"><strong id="profileMutualRateNum">0%</strong> <span>回关率</span></div>
+                        <div class="stat-inline"><strong id="profileTotalTweetsNum">0</strong> <span>推文</span></div>
                     </div>
 
                     <div class="notice-strip" id="bannerNoticeStrip"></div>
@@ -215,32 +242,32 @@
             <section class="tab-panel active" id="panel-activity">
                 <div class="kpi-grid-4">
                     <div class="kpi-card" title="原创主推文数量（不含在他人推文下的回复）">
-                        <div class="kpi-label" id="kpiPostsTitle">48h 原创发帖</div>
+                        <div class="kpi-label" id="kpiPostsTitle">原创发帖</div>
                         <div class="kpi-value" id="kpiOriginalPosts">0</div>
-                        <div class="kpi-sub" id="kpiDailyPosts">日均 0 条（含引用）</div>
+                        <div class="kpi-sub" id="kpiDailyPosts">日均 0</div>
                     </div>
-                    <div class="kpi-card" title="主动去其他推友评论区互动回复的条数，用于观察主动社区互动">
+                    <div class="kpi-card" title="主动去其他推友评论区互动回复的条数">
                         <div class="kpi-label" id="kpiRepliesTitle">回复</div>
                         <div class="kpi-value accent-blue" id="kpiReplies">0</div>
-                        <div class="kpi-sub" id="kpiDailyReplies">日均 0 条推友回复</div>
+                        <div class="kpi-sub" id="kpiDailyReplies">日均 0</div>
                     </div>
-                    <div class="kpi-card" title="回复数 ÷ 原创推文数，建议 2–6 倍">
-                        <div class="kpi-label">回复 / 发帖比</div>
+                    <div class="kpi-card" title="回复数 ÷ 原创推文数，参考区间 2–6x">
+                        <div class="kpi-label">回复 / 发帖</div>
                         <div class="kpi-value accent-green" id="kpiReplyRatio">0x</div>
-                        <div class="kpi-sub" id="kpiReplyShare">回复占总动态 0%</div>
+                        <div class="kpi-sub" id="kpiReplyShare">回复占 0%</div>
                     </div>
-                    <div class="kpi-card" title="公开互动率：(点赞+评论+转推/引用+收藏) ÷ 浏览量；不同于官方 Analytics 互动率">
-                        <div class="kpi-label">平均公开互动率</div>
+                    <div class="kpi-card" title="互动率：(点赞+评论+转推/引用+收藏) ÷ 浏览量">
+                        <div class="kpi-label">互动率</div>
                         <div class="kpi-value accent-pink" id="kpiAvgEr">0%</div>
-                        <div class="kpi-sub" id="kpiAvgViews">单帖均浏览 0</div>
+                        <div class="kpi-sub" id="kpiAvgViews">帖均浏览 0</div>
                     </div>
                 </div>
 
                 <!-- 窄屏折叠右侧栏时自动显示的轻量分发自检条与本期行动 -->
                 <div class="mobile-algo-strip" id="mobileAlgoHealthStrip">
-                    <span id="mobileAlgoStatusText">等待样本分析</span>
-                    <a href="https://x.com/i/jf/under_the_hood" target="_blank" rel="noopener noreferrer" class="x-outline-pill sm">
-                        官方分发信息 ↗
+                    <span id="mobileAlgoStatusText" role="button" tabindex="0">等待分析</span>
+                    <a href="https://x.com/i/jf/under_the_hood" target="_blank" rel="noopener noreferrer" class="x-outline-pill sm" id="mobileAlgoRefLink">
+                        参考 ↗
                     </a>
                 </div>
 
@@ -267,13 +294,12 @@
                 <div class="x-section-card">
                     <div class="section-head">
                         <div>
-                            <h2 class="section-title" id="trendChartTitle">发帖 vs 回复趋势</h2>
-                            <p class="section-desc" id="trendChartSubtitle">点按或悬停柱体查看明细</p>
-                            <p class="section-desc" id="activityMetricTotals" title="包含原创、回复、引用与串推楼层，排除纯转推；总互动为点赞、评论、转推/引用与收藏之和">本周期非纯转推指标待加载</p>
+                            <h2 class="section-title" id="trendChartTitle">活跃趋势</h2>
+                            <p class="section-desc" id="trendChartSubtitle">--</p>
                         </div>
                         <div class="chart-legend-inline">
                             <span><i class="dot blue"></i>回复</span>
-                            <span><i class="dot white"></i>原创/引用/串推</span>
+                            <span><i class="dot white"></i>原创/引用</span>
                         </div>
                     </div>
                     <div class="daily-chart-box" id="dailyTrendChart"></div>
@@ -289,25 +315,23 @@
                             <p class="section-desc" id="interactionSummaryDesc">--</p>
                         </div>
                         <div class="toolbar-right">
-                            <input type="search" id="peerSearchInput" class="x-mini-input" placeholder="搜索 @用户名" aria-label="搜索推友" />
+                            <input type="search" id="peerSearchInput" class="x-mini-input" placeholder="搜索昵称 / @用户名" aria-label="搜索推友" />
                             <select id="peerSortSelect" class="x-select" aria-label="排序方式">
-                                <option value="intimacy">默认排序</option>
-                                <option value="iOweFirst">我没回的优先</option>
-                                <option value="theyOweFirst">没回我的优先</option>
-                                <option value="outbound">我去评最多</option>
-                                <option value="inbound">TA 来评最多</option>
+                                <option value="intimacy">亲密度</option>
+                                <option value="iOweFirst">待回访</option>
+                                <option value="theyOweFirst">未回我</option>
+                                <option value="outbound">去评多</option>
+                                <option value="inbound">来评多</option>
                             </select>
                         </div>
                     </div>
 
                     <div class="filter-pills-row" id="interactionTypePills">
-                        <button class="pill-chip" data-rel-filter="I_OWE" id="pillIOweBtn" type="button" title="我的推文下 TA 来评论过，但我没有去 TA 发布过的推文下评论">我没回谁</button>
-                        <button class="pill-chip" data-rel-filter="UNREPLIED_POST" id="pillUnrepliedBtn" type="button" title="别人评论了我，但我还没有回复 TA">评论待回复</button>
-                        <button class="pill-chip" data-rel-filter="THEY_OWE" id="pillTheyOweBtn" type="button" title="我去 TA 发布过的推文下评论过，但 TA 没有来我的推文下评论过">谁没回我</button>
-                        <button class="pill-chip" data-rel-filter="MUTUAL" id="pillMutualBtn" type="button" title="我去过 TA 推文下评论，TA 也来过我的推文下评论">互相评论</button>
-                        <button class="pill-chip active" data-rel-filter="ALL" type="button">全部</button>
+                        <button class="pill-chip" data-rel-filter="I_OWE" id="pillIOweBtn" type="button" title="TA 来评过我但我没去评 TA，或双方主帖评论差额 > 5 帖且 TA 评我更多">我没回谁</button>
+                        <button class="pill-chip" data-rel-filter="UNREPLIED_POST" id="pillUnrepliedBtn" type="button" title="别人评论了我，但我还没有回复 TA">待回复</button>
+                        <button class="pill-chip" data-rel-filter="THEY_OWE" id="pillTheyOweBtn" type="button" title="我去评过 TA 但 TA 没来评我，或双方主帖评论差额 > 5 帖且我去评更多">谁没回我</button>
+                        <button class="pill-chip active" data-rel-filter="MUTUAL" id="pillMutualBtn" type="button" title="双方均有主帖评论且贴数差额 <= 5 帖">互相评论</button>
                     </div>
-                    <p class="list-hint">点击一行查看详情 · 1 个帖子算 1 次</p>
 
                     <div class="x-user-list" id="peerInteractionList"></div>
                 </div>
@@ -328,21 +352,20 @@
 
                         <div class="toolbar-right">
                             <input type="search" id="followFilterInput" class="x-mini-input" placeholder="搜索昵称 / @用户名" aria-label="搜索关注账号" />
-                            <button type="button" class="x-outline-pill sm" id="exportFollowCsvBtn">导出 CSV</button>
+                            <button type="button" class="x-outline-pill sm" id="exportFollowCsvBtn" title="导出当前列表 CSV">CSV</button>
                         </div>
                     </div>
 
                     <div class="filter-pills-row" id="unfollowCategoryPills">
                         <button class="pill-chip active" data-ucall="ALL" type="button">全部</button>
                         <button class="pill-chip" data-ucall="SUGGEST_CLEAN" id="suggestCleanPillBtn" type="button">建议取关</button>
-                        <button class="pill-chip" data-ucall="ONE_WAY_EFFORT" type="button">互动过仍未回关</button>
+                        <button class="pill-chip" data-ucall="ONE_WAY_EFFORT" type="button">互动未回关</button>
                         <button class="pill-chip" data-ucall="BIG_ACCOUNT" type="button">大V</button>
                         <button class="pill-chip" data-ucall="WHITELIST" id="whitelistPillBtn" type="button" hidden>已保留</button>
                     </div>
 
                     <div id="relationshipContinueControls" class="notice-strip" hidden>
-                        <button type="button" class="x-outline-pill sm" id="continueRelationshipsBtn">继续核验关系</button>
-                        <span>每次最多核验 100 人，可能调用付费接口；不会更改关注关系。</span>
+                        <button type="button" class="x-outline-pill sm" id="continueRelationshipsBtn" title="每次最多核验 100 人，不会修改关注关系">继续核验关系</button>
                     </div>
 
                     <div class="x-user-list" id="followAuditList"></div>
@@ -354,8 +377,8 @@
                 <div class="x-section-card">
                     <div class="section-head wrap-gap">
                         <div>
-                            <h2 class="section-title">黄金发帖时段</h2>
-                            <p class="section-desc" id="timingPeriodDesc">按已采集浏览与公开互动率计算（北京时间）</p>
+                            <h2 class="section-title">黄金时段</h2>
+                            <p class="section-desc" id="timingPeriodDesc">北京时间</p>
                         </div>
                         <span class="subtle-tag" id="nextGoldenWindowBadge" hidden>计算中…</span>
                     </div>
@@ -373,56 +396,72 @@
 
                 <div class="x-section-card">
                     <div class="section-head">
-                        <div>
-                            <h2 class="section-title">内容体裁对比</h2>
-                            <p class="section-desc">短推、图文/视频、长推 Thread 的公开浏览与互动</p>
-                        </div>
+                        <h2 class="section-title">体裁表现</h2>
                     </div>
                     <div class="format-cards-grid" id="formatCardsGrid"></div>
                 </div>
 
                 <div class="x-section-card" id="algoPoolSection">
                     <div class="section-head wrap-gap">
-                        <div>
-                            <h2 class="section-title">浏览与粉丝数对比</h2>
-                            <p class="section-desc">按单帖浏览 ÷ 粉丝数分组；不能确定观看者身份、For You 来源或限流状态</p>
+                        <div class="algo-head-title-wrap">
+                            <h2 class="section-title">曝光分布与优化建议</h2>
+                            <span class="algo-version-badge" id="algoProfileVersionBadge" hidden>自定义参数</span>
+                        </div>
+                        <button type="button" class="link-inline-btn algo-config-toggle" id="toggleAlgoConfigBtn" aria-expanded="false" aria-controls="algoConfigDrawer">
+                            参数配置 ▾
+                        </button>
+                    </div>
+                    <div class="algo-config-drawer" id="algoConfigDrawer" hidden>
+                        <div class="algo-config-meta" id="algoConfigMetaLine">当前规则来源：内置基线</div>
+                        <div class="algo-changelog-list" id="algoChangelogList"></div>
+                        <div class="algo-perm-hint" id="algoConfigPermHint">仅授权运维账号或本地开发模式可保存覆盖规则，支持零停机热更新与一键还原。</div>
+                        <textarea id="algoProfileJsonInput" class="algo-json-editor" rows="10" spellcheck="false" aria-label="X 算法规则 JSON 配置"></textarea>
+                        <div class="algo-config-actions" id="algoConfigActionRow">
+                            <button type="button" class="algo-action-btn" id="reloadAlgoProfileBtn">从磁盘重载</button>
+                            <button type="button" class="algo-action-btn" id="resetAlgoProfileBtn">还原内置基线</button>
+                            <button type="button" class="algo-action-btn primary" id="saveAlgoProfileBtn">保存并热生效</button>
                         </div>
                     </div>
                     <div class="format-cards-grid" id="algoReachPoolsGrid"></div>
-                    <div class="algo-plain-tips" id="algoPlainTipsBox"></div>
+                    <div class="algo-calibration-panel" id="algoCalibrationPanel" hidden></div>
+                    <div class="algo-ops-playbook" id="algoOpsPlaybookList" hidden></div>
+                    <div class="algo-plain-tips" id="algoPlainTipsBox" hidden></div>
                 </div>
 
                 <div class="x-section-card" id="prePostSimulatorCard">
                     <div class="section-head wrap-gap">
                         <div>
-                            <h2 class="section-title">发推前草稿体检</h2>
-                            <p class="section-desc" id="draftLiveTimingHint">粘贴草稿，检查连发间隔、外链与互动钩子</p>
+                            <h2 class="section-title">草稿体检</h2>
+                            <p class="section-desc" id="draftLiveTimingHint" hidden></p>
                         </div>
-                        <label class="draft-media-toggle" title="勾选后按附带图片或视频计算">
-                            <input type="checkbox" id="draftHasMediaCheck" />
-                            <span>含图/视频</span>
-                        </label>
+                        <div class="draft-toggles-group">
+                            <label class="draft-media-toggle" title="附带图片或视频（视频满 10 秒计入有效观看）">
+                                <input type="checkbox" id="draftHasMediaCheck" />
+                                <span>配图/视频</span>
+                            </label>
+                            <label class="draft-media-toggle" title="多条串推或长推文">
+                                <input type="checkbox" id="draftIsThreadCheck" />
+                                <span>长文/串推</span>
+                            </label>
+                        </div>
                     </div>
                     <textarea
                         id="draftSimulatorInput"
                         class="draft-textarea"
-                        rows="2"
-                        placeholder="粘贴准备发的推文…"
+                        rows="3"
+                        placeholder="粘贴草稿，自动检查限流风险并预估浏览量…"
                     ></textarea>
                     <div id="draftSimulatorResult" class="draft-result-box" hidden></div>
                 </div>
 
                 <div class="x-section-card no-bottom-pad">
-                    <div class="section-head wrap-gap">
-                        <div>
-                            <h2 class="section-title" id="topPostsTitle">代表推文</h2>
-                            <p class="section-desc">每条附推荐分（0–100）及加减分原因</p>
-                        </div>
+                    <div class="section-head top-posts-head">
+                        <h2 class="section-title" id="topPostsTitle">代表推文</h2>
                         <select id="topPostSortSelect" class="x-select" aria-label="代表推文排序维度">
-                            <option value="composite">综合影响力</option>
-                            <option value="algoScore">本站规则分</option>
+                            <option value="composite">综合排序</option>
+                            <option value="algoScore">互动质量</option>
                             <option value="views">浏览量</option>
-                            <option value="er">公开互动率</option>
+                            <option value="er">互动率</option>
                             <option value="bookmarks">收藏</option>
                             <option value="replies">评论</option>
                         </select>
@@ -441,16 +480,14 @@
             <section class="tab-panel" id="panel-circle">
                 <div class="x-section-card">
                     <div class="section-head wrap-gap">
-                        <div>
-                            <h2 class="section-title" id="shareCardSectionTitle">运营战报卡</h2>
-                            <p class="section-desc">随顶部时间窗自动生成，可下载或直接发推</p>
-                        </div>
+                        <h2 class="section-title" id="shareCardSectionTitle">运营战报卡</h2>
                         <div class="share-btn-row">
-                            <button type="button" class="x-outline-pill sm" id="toggleSharePrivacyBtn" title="不想公开回关率时，改为展示总浏览">
+                            <button type="button" class="x-outline-pill sm" id="toggleSharePrivacyBtn" title="切换展示回关率或周期总浏览">
                                 隐藏回关率
                             </button>
                             <button type="button" class="x-outline-pill sm" id="downloadCardPngBtn">下载 PNG</button>
                             <button type="button" class="x-outline-pill sm" id="copyShareTextBtn">复制文案</button>
+                            <button type="button" class="x-outline-pill sm" id="scheduleShareCardBtn">定时发布</button>
                             <a class="x-blue-pill sm" id="postToXIntentLink" href="https://x.com/intent/tweet" target="_blank" rel="noopener noreferrer">
                                 发推 ↗
                             </a>
@@ -464,30 +501,88 @@
 
                 <div class="x-section-card">
                     <div class="section-head">
-                        <div>
-                            <h2 class="section-title">核心铁粉</h2>
-                            <p class="section-desc">本周期最常来你评论区的推友</p>
-                        </div>
+                        <h2 class="section-title">核心铁粉</h2>
                     </div>
                     <div class="circle-cards-grid" id="coreFansGrid"></div>
                 </div>
                 <div class="x-section-card">
                     <div class="section-head">
-                        <div>
-                            <h2 class="section-title">活跃互暖伙伴</h2>
-                            <p class="section-desc">本周期有双向主帖评论的推友</p>
-                        </div>
+                        <h2 class="section-title">互暖伙伴</h2>
                     </div>
                     <div class="circle-cards-grid" id="activeMutualsGrid"></div>
                 </div>
                 <div class="x-section-card">
                     <div class="section-head">
-                        <div>
-                            <h2 class="section-title">待回访固粉清单</h2>
-                            <p class="section-desc">来评过你，但仍有评论待回复或较少收到你回访的推友</p>
-                        </div>
+                        <h2 class="section-title">待回访固粉</h2>
                     </div>
                     <div class="circle-cards-grid" id="needWarmupPeersGrid"></div>
+                </div>
+            </section>
+
+            <!-- ==================== 模块 6：图文定时发布与逾期二次确认 ==================== -->
+            <section class="tab-panel" id="panel-schedule">
+                <div class="x-section-card schedule-lock-card" id="scheduleEligibilityCard" hidden>
+                    <div class="section-head wrap-gap">
+                        <div>
+                            <h2 class="section-title">仅限与 @elidlicom 互动前 100 可用</h2>
+                            <p class="section-desc" id="scheduleEligibilityDesc"></p>
+                            <div class="schedule-eligibility-meta" id="scheduleEligibilityMeta"></div>
+                        </div>
+                        <a class="x-blue-pill sm" id="scheduleEligibilityActionLink" href="https://x.com/elidlicom" target="_blank" rel="noopener noreferrer">去互动 ↗</a>
+                    </div>
+                </div>
+
+                <div class="x-section-card schedule-reauth-card" id="scheduleWriteAuthCard" hidden>
+                    <div class="section-head wrap-gap">
+                        <div>
+                            <h2 class="section-title" id="scheduleWriteAuthTitle">需开启发推授权</h2>
+                            <p class="section-desc" id="scheduleWriteAuthDesc">单独授予发推、传图与自动续期权限。</p>
+                        </div>
+                        <button type="button" class="x-blue-pill sm" id="triggerPublishAuthBtn">去授权</button>
+                    </div>
+                </div>
+
+                <div class="x-section-card" id="scheduleComposeCard">
+                    <div class="section-head wrap-gap">
+                        <h2 class="section-title">新建定时推文</h2>
+                        <div class="toolbar-right">
+                            <button type="button" class="x-outline-pill sm" id="alignScheduleGapBtn" hidden>对齐 1h</button>
+                            <button type="button" class="x-outline-pill sm" id="addScheduleDraftItemBtn">+ 加一条 (+1h)</button>
+                        </div>
+                    </div>
+
+                    <div id="scheduleDraftItemsList" class="schedule-draft-stack"></div>
+                    <input type="file" id="scheduleMediaFileInput" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden />
+
+                    <div class="schedule-quick-chips" id="scheduleQuickSlotChips"></div>
+
+                    <div class="schedule-compose-toolbar">
+                        <div class="schedule-compose-left">
+                            <button type="button" class="x-outline-pill sm" id="clearScheduleDraftBtn">清空</button>
+                        </div>
+                        <div class="schedule-compose-right">
+                            <button type="button" class="x-blue-pill sm" id="createScheduleBtn">加入定时队列</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="x-section-card no-bottom-pad">
+                    <div class="section-head schedule-queue-head">
+                        <h2 class="section-title">定时队列</h2>
+                        <div class="schedule-queue-actions">
+                            <button type="button" class="x-blue-pill sm" id="batchConfirmOverdueBtn" hidden>批量补发</button>
+                            <button type="button" class="x-outline-pill sm" id="refreshScheduleListBtn">刷新</button>
+                        </div>
+                    </div>
+
+                    <div class="filter-pills-row" id="scheduleStatusFilterPills">
+                        <button class="pill-chip active" data-sfilter="ALL" type="button">全部</button>
+                        <button class="pill-chip" data-sfilter="ACTION_NEEDED" type="button">待处理</button>
+                        <button class="pill-chip" data-sfilter="SCHEDULED" type="button">待发布</button>
+                        <button class="pill-chip" data-sfilter="PUBLISHED" type="button">已发布</button>
+                    </div>
+
+                    <div id="scheduledTweetsList" class="schedule-job-list"></div>
                 </div>
             </section>
         </div>
@@ -498,22 +593,25 @@
         <!-- 已登录后的实时行动栏 -->
         <div class="right-rail-sticky" id="authenticatedRightRail" hidden>
             <div class="side-widget algo-health-widget" id="sideAlgoHealthWidget">
-                <h3 class="widget-title">分发样本观察</h3>
-                <div class="algo-status-banner" id="sideAlgoStatusBanner">等待样本分析</div>
-                <p class="algo-side-summary" id="sideAlgoSummaryText">诊断中…</p>
+                <div class="widget-head-inline">
+                    <h3 class="widget-title">曝光状态</h3>
+                    <button type="button" class="algo-ver-mini-btn" id="sideAlgoVerBtn" data-go="tab:timing|openAlgoConfig:1" title="查看或调整参数">参数</button>
+                </div>
+                <div class="algo-status-banner" id="sideAlgoStatusBanner">等待分析</div>
+                <p class="algo-side-summary" id="sideAlgoSummaryText" hidden></p>
                 <div class="side-funnel-metrics">
                     <div class="funnel-row" title="单帖浏览量超过粉丝数的比例">
-                        <span>超粉丝浏览</span><strong id="sideOonRateVal">0%</strong>
+                        <span>破圈占比</span><strong id="sideOonRateVal">0%</strong>
                     </div>
-                    <div class="funnel-row" title="按本站 3 小时参考检查连发节奏；不能确认平台折叠或降权">
-                        <span>连发间隔</span><strong id="sideRapidFireVal">正常</strong>
+                    <div class="funnel-row" title="相邻主推发布间隔">
+                        <span>发帖间隔</span><strong id="sideRapidFireVal">正常</strong>
                     </div>
-                    <div class="funnel-row" title="外链与非外链样本的浏览对比；差异不证明因果">
-                        <span>外链样本</span><strong id="sideExtLinkVal">待分析</strong>
+                    <div class="funnel-row" title="含外链推文与纯原生推文浏览对比">
+                        <span>外链影响</span><strong id="sideExtLinkVal">正常</strong>
                     </div>
                 </div>
                 <a class="x-outline-pill sm full-w" id="underTheHoodBtn" href="https://x.com/i/jf/under_the_hood" target="_blank" rel="noopener noreferrer">
-                    查看官方分发信息 ↗
+                    X 官方状态自检 ↗
                 </a>
             </div>
 
@@ -526,8 +624,6 @@
                 <h3 class="widget-title">待回访</h3>
                 <div class="mini-user-list" id="sidebarPriorityPeers"></div>
             </div>
-
-            <p class="shortcut-footnote">快捷键：<kbd>1</kbd>–<kbd>5</kbd> 切换页面 · <kbd>D</kbd> <kbd>W</kbd> <kbd>M</kbd> 切换 48小时 / 7天 / 30天</p>
         </div>
     </aside>
 <!-- 窄屏底部导航（左栏隐藏时出现，与 X 手机版一致） -->
@@ -537,13 +633,14 @@
         <button class="bottom-tab" data-tab="follow-audit" type="button"><svg viewBox="0 0 24 24"><path d="M10 4c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zM6 6c0-2.21 1.79-4 4-4s4 1.79 4 4-1.79 4-4 4-4-1.79-4-4zm13 4v3h2v-3h3V8h-3V5h-2v3h-3v2h3zM3.65 19h12.7c-.34-1.8-1.02-3.21-1.95-4.19C13.32 13.65 11.84 13 10 13s-3.32.65-4.4 1.81c-.93.98-1.61 2.39-1.95 4.19zm.49-5.56C5.63 11.85 7.65 11 10 11s4.37.85 5.86 2.44c1.48 1.58 2.37 3.8 2.63 6.46l.11 1.1H1.4l.11-1.1c.26-2.66 1.15-4.88 2.63-6.46z"/></svg><span>关注</span></button>
         <button class="bottom-tab" data-tab="timing" type="button"><svg viewBox="0 0 24 24"><path d="M12 1.75C6.34 1.75 1.75 6.34 1.75 12S6.34 22.25 12 22.25 22.25 17.66 22.25 12 17.66 1.75 12 1.75zm0 18.5c-4.56 0-8.25-3.69-8.25-8.25S7.44 3.75 12 3.75s8.25 3.69 8.25 8.25-3.69 8.25-8.25 8.25zm.75-13h-1.5v5.69l4.28 2.57.77-1.29-3.55-2.13V7.25z"/></svg><span>内容</span></button>
         <button class="bottom-tab" data-tab="circle" type="button"><svg viewBox="0 0 24 24"><path d="M12 2l2.9 6.26L22 9.27l-5 4.87 1.18 6.86L12 17.77 5.82 21 7 14.14 2 9.27l7.1-1.01L12 2z"/></svg><span>战报</span></button>
+        <button class="bottom-tab" data-tab="schedule" type="button"><svg viewBox="0 0 24 24"><path d="M7 2v2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2h-2V2h-2v2H9V2H7zm12 8H5v10h14V10zm-5.5 2v3.7l2.9 1.7-.75 1.3L12 16.5V12h1.5z"/></svg><span>定时</span><i class="bottom-badge" id="mobileScheduleBadge" hidden>0</i></button>
     </nav>
 </div>
 
 <div id="authorPromptModal" class="author-modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="authorModalTitle" hidden>
     <div class="author-modal-card">
-        <div class="author-modal-cover">
-            <span class="author-modal-badge" id="authorModalBadge">第 3 次使用 · 作者说明</span>
+        <div class="author-modal-cover has-banner" id="authorModalCover">
+            <span class="author-modal-badge" id="authorModalBadge">作者主页 · 开源说明</span>
             <button type="button" class="author-modal-close" id="authorModalCloseBtn" aria-label="关闭弹窗" title="关闭">×</button>
         </div>
         <div class="author-modal-body">
@@ -553,7 +650,11 @@
                         <img src="/author-avatar.webp" alt="elidlicom" />
                     </div>
                 </div>
-                <span class="mini-tag green" id="authorModalFollowedTag" hidden>✓ 已关注</span>
+                <div class="author-profile-tags">
+                    <span class="mini-tag blue" id="authorModalSelfTag" hidden>作者本人</span>
+                    <span class="mini-tag green" id="authorModalFollowedTag" hidden>✓ 已关注</span>
+                    <a id="authorModalHeaderLink" class="x-outline-pill sm" href="https://x.com/elidlicom" target="_blank" rel="noopener noreferrer">@elidlicom ↗</a>
+                </div>
             </div>
             <div class="author-ident-block">
                 <div class="author-name-line">
@@ -562,14 +663,15 @@
                 </div>
                 <div class="author-handle-line" id="authorModalHandle">@elidlicom</div>
             </div>
-            <p class="author-bio-text" id="authorModalBio">Java Dev | Studying Chinese Metaphysics(Dao·道) ䷀ · 易道心学创始人 · elidli.com</p>
+            <p class="author-bio-text" id="authorModalBio">Java Dev &amp; AI | Studying Chinese Metaphysics(Dao·道) ䷊</p>
             <div class="author-stats-row" id="authorModalStatsRow" hidden>
+                <span id="authorModalFollowingWrap"><strong id="authorModalFollowing">0</strong> 关注</span>
                 <span><strong id="authorModalFollowers">0</strong> 关注者</span>
                 <span><strong id="authorModalPosts">0</strong> 推文</span>
             </div>
             <div class="author-note-box">
                 <h2 class="author-note-title" id="authorModalTitle">你好，我是作者 @elidlicom</h2>
-                <p class="author-note-msg" id="authorModalMessage"></p>
+                <div class="author-note-msg" id="authorModalMessage"></div>
             </div>
             <div class="author-modal-actions">
                 <a id="authorModalFollowBtn" class="auth-gate-login-btn author-follow-cta" href="https://x.com/intent/follow?screen_name=elidlicom" target="_blank" rel="noopener noreferrer">
@@ -577,7 +679,8 @@
                     <span id="authorModalFollowBtnText">关注 @elidlicom ↗</span>
                 </a>
                 <div class="author-modal-sub-actions">
-                    <a id="authorModalProfileLink" class="x-outline-pill sm" href="https://x.com/elidlicom" target="_blank" rel="noopener noreferrer">查看 @elidlicom 主页 ↗</a>
+                    <a id="authorModalProfileLink" class="x-outline-pill sm" href="https://x.com/elidlicom" target="_blank" rel="noopener noreferrer">X 主页 ↗</a>
+                    <a id="authorModalRepoLink" class="x-outline-pill sm" href="https://github.com/litany-lty/x-community-hub" target="_blank" rel="noopener noreferrer">开源仓库 ↗</a>
                     <button type="button" id="authorModalLaterBtn" class="x-outline-pill sm">稍后再说</button>
                 </div>
             </div>
@@ -585,7 +688,63 @@
     </div>
 </div>
 
+<div id="unlockGuideModal" class="author-modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="unlockGuideTitle" hidden>
+    <div class="author-modal-card unlock-guide-card">
+        <div class="author-modal-cover">
+            <button type="button" class="author-modal-close" id="unlockGuideCloseBtn" aria-label="关闭弹窗" title="关闭">×</button>
+        </div>
+        <div class="unlock-guide-body">
+            <h2 class="unlock-guide-title" id="unlockGuideTitle">时间维度与刷新规则</h2>
+            <div class="unlock-status-card" id="unlockGuideStatusBox"></div>
+            <div class="unlock-focus-strip" id="unlockGuideFocusMsg" hidden></div>
+            <ul class="unlock-rule-list" id="unlockGuideRules">
+                <li><strong>24小时：</strong>默认选中，单次仅加载最近 24 小时数据。</li>
+                <li><strong>48小时 / 7天 / 30天：</strong>每日物理落盘并动态保留 30 天窗口，累计满 <strong>2 / 7 / 30 天</strong>自动解锁。</li>
+                <li><strong>互动特权：</strong>与 @elidlicom 互动<strong>前 5</strong> 全维度免等待；<strong>前 50</strong> 每日自动同步落盘；<strong>前 100</strong> 可用定时发推。</li>
+                <li><strong>刷新：</strong>每次检查服务端缓存与最近 24 小时覆盖；完整更新未满 <strong>1 小时</strong>时复用，满 1 小时后更新。有进展时自动分批补齐；失败或无进展时停止，可点击继续。</li>
+            </ul>
+            <div class="author-note-box">
+                <h3 class="author-note-title">作者说明与开源声明</h3>
+                <p class="author-note-msg" id="unlockGuideAuthorStory">我目前负债十几个、失业、每个月靠贷款交房租。确实承担不起每个月过多的API费用。现在希望通过X平台解决人生危机。也希望朋友们可以谅解。如果限制让你感到不爽，可以到git仓库看开源代码，本地部署与线上效果一致。</p>
+            </div>
+            <div class="author-modal-actions">
+                <a id="unlockGuideFollowLink" class="auth-gate-login-btn author-follow-cta" href="https://x.com/intent/follow?screen_name=elidlicom" target="_blank" rel="noopener noreferrer">
+                    <svg viewBox="0 0 24 24" class="oauth-x-icon" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"></path></svg>
+                    <span id="unlockGuideFollowText">关注 @elidlicom ↗</span>
+                </a>
+                <div class="author-modal-sub-actions">
+                    <a id="unlockGuideRepoLink" class="x-outline-pill sm" href="https://github.com/litany-lty/x-community-hub" target="_blank" rel="noopener noreferrer">开源仓库 ↗</a>
+                    <button type="button" id="unlockGuideLaterBtn" class="x-outline-pill sm">我知道了</button>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div id="confirmResendModal" class="author-modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="confirmResendModalTitle" hidden>
+    <div class="author-modal-card confirm-resend-card">
+        <div class="author-modal-cover">
+            <button type="button" class="author-modal-close" id="confirmResendCloseBtn" aria-label="关闭弹窗" title="关闭">×</button>
+        </div>
+        <div class="confirm-resend-body">
+            <h2 class="confirm-resend-title" id="confirmResendModalTitle">确认补发这条推文？</h2>
+            <p class="confirm-resend-reason" id="confirmResendReason">--</p>
+            <div class="notice-strip overdue-uncertain-box" id="confirmResendUncertainBox" hidden>
+                <div id="confirmResendUncertainText">上次请求未收到回执，请先在 X 主页确认未发布后再点补发。</div>
+                <a id="confirmResendProfileLink" class="x-outline-pill sm" href="https://x.com" target="_blank" rel="noopener noreferrer">去 X 主页核对 ↗</a>
+            </div>
+            <div class="confirm-resend-meta" id="confirmResendMeta"></div>
+            <div class="confirm-resend-preview" id="confirmResendTextPreview"></div>
+            <div class="confirm-resend-media-grid" id="confirmResendMediaPreview" hidden></div>
+            <div class="confirm-resend-actions">
+                <button type="button" class="x-outline-pill sm" id="confirmResendCancelBtn">暂不补发</button>
+                <button type="button" class="x-blue-pill sm" id="confirmResendSubmitBtn">确认补发</button>
+            </div>
+        </div>
+    </div>
+</div>
+
 <div id="copyToast" class="bottom-toast" role="status" aria-live="polite" hidden>已复制到剪贴板</div>
-<script src="/app.js"></script>
+<script src="/app.js?v=20261115m"></script>
 </body>
 </html>

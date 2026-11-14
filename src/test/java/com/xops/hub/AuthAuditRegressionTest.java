@@ -1,15 +1,25 @@
 package com.xops.hub;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.xops.hub.config.XOAuthSessionRestoreFilter;
 import com.xops.hub.config.XOpsProperties;
 import com.xops.hub.controller.XOAuthController;
+import com.xops.hub.model.AnalyticsReportModels.AuthenticatedXUser;
 import com.xops.hub.provider.XDataProviderException;
 import com.xops.hub.service.XOAuthService;
+import com.xops.hub.store.XOAuthSessionStore;
+import jakarta.servlet.http.Cookie;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import org.springframework.http.HttpHeaders;
+import org.springframework.mock.web.MockFilterChain;
+import org.springframework.mock.web.MockHttpServletRequest;
+import org.springframework.mock.web.MockHttpServletResponse;
 import org.springframework.mock.web.MockHttpSession;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.lang.reflect.Constructor;
+import java.nio.file.Path;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
@@ -94,6 +104,68 @@ class AuthAuditRegressionTest {
                 () -> tryAuthorize(service), () -> tryAuthorize(service));
         assertThat(accepted).containsExactlyInAnyOrder(true, false);
         assertThat(states).hasSize(2000).containsEntry(original, saved);
+    }
+
+    @Test
+    void authorizePublishRestoresPersistedSessionAfterServerRestartAndLogoutExpiresCookie(@TempDir Path tempDir) throws Exception {
+        XOpsProperties props = new XOpsProperties();
+        props.setOauthClientId("local-test-client");
+        props.setDiskCacheDir(tempDir.toString());
+        props.setTokenEncryptionSecret("unit-test-session-secret-key-2026");
+
+        ObjectMapper mapper = new ObjectMapper();
+        XOAuthSessionStore sessionStore = new XOAuthSessionStore(props, mapper);
+        XOAuthService oauthService = new XOAuthService(props, mapper);
+        XOAuthController controller = new XOAuthController(props, oauthService, sessionStore);
+        XOAuthSessionRestoreFilter restoreFilter = new XOAuthSessionRestoreFilter(sessionStore);
+
+        long nowSec = Instant.now().getEpochSecond();
+        AuthenticatedXUser persistedUser = new AuthenticatedXUser(
+                "u_restore_1",
+                "restore_tester",
+                "Restore Tester",
+                "",
+                true,
+                Instant.now()
+        );
+        sessionStore.saveSession("persisted-sid-1", persistedUser, nowSec);
+
+        // 模拟服务端重启后内存 HttpSession 为空，用户直接点击「前往 X 开启定时发布授权」访问 /api/auth/x/authorize-publish
+        MockHttpServletRequest req = new MockHttpServletRequest("GET", "/api/auth/x/authorize-publish");
+        req.setCookies(new Cookie("JSESSIONID", "persisted-sid-1"));
+        req.setRequestedSessionId("persisted-sid-1");
+        MockHttpServletResponse resp = new MockHttpServletResponse();
+
+        restoreFilter.doFilter(req, resp, new MockFilterChain() {
+            @Override
+            public void doFilter(jakarta.servlet.ServletRequest request, jakarta.servlet.ServletResponse response) {
+                try {
+                    controller.authorizePublish((jakarta.servlet.http.HttpServletRequest) request,
+                            (jakarta.servlet.http.HttpServletResponse) response);
+                } catch (Exception ex) {
+                    throw new RuntimeException(ex);
+                }
+            }
+        });
+
+        // 必须成功恢复身份并跳转到 X OAuth 2.0 授权页（而不是被误踢回 /?auth_error=请先使用...），同时下发 400 天轮换 Cookie
+        assertThat(resp.getRedirectedUrl()).startsWith("https://x.com/i/oauth2/authorize?");
+        assertThat(resp.getRedirectedUrl()).contains("tweet.write");
+        String restoredSetCookie = resp.getHeader(HttpHeaders.SET_COOKIE);
+        assertThat(restoredSetCookie).contains("JSESSIONID=").contains("Max-Age=34560000");
+        String rotatedSessionId = req.getSession(false).getId();
+        assertThat(sessionStore.loadValid(rotatedSessionId, nowSec + 1)).isNotNull();
+
+        // 退出登录：必须撤销整条轮换会话链并立即下发 Max-Age=0 的清除 Cookie
+        MockHttpServletRequest logoutReq = new MockHttpServletRequest("POST", "/api/auth/x/logout");
+        logoutReq.setSession(req.getSession(false));
+        logoutReq.setRequestedSessionId(rotatedSessionId);
+        MockHttpServletResponse logoutResp = new MockHttpServletResponse();
+        controller.logout(logoutReq, logoutResp);
+
+        assertThat(logoutResp.getHeader(HttpHeaders.SET_COOKIE)).contains("JSESSIONID=;").contains("Max-Age=0");
+        assertThat(sessionStore.loadValid(rotatedSessionId, nowSec + 2)).isNull();
+        assertThat(sessionStore.loadValid("persisted-sid-1", nowSec + 2)).isNull();
     }
 
     private boolean tryAuthorize(XOAuthService service) {

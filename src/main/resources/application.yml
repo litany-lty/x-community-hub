@@ -5,10 +5,11 @@ server:
     mime-types: application/json,text/html,text/css,application/javascript,image/svg+xml
   servlet:
     session:
-      timeout: 7d
+      timeout: ${X_SESSION_TIMEOUT:400d}
       persistent: true
       store-dir: ${X_SESSION_STORE_DIR:./.sessions}
       cookie:
+        max-age: ${X_SESSION_COOKIE_MAX_AGE:400d}
         http-only: true
         same-site: lax
 
@@ -17,6 +18,10 @@ spring:
     import: "optional:file:./application-local.yml"
   application:
     name: x-community-hub
+  servlet:
+    multipart:
+      max-file-size: 16MB
+      max-request-size: 25MB
   jackson:
     serialization:
       write-dates-as-timestamps: false
@@ -58,3 +63,16 @@ xops:
   cache-ttl-seconds: ${X_CACHE_TTL_SECONDS:300}
   disk-cache-dir: ${X_DISK_CACHE_DIR:./.cache/snapshots}
   timezone: ${X_TIMEZONE:Asia/Shanghai}
+
+  # 定时发推与加密令牌存储配置
+  token-encryption-secret: "${X_TOKEN_ENCRYPTION_SECRET:}"
+  scheduler-enabled: ${X_SCHEDULER_ENABLED:true}
+  scheduler-poll-ms: ${X_SCHEDULER_POLL_MS:15000}
+  schedule-grace-window-seconds: ${X_SCHEDULE_GRACE_WINDOW_SECONDS:300}
+
+  # 与 @elidlicom 互动前 50 名活跃已登录用户每日自动同步配置
+  top50-auto-sync-enabled: ${X_TOP50_AUTO_SYNC_ENABLED:true}
+  top50-auto-sync-cron: "${X_TOP50_AUTO_SYNC_CRON:0 20 23 * * *}"
+
+  # 可热更新的 X 推荐算法规则覆盖文件路径（不存在时使用内置默认基线）
+  algo-profile-path: "${X_ALGO_PROFILE_PATH:./.cache/x-algorithm-profile.json}"

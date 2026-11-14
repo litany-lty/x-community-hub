@@ -6,6 +6,8 @@ import com.xops.hub.config.XOpsProperties;
 import com.xops.hub.model.AnalyticsReportModels.AuthenticatedXUser;
 import com.xops.hub.provider.SharedApiExecutor;
 import com.xops.hub.provider.XDataProviderException;
+import com.xops.hub.store.XOAuthTokenStore;
+import com.xops.hub.store.XOAuthTokenStore.StoredOAuthToken;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
@@ -21,32 +23,68 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.Base64;
 import java.util.Iterator;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * X OAuth 2.0 Authorization Code + PKCE (S256) 登录验身服务：
- * 访客点击「使用 X 账号登录」后完成官方身份验证（仅消耗 1 次 users/me 读取），
- * 自动绑定其真实 @username 并配合 TwitterAPI.io 拉取全量运营数据。
+ * X OAuth 2.0 Authorization Code + PKCE (S256) 登录与按需二次授权服务：
+ * 1. 默认登录仅申请最小只读范围（users.read tweet.read），无需额外发推授权即可查看全部运营报表；
+ * 2. 使用定时发推与逾期补发时，再通过独立二次授权补充 tweet.write media.write offline.access，
+ *    并借助 refresh_token 自动轮换尽可能延长授权有效时间。
  */
 @Service
 public class XOAuthService {
 
+    public static final String LOGIN_OAUTH_SCOPE = "users.read tweet.read";
+    public static final String PUBLISH_OAUTH_SCOPE = "users.read tweet.read tweet.write media.write offline.access";
+    public static final String DEFAULT_OAUTH_SCOPE = LOGIN_OAUTH_SCOPE;
     private static final String AUTHORIZE_ENDPOINT = "https://x.com/i/oauth2/authorize";
     private static final int MAX_PENDING_STATES = 2000;
+    private static final Duration PKCE_STATE_TTL = Duration.ofMinutes(15);
+    private static final long TOKEN_REFRESH_MARGIN_SECONDS = 90L;
+
+    public enum AuthPurpose {
+        LOGIN,
+        PUBLISH
+    }
 
     public record AuthorizationRequestInfo(String authorizationUrl, String state) {
+    }
+
+    public record TokenCapability(boolean writeAuthorized, boolean mediaWriteAuthorized, boolean offlineRefreshable) {
+    }
+
+    public record CallbackResult(
+            AuthenticatedXUser user,
+            AuthPurpose purpose,
+            boolean writeAuthorized,
+            boolean mediaWriteAuthorized,
+            boolean offlineRefreshable
+    ) {
+    }
+
+    private record TokenGrant(String accessToken, String refreshToken, long expiresInSec, String scope) {
+    }
+
+    private record TokenEndpointResponse(int statusCode, JsonNode body) {
     }
 
     private record PkceChallengeState(String codeVerifier, String redirectUri, Instant expiresAt) {
     }
 
+    private record PendingAuthMeta(AuthPurpose purpose, String expectedAccountId, Instant expiresAt) {
+    }
+
     private final XOpsProperties properties;
     private final ObjectMapper objectMapper;
     private final SharedApiExecutor sharedExecutor;
+    private final XOAuthTokenStore tokenStore;
     private final HttpClient httpClient;
     private final SecureRandom secureRandom = new SecureRandom();
     private final ConcurrentHashMap<String, PkceChallengeState> pendingStates = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, PendingAuthMeta> pendingAuthMeta = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Object> tokenRefreshLocks = new ConcurrentHashMap<>();
 
     public XOAuthService(XOpsProperties properties, ObjectMapper objectMapper) {
         this(properties, objectMapper, new SharedApiExecutor(properties));
@@ -57,6 +95,7 @@ public class XOAuthService {
         this.properties = properties;
         this.objectMapper = objectMapper;
         this.sharedExecutor = sharedExecutor;
+        this.tokenStore = new XOAuthTokenStore(properties, objectMapper);
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(10))
                 .build();
@@ -75,6 +114,25 @@ public class XOAuthService {
     }
 
     public synchronized AuthorizationRequestInfo createAuthorizationRequest(String baseOrigin) {
+        return createAuthorizationRequest(baseOrigin, AuthPurpose.LOGIN, null, LOGIN_OAUTH_SCOPE);
+    }
+
+    public synchronized AuthorizationRequestInfo createPublishAuthorizationRequest(
+            String baseOrigin,
+            String expectedAccountId
+    ) {
+        if (expectedAccountId == null || expectedAccountId.isBlank()) {
+            throw new XDataProviderException(401, "请先使用 X 账号登录后再发起定时发布二次授权");
+        }
+        return createAuthorizationRequest(baseOrigin, AuthPurpose.PUBLISH, expectedAccountId.trim(), PUBLISH_OAUTH_SCOPE);
+    }
+
+    private AuthorizationRequestInfo createAuthorizationRequest(
+            String baseOrigin,
+            AuthPurpose purpose,
+            String expectedAccountId,
+            String scope
+    ) {
         if (!properties.hasOAuthClient()) {
             throw new XDataProviderException(400, "服务端尚未在 application.yml 中配置 xops.oauth-client-id");
         }
@@ -87,14 +145,19 @@ public class XOAuthService {
         String codeVerifier = randomUrlSafe(48);
         String codeChallenge = sha256Base64Url(codeVerifier);
         String redirectUri = resolveCallbackUrl(baseOrigin);
+        Instant expiresAt = Instant.now().plus(PKCE_STATE_TTL);
 
         pendingStates.put(state, new PkceChallengeState(
                 codeVerifier,
                 redirectUri,
-                Instant.now().plus(Duration.ofMinutes(10))
+                expiresAt
+        ));
+        pendingAuthMeta.put(state, new PendingAuthMeta(
+                purpose,
+                expectedAccountId,
+                expiresAt
         ));
 
-        String scope = "users.read tweet.read";
         String url = AUTHORIZE_ENDPOINT
                 + "?response_type=code"
                 + "&client_id=" + urlEnc(properties.getOauthClientId().trim())
@@ -106,43 +169,249 @@ public class XOAuthService {
         return new AuthorizationRequestInfo(url, state);
     }
 
+    public void discardPendingState(String state) {
+        if (state == null || state.isBlank()) {
+            return;
+        }
+        pendingStates.remove(state);
+        pendingAuthMeta.remove(state);
+    }
+
     public AuthenticatedXUser handleCallback(String code, String state) {
+        return handleCallbackResult(code, state).user();
+    }
+
+    public CallbackResult handleCallbackResult(String code, String state) {
         if (state == null || state.isBlank()) {
             throw new XDataProviderException(400, "缺少 OAuth state 参数，登录校验失败");
         }
         PkceChallengeState saved = pendingStates.remove(state);
+        PendingAuthMeta meta = pendingAuthMeta.remove(state);
         if (saved == null || Instant.now().isAfter(saved.expiresAt())) {
-            throw new XDataProviderException(400, "登录会话已过期或 state 不匹配，请重新发起 X 授权登录");
+            throw new XDataProviderException(400, "登录会话已过期或 state 不匹配，请重新发起 X 授权");
         }
         if (code == null || code.isBlank()) {
             throw new XDataProviderException(400, "未获取到 X 授权码 code");
         }
 
-        String accessToken = exchangeCodeForToken(code, saved.codeVerifier(), saved.redirectUri());
-        return fetchCurrentXUser(accessToken);
+        AuthPurpose purpose = meta != null ? meta.purpose() : AuthPurpose.LOGIN;
+        String expectedAccountId = meta != null ? meta.expectedAccountId() : null;
+
+        TokenGrant grant = exchangeCodeForTokenGrant(code, saved.codeVerifier(), saved.redirectUri());
+        AuthenticatedXUser user = fetchCurrentXUser(grant.accessToken());
+        if (purpose == AuthPurpose.PUBLISH
+                && expectedAccountId != null
+                && !expectedAccountId.isBlank()
+                && !expectedAccountId.equals(user.id())) {
+            throw new XDataProviderException(
+                    403,
+                    "二次授权的 X 账号（@" + user.username() + "）与当前已登录账号不一致，请切换回原 X 账号后重试"
+            );
+        }
+
+        persistTokenGrant(user, grant, purpose);
+        TokenCapability capability = getTokenCapability(user.id());
+        return new CallbackResult(
+                user,
+                purpose,
+                capability.writeAuthorized(),
+                capability.mediaWriteAuthorized(),
+                capability.offlineRefreshable()
+        );
     }
 
-    private String exchangeCodeForToken(String code, String codeVerifier, String redirectUri) {
-        String clientId = properties.getOauthClientId().trim();
-        String clientSecret = properties.getOauthClientSecret() != null
-                ? properties.getOauthClientSecret().trim()
-                : "";
+    public TokenCapability getTokenCapability(String accountId) {
+        if (accountId == null || accountId.isBlank()) {
+            return new TokenCapability(false, false, false);
+        }
+        synchronized (lockForAccount(accountId)) {
+            StoredOAuthToken token = tokenStore.load(accountId);
+            if (token == null) {
+                return new TokenCapability(false, false, false);
+            }
+            long nowSec = Instant.now().getEpochSecond();
+            boolean accessTokenUnexpired = token.accessToken() != null
+                    && !token.accessToken().isBlank()
+                    && nowSec + TOKEN_REFRESH_MARGIN_SECONDS < token.expiresAtEpochSec();
+            boolean usable = token.hasRefreshToken() || accessTokenUnexpired;
+            return new TokenCapability(
+                    usable && token.hasWriteScope(),
+                    usable && token.hasMediaWriteScope(),
+                    token.hasRefreshToken()
+            );
+        }
+    }
 
+    public String getValidWriteAccessToken(String accountId, boolean requireMediaWrite) {
+        if (accountId == null || accountId.isBlank()) {
+            throw new XDataProviderException(401, "缺少账号 ID，请重新使用 X 授权登录");
+        }
+        synchronized (lockForAccount(accountId)) {
+            StoredOAuthToken token = tokenStore.load(accountId);
+            if (token == null) {
+                throw new XDataProviderException(403, "当前账号尚未开通定时发布二次授权，请前往「定时发布」页点击「前往 X 二次授权」");
+            }
+            if (!token.hasWriteScope()) {
+                throw new XDataProviderException(403, "当前账号尚未授予发推权限（tweet.write），请前往「定时发布」页完成二次授权");
+            }
+            if (requireMediaWrite && !token.hasMediaWriteScope()) {
+                throw new XDataProviderException(403, "当前账号尚未授予图片上传权限（media.write），请前往「定时发布」页完成二次授权");
+            }
+            long nowSec = Instant.now().getEpochSecond();
+            if (token.accessToken() != null && !token.accessToken().isBlank()
+                    && nowSec + TOKEN_REFRESH_MARGIN_SECONDS < token.expiresAtEpochSec()) {
+                return token.accessToken();
+            }
+            if (!token.hasRefreshToken()) {
+                throw new XDataProviderException(401, "X 发推访问令牌已过期且未获得离线刷新权限（offline.access），请前往「定时发布」页完成二次授权");
+            }
+            if (!properties.hasOAuthClient()) {
+                throw new XDataProviderException(400, "服务端尚未配置 xops.oauth-client-id，无法刷新令牌");
+            }
+
+            TokenGrant refreshed = exchangeRefreshToken(accountId, token.refreshToken());
+            String nextRefresh = refreshed.refreshToken().isBlank() ? token.refreshToken() : refreshed.refreshToken();
+            String nextScope = refreshed.scope().isBlank() ? token.scope() : refreshed.scope();
+            long expiresIn = refreshed.expiresInSec() > 0 ? refreshed.expiresInSec() : 7200L;
+            StoredOAuthToken updated = new StoredOAuthToken(
+                    token.accountId(),
+                    token.username(),
+                    refreshed.accessToken(),
+                    nextRefresh,
+                    Instant.now().getEpochSecond() + expiresIn,
+                    nextScope,
+                    Instant.now().getEpochSecond()
+            );
+            tokenStore.save(updated);
+            return updated.accessToken();
+        }
+    }
+
+    private void persistTokenGrant(AuthenticatedXUser user, TokenGrant grant, AuthPurpose purpose) {
+        if (user == null || user.id() == null || user.id().isBlank()) {
+            return;
+        }
+        String dir = properties.getDiskCacheDir();
+        if (dir == null || dir.isBlank()) {
+            return;
+        }
+        String effectiveScope = !grant.scope().isBlank()
+                ? grant.scope()
+                : (purpose == AuthPurpose.PUBLISH ? PUBLISH_OAUTH_SCOPE : LOGIN_OAUTH_SCOPE);
+        boolean grantHasWrite = hasScopeToken(effectiveScope, "tweet.write");
+
+        synchronized (lockForAccount(user.id())) {
+            StoredOAuthToken existing = tokenStore.load(user.id());
+            if (grantHasWrite) {
+                String refreshToken = !grant.refreshToken().isBlank()
+                        ? grant.refreshToken()
+                        : (existing != null && existing.refreshToken() != null ? existing.refreshToken() : "");
+                long expiresIn = grant.expiresInSec() > 0 ? grant.expiresInSec() : 7200L;
+                long nowSec = Instant.now().getEpochSecond();
+                tokenStore.save(new StoredOAuthToken(
+                        user.id(),
+                        user.username(),
+                        grant.accessToken(),
+                        refreshToken,
+                        nowSec + expiresIn,
+                        effectiveScope,
+                        nowSec
+                ));
+                return;
+            }
+            // 默认只读登录不得覆盖或降级已有的写权限与离线刷新令牌
+            if (existing != null && existing.hasWriteScope() && !user.username().equals(existing.username())) {
+                tokenStore.save(new StoredOAuthToken(
+                        existing.accountId(),
+                        user.username(),
+                        existing.accessToken(),
+                        existing.refreshToken(),
+                        existing.expiresAtEpochSec(),
+                        existing.scope(),
+                        existing.updatedAtEpochSec()
+                ));
+            }
+        }
+    }
+
+    private static boolean hasScopeToken(String scope, String target) {
+        if (scope == null || scope.isBlank() || target == null || target.isBlank()) {
+            return false;
+        }
+        for (String token : scope.trim().split("\\s+")) {
+            if (target.equals(token)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private Object lockForAccount(String accountId) {
+        if (tokenRefreshLocks.size() > 2048) {
+            tokenRefreshLocks.clear();
+        }
+        return tokenRefreshLocks.computeIfAbsent(accountId, k -> new Object());
+    }
+
+    private TokenGrant exchangeCodeForTokenGrant(String code, String codeVerifier, String redirectUri) {
         StringBuilder form = new StringBuilder();
         form.append("code=").append(urlEnc(code));
         form.append("&grant_type=authorization_code");
         form.append("&redirect_uri=").append(urlEnc(redirectUri));
         form.append("&code_verifier=").append(urlEnc(codeVerifier));
 
-        String baseUrl = properties.getOfficialBaseUrl();
-        if (baseUrl == null || baseUrl.isBlank()) {
-            baseUrl = "https://api.x.com/2";
+        TokenEndpointResponse resp = sendTokenFormRequest(form);
+        JsonNode json = resp.body();
+        if (resp.statusCode() >= 400 || json.path("access_token").asText("").isBlank()) {
+            String errDesc = json.path("error_description").asText(json.path("error").asText("HTTP " + resp.statusCode()));
+            throw new XDataProviderException(401, "换取 X OAuth Token 失败：" + errDesc);
         }
-        if (baseUrl.endsWith("/")) {
-            baseUrl = baseUrl.substring(0, baseUrl.length() - 1);
+        return parseTokenGrant(json);
+    }
+
+    private TokenGrant exchangeRefreshToken(String accountId, String refreshToken) {
+        StringBuilder form = new StringBuilder();
+        form.append("grant_type=refresh_token");
+        form.append("&refresh_token=").append(urlEnc(refreshToken));
+
+        TokenEndpointResponse resp = sendTokenFormRequest(form);
+        JsonNode json = resp.body();
+        if (resp.statusCode() == 400 || resp.statusCode() == 401) {
+            String errCode = json.path("error").asText("");
+            String errDesc = json.path("error_description").asText(errCode.isBlank() ? "HTTP " + resp.statusCode() : errCode);
+            if ("invalid_grant".equalsIgnoreCase(errCode) || errDesc.toLowerCase(Locale.ROOT).contains("invalid_grant")) {
+                tokenStore.delete(accountId);
+            }
+            throw new XDataProviderException(401, "X 发推授权已过期或失效，请前往「定时发布」页完成二次授权：" + errDesc);
         }
+        if (resp.statusCode() >= 400 || json.path("access_token").asText("").isBlank()) {
+            String errDesc = json.path("error_description").asText(json.path("error").asText("HTTP " + resp.statusCode()));
+            throw new XDataProviderException(502, "刷新 X 访问令牌失败，请稍后重试（" + errDesc + "）");
+        }
+        return parseTokenGrant(json);
+    }
+
+    private static TokenGrant parseTokenGrant(JsonNode json) {
+        long expiresIn = json.path("expires_in").asLong(7200L);
+        if (expiresIn <= 0) {
+            expiresIn = 7200L;
+        }
+        return new TokenGrant(
+                json.path("access_token").asText(""),
+                json.path("refresh_token").asText(""),
+                expiresIn,
+                json.path("scope").asText("")
+        );
+    }
+
+    private TokenEndpointResponse sendTokenFormRequest(StringBuilder form) {
+        String clientId = properties.getOauthClientId().trim();
+        String clientSecret = properties.getOauthClientSecret() != null
+                ? properties.getOauthClientSecret().trim()
+                : "";
+
         HttpRequest.Builder reqBuilder = HttpRequest.newBuilder()
-                .uri(URI.create(baseUrl + "/oauth2/token"))
+                .uri(URI.create(resolveOfficialBaseUrl() + "/oauth2/token"))
                 .timeout(Duration.ofSeconds(15))
                 .header("Content-Type", "application/x-www-form-urlencoded")
                 .header("Accept", "application/json");
@@ -167,11 +436,7 @@ public class XOAuthService {
             } catch (Exception parseEx) {
                 throw new XDataProviderException(502, "X OAuth 网关返回非 JSON 响应（HTTP " + resp.statusCode() + "），请稍后重试");
             }
-            if (resp.statusCode() >= 400 || json.path("access_token").asText("").isBlank()) {
-                String errDesc = json.path("error_description").asText(json.path("error").asText("HTTP " + resp.statusCode()));
-                throw new XDataProviderException(401, "换取 X OAuth Token 失败：" + errDesc);
-            }
-            return json.path("access_token").asText();
+            return new TokenEndpointResponse(resp.statusCode(), json);
         } catch (XDataProviderException e) {
             throw e;
         } catch (Exception e) {
@@ -179,15 +444,16 @@ public class XOAuthService {
         }
     }
 
-    private AuthenticatedXUser fetchCurrentXUser(String userAccessToken) {
+    private String resolveOfficialBaseUrl() {
         String baseUrl = properties.getOfficialBaseUrl();
         if (baseUrl == null || baseUrl.isBlank()) {
-            baseUrl = "https://api.x.com/2";
+            return "https://api.x.com/2";
         }
-        if (baseUrl.endsWith("/")) {
-            baseUrl = baseUrl.substring(0, baseUrl.length() - 1);
-        }
-        String url = baseUrl + "/users/me?user.fields=profile_image_url,verified";
+        return baseUrl.endsWith("/") ? baseUrl.substring(0, baseUrl.length() - 1) : baseUrl;
+    }
+
+    private AuthenticatedXUser fetchCurrentXUser(String userAccessToken) {
+        String url = resolveOfficialBaseUrl() + "/users/me?user.fields=profile_image_url,verified";
         Exception lastErr = null;
         for (int attempt = 0; attempt < 2; attempt++) {
             try {
@@ -240,8 +506,16 @@ public class XOAuthService {
         Instant now = Instant.now();
         Iterator<Map.Entry<String, PkceChallengeState>> it = pendingStates.entrySet().iterator();
         while (it.hasNext()) {
-            if (now.isAfter(it.next().getValue().expiresAt())) {
+            Map.Entry<String, PkceChallengeState> entry = it.next();
+            if (now.isAfter(entry.getValue().expiresAt())) {
                 it.remove();
+                pendingAuthMeta.remove(entry.getKey());
+            }
+        }
+        Iterator<Map.Entry<String, PendingAuthMeta>> metaIt = pendingAuthMeta.entrySet().iterator();
+        while (metaIt.hasNext()) {
+            if (now.isAfter(metaIt.next().getValue().expiresAt())) {
+                metaIt.remove();
             }
         }
     }

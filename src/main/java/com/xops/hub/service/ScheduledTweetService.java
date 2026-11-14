@@ -1,0 +1,1394 @@
+package com.xops.hub.service;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.xops.hub.config.XOpsProperties;
+import com.xops.hub.model.ScheduledTweetModels.BatchConfirmItem;
+import com.xops.hub.model.ScheduledTweetModels.BatchCreateResponse;
+import com.xops.hub.model.ScheduledTweetModels.OverdueReason;
+import com.xops.hub.model.ScheduledTweetModels.ScheduledMediaAsset;
+import com.xops.hub.model.ScheduledTweetModels.ScheduledTweetJob;
+import com.xops.hub.model.ScheduledTweetModels.ScheduledTweetListResponse;
+import com.xops.hub.model.ScheduledTweetModels.ScheduledTweetStatus;
+import com.xops.hub.provider.XDataProviderException;
+import com.xops.hub.provider.XPublishClient;
+import com.xops.hub.provider.XPublishClient.XPublishException;
+import jakarta.annotation.PreDestroy;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.security.MessageDigest;
+import java.time.Clock;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.HexFormat;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Pattern;
+import java.util.stream.Stream;
+
+/**
+ * 图文定时推文调度、状态持久化、停机逾期二次确认补发与全链路防重服务。
+ */
+@Service
+public class ScheduledTweetService {
+
+    private static final Logger log = LoggerFactory.getLogger(ScheduledTweetService.class);
+
+    public static final int QUEUE_VERSION = 1;
+    public static final int MAX_STATIC_IMAGES = 4;
+    public static final long MAX_STATIC_IMAGE_BYTES = 5L * 1024 * 1024;
+    public static final long MAX_GIF_BYTES = 15L * 1024 * 1024;
+    public static final int MAX_TEXT_LENGTH = 25_000;
+    public static final long MIN_SCHEDULE_LEAD_MS = 15_000L;
+    public static final long MIN_TWEET_INTERVAL_MS = 3_600_000L;
+    public static final int MAX_BATCH_CREATE_ITEMS = 20;
+    public static final long DUPLICATE_WINDOW_MS = 60_000L;
+    public static final long MEDIA_REUSE_TTL_MS = 20L * 3600_000L;
+    private static final int MAX_CLIENT_REQUEST_CACHE = 200;
+    private static final Pattern SAFE_ID_PATTERN = Pattern.compile("^[A-Za-z0-9_-]{1,64}$");
+    private static final DateTimeFormatter CONFLICT_TIME_FMT = DateTimeFormatter.ofPattern("MM-dd HH:mm");
+
+    public record MediaUploadInput(String fileName, byte[] bytes) {
+    }
+
+    public record BatchTweetDraftInput(
+            String text,
+            long scheduledAtEpochMs,
+            String clientRequestId,
+            List<MediaUploadInput> uploads
+    ) {
+    }
+
+    public record MediaFileContent(byte[] bytes, String mimeType, String fileName) {
+    }
+
+    private record DetectedImageFormat(String mimeType, String extension, long maxBytes) {
+    }
+
+    private record QueueStorage(
+            int version,
+            String accountId,
+            String username,
+            List<ScheduledTweetJob> jobs,
+            Map<String, String> clientRequestMap
+    ) {
+        static QueueStorage empty(String accountId, String username) {
+            return new QueueStorage(QUEUE_VERSION, accountId, username, new ArrayList<>(), new LinkedHashMap<>());
+        }
+
+        QueueStorage mutableCopy(String fallbackUsername) {
+            List<ScheduledTweetJob> copyJobs = jobs != null ? new ArrayList<>(jobs) : new ArrayList<>();
+            Map<String, String> copyMap = clientRequestMap != null ? new LinkedHashMap<>(clientRequestMap) : new LinkedHashMap<>();
+            String resolvedUser = (username != null && !username.isBlank()) ? username : fallbackUsername;
+            return new QueueStorage(QUEUE_VERSION, accountId, resolvedUser, copyJobs, copyMap);
+        }
+    }
+
+    private final XOpsProperties properties;
+    private final ObjectMapper objectMapper;
+    private final XOAuthService oauthService;
+    private final XPublishClient publishClient;
+    private final CommunityHubService communityHubService;
+    private final Clock clock;
+    private final ConcurrentHashMap<String, Object> accountLocks = new ConcurrentHashMap<>();
+    private final ExecutorService dispatchExecutor;
+    private final AtomicBoolean bootRecovered = new AtomicBoolean(false);
+
+    @Autowired
+    public ScheduledTweetService(
+            XOpsProperties properties,
+            ObjectMapper objectMapper,
+            XOAuthService oauthService,
+            XPublishClient publishClient,
+            CommunityHubService communityHubService
+    ) {
+        this(
+                properties,
+                objectMapper,
+                oauthService,
+                publishClient,
+                Objects.requireNonNull(communityHubService, "communityHubService must not be null"),
+                Clock.systemUTC()
+        );
+    }
+
+    public ScheduledTweetService(
+            XOpsProperties properties,
+            ObjectMapper objectMapper,
+            XOAuthService oauthService,
+            XPublishClient publishClient,
+            Clock clock
+    ) {
+        this(properties, objectMapper, oauthService, publishClient, null, clock);
+    }
+
+    public ScheduledTweetService(
+            XOpsProperties properties,
+            ObjectMapper objectMapper,
+            XOAuthService oauthService,
+            XPublishClient publishClient,
+            CommunityHubService communityHubService,
+            Clock clock
+    ) {
+        this.properties = properties;
+        this.objectMapper = objectMapper;
+        this.oauthService = oauthService;
+        this.publishClient = publishClient;
+        this.communityHubService = communityHubService;
+        this.clock = clock != null ? clock : Clock.systemUTC();
+        AtomicInteger seq = new AtomicInteger(1);
+        this.dispatchExecutor = Executors.newFixedThreadPool(2, r -> {
+            Thread t = new Thread(r, "xops-sched-dispatch-" + seq.getAndIncrement());
+            t.setDaemon(true);
+            return t;
+        });
+    }
+
+    @EventListener(ApplicationReadyEvent.class)
+    public void onApplicationReady() {
+        if (!properties.isSchedulerEnabled()) {
+            return;
+        }
+        if (bootRecovered.compareAndSet(false, true)) {
+            recoverAllAccountsOnStartup();
+        }
+    }
+
+    @Scheduled(fixedDelayString = "${xops.scheduler-poll-ms:15000}")
+    public void runScheduledTick() {
+        if (!properties.isSchedulerEnabled()) {
+            return;
+        }
+        if (bootRecovered.compareAndSet(false, true)) {
+            recoverAllAccountsOnStartup();
+        }
+        for (String accountId : discoverScheduledAccountIds()) {
+            try {
+                processDueJobsForAccount(accountId);
+            } catch (Exception ex) {
+                log.warn("Scheduled tweet tick failed for account {}: {}", accountId, ex.getMessage());
+            }
+        }
+    }
+
+    @PreDestroy
+    public void shutdown() {
+        dispatchExecutor.shutdown();
+        try {
+            if (!dispatchExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+                dispatchExecutor.shutdownNow();
+            }
+        } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            dispatchExecutor.shutdownNow();
+        }
+    }
+
+    public void recoverAllAccountsOnStartup() {
+        bootRecovered.set(true);
+        long nowMs = clock.millis();
+        for (String accountId : discoverScheduledAccountIds()) {
+            synchronized (accountLock(accountId)) {
+                QueueStorage queue = loadQueueLocked(accountId, "");
+                boolean changed = false;
+                for (int i = 0; i < queue.jobs().size(); i++) {
+                    ScheduledTweetJob job = queue.jobs().get(i);
+                    if (job.status() == ScheduledTweetStatus.SENDING) {
+                        boolean uncertain = job.postRequestDispatched();
+                        String err = uncertain
+                                ? "服务重启前推文请求已发出但未收到回执，请先查看 X 主页确认未发出后再点击确认补发"
+                                : "服务重启中断了发送流程，二次确认后将自动补发";
+                        queue.jobs().set(i, job.markOverdueConfirmRequired(
+                                OverdueReason.INTERRUPTED_SENDING,
+                                uncertain,
+                                UUID.randomUUID().toString(),
+                                err,
+                                nowMs
+                        ));
+                        changed = true;
+                    }
+                }
+                if (promoteOverdueLocked(queue, nowMs)) {
+                    changed = true;
+                }
+                if (changed) {
+                    saveQueueLocked(queue);
+                }
+            }
+        }
+    }
+
+    public ScheduledTweetListResponse listJobs(String accountId, String username) {
+        validateSafeId(accountId, "accountId");
+        long nowMs = clock.millis();
+        List<ScheduledTweetJob> items;
+        int pendingCount = 0;
+        int overdueConfirmCount = 0;
+        synchronized (accountLock(accountId)) {
+            QueueStorage queue = loadQueueLocked(accountId, username);
+            if (promoteOverdueLocked(queue, nowMs)) {
+                saveQueueLocked(queue);
+            }
+            items = new ArrayList<>(queue.jobs());
+            items.sort(Comparator.comparingLong(ScheduledTweetJob::createdAtEpochMs).reversed());
+            for (ScheduledTweetJob job : items) {
+                if (job.status() == ScheduledTweetStatus.SCHEDULED
+                        || job.status() == ScheduledTweetStatus.RESEND_QUEUED
+                        || job.status() == ScheduledTweetStatus.SENDING) {
+                    pendingCount++;
+                } else if (job.status() == ScheduledTweetStatus.OVERDUE_CONFIRM_REQUIRED) {
+                    overdueConfirmCount++;
+                }
+            }
+        }
+        XOAuthService.TokenCapability cap = oauthService.getTokenCapability(accountId);
+        CommunityHubService.ScheduledPublishAccess access = evaluateAccess(accountId, username);
+        return new ScheduledTweetListResponse(
+                List.copyOf(items),
+                pendingCount,
+                overdueConfirmCount,
+                cap.writeAuthorized(),
+                cap.mediaWriteAuthorized(),
+                nowMs,
+                properties.getTimezone(),
+                access.allowed(),
+                access.followsAuthor(),
+                access.authorInteractionRank(),
+                access.reason(),
+                cap.offlineRefreshable()
+        );
+    }
+
+    public ScheduledTweetJob createScheduledTweet(
+            String accountId,
+            String username,
+            String text,
+            long scheduledAtEpochMs,
+            String clientRequestId,
+            List<MediaUploadInput> uploads
+    ) {
+        validateSafeId(accountId, "accountId");
+        if (username == null || username.isBlank()) {
+            throw new XDataProviderException(401, "缺少当前登录用户名，请重新登录");
+        }
+        requireScheduledPublishEligible(accountId, username);
+        String rawText = text == null ? "" : text;
+        String trimmedText = rawText.trim();
+        if (rawText.length() > MAX_TEXT_LENGTH) {
+            throw new IllegalArgumentException("推文正文长度不能超过 " + MAX_TEXT_LENGTH + " 个字符");
+        }
+        List<MediaUploadInput> mediaInputs = uploads == null ? List.of() : uploads;
+        if (trimmedText.isEmpty() && mediaInputs.isEmpty()) {
+            throw new IllegalArgumentException("请输入推文内容或至少添加 1 张图片");
+        }
+
+        List<DetectedImageFormat> detectedFormats = validateMediaUploads(mediaInputs);
+        XOAuthService.TokenCapability cap = oauthService.getTokenCapability(accountId);
+        if (!cap.writeAuthorized()) {
+            throw new XDataProviderException(403, "当前账号尚未开通定时发布二次授权，请先点击「前往 X 二次授权」开通权限");
+        }
+        if (!mediaInputs.isEmpty() && !cap.mediaWriteAuthorized()) {
+            throw new XDataProviderException(403, "当前账号尚未授予图片上传权限（media.write），请先点击「前往 X 二次授权」补充授权");
+        }
+
+        long nowMs = clock.millis();
+        String normalizedReqId = clientRequestId == null ? "" : clientRequestId.trim();
+        List<String> mediaShaList = new ArrayList<>(mediaInputs.size());
+        for (MediaUploadInput input : mediaInputs) {
+            mediaShaList.add(sha256Hex(input.bytes()));
+        }
+        String fingerprint = computeContentFingerprint(trimmedText, mediaShaList);
+
+        synchronized (accountLock(accountId)) {
+            QueueStorage queue = loadQueueLocked(accountId, username);
+            boolean overduePromoted = promoteOverdueLocked(queue, nowMs);
+            if (!normalizedReqId.isEmpty()) {
+                String existingJobId = queue.clientRequestMap().get(normalizedReqId);
+                if (existingJobId != null) {
+                    ScheduledTweetJob existing = findJob(queue, existingJobId);
+                    if (existing != null) {
+                        if (overduePromoted) {
+                            saveQueueLocked(queue);
+                        }
+                        return existing;
+                    }
+                }
+            }
+
+            if (scheduledAtEpochMs < nowMs + MIN_SCHEDULE_LEAD_MS) {
+                throw new IllegalArgumentException("定时发布时间需晚于当前时间至少 15 秒");
+            }
+
+            for (ScheduledTweetJob active : queue.jobs()) {
+                if (isActiveStatus(active.status())
+                        && fingerprint.equals(active.contentFingerprint())
+                        && Math.abs(active.scheduledAtEpochMs() - scheduledAtEpochMs) < DUPLICATE_WINDOW_MS) {
+                    throw new XDataProviderException(409, "已存在相同内容与相近时间的待发定时推文，已阻止重复创建");
+                }
+            }
+            assertMinOneHourIntervalLocked(queue, scheduledAtEpochMs, null, "");
+
+            String jobId = UUID.randomUUID().toString();
+            List<ScheduledMediaAsset> assets = new ArrayList<>(mediaInputs.size());
+            try {
+                for (int i = 0; i < mediaInputs.size(); i++) {
+                    MediaUploadInput input = mediaInputs.get(i);
+                    DetectedImageFormat fmt = detectedFormats.get(i);
+                    String assetId = UUID.randomUUID().toString();
+                    String safeName = sanitizeFileName(input.fileName(), "image-" + (i + 1) + fmt.extension());
+                    Path target = resolveMediaAssetPath(accountId, jobId, assetId, fmt.extension());
+                    Files.createDirectories(target.getParent());
+                    Files.write(target, input.bytes());
+                    assets.add(new ScheduledMediaAsset(
+                            assetId,
+                            safeName,
+                            fmt.mimeType(),
+                            input.bytes().length,
+                            mediaShaList.get(i),
+                            null,
+                            0L
+                    ));
+                }
+
+                ScheduledTweetJob job = new ScheduledTweetJob(
+                        jobId,
+                        accountId,
+                        username,
+                        rawText,
+                        assets,
+                        scheduledAtEpochMs,
+                        ScheduledTweetStatus.SCHEDULED,
+                        OverdueReason.NONE,
+                        false,
+                        false,
+                        null,
+                        normalizedReqId.isEmpty() ? null : normalizedReqId,
+                        fingerprint,
+                        0,
+                        nowMs,
+                        nowMs,
+                        0L,
+                        0L,
+                        0L,
+                        null,
+                        null,
+                        null
+                );
+                queue.jobs().add(job);
+                if (!normalizedReqId.isEmpty()) {
+                    recordClientRequestId(queue.clientRequestMap(), normalizedReqId, jobId);
+                }
+                saveQueueLocked(queue);
+                return job;
+            } catch (RuntimeException ex) {
+                deleteDirectoryQuietly(resolveJobMediaDir(accountId, jobId));
+                throw ex;
+            } catch (Exception ex) {
+                deleteDirectoryQuietly(resolveJobMediaDir(accountId, jobId));
+                throw new IllegalStateException("保存定时推文媒体文件失败：" + ex.getMessage(), ex);
+            }
+        }
+    }
+
+    private record PreparedDraftItem(
+            String rawText,
+            String trimmedText,
+            long scheduledAtEpochMs,
+            String clientRequestId,
+            List<MediaUploadInput> mediaInputs,
+            List<DetectedImageFormat> detectedFormats,
+            List<String> mediaShaList,
+            String fingerprint
+    ) {
+    }
+
+    public BatchCreateResponse createBatchScheduledTweets(
+            String accountId,
+            String username,
+            List<BatchTweetDraftInput> drafts
+    ) {
+        validateSafeId(accountId, "accountId");
+        if (username == null || username.isBlank()) {
+            throw new XDataProviderException(401, "缺少当前登录用户名，请重新登录");
+        }
+        if (drafts == null || drafts.isEmpty()) {
+            throw new IllegalArgumentException("请至少添加 1 条定时推文");
+        }
+        if (drafts.size() > MAX_BATCH_CREATE_ITEMS) {
+            throw new IllegalArgumentException("单次最多同时预设 " + MAX_BATCH_CREATE_ITEMS + " 条定时推文");
+        }
+        requireScheduledPublishEligible(accountId, username);
+
+        boolean anyHasMedia = false;
+        List<PreparedDraftItem> prepared = new ArrayList<>(drafts.size());
+        Set<String> seenReqIds = new HashSet<>();
+        for (int i = 0; i < drafts.size(); i++) {
+            BatchTweetDraftInput d = drafts.get(i);
+            if (d == null) {
+                throw new IllegalArgumentException("第 " + (i + 1) + " 条定时推文参数为空");
+            }
+            String rawText = d.text() == null ? "" : d.text();
+            String trimmedText = rawText.trim();
+            if (rawText.length() > MAX_TEXT_LENGTH) {
+                throw new IllegalArgumentException("第 " + (i + 1) + " 条推文正文长度不能超过 " + MAX_TEXT_LENGTH + " 个字符");
+            }
+            List<MediaUploadInput> mediaInputs = d.uploads() == null ? List.of() : d.uploads();
+            if (trimmedText.isEmpty() && mediaInputs.isEmpty()) {
+                throw new IllegalArgumentException("第 " + (i + 1) + " 条推文请输入正文或至少添加 1 张图片");
+            }
+            if (!mediaInputs.isEmpty()) {
+                anyHasMedia = true;
+            }
+            List<DetectedImageFormat> detectedFormats = validateMediaUploads(mediaInputs);
+            String reqId = d.clientRequestId() == null ? "" : d.clientRequestId().trim();
+            if (!reqId.isEmpty() && !seenReqIds.add(reqId)) {
+                throw new IllegalArgumentException("批量提交中包含重复的请求标识");
+            }
+            List<String> mediaShaList = new ArrayList<>(mediaInputs.size());
+            for (MediaUploadInput input : mediaInputs) {
+                mediaShaList.add(sha256Hex(input.bytes()));
+            }
+            String fingerprint = computeContentFingerprint(trimmedText, mediaShaList);
+            prepared.add(new PreparedDraftItem(
+                    rawText,
+                    trimmedText,
+                    d.scheduledAtEpochMs(),
+                    reqId,
+                    mediaInputs,
+                    detectedFormats,
+                    mediaShaList,
+                    fingerprint
+            ));
+        }
+
+        // 同批次任意两条定时推文之间必须至少间隔 1 小时
+        for (int i = 0; i < prepared.size(); i++) {
+            for (int j = i + 1; j < prepared.size(); j++) {
+                long diff = Math.abs(prepared.get(i).scheduledAtEpochMs() - prepared.get(j).scheduledAtEpochMs());
+                if (diff < MIN_TWEET_INTERVAL_MS) {
+                    throw new XDataProviderException(
+                            409,
+                            String.format("第 %d 条与第 %d 条定时推文间隔不足 1 小时，每条定时推文之间必须至少间隔 1 小时", i + 1, j + 1)
+                    );
+                }
+            }
+        }
+
+        XOAuthService.TokenCapability cap = oauthService.getTokenCapability(accountId);
+        if (!cap.writeAuthorized()) {
+            throw new XDataProviderException(403, "当前账号尚未开通定时发布二次授权，请先点击「前往 X 授权」开通权限");
+        }
+        if (anyHasMedia && !cap.mediaWriteAuthorized()) {
+            throw new XDataProviderException(403, "当前账号尚未授予图片上传权限（media.write），请先点击「前往 X 授权」补充授权");
+        }
+
+        long nowMs = clock.millis();
+        synchronized (accountLock(accountId)) {
+            QueueStorage queue = loadQueueLocked(accountId, username);
+            boolean overduePromoted = promoteOverdueLocked(queue, nowMs);
+
+            // 整批幂等重放：若全部 clientRequestId 均已存在，直接返回原已创建的记录列表
+            List<ScheduledTweetJob> idempotentHits = new ArrayList<>(prepared.size());
+            int hitCount = 0;
+            for (PreparedDraftItem item : prepared) {
+                if (!item.clientRequestId().isEmpty()) {
+                    String existingId = queue.clientRequestMap().get(item.clientRequestId());
+                    if (existingId != null) {
+                        ScheduledTweetJob existingJob = findJob(queue, existingId);
+                        if (existingJob != null) {
+                            idempotentHits.add(existingJob);
+                            hitCount++;
+                        }
+                    }
+                }
+            }
+            if (hitCount == prepared.size()) {
+                if (overduePromoted) {
+                    saveQueueLocked(queue);
+                }
+                return new BatchCreateResponse(List.copyOf(idempotentHits), idempotentHits.size());
+            }
+            if (hitCount > 0) {
+                throw new XDataProviderException(409, "批次中包含已提交过的请求记录，请刷新队列后重试");
+            }
+
+            for (int i = 0; i < prepared.size(); i++) {
+                PreparedDraftItem item = prepared.get(i);
+                String prefix = prepared.size() > 1 ? ("第 " + (i + 1) + " 条") : "";
+                if (item.scheduledAtEpochMs() < nowMs + MIN_SCHEDULE_LEAD_MS) {
+                    throw new IllegalArgumentException(
+                            (prefix.isEmpty() ? "" : prefix) + "定时发布时间需晚于当前时间至少 15 秒"
+                    );
+                }
+                for (ScheduledTweetJob active : queue.jobs()) {
+                    if (isActiveStatus(active.status())
+                            && item.fingerprint().equals(active.contentFingerprint())
+                            && Math.abs(active.scheduledAtEpochMs() - item.scheduledAtEpochMs()) < DUPLICATE_WINDOW_MS) {
+                        throw new XDataProviderException(409, "已存在相同内容与相近时间的待发定时推文，已阻止重复创建");
+                    }
+                }
+                assertMinOneHourIntervalLocked(queue, item.scheduledAtEpochMs(), null, prefix);
+            }
+
+            List<Path> createdDirs = new ArrayList<>(prepared.size());
+            List<ScheduledTweetJob> createdJobs = new ArrayList<>(prepared.size());
+            try {
+                for (int idx = 0; idx < prepared.size(); idx++) {
+                    PreparedDraftItem item = prepared.get(idx);
+                    String jobId = UUID.randomUUID().toString();
+                    createdDirs.add(resolveJobMediaDir(accountId, jobId));
+                    List<ScheduledMediaAsset> assets = new ArrayList<>(item.mediaInputs().size());
+                    for (int m = 0; m < item.mediaInputs().size(); m++) {
+                        MediaUploadInput input = item.mediaInputs().get(m);
+                        DetectedImageFormat fmt = item.detectedFormats().get(m);
+                        String assetId = UUID.randomUUID().toString();
+                        String safeName = sanitizeFileName(input.fileName(), "image-" + (m + 1) + fmt.extension());
+                        Path target = resolveMediaAssetPath(accountId, jobId, assetId, fmt.extension());
+                        Files.createDirectories(target.getParent());
+                        Files.write(target, input.bytes());
+                        assets.add(new ScheduledMediaAsset(
+                                assetId,
+                                safeName,
+                                fmt.mimeType(),
+                                input.bytes().length,
+                                item.mediaShaList().get(m),
+                                null,
+                                0L
+                        ));
+                    }
+                    long itemCreatedAt = nowMs + idx;
+                    ScheduledTweetJob job = new ScheduledTweetJob(
+                            jobId,
+                            accountId,
+                            username,
+                            item.rawText(),
+                            assets,
+                            item.scheduledAtEpochMs(),
+                            ScheduledTweetStatus.SCHEDULED,
+                            OverdueReason.NONE,
+                            false,
+                            false,
+                            null,
+                            item.clientRequestId().isEmpty() ? null : item.clientRequestId(),
+                            item.fingerprint(),
+                            0,
+                            itemCreatedAt,
+                            itemCreatedAt,
+                            0L,
+                            0L,
+                            0L,
+                            null,
+                            null,
+                            null
+                    );
+                    createdJobs.add(job);
+                }
+
+                queue.jobs().addAll(createdJobs);
+                for (ScheduledTweetJob job : createdJobs) {
+                    if (job.clientRequestId() != null && !job.clientRequestId().isBlank()) {
+                        recordClientRequestId(queue.clientRequestMap(), job.clientRequestId(), job.id());
+                    }
+                }
+                saveQueueLocked(queue);
+                return new BatchCreateResponse(List.copyOf(createdJobs), createdJobs.size());
+            } catch (RuntimeException ex) {
+                for (Path dir : createdDirs) {
+                    deleteDirectoryQuietly(dir);
+                }
+                throw ex;
+            } catch (Exception ex) {
+                for (Path dir : createdDirs) {
+                    deleteDirectoryQuietly(dir);
+                }
+                throw new IllegalStateException("保存批量定时推文媒体文件失败：" + ex.getMessage(), ex);
+            }
+        }
+    }
+
+    public ScheduledTweetJob confirmAndResend(String accountId, String jobId, String confirmToken) {
+        return confirmAndResend(accountId, "", jobId, confirmToken);
+    }
+
+    public ScheduledTweetJob confirmAndResend(String accountId, String username, String jobId, String confirmToken) {
+        validateSafeId(accountId, "accountId");
+        validateSafeId(jobId, "jobId");
+        requireScheduledPublishEligible(accountId, username);
+        long nowMs = clock.millis();
+        ScheduledTweetJob updated;
+        synchronized (accountLock(accountId)) {
+            QueueStorage queue = loadQueueLocked(accountId, "");
+            promoteOverdueLocked(queue, nowMs);
+            int idx = findJobIndex(queue, jobId);
+            if (idx < 0) {
+                throw new XDataProviderException(404, "未找到对应的定时推文记录");
+            }
+            ScheduledTweetJob current = queue.jobs().get(idx);
+            if (current.status() == ScheduledTweetStatus.PUBLISHED || current.publishedTweetId() != null) {
+                throw new XDataProviderException(409, "该推文已发布成功，系统已拦截重复发送");
+            }
+            if (current.status() == ScheduledTweetStatus.SENDING || current.status() == ScheduledTweetStatus.RESEND_QUEUED) {
+                return current;
+            }
+            if (current.status() != ScheduledTweetStatus.OVERDUE_CONFIRM_REQUIRED
+                    && current.status() != ScheduledTweetStatus.FAILED) {
+                throw new XDataProviderException(409, "当前推文状态无需二次确认（" + current.status() + "）");
+            }
+            if (confirmToken == null || confirmToken.isBlank() || !confirmToken.equals(current.confirmToken())) {
+                throw new XDataProviderException(409, "二次确认凭证已更新或已在其他页面确认，请刷新后查看");
+            }
+            updated = current.markResendQueued(nowMs);
+            queue.jobs().set(idx, updated);
+            saveQueueLocked(queue);
+        }
+        triggerAsyncDispatch(accountId);
+        return updated;
+    }
+
+    public ScheduledTweetListResponse batchConfirmOverdue(
+            String accountId,
+            String username,
+            List<BatchConfirmItem> items
+    ) {
+        validateSafeId(accountId, "accountId");
+        requireScheduledPublishEligible(accountId, username);
+        if (items == null || items.isEmpty()) {
+            throw new IllegalArgumentException("请选择需要批量确认补发的逾期推文");
+        }
+        long nowMs = clock.millis();
+        boolean anyQueued = false;
+        synchronized (accountLock(accountId)) {
+            QueueStorage queue = loadQueueLocked(accountId, username);
+            boolean promoted = promoteOverdueLocked(queue, nowMs);
+            List<Integer> targetIndices = new ArrayList<>();
+            for (BatchConfirmItem reqItem : items) {
+                if (reqItem == null || reqItem.id() == null || reqItem.id().isBlank()) {
+                    throw new IllegalArgumentException("批量确认条目缺少推文 ID");
+                }
+                validateSafeId(reqItem.id(), "jobId");
+                int idx = findJobIndex(queue, reqItem.id());
+                if (idx < 0) {
+                    throw new XDataProviderException(404, "未找到对应的定时推文记录：" + reqItem.id());
+                }
+                ScheduledTweetJob job = queue.jobs().get(idx);
+                if (job.status() == ScheduledTweetStatus.PUBLISHED
+                        || job.status() == ScheduledTweetStatus.SENDING
+                        || job.status() == ScheduledTweetStatus.RESEND_QUEUED) {
+                    continue;
+                }
+                if (job.uncertainDelivery()) {
+                    throw new XDataProviderException(400, "存在状态存疑的推文，请逐条核对 X 主页后单独确认补发");
+                }
+                if (job.status() != ScheduledTweetStatus.OVERDUE_CONFIRM_REQUIRED) {
+                    throw new XDataProviderException(409, "仅逾期待确认状态的推文支持批量补发：" + job.id());
+                }
+                if (reqItem.confirmToken() == null || !reqItem.confirmToken().equals(job.confirmToken())) {
+                    throw new XDataProviderException(409, "二次确认凭证已更新或已在其他页面确认，请刷新后查看");
+                }
+                if (!targetIndices.contains(idx)) {
+                    targetIndices.add(idx);
+                }
+            }
+            for (int idx : targetIndices) {
+                ScheduledTweetJob job = queue.jobs().get(idx);
+                queue.jobs().set(idx, job.markResendQueued(nowMs));
+                anyQueued = true;
+            }
+            if (promoted || anyQueued) {
+                saveQueueLocked(queue);
+            }
+        }
+        if (anyQueued) {
+            triggerAsyncDispatch(accountId);
+        }
+        return listJobs(accountId, username);
+    }
+
+    public ScheduledTweetJob cancelJob(String accountId, String jobId) {
+        validateSafeId(accountId, "accountId");
+        validateSafeId(jobId, "jobId");
+        long nowMs = clock.millis();
+        synchronized (accountLock(accountId)) {
+            QueueStorage queue = loadQueueLocked(accountId, "");
+            int idx = findJobIndex(queue, jobId);
+            if (idx < 0) {
+                throw new XDataProviderException(404, "未找到对应的定时推文记录");
+            }
+            ScheduledTweetJob current = queue.jobs().get(idx);
+            if (current.status() == ScheduledTweetStatus.PUBLISHED || current.publishedTweetId() != null) {
+                throw new XDataProviderException(409, "已发布的推文不可取消");
+            }
+            if (current.status() == ScheduledTweetStatus.SENDING || current.status() == ScheduledTweetStatus.RESEND_QUEUED) {
+                throw new XDataProviderException(409, "推文正在发送中，暂不可取消");
+            }
+            if (current.status() == ScheduledTweetStatus.CANCELLED) {
+                return current;
+            }
+            ScheduledTweetJob cancelled = current.markCancelled(nowMs);
+            queue.jobs().set(idx, cancelled);
+            saveQueueLocked(queue);
+            return cancelled;
+        }
+    }
+
+    public ScheduledTweetJob rescheduleJob(String accountId, String jobId, long scheduledAtEpochMs, String text) {
+        return rescheduleJob(accountId, "", jobId, scheduledAtEpochMs, text);
+    }
+
+    public ScheduledTweetJob rescheduleJob(
+            String accountId,
+            String username,
+            String jobId,
+            long scheduledAtEpochMs,
+            String text
+    ) {
+        validateSafeId(accountId, "accountId");
+        validateSafeId(jobId, "jobId");
+        requireScheduledPublishEligible(accountId, username);
+        long nowMs = clock.millis();
+        if (scheduledAtEpochMs < nowMs + MIN_SCHEDULE_LEAD_MS) {
+            throw new IllegalArgumentException("定时发布时间需晚于当前时间至少 15 秒");
+        }
+        synchronized (accountLock(accountId)) {
+            QueueStorage queue = loadQueueLocked(accountId, "");
+            promoteOverdueLocked(queue, nowMs);
+            int idx = findJobIndex(queue, jobId);
+            if (idx < 0) {
+                throw new XDataProviderException(404, "未找到对应的定时推文记录");
+            }
+            ScheduledTweetJob current = queue.jobs().get(idx);
+            if (current.status() == ScheduledTweetStatus.PUBLISHED || current.publishedTweetId() != null) {
+                throw new XDataProviderException(409, "已发布的推文不可修改");
+            }
+            if (current.status() == ScheduledTweetStatus.SENDING || current.status() == ScheduledTweetStatus.RESEND_QUEUED) {
+                throw new XDataProviderException(409, "推文正在发送中，暂不可修改");
+            }
+
+            String nextText = text != null ? text : current.text();
+            if (nextText.length() > MAX_TEXT_LENGTH) {
+                throw new IllegalArgumentException("推文正文长度不能超过 " + MAX_TEXT_LENGTH + " 个字符");
+            }
+            if (nextText.trim().isEmpty() && current.media().isEmpty()) {
+                throw new IllegalArgumentException("推文内容与图片不可同时为空");
+            }
+
+            List<String> shaList = current.media().stream().map(ScheduledMediaAsset::sha256).toList();
+            String nextFingerprint = computeContentFingerprint(nextText.trim(), shaList);
+            for (ScheduledTweetJob other : queue.jobs()) {
+                if (!other.id().equals(jobId)
+                        && isActiveStatus(other.status())
+                        && nextFingerprint.equals(other.contentFingerprint())
+                        && Math.abs(other.scheduledAtEpochMs() - scheduledAtEpochMs) < DUPLICATE_WINDOW_MS) {
+                    throw new XDataProviderException(409, "已存在相同内容与相近时间的待发定时推文，已阻止重复改期");
+                }
+            }
+            assertMinOneHourIntervalLocked(queue, scheduledAtEpochMs, jobId, "");
+
+            ScheduledTweetJob updated = current.reschedule(scheduledAtEpochMs, nextText, nextFingerprint, nowMs);
+            queue.jobs().set(idx, updated);
+            saveQueueLocked(queue);
+            return updated;
+        }
+    }
+
+    public void deleteJob(String accountId, String jobId) {
+        validateSafeId(accountId, "accountId");
+        validateSafeId(jobId, "jobId");
+        synchronized (accountLock(accountId)) {
+            QueueStorage queue = loadQueueLocked(accountId, "");
+            int idx = findJobIndex(queue, jobId);
+            if (idx < 0) {
+                throw new XDataProviderException(404, "未找到对应的定时推文记录");
+            }
+            ScheduledTweetJob current = queue.jobs().get(idx);
+            if (current.status() == ScheduledTweetStatus.SENDING || current.status() == ScheduledTweetStatus.RESEND_QUEUED) {
+                throw new XDataProviderException(409, "推文正在发送中，暂不可删除");
+            }
+            queue.jobs().remove(idx);
+            saveQueueLocked(queue);
+            deleteDirectoryQuietly(resolveJobMediaDir(accountId, jobId));
+        }
+    }
+
+    public MediaFileContent loadMediaAssetBytes(String accountId, String jobId, String assetId) {
+        validateSafeId(accountId, "accountId");
+        validateSafeId(jobId, "jobId");
+        validateSafeId(assetId, "assetId");
+        ScheduledMediaAsset found = null;
+        synchronized (accountLock(accountId)) {
+            QueueStorage queue = loadQueueLocked(accountId, "");
+            ScheduledTweetJob job = findJob(queue, jobId);
+            if (job == null) {
+                throw new XDataProviderException(404, "未找到对应的定时推文记录");
+            }
+            for (ScheduledMediaAsset asset : job.media()) {
+                if (assetId.equals(asset.assetId())) {
+                    found = asset;
+                    break;
+                }
+            }
+        }
+        if (found == null) {
+            throw new XDataProviderException(404, "未找到对应的媒体附件");
+        }
+        Path file = resolveMediaAssetPath(accountId, jobId, assetId, extensionForMime(found.mimeType()));
+        if (!Files.exists(file)) {
+            throw new XDataProviderException(404, "媒体附件文件不存在或已被清理");
+        }
+        try {
+            return new MediaFileContent(Files.readAllBytes(file), found.mimeType(), found.fileName());
+        } catch (IOException ex) {
+            throw new IllegalStateException("读取媒体附件失败：" + ex.getMessage(), ex);
+        }
+    }
+
+    public void processDueJobsForAccount(String accountId) {
+        validateSafeId(accountId, "accountId");
+        while (true) {
+            ScheduledTweetJob claimed = claimNextExecutableJob(accountId);
+            if (claimed == null) {
+                return;
+            }
+            dispatchClaimedJob(accountId, claimed);
+        }
+    }
+
+    private void triggerAsyncDispatch(String accountId) {
+        try {
+            dispatchExecutor.execute(() -> {
+                try {
+                    processDueJobsForAccount(accountId);
+                } catch (Exception ex) {
+                    log.warn("Async scheduled tweet dispatch failed for account {}: {}", accountId, ex.getMessage());
+                }
+            });
+        } catch (Exception ex) {
+            log.warn("Failed to enqueue async dispatch for account {}: {}", accountId, ex.getMessage());
+        }
+    }
+
+    private ScheduledTweetJob claimNextExecutableJob(String accountId) {
+        long nowMs = clock.millis();
+        long graceMs = Math.max(10_000L, properties.getScheduleGraceWindowSeconds() * 1000L);
+        synchronized (accountLock(accountId)) {
+            QueueStorage queue = loadQueueLocked(accountId, "");
+            boolean changed = promoteOverdueLocked(queue, nowMs);
+            int candidateIdx = -1;
+            long bestSortTime = Long.MAX_VALUE;
+            for (int i = 0; i < queue.jobs().size(); i++) {
+                ScheduledTweetJob job = queue.jobs().get(i);
+                if (job.publishedTweetId() != null) {
+                    continue;
+                }
+                boolean dueScheduled = job.status() == ScheduledTweetStatus.SCHEDULED
+                        && job.scheduledAtEpochMs() <= nowMs
+                        && nowMs - job.scheduledAtEpochMs() <= graceMs;
+                boolean confirmedResend = job.status() == ScheduledTweetStatus.RESEND_QUEUED;
+                if (dueScheduled || confirmedResend) {
+                    long rankTime = confirmedResend ? job.confirmedAtEpochMs() : job.scheduledAtEpochMs();
+                    if (rankTime < bestSortTime) {
+                        bestSortTime = rankTime;
+                        candidateIdx = i;
+                    }
+                }
+            }
+            if (candidateIdx < 0) {
+                if (changed) {
+                    saveQueueLocked(queue);
+                }
+                return null;
+            }
+            ScheduledTweetJob claimed = queue.jobs().get(candidateIdx).markSending(nowMs);
+            queue.jobs().set(candidateIdx, claimed);
+            saveQueueLocked(queue);
+            return claimed;
+        }
+    }
+
+    private void dispatchClaimedJob(String accountId, ScheduledTweetJob claimed) {
+        boolean dispatchedToTweetEndpoint = false;
+        try {
+            CommunityHubService.ScheduledPublishAccess access = evaluateAccess(accountId, claimed.username());
+            if (!access.allowed()) {
+                long failMs = clock.millis();
+                synchronized (accountLock(accountId)) {
+                    QueueStorage queue = loadQueueLocked(accountId, "");
+                    int idx = findJobIndex(queue, claimed.id());
+                    if (idx >= 0) {
+                        ScheduledTweetJob latest = queue.jobs().get(idx);
+                        if (latest.status() == ScheduledTweetStatus.SENDING && latest.publishedTweetId() == null) {
+                            queue.jobs().set(idx, latest.markFailed(UUID.randomUUID().toString(), access.reason(), failMs));
+                            saveQueueLocked(queue);
+                        }
+                    }
+                }
+                return;
+            }
+            boolean hasMedia = !claimed.media().isEmpty();
+            String accessToken = oauthService.getValidWriteAccessToken(accountId, hasMedia);
+
+            List<ScheduledMediaAsset> workingAssets = new ArrayList<>(claimed.media());
+            List<String> remoteMediaIds = new ArrayList<>(workingAssets.size());
+            for (int i = 0; i < workingAssets.size(); i++) {
+                ScheduledMediaAsset asset = workingAssets.get(i);
+                long nowMs = clock.millis();
+                boolean reusable = asset.remoteMediaId() != null
+                        && !asset.remoteMediaId().isBlank()
+                        && asset.remoteUploadedAtEpochMs() > 0
+                        && (nowMs - asset.remoteUploadedAtEpochMs()) < MEDIA_REUSE_TTL_MS;
+                String mediaId = asset.remoteMediaId();
+                if (!reusable) {
+                    byte[] bytes = readMediaBytesForUpload(accountId, claimed.id(), asset);
+                    mediaId = publishClient.uploadMedia(accessToken, bytes, asset.mimeType(), asset.fileName());
+                    ScheduledMediaAsset updatedAsset = asset.withRemoteMedia(mediaId, clock.millis());
+                    workingAssets.set(i, updatedAsset);
+                    checkpointMediaAsset(accountId, claimed.id(), workingAssets);
+                }
+                remoteMediaIds.add(mediaId);
+            }
+
+            String textToSend;
+            synchronized (accountLock(accountId)) {
+                QueueStorage queue = loadQueueLocked(accountId, "");
+                int idx = findJobIndex(queue, claimed.id());
+                if (idx < 0) {
+                    return;
+                }
+                ScheduledTweetJob latest = queue.jobs().get(idx);
+                if (latest.status() != ScheduledTweetStatus.SENDING || latest.publishedTweetId() != null) {
+                    return;
+                }
+                textToSend = latest.text();
+                queue.jobs().set(idx, latest.withPostRequestDispatched(clock.millis()));
+                saveQueueLocked(queue);
+                dispatchedToTweetEndpoint = true;
+            }
+
+            String tweetId = publishClient.createTweet(accessToken, textToSend, remoteMediaIds);
+            long doneMs = clock.millis();
+            synchronized (accountLock(accountId)) {
+                QueueStorage queue = loadQueueLocked(accountId, "");
+                int idx = findJobIndex(queue, claimed.id());
+                if (idx < 0) {
+                    return;
+                }
+                ScheduledTweetJob latest = queue.jobs().get(idx);
+                String uname = (latest.username() != null && !latest.username().isBlank()) ? latest.username() : "i";
+                String tweetUrl = "https://x.com/" + uname + "/status/" + tweetId;
+                queue.jobs().set(idx, latest.markPublished(tweetId, tweetUrl, doneMs));
+                saveQueueLocked(queue);
+            }
+        } catch (Exception ex) {
+            long failMs = clock.millis();
+            boolean uncertain = dispatchedToTweetEndpoint
+                    && (ex instanceof XPublishException pex ? pex.isDeliveryUncertain() : false);
+            synchronized (accountLock(accountId)) {
+                QueueStorage queue = loadQueueLocked(accountId, "");
+                int idx = findJobIndex(queue, claimed.id());
+                if (idx < 0) {
+                    return;
+                }
+                ScheduledTweetJob latest = queue.jobs().get(idx);
+                if (latest.status() == ScheduledTweetStatus.PUBLISHED || latest.publishedTweetId() != null) {
+                    return;
+                }
+                String newToken = UUID.randomUUID().toString();
+                String msg = (ex.getMessage() != null && !ex.getMessage().isBlank()) ? ex.getMessage() : "定时推文发送失败";
+                if (uncertain) {
+                    queue.jobs().set(idx, latest.markOverdueConfirmRequired(
+                            OverdueReason.UNCERTAIN_DELIVERY,
+                            true,
+                            newToken,
+                            msg,
+                            failMs
+                    ));
+                } else {
+                    queue.jobs().set(idx, latest.markFailed(newToken, msg, failMs));
+                }
+                saveQueueLocked(queue);
+            }
+        }
+    }
+
+    private String resolveUsernameForAccount(String accountId, String username) {
+        if (username != null && !username.isBlank()) {
+            return username;
+        }
+        synchronized (accountLock(accountId)) {
+            QueueStorage queue = loadQueueLocked(accountId, "");
+            return queue.username();
+        }
+    }
+
+    private CommunityHubService.ScheduledPublishAccess evaluateAccess(String accountId, String username) {
+        if (communityHubService == null) {
+            return new CommunityHubService.ScheduledPublishAccess(true, true, null, null);
+        }
+        return communityHubService.evaluateScheduledPublishAccess(
+                accountId,
+                resolveUsernameForAccount(accountId, username)
+        );
+    }
+
+    private void requireScheduledPublishEligible(String accountId, String username) {
+        CommunityHubService.ScheduledPublishAccess access = evaluateAccess(accountId, username);
+        if (!access.allowed()) {
+            throw new XDataProviderException(403, access.reason());
+        }
+    }
+
+    private void checkpointMediaAsset(String accountId, String jobId, List<ScheduledMediaAsset> assets) {
+        long nowMs = clock.millis();
+        synchronized (accountLock(accountId)) {
+            QueueStorage queue = loadQueueLocked(accountId, "");
+            int idx = findJobIndex(queue, jobId);
+            if (idx < 0) {
+                return;
+            }
+            queue.jobs().set(idx, queue.jobs().get(idx).withMedia(assets, nowMs));
+            saveQueueLocked(queue);
+        }
+    }
+
+    private byte[] readMediaBytesForUpload(String accountId, String jobId, ScheduledMediaAsset asset) {
+        Path file = resolveMediaAssetPath(accountId, jobId, asset.assetId(), extensionForMime(asset.mimeType()));
+        if (!Files.exists(file)) {
+            throw new XPublishException(404, "本地暂存的媒体图片缺失：" + asset.fileName(), false);
+        }
+        try {
+            return Files.readAllBytes(file);
+        } catch (IOException ex) {
+            throw new XPublishException(500, "读取本地暂存图片失败：" + ex.getMessage(), ex, false);
+        }
+    }
+
+    private boolean promoteOverdueLocked(QueueStorage queue, long nowMs) {
+        long graceMs = Math.max(10_000L, properties.getScheduleGraceWindowSeconds() * 1000L);
+        boolean changed = false;
+        for (int i = 0; i < queue.jobs().size(); i++) {
+            ScheduledTweetJob job = queue.jobs().get(i);
+            if (job.status() == ScheduledTweetStatus.SCHEDULED && nowMs - job.scheduledAtEpochMs() > graceMs) {
+                queue.jobs().set(i, job.markOverdueConfirmRequired(
+                        OverdueReason.MISSED_WINDOW,
+                        false,
+                        UUID.randomUUID().toString(),
+                        "已错过原定发布时间窗口，二次确认后将立即自动补发",
+                        nowMs
+                ));
+                changed = true;
+            } else if (job.status() == ScheduledTweetStatus.RESEND_QUEUED
+                    && job.confirmedAtEpochMs() > 0
+                    && nowMs - job.confirmedAtEpochMs() > graceMs) {
+                queue.jobs().set(i, job.markOverdueConfirmRequired(
+                        OverdueReason.MISSED_WINDOW,
+                        job.uncertainDelivery(),
+                        UUID.randomUUID().toString(),
+                        "二次确认后的补发窗口已过期，请重新确认后再补发",
+                        nowMs
+                ));
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
+    private List<DetectedImageFormat> validateMediaUploads(List<MediaUploadInput> uploads) {
+        if (uploads.size() > MAX_STATIC_IMAGES) {
+            throw new IllegalArgumentException("单条推文最多附带 4 张静态图片");
+        }
+        List<DetectedImageFormat> result = new ArrayList<>(uploads.size());
+        boolean hasGif = false;
+        for (MediaUploadInput upload : uploads) {
+            if (upload == null || upload.bytes() == null || upload.bytes().length == 0) {
+                throw new IllegalArgumentException("存在空的图片文件，请重新选择");
+            }
+            DetectedImageFormat fmt = detectImageFormat(upload.bytes());
+            if ("image/gif".equals(fmt.mimeType())) {
+                hasGif = true;
+            }
+            if (upload.bytes().length > fmt.maxBytes()) {
+                long maxMb = fmt.maxBytes() / (1024 * 1024);
+                throw new IllegalArgumentException("图片体积超出限制（该格式单张最大 " + maxMb + "MB）");
+            }
+            result.add(fmt);
+        }
+        if (hasGif && uploads.size() > 1) {
+            throw new IllegalArgumentException("GIF 动图每次仅支持上传 1 张，且不可与其他图片混发");
+        }
+        return result;
+    }
+
+    private static DetectedImageFormat detectImageFormat(byte[] b) {
+        if (b.length >= 8
+                && (b[0] & 0xFF) == 0x89 && b[1] == 0x50 && b[2] == 0x4E && b[3] == 0x47
+                && b[4] == 0x0D && b[5] == 0x0A && b[6] == 0x1A && b[7] == 0x0A) {
+            return new DetectedImageFormat("image/png", ".png", MAX_STATIC_IMAGE_BYTES);
+        }
+        if (b.length >= 3
+                && (b[0] & 0xFF) == 0xFF && (b[1] & 0xFF) == 0xD8 && (b[2] & 0xFF) == 0xFF) {
+            return new DetectedImageFormat("image/jpeg", ".jpg", MAX_STATIC_IMAGE_BYTES);
+        }
+        if (b.length >= 6
+                && b[0] == 'G' && b[1] == 'I' && b[2] == 'F' && b[3] == '8'
+                && (b[4] == '7' || b[4] == '9') && b[5] == 'a') {
+            return new DetectedImageFormat("image/gif", ".gif", MAX_GIF_BYTES);
+        }
+        if (b.length >= 12
+                && b[0] == 'R' && b[1] == 'I' && b[2] == 'F' && b[3] == 'F'
+                && b[8] == 'W' && b[9] == 'E' && b[10] == 'B' && b[11] == 'P') {
+            return new DetectedImageFormat("image/webp", ".webp", MAX_STATIC_IMAGE_BYTES);
+        }
+        throw new IllegalArgumentException("仅支持 PNG、JPG、WEBP 或 GIF 格式图片");
+    }
+
+    private static String extensionForMime(String mimeType) {
+        if (mimeType == null) {
+            return ".png";
+        }
+        return switch (mimeType) {
+            case "image/jpeg" -> ".jpg";
+            case "image/gif" -> ".gif";
+            case "image/webp" -> ".webp";
+            default -> ".png";
+        };
+    }
+
+    private QueueStorage loadQueueLocked(String accountId, String fallbackUsername) {
+        Path file = resolveQueueFile(accountId);
+        if (file == null || !Files.exists(file)) {
+            return QueueStorage.empty(accountId, fallbackUsername);
+        }
+        try {
+            QueueStorage raw = objectMapper.readValue(file.toFile(), QueueStorage.class);
+            return raw != null ? raw.mutableCopy(fallbackUsername) : QueueStorage.empty(accountId, fallbackUsername);
+        } catch (Exception ex) {
+            log.warn("Failed to read scheduled tweets queue for account {}: {}", accountId, ex.getMessage());
+            return QueueStorage.empty(accountId, fallbackUsername);
+        }
+    }
+
+    private void saveQueueLocked(QueueStorage queue) {
+        Path file = resolveQueueFile(queue.accountId());
+        if (file == null) {
+            return;
+        }
+        try {
+            Files.createDirectories(file.getParent());
+            Path tmp = file.resolveSibling(
+                    "scheduled_tweets_v1." + ThreadLocalRandom.current().nextLong(1_000_000_000L) + ".tmp"
+            );
+            objectMapper.writeValue(tmp.toFile(), queue);
+            try {
+                Files.move(tmp, file, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            } catch (AtomicMoveNotSupportedException ex) {
+                Files.move(tmp, file, StandardCopyOption.REPLACE_EXISTING);
+            }
+        } catch (IOException ex) {
+            throw new IllegalStateException("持久化定时推文队列失败：" + ex.getMessage(), ex);
+        }
+    }
+
+    private List<String> discoverScheduledAccountIds() {
+        String dir = properties.getDiskCacheDir();
+        if (dir == null || dir.isBlank()) {
+            return List.of();
+        }
+        Path byIdRoot = Path.of(dir).resolve("users").resolve("by-id");
+        if (!Files.isDirectory(byIdRoot)) {
+            return List.of();
+        }
+        List<String> ids = new ArrayList<>();
+        try (Stream<Path> stream = Files.list(byIdRoot)) {
+            stream.filter(Files::isDirectory).forEach(p -> {
+                String name = p.getFileName().toString();
+                if (SAFE_ID_PATTERN.matcher(name).matches()
+                        && Files.exists(p.resolve("scheduled_tweets_v1.json"))) {
+                    ids.add(name);
+                }
+            });
+        } catch (IOException ex) {
+            log.debug("Failed to list scheduled account dirs: {}", ex.getMessage());
+        }
+        return ids;
+    }
+
+    private Path resolveAccountDir(String accountId) {
+        String dir = properties.getDiskCacheDir();
+        if (dir == null || dir.isBlank()) {
+            return null;
+        }
+        validateSafeId(accountId, "accountId");
+        return Path.of(dir).resolve("users").resolve("by-id").resolve(accountId);
+    }
+
+    private Path resolveQueueFile(String accountId) {
+        Path accDir = resolveAccountDir(accountId);
+        return accDir == null ? null : accDir.resolve("scheduled_tweets_v1.json");
+    }
+
+    private Path resolveJobMediaDir(String accountId, String jobId) {
+        Path accDir = resolveAccountDir(accountId);
+        if (accDir == null) {
+            throw new IllegalStateException("未配置磁盘缓存目录，无法存储定时推文图片");
+        }
+        validateSafeId(jobId, "jobId");
+        return accDir.resolve("scheduled_media").resolve(jobId);
+    }
+
+    private Path resolveMediaAssetPath(String accountId, String jobId, String assetId, String ext) {
+        validateSafeId(assetId, "assetId");
+        return resolveJobMediaDir(accountId, jobId).resolve(assetId + ext);
+    }
+
+    private Object accountLock(String accountId) {
+        if (accountLocks.size() > 2048) {
+            accountLocks.clear();
+        }
+        return accountLocks.computeIfAbsent(accountId, k -> new Object());
+    }
+
+    private static ScheduledTweetJob findJob(QueueStorage queue, String jobId) {
+        for (ScheduledTweetJob job : queue.jobs()) {
+            if (jobId.equals(job.id())) {
+                return job;
+            }
+        }
+        return null;
+    }
+
+    private static int findJobIndex(QueueStorage queue, String jobId) {
+        for (int i = 0; i < queue.jobs().size(); i++) {
+            if (jobId.equals(queue.jobs().get(i).id())) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private void assertMinOneHourIntervalLocked(
+            QueueStorage queue,
+            long candidateEpochMs,
+            String excludeJobId,
+            String itemPrefix
+    ) {
+        for (ScheduledTweetJob existing : queue.jobs()) {
+            if (existing.status() != ScheduledTweetStatus.SCHEDULED) {
+                continue;
+            }
+            if (excludeJobId != null && excludeJobId.equals(existing.id())) {
+                continue;
+            }
+            if (Math.abs(existing.scheduledAtEpochMs() - candidateEpochMs) < MIN_TWEET_INTERVAL_MS) {
+                String conflictTime = formatScheduledTimeForMessage(existing.scheduledAtEpochMs());
+                String prefix = (itemPrefix == null || itemPrefix.isBlank()) ? "定时时间" : (itemPrefix + "定时时间");
+                throw new XDataProviderException(
+                        409,
+                        prefix + "与待发队列中的推文（" + conflictTime + "）间隔不足 1 小时，每条定时推文之间必须至少间隔 1 小时"
+                );
+            }
+        }
+    }
+
+    private String formatScheduledTimeForMessage(long epochMs) {
+        ZoneId zone;
+        try {
+            zone = ZoneId.of(properties.getTimezone());
+        } catch (Exception ignored) {
+            zone = ZoneId.of("Asia/Shanghai");
+        }
+        return Instant.ofEpochMilli(epochMs).atZone(zone).format(CONFLICT_TIME_FMT);
+    }
+
+    private static boolean isActiveStatus(ScheduledTweetStatus status) {
+        return status == ScheduledTweetStatus.SCHEDULED
+                || status == ScheduledTweetStatus.OVERDUE_CONFIRM_REQUIRED
+                || status == ScheduledTweetStatus.RESEND_QUEUED
+                || status == ScheduledTweetStatus.SENDING;
+    }
+
+    private static void recordClientRequestId(Map<String, String> map, String reqId, String jobId) {
+        map.put(reqId, jobId);
+        while (map.size() > MAX_CLIENT_REQUEST_CACHE) {
+            Iterator<String> it = map.keySet().iterator();
+            if (it.hasNext()) {
+                it.next();
+                it.remove();
+            } else {
+                break;
+            }
+        }
+    }
+
+    private static String computeContentFingerprint(String normalizedText, List<String> mediaSha256List) {
+        String joined = normalizedText + "|" + String.join(",", mediaSha256List);
+        return sha256Hex(joined.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static String sha256Hex(byte[] bytes) {
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256").digest(bytes);
+            return HexFormat.of().formatHex(digest);
+        } catch (Exception ex) {
+            throw new IllegalStateException("SHA-256 unavailable", ex);
+        }
+    }
+
+    private static String sanitizeFileName(String raw, String fallback) {
+        if (raw == null || raw.isBlank()) {
+            return fallback;
+        }
+        String base = Path.of(raw).getFileName().toString().replaceAll("[\\r\\n\"\\\\/]+", "_").trim();
+        if (base.isEmpty()) {
+            return fallback;
+        }
+        return base.length() > 80 ? base.substring(0, 80) : base;
+    }
+
+    private static void validateSafeId(String value, String fieldName) {
+        if (value == null || value.isBlank() || !SAFE_ID_PATTERN.matcher(value.trim()).matches()) {
+            throw new IllegalArgumentException("非法的 " + fieldName + " 参数");
+        }
+    }
+
+    private static void deleteDirectoryQuietly(Path dir) {
+        if (dir == null || !Files.exists(dir)) {
+            return;
+        }
+        try (Stream<Path> walk = Files.walk(dir)) {
+            walk.sorted(Comparator.reverseOrder()).forEach(p -> {
+                try {
+                    Files.deleteIfExists(p);
+                } catch (IOException ignored) {
+                }
+            });
+        } catch (IOException ignored) {
+        }
+    }
+}

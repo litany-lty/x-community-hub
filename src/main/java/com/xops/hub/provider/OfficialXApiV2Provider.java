@@ -67,7 +67,7 @@ public class OfficialXApiV2Provider {
         // 1. 获取用户基本信息（经由共用线程池执行）
         JsonNode userResp = getJson(
                 baseUrl + "/users/by/username/" + encodedUser
-                        + "?user.fields=created_at,description,profile_image_url,public_metrics,verified",
+                        + "?user.fields=created_at,description,profile_image_url,profile_banner_url,public_metrics,verified",
                 token
         );
         JsonNode userData = userResp.path("data");
@@ -348,7 +348,8 @@ public class OfficialXApiV2Provider {
                 pm.path("followers_count").asInt(0),
                 pm.path("following_count").asInt(0),
                 renamedField(pm, "post_count", "tweet_count").asInt(0),
-                u.path("created_at").asText("")
+                u.path("created_at").asText(""),
+                u.path("profile_banner_url").asText("")
         );
     }
 

@@ -11,18 +11,23 @@ function section(start, end) {
 }
 const resetCode = section('    function cancelReportRequest()', '    // 已精简移除的元素');
 const identityCode = section('    function stableUserId(', '    function getSelfStorageKey(');
+const profileCacheCode = section('    function getProfileHeaderCacheKey(', '    function saveProfileHeaderCache(')
+    + section('    function clearProfileHeaderCache(', '    function canPersistMediaToCacheStorage(');
 const loadCode = section('    async function loadSelfReport(', '    // 首次加载骨架屏');
 const logoutCode = section('        const doLogout = async () => {', '        $("railLogoutBtn").addEventListener')
     .replace('const doLogout =', 'globalThis.doLogout =');
 const timingCode = section('    function computeNextGoldenWindowHint(', '    function timingPeriodDescription(')
     + section('    function timingPeriodDescription(', '    function renderTimingPanel(');
+const dailyStatusCode = section('    function renderDailyCacheStatus(', '    function renderProfileHeader(');
 const noop = () => {};
 function context() {
     const state = {authStatus: {loggedIn: true, user: {id: '1001', username: 'alice'}}, period: 'HOURS_48', days: 2,
         report: null, bundle: null, reportRequestGeneration: 0, authStatusGeneration: 0};
     const element = {classList: {remove: noop}, hidden: false};
+    const removedStorageKeys = [];
     const ctx = {state, LIST_PAGE_SIZE: 50, PERIOD_META: {HOURS_48: {badgePrefix: '48h'}}, Date, Number,
         Boolean, Set, AbortController, Intl,
+        removedStorageKeys, localStorage: {removeItem: key => removedStorageKeys.push(key)},
         $: () => element, setTimeout: () => 1, clearTimeout: noop, setInterval: () => 1, clearInterval: noop,
         isLoggedIn: () => Boolean(state.authStatus?.loggedIn), syncAuthGateAndWorkspaceUI: noop,
         updateRefreshButtonState: noop, hideError: noop, showLoadingSkeleton: noop,
@@ -31,7 +36,7 @@ function context() {
         applyLoadedPeriodReport: r => {state.report = r;}, fetchServerAndAuthStatus: async () => {},
         showToast: msg => {ctx.toast = msg;}};
     vm.createContext(ctx);
-    vm.runInContext(identityCode + resetCode + loadCode + logoutCode + timingCode, ctx);
+    vm.runInContext(identityCode + profileCacheCode + resetCode + loadCode + logoutCode + timingCode + dailyStatusCode, ctx);
     return ctx;
 }
 function response(username = 'alice', id = '1001') {
@@ -89,6 +94,7 @@ function response(username = 'alice', id = '1001') {
     assert.equal(failed.toast, undefined);
     assert.equal(failed.state.authStatus.loggedIn, true);
     assert.match(failed.error, /HTTP 500/);
+    assert.deepEqual(failed.removedStorageKeys, [], 'failed logout must not remove the profile cache');
 
     const stillLoggedIn = context();
     stillLoggedIn.fetch = async () => ({status: 200, ok: true});
@@ -108,6 +114,8 @@ function response(username = 'alice', id = '1001') {
     await success.doLogout();
     assert.match(success.toast, /已退出/);
     assert.equal(success.state.report, null);
+    assert.deepEqual(success.removedStorageKeys, ['xops_profile_meta_user_1001', 'xops_last_uid'],
+        'logout must clear only the stable-ID profile cache and last-user marker');
 
     const timing = context();
     const RealDate = Date;
@@ -117,5 +125,14 @@ function response(username = 'alice', id = '1001') {
     assert.match(timing.timingPeriodDescription(), /America\/New_York/);
     timing.state.report = {contentTiming: {}};
     assert.match(timing.computeNextGoldenWindowHint([{label: '周一 09:00–12:00'}]), /当前正处于黄金档/);
+    const daily = context();
+    daily.state.dailyCacheStatus = {snapshotAt: '2026-11-14T18:53:05Z',
+        latestMetricFetchedAt: '2026-11-14T19:03:05Z', recentPosts: 1, recentInbound: 0, pendingMetricPosts: 0};
+    daily.renderDailyCacheStatus({});
+    assert.match(daily.$('dailyCacheStatusHint').textContent, /指标最近采集.*近24h.*分批读数/);
+    assert.match(daily.$('dailyCacheStatusHint').textContent, /03:03:05/);
+    delete daily.state.dailyCacheStatus.latestMetricFetchedAt;
+    daily.renderDailyCacheStatus({});
+    assert.match(daily.$('dailyCacheStatusHint').textContent, /指标最近采集时间未确认/);
     console.log('auth-state-regression: passed');
 })().catch(err => {console.error(err); process.exitCode = 1;});

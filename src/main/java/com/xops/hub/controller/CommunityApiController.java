@@ -62,7 +62,7 @@ public class CommunityApiController {
     public CommunityDashboardReport analyze(
             @RequestParam(value = "username", required = false) String username,
             @RequestParam(value = "period", required = false) String period,
-            @RequestParam(value = "days", defaultValue = "2") int days,
+            @RequestParam(value = "days", required = false) Integer days,
             @RequestParam(value = "provider", required = false) String provider,
             @RequestParam(value = "refresh", defaultValue = "false") boolean refresh,
             HttpServletRequest request,
@@ -70,9 +70,12 @@ public class CommunityApiController {
     ) {
         applyPrivateNoStoreHeaders(response);
         String authorizedUsername = resolveAuthorizedTargetUsername(username, request);
-        int resolvedDays = parsePeriodOrDays(period, days);
+        CommunityAnalyticsEngine.ReportPeriod resolvedPeriod = parseReportPeriod(
+                period, days, CommunityAnalyticsEngine.ReportPeriod.HOURS_24);
         String clientIp = extractClientIp(request);
-        CommunityDashboardReport report = hubService.analyzeAccount(authorizedUsername, resolvedDays, provider, refresh, clientIp, resolveAuthorizedAccountId(authorizedUsername, request));
+        CommunityDashboardReport report = hubService.analyzeWorkspaceReport(
+                authorizedUsername, resolvedPeriod, provider, refresh, clientIp,
+                resolveAuthorizedAccountId(authorizedUsername, request));
         verifyReportAccountIsolation(authorizedUsername, report);
         return report;
     }
@@ -81,7 +84,7 @@ public class CommunityApiController {
     public MultiPeriodDashboardBundle analyzeBundle(
             @RequestParam(value = "username", required = false) String username,
             @RequestParam(value = "period", required = false) String period,
-            @RequestParam(value = "targetDays", defaultValue = "2") int targetDays,
+            @RequestParam(value = "targetDays", required = false) Integer targetDays,
             @RequestParam(value = "provider", required = false) String provider,
             @RequestParam(value = "refresh", defaultValue = "false") boolean refresh,
             @RequestParam(value = "continueRelations", defaultValue = "false") boolean continueRelations,
@@ -91,16 +94,18 @@ public class CommunityApiController {
     ) {
         applyPrivateNoStoreHeaders(response);
         String authorizedUsername = resolveAuthorizedTargetUsername(username, request, stored);
-        int resolvedTargetDays = parsePeriodOrDays(period, targetDays);
+        CommunityAnalyticsEngine.ReportPeriod resolvedPeriod = parseReportPeriod(
+                period, targetDays, CommunityAnalyticsEngine.ReportPeriod.HOURS_24);
         String clientIp = extractClientIp(request);
         String accountId = resolveAuthorizedAccountId(authorizedUsername, request);
         MultiPeriodDashboardBundle bundle = stored
                 ? hubService.analyzeStoredAccountBundle(authorizedUsername, accountId)
-                : hubService.analyzeAccountBundle(authorizedUsername, resolvedTargetDays, provider, refresh,
+                : hubService.analyzeWorkspaceBundle(authorizedUsername, resolvedPeriod, provider, refresh,
                         clientIp, accountId, continueRelations);
-        verifyReportAccountIsolation(authorizedUsername, bundle.day());
-        verifyReportAccountIsolation(authorizedUsername, bundle.week());
-        verifyReportAccountIsolation(authorizedUsername, bundle.month());
+        if (bundle.hours24() != null) verifyReportAccountIsolation(authorizedUsername, bundle.hours24());
+        if (bundle.day() != null) verifyReportAccountIsolation(authorizedUsername, bundle.day());
+        if (bundle.week() != null) verifyReportAccountIsolation(authorizedUsername, bundle.week());
+        if (bundle.month() != null) verifyReportAccountIsolation(authorizedUsername, bundle.month());
         return bundle;
     }
 
@@ -199,16 +204,27 @@ public class CommunityApiController {
         throw new IllegalArgumentException("请输入要查询的 X 账号");
     }
 
-    private int parsePeriodOrDays(String period, int fallbackDays) {
+    private CommunityAnalyticsEngine.ReportPeriod parseReportPeriod(
+            String period,
+            Integer fallbackDays,
+            CommunityAnalyticsEngine.ReportPeriod defaultPeriod
+    ) {
         if (period != null && !period.isBlank()) {
             return switch (period.trim().toUpperCase()) {
-                case "HOURS_48", "48H", "DAY", "D", "2", "1" -> 2;
-                case "WEEK", "W", "7D", "7" -> 7;
-                case "MONTH", "M", "30D", "30" -> 30;
-                default -> CommunityAnalyticsEngine.resolvePeriodDays(fallbackDays);
+                case "HOURS_24", "24H", "24HOURS", "HOURS_8", "8H", "8HOURS", "1" -> CommunityAnalyticsEngine.ReportPeriod.HOURS_24;
+                case "HOURS_48", "48H", "DAY", "D", "2" -> CommunityAnalyticsEngine.ReportPeriod.HOURS_48;
+                case "WEEK", "W", "7D", "7" -> CommunityAnalyticsEngine.ReportPeriod.WEEK;
+                case "MONTH", "M", "30D", "30" -> CommunityAnalyticsEngine.ReportPeriod.MONTH;
+                default -> defaultPeriod;
             };
         }
-        return CommunityAnalyticsEngine.resolvePeriodDays(fallbackDays);
+        if (fallbackDays != null) {
+            if (fallbackDays <= 1) {
+                return CommunityAnalyticsEngine.ReportPeriod.HOURS_24;
+            }
+            return CommunityAnalyticsEngine.ReportPeriod.fromDays(fallbackDays);
+        }
+        return defaultPeriod;
     }
 
     private String extractClientIp(HttpServletRequest request) {

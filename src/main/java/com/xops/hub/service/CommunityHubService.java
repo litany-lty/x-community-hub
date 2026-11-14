@@ -1,24 +1,34 @@
 package com.xops.hub.service;
 
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.xops.hub.config.XOpsProperties;
+import com.xops.hub.model.AnalyticsReportModels.AccessPolicy;
 import com.xops.hub.model.AnalyticsReportModels.CommunityDashboardReport;
+import com.xops.hub.model.AnalyticsReportModels.DailyCacheStatus;
 import com.xops.hub.model.AnalyticsReportModels.MultiPeriodDashboardBundle;
+import com.xops.hub.model.AnalyticsReportModels.PeerInteractionStat;
 import com.xops.hub.model.AnalyticsReportModels.ServerCapabilities;
 import com.xops.hub.model.AnalyticsReportModels.UsageCheckinResponse;
+import com.xops.hub.model.RawSnapshotModels.InboundInteraction;
 import com.xops.hub.model.RawSnapshotModels.ProviderMode;
 import com.xops.hub.model.RawSnapshotModels.RawAccountSnapshot;
+import com.xops.hub.model.RawSnapshotModels.RawTweet;
 import com.xops.hub.model.RawSnapshotModels.RelationshipEntry;
 import com.xops.hub.model.RawSnapshotModels.XUserSummary;
 import com.xops.hub.provider.DemoXDataProvider;
 import com.xops.hub.provider.OfficialXApiV2Provider;
 import com.xops.hub.provider.TwitterApiIoProvider;
 import com.xops.hub.provider.XDataProviderException;
+import com.xops.hub.service.CommunityAnalyticsEngine.ReportPeriod;
 import com.xops.hub.store.AccountStore;
 import com.xops.hub.util.HandleNormalizer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
 import java.nio.charset.StandardCharsets;
@@ -27,12 +37,21 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.LocalDate;
 import java.time.ZoneId;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Stream;
 
 @Service
 public class CommunityHubService {
@@ -41,9 +60,19 @@ public class CommunityHubService {
     public static final String AUTHOR_USERNAME = "elidlicom";
     private static final String AUTHOR_DISPLAY_NAME = "Litany（李丰一）";
     private static final String AUTHOR_AVATAR_URL = "/author-avatar.webp";
-    private static final String AUTHOR_DEFAULT_BIO = "Java Dev | Studying Chinese Metaphysics(Dao·道) ䷀ · 易道心学创始人 · elidli.com";
-    private static final String AUTHOR_PROFILE_URL = "https://x.com/elidlicom";
-    private static final String AUTHOR_FOLLOW_INTENT_URL = "https://x.com/intent/follow?screen_name=elidlicom";
+    private static final String AUTHOR_BANNER_URL = "/author-banner.webp";
+    private static final String AUTHOR_DEFAULT_BIO = "Java Dev & AI | Studying Chinese Metaphysics(Dao·道) ䷊";
+    public static final String AUTHOR_PROFILE_URL = "https://x.com/elidlicom";
+    public static final String AUTHOR_FOLLOW_INTENT_URL = "https://x.com/intent/follow?screen_name=elidlicom";
+    public static final String AUTHOR_REPO_URL = "https://github.com/litany-lty/x-community-hub";
+    public static final String AUTHOR_COST_STORY =
+            "我目前负债十几个、失业、每个月靠贷款交房租。确实承担不起每个月过多的API费用。现在希望通过X平台解决人生危机。也希望朋友们可以谅解。如果限制让你感到不爽，可以到git仓库看开源代码，本地部署与线上效果一致。";
+    public static final int DAILY_MANUAL_REFRESH_LIMIT = 1;
+    public static final int TOP_FREE_FULL_RANK = 5;
+    public static final int TOP_AUTO_SYNC_RANK = 50;
+    public static final int TOP_SCHEDULED_PUBLISH_RANK = 100;
+    private static final long DAILY_REFRESH_SECONDS = 3600L;
+    private static final int MAX_SYNCED_DATES = 30;
     private static final int MAX_CACHE_ENTRIES = 500;
     private static final int MAX_MEMORY_STORES = 200;
     /** 按独立认证账号限流：每人独立计数互不连坐（5 分钟已覆盖请求走内存缓存不扣额度） */
@@ -53,11 +82,43 @@ public class CommunityHubService {
     private static final java.util.regex.Pattern SAFE_HANDLE_KEY_PATTERN =
             java.util.regex.Pattern.compile("^[a-z0-9_]{1,15}$");
 
+    @JsonIgnoreProperties(ignoreUnknown = true)
     public record UserUsageEntry(
             int usageCount,
             int lastModalShownAtCount,
             Instant optimisticFollowedAt,
-            Instant updatedAt
+            Instant updatedAt,
+            String quotaDate,
+            boolean initialLoadedToday,
+            int manualRefreshUsedToday,
+            List<String> syncedDates
+    ) {
+        @JsonCreator
+        public UserUsageEntry {
+            usageCount = Math.max(0, usageCount);
+            manualRefreshUsedToday = Math.max(0, manualRefreshUsedToday);
+            syncedDates = syncedDates == null ? List.of() : List.copyOf(syncedDates);
+        }
+
+        public UserUsageEntry(int usageCount, int lastModalShownAtCount, Instant optimisticFollowedAt, Instant updatedAt) {
+            this(usageCount, lastModalShownAtCount, optimisticFollowedAt, updatedAt, null, false, 0, List.of());
+        }
+    }
+
+    public record ScheduledPublishAccess(
+            boolean allowed,
+            boolean followsAuthor,
+            Integer authorInteractionRank,
+            String reason
+    ) {
+    }
+
+    private record CachedAuthorRanks(
+            long authorSyncedAt,
+            Map<String, Integer> rankById,
+            Map<String, Integer> rankByUsername,
+            Set<String> followerIds,
+            Set<String> followerUsernames
     ) {
     }
 
@@ -71,7 +132,9 @@ public class CommunityHubService {
             RawAccountSnapshot snapshot,
             MultiPeriodDashboardBundle bundle,
             long ttlSeconds,
-            Instant expiresAt
+            Instant expiresAt,
+            String algoFingerprint,
+            Instant computedAt
     ) {
     }
 
@@ -91,6 +154,7 @@ public class CommunityHubService {
     private final TwitterApiIoProvider twitterApiIoProvider;
     private final OfficialXApiV2Provider officialXApiV2Provider;
     private final ObjectMapper objectMapper;
+    private final XAlgorithmProfileRegistry algoProfileRegistry;
     private final CommunityAnalyticsEngine analyticsEngine;
 
     private final ConcurrentHashMap<String, CachedSnapshot> snapshotCache = new ConcurrentHashMap<>();
@@ -104,6 +168,9 @@ public class CommunityHubService {
     private final Object legacyUsageLock = new Object();
     private volatile boolean legacyUsageHydrated = false;
     private volatile CachedAuthorProfile cachedAuthorProfile = null;
+    private volatile CachedAuthorRanks cachedAuthorRanks = null;
+    private volatile Path cachedAuthorStoreFile = null;
+    private final AtomicBoolean top50AutoSyncRunning = new AtomicBoolean(false);
 
     public CommunityHubService(
             XOpsProperties properties,
@@ -112,12 +179,42 @@ public class CommunityHubService {
             OfficialXApiV2Provider officialXApiV2Provider,
             ObjectMapper objectMapper
     ) {
+        this(properties, demoProvider, twitterApiIoProvider, officialXApiV2Provider, objectMapper, null);
+    }
+
+    @Autowired
+    public CommunityHubService(
+            XOpsProperties properties,
+            DemoXDataProvider demoProvider,
+            TwitterApiIoProvider twitterApiIoProvider,
+            OfficialXApiV2Provider officialXApiV2Provider,
+            ObjectMapper objectMapper,
+            XAlgorithmProfileRegistry algoProfileRegistry
+    ) {
         this.properties = properties;
         this.demoProvider = demoProvider;
         this.twitterApiIoProvider = twitterApiIoProvider;
         this.officialXApiV2Provider = officialXApiV2Provider;
         this.objectMapper = objectMapper;
-        this.analyticsEngine = new CommunityAnalyticsEngine();
+        this.algoProfileRegistry = algoProfileRegistry;
+        this.analyticsEngine = algoProfileRegistry != null
+                ? new CommunityAnalyticsEngine(algoProfileRegistry::currentProfile)
+                : new CommunityAnalyticsEngine();
+    }
+
+    private String currentAlgoFingerprint() {
+        return algoProfileRegistry != null ? algoProfileRegistry.currentState().fingerprint() : "builtin";
+    }
+
+    private void putSnapshotCache(
+            String cacheKey,
+            RawAccountSnapshot snapshot,
+            MultiPeriodDashboardBundle bundle,
+            long ttlSeconds,
+            Instant expiresAt,
+            String algoFingerprint
+    ) {
+        snapshotCache.put(cacheKey, new CachedSnapshot(snapshot, bundle, ttlSeconds, expiresAt, algoFingerprint, Instant.now()));
     }
 
     public ServerCapabilities getCapabilities() {
@@ -202,26 +299,425 @@ public class CommunityHubService {
         return refreshBundleTimestamps(holder.bundle(), holder.fromCache(), holder.ttlSeconds(), holder.expiresAt());
     }
 
+    /**
+     * 按当前已累计天数、作者关注关系、@elidlicom 互动排名（前5全量 / 前50每日自动同步）及每日刷新配额返回工作台维度分析。
+     */
+    public CommunityDashboardReport analyzeWorkspaceReport(
+            String rawHandle,
+            ReportPeriod period,
+            String requestedProvider,
+            boolean forceRefresh,
+            String clientIp,
+            String expectedAccountId
+    ) {
+        ReportPeriod target = period != null ? period : ReportPeriod.HOURS_24;
+        MultiPeriodDashboardBundle bundle = analyzeWorkspaceBundle(
+                rawHandle, target, requestedProvider, forceRefresh, clientIp, expectedAccountId, false);
+        AccessPolicy policy = bundle.accessPolicy();
+        if (policy != null && policy.unlockedPeriods() != null && !policy.unlockedPeriods().contains(target.code)) {
+            String reason = policy.lockedReasons() != null
+                    ? policy.lockedReasons().getOrDefault(target.code, "该时间维度尚未解锁")
+                    : "该时间维度尚未解锁";
+            throw new XDataProviderException(403, reason);
+        }
+        return switch (target) {
+            case HOURS_24 -> bundle.hours24();
+            case HOURS_48 -> bundle.day();
+            case WEEK -> bundle.week();
+            case MONTH -> bundle.month();
+        };
+    }
+
+    public MultiPeriodDashboardBundle analyzeWorkspaceBundle(
+            String rawHandle,
+            ReportPeriod targetPeriod,
+            String requestedProvider,
+            boolean forceRefresh,
+            String clientIp,
+            String expectedAccountId,
+            boolean continueRelations
+    ) {
+        ReportPeriod resolvedPeriod = targetPeriod != null ? targetPeriod : ReportPeriod.HOURS_24;
+        String handle = HandleNormalizer.normalize(rawHandle);
+        String handleKey = validateIsolatedHandleKey(handle);
+        ProviderMode resolvedMode = resolveProviderMode(requestedProvider);
+        String ownerKey = accountOwnerKey(handleKey, expectedAccountId);
+        String cacheKey = resolvedMode.name() + ":" + ownerKey;
+        long configuredTtl = resolvedMode == ProviderMode.DEMO
+                ? Math.max(0L, properties.getCacheTtlSeconds()) : DAILY_REFRESH_SECONDS;
+        ZoneId zone = resolveZoneId();
+        String today = LocalDate.now(zone).toString();
+
+        Instant requestedAt = Instant.now();
+        Object lock = fetchLocks.computeIfAbsent(cacheKey, k -> new Object());
+        synchronized (lock) {
+            Instant now = Instant.now();
+            UserUsageEntry quotaEntry = readUsageSnapshot(ownerKey);
+            boolean sameDay = today.equals(quotaEntry.quotaDate());
+            boolean initialLoadedToday = sameDay && quotaEntry.initialLoadedToday();
+
+            String algoFp = currentAlgoFingerprint();
+            CachedSnapshot active = snapshotCache.get(cacheKey);
+            boolean cacheValid = configuredTtl > 0 && isValidAccountCacheHit(active, handleKey, expectedAccountId, now);
+
+            Integer initialRank = resolveAuthorInteractionRank(handleKey, expectedAccountId);
+
+            if (continueRelations) {
+                if (resolvedMode != ProviderMode.TWITTERAPI_IO) {
+                    throw new XDataProviderException(400, "当前数据源不支持逐人继续核验");
+                }
+                checkLiveSyncRateLimit(handleKey, clientIp);
+                AccountStore.StoredAccount stored = loadStore(handleKey, expectedAccountId);
+                if (stored != null) verifyAccountOwner(stored.profile(), handleKey, expectedAccountId);
+                var continued = twitterApiIoProvider.continueRelationships(handle, stored, expectedAccountId);
+                verifyAccountOwner(continued.store().profile(), handleKey, expectedAccountId);
+                saveStore(handleKey, expectedAccountId, continued.store());
+                RawAccountSnapshot snap = TwitterApiIoProvider.snapshotOf(continued.store(),
+                        "本次仅继续逐人关系核验；未成功确认的对象仍保留未知。", continued.degraded());
+                Instant fallbackSynced = continued.store().syncedAtInstant() != null
+                        ? continued.store().syncedAtInstant()
+                        : (stored != null && stored.syncedAtInstant() != null ? stored.syncedAtInstant() : now);
+                Instant expires = active != null ? active.expiresAt() : fallbackSynced.plusSeconds(configuredTtl);
+                Integer rankAfter = resolveAuthorInteractionRank(handleKey, snap.profile().id());
+                UserUsageEntry latestUsage = readUsageSnapshot(ownerKey);
+                AccessPolicy policy = buildAccessPolicy(handleKey, snap, latestUsage, zone, today, rankAfter);
+                MultiPeriodDashboardBundle bundle = buildWorkspaceBundle(
+                        snap, policy, false, configuredTtl, expires, false,
+                        TwitterApiIoProvider.pendingRelationshipChecks(continued.store()))
+                        .withDailyCacheStatus(dailyCacheStatus(continued.store(), continued.degraded()));
+                if (configuredTtl > 0) putSnapshotCache(cacheKey, snap, bundle, configuredTtl, expires, algoFp);
+                return refreshWorkspaceTimestamps(bundle, false, configuredTtl, expires, policy);
+            }
+
+            // Every request reads real persistence under the same account lock, including cold starts.
+            AccountStore.StoredAccount rawStored = resolvedMode == ProviderMode.DEMO
+                    ? null : loadStore(handleKey, expectedAccountId);
+            if (rawStored != null) verifyAccountOwner(rawStored.profile(), handleKey, expectedAccountId);
+            AccountStore.StoredAccount stored = AccountStore.pruneToRollingWindow(rawStored, now);
+            boolean completedDaily = isDailyRefreshComplete(stored);
+            boolean freshDaily = completedDaily && now.getEpochSecond() >= stored.dailyRefreshedAt()
+                    && now.getEpochSecond() < stored.dailyRefreshedAt() + DAILY_REFRESH_SECONDS;
+            boolean exhaustedDailyAttempts = canContinueDailyRefresh(stored, now) && !dailyCanContinue(stored);
+            boolean coalesced = active != null && active.computedAt() != null
+                    && !active.computedAt().isBefore(requestedAt);
+            if (resolvedMode != ProviderMode.DEMO && stored != null && coalesced && !freshDaily
+                    && active.bundle() != null && active.bundle().hours24() != null) {
+                AccessPolicy policy = buildAccessPolicy(handleKey, active.snapshot(), quotaEntry, zone, today, initialRank);
+                return refreshWorkspaceTimestamps(active.bundle(), true, active.ttlSeconds(), active.expiresAt(), policy)
+                        .withDailyCacheStatus(active.bundle().dailyCacheStatus() != null
+                                ? active.bundle().dailyCacheStatus() : dailyCacheStatus(stored));
+            }
+            if (resolvedMode != ProviderMode.DEMO && stored != null && (freshDaily || exhaustedDailyAttempts)) {
+                Instant warmExpires = dailyRefreshExpiresAt(stored, now);
+                if (active != null && active.bundle() != null && active.snapshot() != null
+                        && Objects.equals(stored.syncedAtInstant(), active.snapshot().fetchedAt())
+                        && Objects.equals(algoFp, active.algoFingerprint())
+                        && active.bundle().hasMoreHistoryForTarget() == !completedDaily) {
+                    AccessPolicy policy = buildAccessPolicy(handleKey, active.snapshot(), quotaEntry, zone, today, initialRank);
+                    AccessPolicy cachedPolicy = active.bundle().accessPolicy();
+                    if (cachedPolicy != null
+                            && Objects.equals(cachedPolicy.unlockedPeriods(), policy.unlockedPeriods())
+                            && cachedPolicy.accumulatedSummaryMode() == policy.accumulatedSummaryMode()) {
+                        return refreshWorkspaceTimestamps(active.bundle(), true, configuredTtl, warmExpires, policy)
+                                .withDailyCacheStatus(dailyCacheStatus(stored));
+                    }
+                }
+                RawAccountSnapshot warmSnap = TwitterApiIoProvider.snapshotOf(stored, "", !completedDaily);
+                warmSnap = withNotice(warmSnap, buildDailyRefreshNotice(stored, completedDaily));
+                AccessPolicy policy = buildAccessPolicy(handleKey, warmSnap, quotaEntry, zone, today, initialRank);
+                MultiPeriodDashboardBundle warmBundle = buildWorkspaceBundle(
+                        warmSnap, policy, true, configuredTtl, warmExpires, !completedDaily,
+                        TwitterApiIoProvider.pendingRelationshipChecks(stored)).withDailyCacheStatus(dailyCacheStatus(stored));
+                putSnapshotCache(cacheKey, warmSnap, warmBundle, configuredTtl, warmExpires, algoFp);
+                return refreshWorkspaceTimestamps(warmBundle, true, configuredTtl, warmExpires, policy);
+            }
+            if (resolvedMode == ProviderMode.DEMO && cacheValid && !forceRefresh && initialLoadedToday) {
+                AccessPolicy policy = buildAccessPolicy(handleKey, active.snapshot(), quotaEntry, zone, today, initialRank);
+                MultiPeriodDashboardBundle demoBundle = buildWorkspaceBundle(active.snapshot(), policy, true,
+                        active.ttlSeconds(), active.expiresAt(), false, 0);
+                return refreshWorkspaceTimestamps(demoBundle, true, active.ttlSeconds(), active.expiresAt(), policy);
+            }
+
+            if (resolvedMode != ProviderMode.TWITTERAPI_IO) {
+                String priorOfficialDate = stored != null && stored.syncedAtInstant() != null
+                        ? stored.syncedAtInstant().atZone(zone).toLocalDate().toString()
+                        : null;
+                AccountStore.StoredAccount officialStored = null;
+                RawAccountSnapshot snap = switch (resolvedMode) {
+                    case X_OFFICIAL_V2 -> {
+                        checkLiveSyncRateLimit(handleKey, clientIp);
+                        RawAccountSnapshot fetched = officialXApiV2Provider.fetchSnapshot(handle, null);
+                        verifyAccountOwner(fetched.profile(), handleKey, expectedAccountId);
+                        Instant syncAt = fetched.fetchedAt() != null ? fetched.fetchedAt() : now;
+                        Instant cutoff24 = syncAt.minus(Duration.ofHours(ReportPeriod.HOURS_24.windowHours));
+                        List<RawTweet> tweets24 = (fetched.timeline() != null ? fetched.timeline() : List.<RawTweet>of()).stream()
+                                .filter(t -> t != null && t.createdAt() != null && !t.createdAt().isBefore(cutoff24))
+                                .toList();
+                        List<InboundInteraction> inbound24 = (fetched.inboundInteractions() != null ? fetched.inboundInteractions() : List.<InboundInteraction>of()).stream()
+                                .filter(i -> i != null && i.createdAt() != null && !i.createdAt().isBefore(cutoff24))
+                                .toList();
+                        List<XUserSummary> fg = new ArrayList<>();
+                        List<XUserSummary> fr = new ArrayList<>();
+                        Set<String> back = new LinkedHashSet<>();
+                        if (fetched.relationships() != null) {
+                            for (RelationshipEntry r : fetched.relationships()) {
+                                if (r == null || r.user() == null) continue;
+                                if (r.iFollowThem()) fg.add(r.user());
+                                if (r.theyFollowMe()) fr.add(r.user());
+                                if (r.iFollowThem() && r.theyFollowMe() && r.user().username() != null) {
+                                    back.add(r.user().username().toLowerCase(Locale.ROOT));
+                                }
+                            }
+                        }
+                        // Earlier code asserted a whole day from any bounded first page. Discard those
+                        // unproven intervals while retaining the actual historical rows.
+                        AccountStore.StoredAccount provenBase = stored != null
+                                ? AccountStore.withCoverage(stored, List.of(), List.of()) : null;
+                        List<long[]> tweetProof = officialCoverage(fetched.timelineTailTime(), fetched.timelineExhausted(), cutoff24, syncAt);
+                        List<long[]> inboundProof = officialCoverage(fetched.mentionsTailTime(), fetched.mentionsExhausted(), cutoff24, syncAt);
+                        AccountStore.StoredAccount mergedOfficial = AccountStore.merge(
+                                provenBase,
+                                fetched.profile(),
+                                syncAt,
+                                tweets24,
+                                inbound24,
+                                tweetProof,
+                                inboundProof,
+                                new AccountStore.GraphUpdate(fg, fr, back, fetched.followersTruncated(), fetched.followingsTruncated(), false, false)
+                        );
+                        boolean full = streamCoversDaily(tweetProof, syncAt.getEpochSecond())
+                                && streamCoversDaily(inboundProof, syncAt.getEpochSecond())
+                                && !fetched.degradedPartial();
+                        mergedOfficial = AccountStore.withDailyRefreshState(mergedOfficial,
+                                syncAt.getEpochSecond(), full ? syncAt.getEpochSecond() : 0);
+                        officialStored = mergedOfficial;
+                        saveStore(handleKey, expectedAccountId, mergedOfficial);
+                        yield TwitterApiIoProvider.snapshotOf(mergedOfficial, fetched.bannerNotice(), fetched.degradedPartial());
+                    }
+                    case DEMO -> demoSnapshotForAccount(handle, expectedAccountId);
+                    default -> throw new XDataProviderException(500, "不支持的数据源模式");
+                };
+                verifyAccountOwner(snap.profile(), handleKey, expectedAccountId);
+                boolean complete = officialStored == null || isDailyRefreshComplete(officialStored);
+                Instant expiresAt = officialStored != null ? dailyRefreshExpiresAt(officialStored, now)
+                        : now.plusSeconds(configuredTtl);
+                harvestAuthorProfileFromSnapshot(snap);
+                UserUsageEntry updatedUsage = complete
+                        ? recordWorkspaceSyncSuccess(ownerKey, today, false, priorOfficialDate) : quotaEntry;
+                Integer rankAfter = resolveAuthorInteractionRank(handleKey, snap.profile().id());
+                AccessPolicy policy = buildAccessPolicy(handleKey, snap, updatedUsage, zone, today, rankAfter);
+                MultiPeriodDashboardBundle bundle = buildWorkspaceBundle(
+                        snap, policy, false, configuredTtl, expiresAt, !complete, 0);
+                if (configuredTtl > 0) {
+                    pruneCacheIfNeeded();
+                    putSnapshotCache(cacheKey, snap, bundle, configuredTtl, expiresAt, algoFp);
+                }
+                return refreshWorkspaceTimestamps(bundle, false, configuredTtl, expiresAt, policy);
+            }
+
+            checkLiveSyncRateLimit(handleKey, clientIp);
+            String priorSyncDate = stored != null && stored.syncedAtInstant() != null
+                    ? stored.syncedAtInstant().atZone(zone).toLocalDate().toString()
+                    : null;
+            // 单次统一只加载最近 24 小时数据，每日合并写入物理存储，并动态保留近 30 天滚动窗口
+            boolean lightweightDaily = true;
+            int targetSyncHours = ReportPeriod.HOURS_24.windowHours;
+
+            TwitterApiIoProvider.SyncOutcome outcome;
+            try {
+                outcome = twitterApiIoProvider.syncStoreByHours(
+                        handle, stored, targetSyncHours, !canContinueDailyRefresh(stored, now), lightweightDaily, null, expectedAccountId);
+                verifyAccountOwner(outcome.store().profile(), handleKey, expectedAccountId);
+                saveStore(handleKey, expectedAccountId, outcome.store());
+            } catch (XDataProviderException ex) {
+                if (stored != null && stored.profile() != null
+                        && (ex.getStatusCode() == 503 || ex.getStatusCode() == 429)) {
+                    log.warn("Peak queue/rate guard triggered for @{}; serving persisted store immediately: {}", handle, ex.getMessage());
+                    RawAccountSnapshot fallbackSnap = TwitterApiIoProvider.snapshotOf(
+                            AccountStore.withoutRelationshipEvidence(stored), "", true);
+                    fallbackSnap = withNotice(fallbackSnap,
+                            "当前访问高峰排队较多，已直接秒开本地已入库数据（" + stored.tweets().size() + " 条动态 / "
+                                    + stored.inbound().size() + " 条互动），未扣减今日刷新次数。");
+                    long shortTtl = Math.min(30L, configuredTtl > 0 ? configuredTtl : 30L);
+                    Instant shortExpires = dailyRefreshExpiresAt(stored, now);
+                    AccessPolicy fallbackPolicy = buildAccessPolicy(handleKey, fallbackSnap, quotaEntry, zone, today, initialRank);
+                    MultiPeriodDashboardBundle fallbackBundle = buildWorkspaceBundle(
+                            fallbackSnap, fallbackPolicy, true, shortTtl, shortExpires, true,
+                            TwitterApiIoProvider.pendingRelationshipChecks(stored))
+                            .withDailyCacheStatus(dailyCacheStatus(stored, true));
+                    if (configuredTtl > 0) {
+                        pruneCacheIfNeeded();
+                        putSnapshotCache(cacheKey, fallbackSnap, fallbackBundle, shortTtl, shortExpires, algoFp);
+                    }
+                    return refreshWorkspaceTimestamps(fallbackBundle, true, shortTtl, shortExpires, fallbackPolicy);
+                }
+                throw ex;
+            }
+
+            RawAccountSnapshot snap = TwitterApiIoProvider.snapshotOf(outcome.store(), "", outcome.degraded());
+            harvestAuthorProfileFromSnapshot(snap);
+            String resolvedAccountId = snap.profile() != null ? snap.profile().id() : expectedAccountId;
+            Integer rankAfter = resolveAuthorInteractionRank(handleKey, resolvedAccountId);
+
+            boolean complete = isDailyRefreshComplete(outcome.store());
+            UserUsageEntry updatedUsage = complete
+                    ? recordWorkspaceSyncSuccess(ownerKey, today, false, priorSyncDate) : quotaEntry;
+            AccessPolicy policy = buildAccessPolicy(handleKey, snap, updatedUsage, zone, today, rankAfter);
+            snap = withNotice(snap, buildDailyRefreshNotice(outcome.store(), complete));
+
+            Instant expiresAt = dailyRefreshExpiresAt(outcome.store(), now);
+            boolean hasMore = !complete;
+            MultiPeriodDashboardBundle bundle = buildWorkspaceBundle(
+                    snap, policy, false, configuredTtl, expiresAt, hasMore,
+                    TwitterApiIoProvider.pendingRelationshipChecks(outcome.store()))
+                    .withDailyCacheStatus(dailyCacheStatus(outcome.store(), outcome.dailyMetricBatchFailed()
+                            || (outcome.degraded() && !outcome.progressed())));
+            if (configuredTtl > 0) {
+                pruneCacheIfNeeded();
+                putSnapshotCache(cacheKey, snap, bundle, configuredTtl, expiresAt, algoFp);
+            }
+            return refreshWorkspaceTimestamps(bundle, false, configuredTtl, expiresAt, policy);
+        }
+    }
+
+    private static List<long[]> officialCoverage(Instant oldest, boolean exhausted, Instant cutoff, Instant anchor) {
+        if (exhausted) return List.of(new long[]{cutoff.getEpochSecond(), anchor.getEpochSecond()});
+        if (oldest == null || oldest.isAfter(anchor)) return List.of();
+        long from = Math.max(oldest.getEpochSecond(), cutoff.getEpochSecond());
+        return from < anchor.getEpochSecond() ? List.of(new long[]{from, anchor.getEpochSecond()}) : List.of();
+    }
+
+    private static boolean streamCoversDaily(List<long[]> coverage, long anchor) {
+        return anchor > 0 && AccountStore.missingRanges(coverage, anchor - 86_400L, anchor).isEmpty();
+    }
+
+    private static int pendingDailyMetrics(AccountStore.StoredAccount stored) {
+        if (stored == null) return 0;
+        long anchor = stored.dailyRefreshStartedAt() > 0 ? stored.dailyRefreshStartedAt() : stored.syncedAt();
+        return (int) stored.tweets().stream()
+                .filter(t -> t.createdAt() >= anchor - 86_400L && t.createdAt() <= anchor)
+                .filter(TwitterApiIoProvider::isDailyMetricTarget)
+                .filter(t -> t.metricsFetchedAt() < anchor || !t.unavailableMetrics().isEmpty()).count();
+    }
+
+    private static int unattemptedDailyMetrics(AccountStore.StoredAccount stored) {
+        if (stored == null) return 0;
+        long anchor = stored.dailyRefreshStartedAt() > 0 ? stored.dailyRefreshStartedAt() : stored.syncedAt();
+        return (int) stored.tweets().stream()
+                .filter(t -> t.createdAt() >= anchor - 86_400L && t.createdAt() <= anchor)
+                .filter(TwitterApiIoProvider::isDailyMetricTarget)
+                .filter(t -> t.metricsAttemptedAt() < anchor).count();
+    }
+
+    private static boolean dailyCanContinue(AccountStore.StoredAccount stored) {
+        if (stored == null || stored.dailyRefreshStartedAt() <= 0) return false;
+        long anchor = stored.dailyRefreshStartedAt();
+        return !streamCoversDaily(stored.tweetCoverage(), anchor)
+                || !streamCoversDaily(stored.inboundCoverage(), anchor) || unattemptedDailyMetrics(stored) > 0;
+    }
+
+    private static boolean isDailyRefreshComplete(AccountStore.StoredAccount stored) {
+        return stored != null && stored.dailyRefreshedAt() > 0
+                && stored.dailyRefreshStartedAt() == stored.dailyRefreshedAt()
+                && stored.syncedAt() == stored.dailyRefreshedAt()
+                && streamCoversDaily(stored.tweetCoverage(), stored.dailyRefreshedAt())
+                && streamCoversDaily(stored.inboundCoverage(), stored.dailyRefreshedAt())
+                && pendingDailyMetrics(stored) == 0;
+    }
+
+    private static boolean canContinueDailyRefresh(AccountStore.StoredAccount stored, Instant now) {
+        return stored != null && stored.dailyRefreshStartedAt() > stored.dailyRefreshedAt()
+                && stored.syncedAt() == stored.dailyRefreshStartedAt()
+                && now.getEpochSecond() >= stored.dailyRefreshStartedAt()
+                && now.getEpochSecond() < stored.dailyRefreshStartedAt() + DAILY_REFRESH_SECONDS;
+    }
+
+    private static Instant dailyRefreshExpiresAt(AccountStore.StoredAccount stored, Instant now) {
+        if (canContinueDailyRefresh(stored, now) && !dailyCanContinue(stored)) {
+            return Instant.ofEpochSecond(stored.dailyRefreshStartedAt() + DAILY_REFRESH_SECONDS);
+        }
+        return isDailyRefreshComplete(stored)
+                ? Instant.ofEpochSecond(stored.dailyRefreshedAt() + DAILY_REFRESH_SECONDS)
+                : (stored != null && stored.syncedAtInstant() != null ? stored.syncedAtInstant() : now);
+    }
+
+    private static DailyCacheStatus dailyCacheStatus(AccountStore.StoredAccount stored) {
+        return dailyCacheStatus(stored, false);
+    }
+
+    private static DailyCacheStatus dailyCacheStatus(AccountStore.StoredAccount stored, boolean lastAttemptDegraded) {
+        long anchor = stored.dailyRefreshStartedAt() > 0 ? stored.dailyRefreshStartedAt() : stored.syncedAt();
+        int posts = (int) stored.tweets().stream()
+                .filter(t -> t.createdAt() >= anchor - 86_400L && t.createdAt() <= anchor).count();
+        int inbound = (int) stored.inbound().stream()
+                .filter(i -> i.createdAt() >= anchor - 86_400L && i.createdAt() <= anchor).count();
+        long latestMetricFetchedAt = stored.tweets().stream()
+                .filter(t -> t.createdAt() >= anchor - 86_400L && t.createdAt() <= anchor)
+                .filter(t -> t.metricsTimeObserved() && t.metricsFetchedAt() > 0 && t.unavailableMetrics().isEmpty())
+                .mapToLong(AccountStore.StoredTweet::metricsFetchedAt).max().orElse(0);
+        return new DailyCacheStatus(stored.syncedAtInstant(),
+                stored.dailyRefreshStartedAt() > 0 ? Instant.ofEpochSecond(stored.dailyRefreshStartedAt()) : null,
+                stored.dailyRefreshedAt() > 0 ? Instant.ofEpochSecond(stored.dailyRefreshedAt()) : null,
+                streamCoversDaily(stored.tweetCoverage(), anchor), streamCoversDaily(stored.inboundCoverage(), anchor),
+                posts, inbound, pendingDailyMetrics(stored), unattemptedDailyMetrics(stored),
+                dailyCanContinue(stored), lastAttemptDegraded,
+                anchor > 0 ? Instant.ofEpochSecond(AccountStore.contiguousFrom(stored.tweetCoverage(), anchor)) : null,
+                anchor > 0 ? Instant.ofEpochSecond(AccountStore.contiguousFrom(stored.inboundCoverage(), anchor)) : null,
+                latestMetricFetchedAt > 0 ? Instant.ofEpochSecond(latestMetricFetchedAt) : null);
+    }
+
+    private static String buildDailyRefreshNotice(AccountStore.StoredAccount stored, boolean complete) {
+        return (complete ? "最近 24 小时数据与指标已完成本轮同步；满 1 小时后再次检查更新。"
+                : (dailyCanContinue(stored) ? "本轮最近 24 小时数据或指标尚未补齐；继续补充可获取数据，未计为完整新鲜缓存。"
+                    : "本轮可请求的数据已尝试完毕，仍有未确认项；保留原值和缺失状态，下一小时再检查，不重复请求本轮失败项。"))
+                + "已入库 " + stored.tweets().size() + " 条动态、" + stored.inbound().size() + " 条互动；历史数据仍按原覆盖范围累计。";
+    }
+
     /** 显式查看本人已入库快照；不访问上游、不写盘，也不改变默认刷新缓存。 */
     public MultiPeriodDashboardBundle analyzeStoredAccountBundle(String rawHandle, String expectedAccountId) {
-        String handleKey = validateIsolatedHandleKey(HandleNormalizer.normalize(rawHandle));
+        String handle = HandleNormalizer.normalize(rawHandle);
+        String handleKey = validateIsolatedHandleKey(handle);
         if (expectedAccountId == null || expectedAccountId.isBlank()) {
             throw new XDataProviderException(401, "请先使用 X 账号授权登录后查看本人已入库报表");
         }
         String ownerKey = accountOwnerKey(handleKey, expectedAccountId);
         Path file = accountStoreFile(handleKey, expectedAccountId);
-        AccountStore.StoredAccount stored = file == null
+        AccountStore.StoredAccount rawStored = file == null
                 ? memoryStores.get(ownerKey) : AccountStore.read(file, objectMapper);
-        if (stored == null || stored.syncedAt() <= 0) {
+        if (rawStored == null || rawStored.syncedAt() <= 0) {
             throw new XDataProviderException(404, "当前登录账号暂无已入库快照，请先使用正常刷新获取数据");
         }
-        verifyAccountOwner(stored.profile(), handleKey, expectedAccountId);
+        verifyAccountOwner(rawStored.profile(), handleKey, expectedAccountId);
+        AccountStore.StoredAccount stored = AccountStore.pruneToRollingWindow(rawStored, rawStored.syncedAtInstant());
         RawAccountSnapshot snapshot = TwitterApiIoProvider.snapshotOf(stored,
                 "正在查看已入库快照；本次未同步上游，时间窗以原数据同步时间为准。", stored.graphRefreshFailed());
         long ttl = Math.max(0L, properties.getCacheTtlSeconds());
         Instant expiresAt = stored.syncedAtInstant().plusSeconds(ttl);
-        return computeBundleOnce(snapshot, true, ttl, expiresAt, false,
-                TwitterApiIoProvider.pendingRelationshipChecks(stored));
+        ZoneId zone = resolveZoneId();
+        String today = LocalDate.now(zone).toString();
+        UserUsageEntry usage = readUsageSnapshot(ownerKey);
+        UserUsageEntry effectiveUsage = usage;
+        int coveredDays = Math.max(0, snapshot.coveredWindowDays());
+        if (coveredDays > effectiveUsage.syncedDates().size()) {
+            List<String> syntheticDates = new ArrayList<>(effectiveUsage.syncedDates());
+            for (int i = syntheticDates.size(); i < coveredDays; i++) {
+                syntheticDates.add("stored-day-" + (i + 1));
+            }
+            effectiveUsage = new UserUsageEntry(
+                    effectiveUsage.usageCount(),
+                    effectiveUsage.lastModalShownAtCount(),
+                    effectiveUsage.optimisticFollowedAt(),
+                    effectiveUsage.updatedAt(),
+                    effectiveUsage.quotaDate(),
+                    effectiveUsage.initialLoadedToday(),
+                    effectiveUsage.manualRefreshUsedToday(),
+                    syntheticDates
+            );
+        }
+        Integer rank = resolveAuthorInteractionRank(handleKey, expectedAccountId);
+        AccessPolicy policy = buildAccessPolicy(handleKey, snapshot, effectiveUsage, zone, today, rank);
+        return buildWorkspaceBundle(snapshot, policy, true, ttl, expiresAt, false,
+                TwitterApiIoProvider.pendingRelationshipChecks(stored)).withDailyCacheStatus(dailyCacheStatus(stored));
     }
 
     private ResolvedBundleHolder obtainBundle(
@@ -240,9 +736,11 @@ public class CommunityHubService {
         String cacheKey = resolvedMode.name() + ":" + ownerKey;
         long configuredTtl = Math.max(0L, properties.getCacheTtlSeconds());
 
+        String algoFp = currentAlgoFingerprint();
         if (!continueRelations && configuredTtl > 0) {
             CachedSnapshot memHit = snapshotCache.get(cacheKey);
             if (isValidAccountCacheHit(memHit, handleKey, expectedAccountId, Instant.now())
+                    && Objects.equals(algoFp, memHit.algoFingerprint())
                     && (resolvedMode != ProviderMode.TWITTERAPI_IO || memHit.snapshot().coveredWindowDays() >= requiredDays)) {
                 return new ResolvedBundleHolder(memHit.bundle(), true, memHit.ttlSeconds(), memHit.expiresAt());
             }
@@ -265,15 +763,27 @@ public class CommunityHubService {
                 saveStore(handleKey, expectedAccountId, continued.store());
                 RawAccountSnapshot snapshot = TwitterApiIoProvider.snapshotOf(continued.store(),
                         "本次仅继续逐人关系核验；未成功确认的对象仍保留未知。", continued.degraded());
+                Instant fallbackSynced = continued.store().syncedAtInstant() != null
+                        ? continued.store().syncedAtInstant()
+                        : (stored != null && stored.syncedAtInstant() != null ? stored.syncedAtInstant() : Instant.now());
                 Instant expires = active != null ? active.expiresAt()
-                        : stored.syncedAtInstant().plusSeconds(configuredTtl);
+                        : fallbackSynced.plusSeconds(configuredTtl);
                 MultiPeriodDashboardBundle bundle = computeBundleOnce(snapshot, false, configuredTtl, expires, false,
                         TwitterApiIoProvider.pendingRelationshipChecks(continued.store()));
-                if (configuredTtl > 0) snapshotCache.put(cacheKey, new CachedSnapshot(snapshot, bundle, configuredTtl, expires));
+                if (configuredTtl > 0) putSnapshotCache(cacheKey, snapshot, bundle, configuredTtl, expires, algoFp);
                 return new ResolvedBundleHolder(bundle, false, configuredTtl, expires);
             }
             if (cacheValid && (resolvedMode != ProviderMode.TWITTERAPI_IO || active.snapshot().coveredWindowDays() >= requiredDays)) {
-                return new ResolvedBundleHolder(active.bundle(), true, active.ttlSeconds(), active.expiresAt());
+                MultiPeriodDashboardBundle cachedBundle = active.bundle();
+                if (!Objects.equals(algoFp, active.algoFingerprint())) {
+                    int pendingChecks = cachedBundle != null ? cachedBundle.pendingRelationshipChecks() : 0;
+                    boolean hasMore = cachedBundle != null && cachedBundle.hasMoreHistoryForTarget();
+                    cachedBundle = computeBundleOnce(
+                            active.snapshot(), true, active.ttlSeconds(), active.expiresAt(), hasMore, pendingChecks);
+                    putSnapshotCache(cacheKey, active.snapshot(), cachedBundle,
+                            active.ttlSeconds(), active.expiresAt(), algoFp);
+                }
+                return new ResolvedBundleHolder(cachedBundle, true, active.ttlSeconds(), active.expiresAt());
             }
 
             if (resolvedMode != ProviderMode.TWITTERAPI_IO) {
@@ -292,7 +802,7 @@ public class CommunityHubService {
                 MultiPeriodDashboardBundle bundle = computeBundleOnce(snap, false, configuredTtl, expiresAt, false);
                 if (configuredTtl > 0) {
                     pruneCacheIfNeeded();
-                    snapshotCache.put(cacheKey, new CachedSnapshot(snap, bundle, configuredTtl, expiresAt));
+                    putSnapshotCache(cacheKey, snap, bundle, configuredTtl, expiresAt, algoFp);
                 }
                 return new ResolvedBundleHolder(bundle, false, configuredTtl, expiresAt);
             }
@@ -322,7 +832,7 @@ public class CommunityHubService {
                     MultiPeriodDashboardBundle fallbackBundle = computeBundleOnce(fallbackSnap, false, shortTtl, shortExpires, false);
                     if (configuredTtl > 0) {
                         pruneCacheIfNeeded();
-                        snapshotCache.put(cacheKey, new CachedSnapshot(fallbackSnap, fallbackBundle, shortTtl, shortExpires));
+                        putSnapshotCache(cacheKey, fallbackSnap, fallbackBundle, shortTtl, shortExpires, algoFp);
                     }
                     return new ResolvedBundleHolder(fallbackBundle, false, shortTtl, shortExpires);
                 }
@@ -338,7 +848,7 @@ public class CommunityHubService {
                     TwitterApiIoProvider.pendingRelationshipChecks(outcome.store()));
             if (configuredTtl > 0) {
                 pruneCacheIfNeeded();
-                snapshotCache.put(cacheKey, new CachedSnapshot(snap, bundle, configuredTtl, expiresAt));
+                putSnapshotCache(cacheKey, snap, bundle, configuredTtl, expiresAt, algoFp);
             }
             return new ResolvedBundleHolder(bundle, false, configuredTtl, expiresAt);
         }
@@ -349,7 +859,8 @@ public class CommunityHubService {
         if (expectedAccountId == null) return s;
         XUserSummary p = s.profile();
         XUserSummary owner = new XUserSummary(expectedAccountId, p.username(), p.displayName(), p.avatarUrl(),
-                p.bio(), p.verified(), p.followersCount(), p.followingCount(), p.totalPostsCount(), p.joinedDate());
+                p.bio(), p.verified(), p.followersCount(), p.followingCount(), p.totalPostsCount(), p.joinedDate(),
+                p.bannerUrl());
         // 仅在明确选择 DEMO 时绑定会话身份；数据仍标为演示，真实数据源始终核验上游 ID。
         return new RawAccountSnapshot(ProviderMode.DEMO, false, s.bannerNotice(), s.fetchedAt(), owner,
                 s.timeline(), s.inboundInteractions(), s.relationships(), s.followersTruncated(), s.degradedPartial(),
@@ -579,6 +1090,9 @@ public class CommunityHubService {
         memoryStores.remove(ownerKey);
         try {
             AccountStore.write(file, store, objectMapper);
+            if (AUTHOR_USERNAME.equalsIgnoreCase(safeKey)) {
+                this.cachedAuthorStoreFile = file;
+            }
             Path legacyFlat = accountId == null ? legacyFlatStoreFile(safeKey) : null;
             if (legacyFlat != null) {
                 Files.deleteIfExists(legacyFlat);
@@ -636,7 +1150,71 @@ public class CommunityHubService {
                 bundle.coveredWindowDays(),
                 fromCache ? false : bundle.hasMoreHistoryForTarget(),
                 bundle.coveredUntil(),
-                bundle.pendingRelationshipChecks()
+                bundle.pendingRelationshipChecks(),
+                withLiveCacheMeta(bundle.hours24(), fromCache, ttlSeconds, remain, expiresAt),
+                bundle.accessPolicy(),
+                bundle.dailyCacheStatus()
+        );
+    }
+
+    private MultiPeriodDashboardBundle refreshWorkspaceTimestamps(
+            MultiPeriodDashboardBundle bundle,
+            boolean fromCache,
+            long ttlSeconds,
+            Instant expiresAt,
+            AccessPolicy freshPolicy
+    ) {
+        long remain = bundle.hasMoreHistoryForTarget() ? 0L
+                : Math.max(0L, Duration.between(Instant.now(), expiresAt).getSeconds());
+        return new MultiPeriodDashboardBundle(
+                withLiveCacheMeta(bundle.month(), fromCache, ttlSeconds, remain, expiresAt),
+                withLiveCacheMeta(bundle.week(), fromCache, ttlSeconds, remain, expiresAt),
+                withLiveCacheMeta(bundle.day(), fromCache, ttlSeconds, remain, expiresAt),
+                bundle.coveredWindowDays(),
+                bundle.hasMoreHistoryForTarget(),
+                bundle.coveredUntil(),
+                bundle.pendingRelationshipChecks(),
+                withLiveCacheMeta(bundle.hours24(), fromCache, ttlSeconds, remain, expiresAt),
+                freshPolicy != null ? freshPolicy : bundle.accessPolicy(),
+                bundle.dailyCacheStatus()
+        );
+    }
+
+    private MultiPeriodDashboardBundle buildWorkspaceBundle(
+            RawAccountSnapshot snapshot,
+            AccessPolicy policy,
+            boolean fromCache,
+            long ttlSeconds,
+            Instant expiresAt,
+            boolean hasMoreHistoryForTarget,
+            int pendingRelationshipChecks
+    ) {
+        ZoneId zone = resolveZoneId();
+        boolean accumulatedMode = policy != null && policy.accumulatedSummaryMode();
+        List<String> unlocked = policy != null && policy.unlockedPeriods() != null
+                ? policy.unlockedPeriods()
+                : List.of(ReportPeriod.HOURS_24.code);
+        CommunityDashboardReport hours24 = analyticsEngine.analyze(
+                snapshot, ReportPeriod.HOURS_24, accumulatedMode, zone, fromCache, ttlSeconds, expiresAt);
+        CommunityDashboardReport hours48 = unlocked.contains(ReportPeriod.HOURS_48.code)
+                ? analyticsEngine.analyze(snapshot, ReportPeriod.HOURS_48, accumulatedMode, zone, fromCache, ttlSeconds, expiresAt)
+                : null;
+        CommunityDashboardReport week = unlocked.contains(ReportPeriod.WEEK.code)
+                ? analyticsEngine.analyze(snapshot, ReportPeriod.WEEK, accumulatedMode, zone, fromCache, ttlSeconds, expiresAt)
+                : null;
+        CommunityDashboardReport month = unlocked.contains(ReportPeriod.MONTH.code)
+                ? analyticsEngine.analyze(snapshot, ReportPeriod.MONTH, accumulatedMode, zone, fromCache, ttlSeconds, expiresAt)
+                : null;
+        return new MultiPeriodDashboardBundle(
+                month,
+                week,
+                hours48,
+                snapshot.coveredWindowDays(),
+                hasMoreHistoryForTarget,
+                computeJointCoveredUntil(snapshot),
+                pendingRelationshipChecks,
+                hours24,
+                policy
         );
     }
 
@@ -647,6 +1225,9 @@ public class CommunityHubService {
             long remainSeconds,
             Instant expiresAt
     ) {
+        if (r == null) {
+            return null;
+        }
         return new CommunityDashboardReport(
                 r.provider(),
                 r.liveData(),
@@ -796,28 +1377,35 @@ public class CommunityHubService {
             newCount = prev.usageCount() + 1;
             followingAuthor = checkIfUserFollowsAuthor(handleKey, expectedAccountId);
 
+            String storySuffix = "\n\n" + AUTHOR_COST_STORY + "\n开源仓库（可本地部署，与线上一致）：" + AUTHOR_REPO_URL;
             if (newCount == 3 && prev.lastModalShownAtCount() != 3) {
                 shouldShow = true;
                 reasonCode = "THIRD_USE_INTRO";
                 badgeText = "第 3 次使用 · 作者说明";
                 modalTitle = "你好，我是作者 @elidlicom";
-                modalMessage = (followingAuthor || selfIsAuthor)
+                modalMessage = ((followingAuthor || selfIsAuthor)
                         ? "这是你第 3 次使用本工作台！因为每次使用这个网站服务，我都是真实付费调用 API 的。感谢你已经关注 @elidlicom 结下这份善缘，后续更新都会第一时间在 X 分享！"
-                        : "这是你第 3 次使用本工作台！因为每次使用这个网站服务，我都是真实付费调用 API 为你拉取数据的。免费开放给大家用，结个善缘，求关注 @elidlicom！";
+                        : "这是你第 3 次使用本工作台！因为每次使用这个网站服务，我都是真实付费调用 API 为你拉取数据的。免费开放给大家用，结个善缘，求关注 @elidlicom！")
+                        + storySuffix;
             } else if (newCount >= 10 && newCount % 10 == 0 && !followingAuthor && !selfIsAuthor
                     && prev.lastModalShownAtCount() != newCount) {
                 shouldShow = true;
                 reasonCode = "EVERY_10_REMINDER";
                 badgeText = "第 " + newCount + " 次使用 · 结个善缘";
                 modalTitle = "已陪伴你使用 " + newCount + " 次";
-                modalMessage = "因为每次使用这个网站服务，我都是真实付费调用 API 的。如果这个工作台对你有帮助，结个善缘，求关注 @elidlicom！关注后将不再弹出此提示。";
+                modalMessage = "因为每次使用这个网站服务，我都是真实付费调用 API 的。如果这个工作台对你有帮助，结个善缘，求关注 @elidlicom！关注后将不再弹出此提示。"
+                        + storySuffix;
             }
 
             UserUsageEntry updated = new UserUsageEntry(
                     newCount,
                     shouldShow ? newCount : prev.lastModalShownAtCount(),
                     prev.optimisticFollowedAt(),
-                    Instant.now()
+                    Instant.now(),
+                    prev.quotaDate(),
+                    prev.initialLoadedToday(),
+                    prev.manualRefreshUsedToday(),
+                    prev.syncedDates()
             );
             saveUserUsage(ownerKey, updated);
         }
@@ -858,9 +1446,10 @@ public class CommunityHubService {
         XUserSummary authorSummary = resolveAuthorProfile(true);
         String badgeText = "第 " + currentCount + " 次使用 · 作者说明";
         String modalTitle = "你好，我是作者 @elidlicom";
-        String modalMessage = (followingAuthor && !selfIsAuthor)
+        String modalMessage = ((followingAuthor && !selfIsAuthor)
                 ? "因为每次使用这个网站服务，我都是真实付费调用 API 的。感谢你已经关注 @elidlicom 结下这份善缘，后续更新都会第一时间在 X 分享！"
-                : "因为每次使用这个网站服务，我都是真实付费调用 API 为大家拉取数据的。免费开放使用，结个善缘，求关注 @elidlicom！";
+                : "因为每次使用这个网站服务，我都是真实付费调用 API 为大家拉取数据的。免费开放使用，结个善缘，求关注 @elidlicom！")
+                + "\n\n" + AUTHOR_COST_STORY + "\n开源仓库（可本地部署，与线上一致）：" + AUTHOR_REPO_URL;
         return new UsageCheckinResponse(
                 handle,
                 currentCount,
@@ -898,17 +1487,58 @@ public class CommunityHubService {
     private boolean checkIfUserFollowsAuthor(String handleKey, String expectedAccountId) {
         if (AUTHOR_USERNAME.equalsIgnoreCase(handleKey)) return true;
         RawAccountSnapshot snap = findLatestSnapshotForUser(handleKey, expectedAccountId);
-        if (snap == null || snap.relationships() == null) return false;
-        harvestAuthorProfileFromSnapshot(snap);
-        return snap.relationships().stream().anyMatch(r -> r != null && r.user() != null
-                && AUTHOR_USERNAME.equalsIgnoreCase(r.user().username()) && r.iFollowThem());
+        if (snap != null) {
+            harvestAuthorProfileFromSnapshot(snap);
+        }
+        return doesUserFollowAuthor(handleKey, expectedAccountId, snap);
+    }
+
+    private boolean doesUserFollowAuthor(String handleKey, String expectedAccountId, RawAccountSnapshot currentSnapshot) {
+        if (AUTHOR_USERNAME.equalsIgnoreCase(handleKey)) {
+            return true;
+        }
+        RawAccountSnapshot snap = currentSnapshot != null
+                ? currentSnapshot
+                : findLatestSnapshotForUser(handleKey, expectedAccountId);
+        if (snap != null && snap.relationships() != null) {
+            for (RelationshipEntry r : snap.relationships()) {
+                if (r != null && r.user() != null && AUTHOR_USERNAME.equalsIgnoreCase(r.user().username())) {
+                    if (r.iFollowThem()) {
+                        return true;
+                    }
+                    if (r.relationshipVerified()) {
+                        return false;
+                    }
+                }
+            }
+        }
+        CachedAuthorRanks ranks = getOrComputeAuthorRanks();
+        if (ranks != null) {
+            if (expectedAccountId != null && !expectedAccountId.isBlank()
+                    && ranks.followerIds().contains(expectedAccountId.trim())) {
+                return true;
+            }
+            if (handleKey != null && !handleKey.isBlank()
+                    && ranks.followerUsernames().contains(handleKey.trim().toLowerCase(Locale.ROOT))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private ProviderMode resolvePreferredModeQuietly() {
+        try {
+            return resolveProviderMode(null);
+        } catch (XDataProviderException ex) {
+            return ProviderMode.fromString(properties.getDefaultProvider(), ProviderMode.AUTO);
+        }
     }
 
     private RawAccountSnapshot findLatestSnapshotForUser(String handleKey, String expectedAccountId) {
         String safeKey = validateIsolatedHandleKey(handleKey);
         String ownerKey = accountOwnerKey(safeKey, expectedAccountId);
-        ProviderMode preferredMode = resolveProviderMode(null);
-        CachedSnapshot exactMem = snapshotCache.get(preferredMode.name() + ":" + ownerKey);
+        ProviderMode preferredMode = resolvePreferredModeQuietly();
+        CachedSnapshot exactMem = preferredMode != null ? snapshotCache.get(preferredMode.name() + ":" + ownerKey) : null;
         if (exactMem != null && exactMem.snapshot() != null && exactMem.snapshot().profile() != null
                 && safeKey.equalsIgnoreCase(exactMem.snapshot().profile().username())
                 && (expectedAccountId == null || expectedAccountId.equals(exactMem.snapshot().profile().id()))) {
@@ -982,7 +1612,8 @@ public class CommunityHubService {
                     0,
                     0,
                     0,
-                    ""
+                    "",
+                    AUTHOR_BANNER_URL
             );
         }
         String dName = (raw.displayName() != null && !raw.displayName().isBlank() && !raw.displayName().equalsIgnoreCase(AUTHOR_USERNAME))
@@ -1001,7 +1632,8 @@ public class CommunityHubService {
                 raw.followersCount(),
                 raw.followingCount(),
                 raw.totalPostsCount(),
-                raw.joinedDate() != null ? raw.joinedDate() : ""
+                raw.joinedDate() != null ? raw.joinedDate() : "",
+                AUTHOR_BANNER_URL
         );
     }
 
@@ -1046,6 +1678,530 @@ public class CommunityHubService {
         } catch (Exception ex) {
             return null;
         }
+    }
+
+    private UserUsageEntry readUsageSnapshot(String ownerKey) {
+        synchronized (usageLockFor(ownerKey)) {
+            return loadUserUsage(ownerKey);
+        }
+    }
+
+    private UserUsageEntry recordWorkspaceSyncSuccess(
+            String ownerKey,
+            String today,
+            boolean incrementManualRefresh,
+            String legacyPriorDate
+    ) {
+        synchronized (usageLockFor(ownerKey)) {
+            UserUsageEntry prev = loadUserUsage(ownerKey);
+            boolean sameDay = today.equals(prev.quotaDate());
+            int nextManualUsed = sameDay ? prev.manualRefreshUsedToday() : 0;
+            if (incrementManualRefresh) {
+                nextManualUsed++;
+            }
+            List<String> mergedDates = mergeSyncedDates(prev.syncedDates(), legacyPriorDate, today);
+            UserUsageEntry next = new UserUsageEntry(
+                    prev.usageCount(),
+                    prev.lastModalShownAtCount(),
+                    prev.optimisticFollowedAt(),
+                    Instant.now(),
+                    today,
+                    true,
+                    nextManualUsed,
+                    mergedDates
+            );
+            saveUserUsage(ownerKey, next);
+            return next;
+        }
+    }
+
+    private UserUsageEntry recordAccumulatedDateOnly(String ownerKey, String today, String legacyPriorDate) {
+        synchronized (usageLockFor(ownerKey)) {
+            UserUsageEntry prev = loadUserUsage(ownerKey);
+            List<String> mergedDates = mergeSyncedDates(prev.syncedDates(), legacyPriorDate, today);
+            if (mergedDates.equals(prev.syncedDates())) {
+                return prev;
+            }
+            UserUsageEntry next = new UserUsageEntry(
+                    prev.usageCount(),
+                    prev.lastModalShownAtCount(),
+                    prev.optimisticFollowedAt(),
+                    Instant.now(),
+                    prev.quotaDate(),
+                    prev.initialLoadedToday(),
+                    prev.manualRefreshUsedToday(),
+                    mergedDates
+            );
+            saveUserUsage(ownerKey, next);
+            return next;
+        }
+    }
+
+    private static List<String> mergeSyncedDates(List<String> existing, String priorDate, String today) {
+        String minRollingDate = null;
+        if (today != null && today.trim().matches("\\d{4}-\\d{2}-\\d{2}")) {
+            try {
+                minRollingDate = LocalDate.parse(today.trim()).minusDays(30).toString();
+            } catch (Exception ignored) {
+                minRollingDate = null;
+            }
+        }
+        LinkedHashSet<String> set = new LinkedHashSet<>();
+        if (existing != null) {
+            for (String d : existing) {
+                if (d == null || d.isBlank()) continue;
+                String trimmed = d.trim();
+                if (minRollingDate != null && trimmed.matches("\\d{4}-\\d{2}-\\d{2}") && trimmed.compareTo(minRollingDate) < 0) {
+                    continue;
+                }
+                set.add(trimmed);
+            }
+        }
+        if (priorDate != null && !priorDate.isBlank()) {
+            String trimmedPrior = priorDate.trim();
+            if (minRollingDate == null || !trimmedPrior.matches("\\d{4}-\\d{2}-\\d{2}") || trimmedPrior.compareTo(minRollingDate) >= 0) {
+                set.add(trimmedPrior);
+            }
+        }
+        if (today != null && !today.isBlank()) {
+            set.add(today.trim());
+        }
+        List<String> sorted = new ArrayList<>(set);
+        sorted.sort(String::compareTo);
+        if (sorted.size() > MAX_SYNCED_DATES) {
+            sorted = new ArrayList<>(sorted.subList(sorted.size() - MAX_SYNCED_DATES, sorted.size()));
+        }
+        return List.copyOf(sorted);
+    }
+
+    private AccessPolicy buildAccessPolicy(
+            String handleKey,
+            RawAccountSnapshot snapshot,
+            UserUsageEntry usage,
+            ZoneId zone,
+            String today,
+            Integer authorRank
+    ) {
+        boolean selfIsAuthor = AUTHOR_USERNAME.equalsIgnoreCase(handleKey);
+        String snapAccountId = snapshot != null && snapshot.profile() != null ? snapshot.profile().id() : null;
+        boolean followsAuthor = selfIsAuthor || doesUserFollowAuthor(handleKey, snapAccountId, snapshot);
+        boolean top5Full = selfIsAuthor || (authorRank != null && authorRank <= TOP_FREE_FULL_RANK);
+        boolean top50AutoSync = selfIsAuthor || (authorRank != null && authorRank <= TOP_AUTO_SYNC_RANK);
+        ScheduledPublishAccess schedAccess = computeScheduledPublishAccess(selfIsAuthor, followsAuthor, authorRank);
+
+        String minRollingDate = today != null && today.trim().matches("\\d{4}-\\d{2}-\\d{2}")
+                ? LocalDate.parse(today.trim()).minusDays(30).toString()
+                : null;
+        int accumulatedDays = 0;
+        if (usage != null && usage.syncedDates() != null) {
+            for (String d : usage.syncedDates()) {
+                if (d == null || d.isBlank()) continue;
+                String trimmed = d.trim();
+                if (minRollingDate != null && trimmed.matches("\\d{4}-\\d{2}-\\d{2}") && trimmed.compareTo(minRollingDate) < 0) {
+                    continue;
+                }
+                accumulatedDays++;
+            }
+            accumulatedDays = Math.min(MAX_SYNCED_DATES, accumulatedDays);
+        }
+        if (accumulatedDays == 0 && snapshot != null && snapshot.fetchedAt() != null) {
+            accumulatedDays = 1;
+        }
+
+        List<String> unlocked = new ArrayList<>();
+        Map<String, String> lockedReasons = new LinkedHashMap<>();
+        unlocked.add(ReportPeriod.HOURS_24.code);
+
+        if (top5Full || accumulatedDays >= 2) {
+            unlocked.add(ReportPeriod.HOURS_48.code);
+        } else {
+            lockedReasons.put(ReportPeriod.HOURS_48.code,
+                    String.format("需累计满 2 天物理存储数据后解锁 48 小时窗口（当前 %d/2 天，单次加载 24 小时、每日落盘累计）", accumulatedDays));
+        }
+
+        if (top5Full || accumulatedDays >= 7) {
+            unlocked.add(ReportPeriod.WEEK.code);
+        } else {
+            lockedReasons.put(ReportPeriod.WEEK.code,
+                    String.format("需累计满 7 天物理存储数据后解锁 7 天窗口（当前 %d/7 天，单次加载 24 小时、每日落盘累计）", accumulatedDays));
+        }
+
+        if (top5Full || accumulatedDays >= 30) {
+            unlocked.add(ReportPeriod.MONTH.code);
+        } else {
+            lockedReasons.put(ReportPeriod.MONTH.code,
+                    String.format("需累计满 30 天物理存储数据后解锁 30 天窗口（当前 %d/30 天，动态保留近 30 天窗口数据）", accumulatedDays));
+        }
+
+        boolean sameDay = usage != null && today.equals(usage.quotaDate());
+        int used = sameDay ? usage.manualRefreshUsedToday() : 0;
+        int limit = selfIsAuthor ? 99 : DAILY_MANUAL_REFRESH_LIMIT;
+        int remaining = Math.max(0, limit - used);
+        boolean accumulatedSummaryMode = !top5Full;
+
+        String accumulationNote = top5Full
+                ? (selfIsAuthor
+                        ? "作者账号已解锁全部时间维度；单次加载 24 小时并落盘，动态保留近 30 天窗口数据。"
+                        : String.format("你是 @%s 互动前 %d 好朋友（第 %d 名），已解锁全部时间维度；单次加载 24 小时并每日物理落盘，动态保留近 30 天窗口数据。",
+                                AUTHOR_USERNAME, TOP_FREE_FULL_RANK, authorRank))
+                : (top50AutoSync
+                        ? String.format("你是 @%s 互动前 %d（第 %d 名），系统每日自动同步最近 24 小时数据并物理落盘；当前滚动窗口已累计 %d/30 天。",
+                                AUTHOR_USERNAME, TOP_AUTO_SYNC_RANK, authorRank, accumulatedDays)
+                        : String.format("当前滚动窗口已累计 %d/30 天：单次仅加载 24 小时，每日物理落盘累计，动态保留近 30 天数据（与 @%s 互动前 50 享每日自动同步）。",
+                                accumulatedDays, AUTHOR_USERNAME));
+
+        return new AccessPolicy(
+                accumulatedDays,
+                followsAuthor,
+                AUTHOR_USERNAME,
+                authorRank,
+                top5Full,
+                top50AutoSync,
+                List.copyOf(unlocked),
+                Map.copyOf(lockedReasons),
+                limit,
+                used,
+                remaining,
+                today,
+                accumulatedSummaryMode,
+                accumulationNote,
+                AUTHOR_COST_STORY,
+                AUTHOR_REPO_URL,
+                schedAccess.allowed(),
+                schedAccess.reason()
+        );
+    }
+
+    public ScheduledPublishAccess evaluateScheduledPublishAccess(String accountId, String rawUsername) {
+        if (rawUsername == null || rawUsername.isBlank()) {
+            return computeScheduledPublishAccess(false, false, null);
+        }
+        String handleKey;
+        try {
+            String handle = HandleNormalizer.normalize(rawUsername);
+            handleKey = validateIsolatedHandleKey(handle);
+        } catch (RuntimeException ex) {
+            return computeScheduledPublishAccess(false, false, null);
+        }
+        boolean selfIsAuthor = AUTHOR_USERNAME.equalsIgnoreCase(handleKey);
+        boolean followsAuthor = selfIsAuthor || doesUserFollowAuthor(handleKey, accountId, null);
+        Integer authorRank = resolveAuthorInteractionRank(handleKey, accountId);
+        return computeScheduledPublishAccess(selfIsAuthor, followsAuthor, authorRank);
+    }
+
+    private static ScheduledPublishAccess computeScheduledPublishAccess(
+            boolean selfIsAuthor,
+            boolean followsAuthor,
+            Integer authorRank
+    ) {
+        boolean inTop100 = authorRank != null && authorRank >= 1 && authorRank <= TOP_SCHEDULED_PUBLISH_RANK;
+        boolean allowed = selfIsAuthor || inTop100;
+        if (allowed) {
+            return new ScheduledPublishAccess(true, followsAuthor, authorRank, null);
+        }
+        String reason;
+        if (authorRank == null) {
+            reason = String.format(
+                    "定时发布仅限与 @%s 互动频率前 %d 的推友可用（当前暂未进入与 @%s 的互动频率前 %d）。",
+                    AUTHOR_USERNAME, TOP_SCHEDULED_PUBLISH_RANK, AUTHOR_USERNAME, TOP_SCHEDULED_PUBLISH_RANK);
+        } else {
+            reason = String.format(
+                    "定时发布仅限与 @%s 互动频率前 %d 的推友可用（当前位列互动频率第 %d 名，进入前 %d 名自动解锁）。",
+                    AUTHOR_USERNAME, TOP_SCHEDULED_PUBLISH_RANK, authorRank, TOP_SCHEDULED_PUBLISH_RANK);
+        }
+        return new ScheduledPublishAccess(false, followsAuthor, authorRank, reason);
+    }
+
+    private int computeStoredCoveredDays(AccountStore.StoredAccount stored) {
+        if (stored == null || stored.syncedAtInstant() == null) return 0;
+        return TwitterApiIoProvider.snapshotOf(stored, "", false).coveredWindowDays();
+    }
+
+    private String buildAccumulationBannerNotice(
+            AccountStore.StoredAccount st,
+            RawAccountSnapshot snap,
+            boolean top5Full,
+            Integer rank
+    ) {
+        if (top5Full) {
+            String extra = rank != null && rank > 0
+                    ? String.format("（@%s 互动第 %d 名·已解锁全时间窗口）", AUTHOR_USERNAME, rank)
+                    : "";
+            return String.format(
+                    "单次加载 24 小时并已完成物理落盘（当前滚动保留近 30 天共 %d 条动态、%d 条互动）%s",
+                    st.tweets().size(), st.inbound().size(), extra);
+        }
+        String rankInfo = (rank != null && rank <= TOP_AUTO_SYNC_RANK)
+                ? String.format("你位列 @%s 互动前 %d（第 %d 名），每日自动同步最近 24 小时并落盘；", AUTHOR_USERNAME, TOP_AUTO_SYNC_RANK, rank)
+                : "";
+        return String.format(
+                "每日物理存储模式：%d 条动态、%d 条互动已落盘。%s单次仅加载 24 小时，动态保留近 30 天窗口数据。",
+                st.tweets().size(), st.inbound().size(), rankInfo);
+    }
+
+    public Integer resolveAuthorInteractionRank(String handleKey, String accountId) {
+        if (AUTHOR_USERNAME.equalsIgnoreCase(handleKey)) {
+            return 0;
+        }
+        CachedAuthorRanks ranks = getOrComputeAuthorRanks();
+        if (ranks == null) {
+            return null;
+        }
+        if (accountId != null && !accountId.isBlank()) {
+            Integer byId = ranks.rankById().get(accountId);
+            if (byId != null) return byId;
+        }
+        return handleKey != null ? ranks.rankByUsername().get(handleKey.toLowerCase(Locale.ROOT)) : null;
+    }
+
+    private CachedAuthorRanks getOrComputeAuthorRanks() {
+        AccountStore.StoredAccount authorStore = findAuthorStoredAccount();
+        if (authorStore == null || authorStore.syncedAt() <= 0 || authorStore.profile() == null) {
+            return null;
+        }
+        CachedAuthorRanks existing = this.cachedAuthorRanks;
+        if (existing != null && existing.authorSyncedAt() == authorStore.syncedAt()) {
+            return existing;
+        }
+        RawAccountSnapshot snap = TwitterApiIoProvider.snapshotOf(authorStore, "", false);
+        CommunityDashboardReport monthReport = analyticsEngine.analyze(
+                snap, ReportPeriod.MONTH, false, resolveZoneId(), true, 0L, snap.fetchedAt());
+        List<PeerInteractionStat> ranked = new ArrayList<>(monthReport.interactions().peerStats());
+        ranked.sort(Comparator.comparingInt((PeerInteractionStat p) -> p.myRepliesToPeer() + p.peerRepliesToMe()).reversed()
+                .thenComparing(Comparator.comparingInt(PeerInteractionStat::peerRepliesToMe).reversed())
+                .thenComparing((PeerInteractionStat p) -> p.peer() != null && p.peer().verified(), Comparator.reverseOrder())
+                .thenComparing(p -> p.peer() != null && p.peer().username() != null
+                        ? p.peer().username().toLowerCase(Locale.ROOT) : ""));
+
+        Map<String, Integer> byId = new LinkedHashMap<>();
+        Map<String, Integer> byUsername = new LinkedHashMap<>();
+        int rank = 1;
+        for (PeerInteractionStat p : ranked) {
+            if (p.peer() == null) continue;
+            String uname = p.peer().username() != null ? p.peer().username().trim().toLowerCase(Locale.ROOT) : "";
+            String uid = p.peer().id() != null ? p.peer().id().trim() : "";
+            if (!uid.isEmpty()) {
+                byId.putIfAbsent(uid, rank);
+            }
+            if (!uname.isEmpty()) {
+                byUsername.putIfAbsent(uname, rank);
+            }
+            rank++;
+        }
+        Set<String> followerIds = new LinkedHashSet<>();
+        Set<String> followerUsernames = new LinkedHashSet<>();
+        if (snap.relationships() != null) {
+            for (RelationshipEntry r : snap.relationships()) {
+                if (r != null && r.user() != null && r.theyFollowMe()) {
+                    String uid = r.user().id() != null ? r.user().id().trim() : "";
+                    String uname = r.user().username() != null ? r.user().username().trim().toLowerCase(Locale.ROOT) : "";
+                    if (!uid.isEmpty()) {
+                        followerIds.add(uid);
+                    }
+                    if (!uname.isEmpty()) {
+                        followerUsernames.add(uname);
+                    }
+                }
+            }
+        }
+        CachedAuthorRanks computed = new CachedAuthorRanks(
+                authorStore.syncedAt(),
+                Map.copyOf(byId),
+                Map.copyOf(byUsername),
+                Set.copyOf(followerIds),
+                Set.copyOf(followerUsernames)
+        );
+        this.cachedAuthorRanks = computed;
+        return computed;
+    }
+
+    private AccountStore.StoredAccount findAuthorStoredAccount() {
+        String dir = properties.getDiskCacheDir();
+        if (dir != null && !dir.isBlank()) {
+            Path known = this.cachedAuthorStoreFile;
+            if (known != null && Files.isRegularFile(known)) {
+                AccountStore.StoredAccount hit = AccountStore.read(known, objectMapper);
+                if (isOwnedByAccount(hit, AUTHOR_USERNAME)) {
+                    return hit;
+                }
+                this.cachedAuthorStoreFile = null;
+            }
+            Path byIdRoot = Path.of(dir).resolve("users").resolve("by-id");
+            if (Files.isDirectory(byIdRoot)) {
+                AccountStore.StoredAccount best = null;
+                Path bestFile = null;
+                try (Stream<Path> dirs = Files.list(byIdRoot)) {
+                    for (Path p : dirs.toList()) {
+                        Path storeFile = p.resolve("store_v" + AccountStore.VERSION + ".json.gz");
+                        if (!Files.isRegularFile(storeFile)) continue;
+                        AccountStore.StoredAccount candidate = AccountStore.read(storeFile, objectMapper);
+                        if (isOwnedByAccount(candidate, AUTHOR_USERNAME)) {
+                            if (best == null || candidate.syncedAt() > best.syncedAt()) {
+                                best = candidate;
+                                bestFile = storeFile;
+                            }
+                        }
+                    }
+                } catch (Exception ex) {
+                    log.debug("Failed scanning by-id stores for @{}: {}", AUTHOR_USERNAME, ex.getMessage());
+                }
+                if (best != null) {
+                    this.cachedAuthorStoreFile = bestFile;
+                    return best;
+                }
+            }
+            AccountStore.StoredAccount legacy = loadStore(AUTHOR_USERNAME);
+            if (legacy != null) return legacy;
+        }
+        for (AccountStore.StoredAccount mem : memoryStores.values()) {
+            if (isOwnedByAccount(mem, AUTHOR_USERNAME)) {
+                return mem;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 每日定时为与 @elidlicom 互动排名前 50、且已登录落盘存有个人快照的活跃用户同步一次最新 24h 数据。
+     * 未曾登录或未落盘的用户不会纳入定时同步，严控上游 API 开销。
+     */
+    @Scheduled(cron = "${xops.top50-auto-sync-cron:0 20 23 * * *}", zone = "${xops.timezone:Asia/Shanghai}")
+    public void scheduledSyncTop50ActivePeers() {
+        if (!properties.isTop50AutoSyncEnabled()) {
+            return;
+        }
+        runTop50AutoSyncNow();
+    }
+
+    public int runTop50AutoSyncNow() {
+        if (resolveProviderMode(null) != ProviderMode.TWITTERAPI_IO || !properties.hasTwitterApiIoKey()) {
+            return 0;
+        }
+        if (!top50AutoSyncRunning.compareAndSet(false, true)) {
+            return 0;
+        }
+        int syncedCount = 0;
+        try {
+            CachedAuthorRanks ranks = getOrComputeAuthorRanks();
+            if (ranks == null) {
+                return 0;
+            }
+            List<AccountStore.StoredAccount> registeredStores = listPersistedStores();
+            ZoneId zone = resolveZoneId();
+            String today = LocalDate.now(zone).toString();
+            for (AccountStore.StoredAccount st : registeredStores) {
+                if (st == null || st.profile() == null || st.profile().username() == null) {
+                    continue;
+                }
+                String uname = st.profile().username().trim();
+                String uid = st.profile().id() != null ? st.profile().id().trim() : null;
+                String handleKey = validateIsolatedHandleKey(uname);
+                if (AUTHOR_USERNAME.equalsIgnoreCase(handleKey)) {
+                    continue;
+                }
+                Integer rank = uid != null && !uid.isEmpty() ? ranks.rankById().get(uid) : null;
+                if (rank == null) {
+                    rank = ranks.rankByUsername().get(handleKey);
+                }
+                if (rank == null || rank > TOP_AUTO_SYNC_RANK) {
+                    continue;
+                }
+                String ownerKey = accountOwnerKey(handleKey, uid);
+                String lockKey = ProviderMode.TWITTERAPI_IO.name() + ":" + ownerKey;
+                Object lock = fetchLocks.computeIfAbsent(lockKey, k -> new Object());
+                try {
+                    synchronized (lock) {
+                        AccountStore.StoredAccount latest = loadStore(handleKey, uid);
+                        AccountStore.StoredAccount base = latest != null ? latest : st;
+                        Instant checkedAt = Instant.now();
+                        if (isDailyRefreshComplete(base)
+                                && checkedAt.getEpochSecond() < base.dailyRefreshedAt() + DAILY_REFRESH_SECONDS) {
+                            continue;
+                        }
+                        String priorDate = base.syncedAtInstant() != null
+                                ? base.syncedAtInstant().atZone(zone).toLocalDate().toString()
+                                : null;
+                        var outcome = twitterApiIoProvider.syncStoreByHours(
+                                uname, base, 24, !canContinueDailyRefresh(base, checkedAt), true, null, uid);
+                        verifyAccountOwner(outcome.store().profile(), handleKey, uid);
+                        saveStore(handleKey, uid, outcome.store());
+                        snapshotCache.remove(lockKey);
+                        if (isDailyRefreshComplete(outcome.store())) {
+                            recordAccumulatedDateOnly(ownerKey, today, priorDate);
+                            syncedCount++;
+                        }
+                    }
+                } catch (Exception ex) {
+                    log.warn("Top-50 daily auto-sync failed for @{} (rank={}): {}", uname, rank, ex.getMessage());
+                }
+            }
+            if (syncedCount > 0) {
+                log.info("Top-50 daily auto-sync completed for {} registered peer account(s).", syncedCount);
+            }
+            return syncedCount;
+        } finally {
+            top50AutoSyncRunning.set(false);
+        }
+    }
+
+    private List<AccountStore.StoredAccount> listPersistedStores() {
+        List<AccountStore.StoredAccount> result = new ArrayList<>();
+        Set<String> seenOwnerKeys = new LinkedHashSet<>();
+        String dir = properties.getDiskCacheDir();
+        if (dir != null && !dir.isBlank()) {
+            Path usersRoot = Path.of(dir).resolve("users");
+            Path byIdRoot = usersRoot.resolve("by-id");
+            if (Files.isDirectory(byIdRoot)) {
+                try (Stream<Path> dirs = Files.list(byIdRoot)) {
+                    for (Path p : dirs.toList()) {
+                        Path storeFile = p.resolve("store_v" + AccountStore.VERSION + ".json.gz");
+                        if (!Files.isRegularFile(storeFile)) continue;
+                        AccountStore.StoredAccount st = AccountStore.read(storeFile, objectMapper);
+                        if (st != null && st.profile() != null && st.profile().id() != null) {
+                            String key = "id:" + st.profile().id();
+                            if (seenOwnerKeys.add(key)) {
+                                result.add(st);
+                            }
+                        }
+                    }
+                } catch (Exception ex) {
+                    log.debug("Failed listing by-id persisted stores: {}", ex.getMessage());
+                }
+            }
+            if (Files.isDirectory(usersRoot)) {
+                try (Stream<Path> dirs = Files.list(usersRoot)) {
+                    for (Path p : dirs.toList()) {
+                        if ("by-id".equals(p.getFileName().toString())) continue;
+                        Path storeFile = p.resolve("store_v" + AccountStore.VERSION + ".json.gz");
+                        if (!Files.isRegularFile(storeFile)) continue;
+                        AccountStore.StoredAccount st = AccountStore.read(storeFile, objectMapper);
+                        if (st != null && st.profile() != null && st.profile().username() != null) {
+                            String uid = st.profile().id();
+                            String key = (uid != null && !uid.isBlank())
+                                    ? "id:" + uid
+                                    : st.profile().username().toLowerCase(Locale.ROOT);
+                            if (seenOwnerKeys.add(key)) {
+                                result.add(st);
+                            }
+                        }
+                    }
+                } catch (Exception ex) {
+                    log.debug("Failed listing handle persisted stores: {}", ex.getMessage());
+                }
+            }
+        }
+        for (AccountStore.StoredAccount mem : memoryStores.values()) {
+            if (mem != null && mem.profile() != null && mem.profile().username() != null) {
+                String uid = mem.profile().id();
+                String key = (uid != null && !uid.isBlank())
+                        ? "id:" + uid
+                        : mem.profile().username().toLowerCase(Locale.ROOT);
+                if (seenOwnerKeys.add(key)) {
+                    result.add(mem);
+                }
+            }
+        }
+        return result;
     }
 
     private Path userUsageFile(String handleKey) {

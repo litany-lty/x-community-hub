@@ -142,7 +142,7 @@ class AnalyticsAuditRegressionTest {
         for (String joinedDate : new String[]{null, "", "Joined 2020", "2025-02-30"}) {
             var health = ageReport(joinedDate, NOW).algorithmHealth();
             assertThat(health.underTheHoodEligible()).as("joined date: %s", joinedDate).isFalse();
-            assertThat(health.underTheHoodHint()).contains("无法确认");
+            assertThat(health.underTheHoodHint()).contains("注册日期缺失或无法解析", "无法核验");
         }
     }
 

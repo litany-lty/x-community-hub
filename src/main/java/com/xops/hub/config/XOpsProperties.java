@@ -26,6 +26,13 @@ public class XOpsProperties {
     private String diskCacheDir = "./.cache/snapshots";
     private boolean requireLoginSelfOnly = true;
     private String timezone = "Asia/Shanghai";
+    private String tokenEncryptionSecret = "";
+    private boolean schedulerEnabled = true;
+    private long schedulerPollMs = 15000L;
+    private long scheduleGraceWindowSeconds = 300L;
+    private boolean top50AutoSyncEnabled = true;
+    private String top50AutoSyncCron = "0 20 23 * * *";
+    private String algoProfilePath = "./.cache/x-algorithm-profile.json";
 
     public String getDefaultProvider() {
         return defaultProvider;
@@ -193,6 +200,62 @@ public class XOpsProperties {
 
     public void setTimezone(String timezone) {
         this.timezone = timezone;
+    }
+
+    public String getTokenEncryptionSecret() {
+        return tokenEncryptionSecret;
+    }
+
+    public void setTokenEncryptionSecret(String tokenEncryptionSecret) {
+        this.tokenEncryptionSecret = tokenEncryptionSecret;
+    }
+
+    public boolean isSchedulerEnabled() {
+        return schedulerEnabled;
+    }
+
+    public void setSchedulerEnabled(boolean schedulerEnabled) {
+        this.schedulerEnabled = schedulerEnabled;
+    }
+
+    public long getSchedulerPollMs() {
+        return schedulerPollMs;
+    }
+
+    public void setSchedulerPollMs(long schedulerPollMs) {
+        this.schedulerPollMs = schedulerPollMs;
+    }
+
+    public long getScheduleGraceWindowSeconds() {
+        return scheduleGraceWindowSeconds;
+    }
+
+    public void setScheduleGraceWindowSeconds(long scheduleGraceWindowSeconds) {
+        this.scheduleGraceWindowSeconds = scheduleGraceWindowSeconds;
+    }
+
+    public boolean isTop50AutoSyncEnabled() {
+        return top50AutoSyncEnabled;
+    }
+
+    public void setTop50AutoSyncEnabled(boolean top50AutoSyncEnabled) {
+        this.top50AutoSyncEnabled = top50AutoSyncEnabled;
+    }
+
+    public String getTop50AutoSyncCron() {
+        return top50AutoSyncCron;
+    }
+
+    public void setTop50AutoSyncCron(String top50AutoSyncCron) {
+        this.top50AutoSyncCron = top50AutoSyncCron;
+    }
+
+    public String getAlgoProfilePath() {
+        return algoProfilePath;
+    }
+
+    public void setAlgoProfilePath(String algoProfilePath) {
+        this.algoProfilePath = algoProfilePath;
     }
 
     public boolean hasTwitterApiIoKey() {

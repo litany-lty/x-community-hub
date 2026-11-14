@@ -45,10 +45,17 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 @SpringBootTest(
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
         properties = {
+                "spring.config.import=",
                 "xops.default-provider=DEMO",
                 "xops.require-login-self-only=true",
+                "xops.twitterapi-io-key=",
+                "xops.official-bearer-token=",
                 "xops.oauth-client-id=test_oauth_client_id",
-                "xops.oauth-client-secret=test_oauth_secret"
+                "xops.oauth-client-secret=test_oauth_secret",
+                "xops.token-encryption-secret=test_token_encryption_secret",
+                "xops.scheduler-enabled=false",
+                "xops.top50-auto-sync-enabled=false",
+                "server.servlet.session.persistent=false"
         }
 )
 class CommunityAnalyticsAndApiTest {
@@ -70,6 +77,7 @@ class CommunityAnalyticsAndApiTest {
         int port = mockXOfficialOAuthServer.getAddress().getPort();
         registry.add("xops.official-base-url", () -> "http://127.0.0.1:" + port + "/2");
         registry.add("xops.disk-cache-dir", () -> testDiskCacheDir.toString());
+        registry.add("xops.algo-profile-path", () -> testDiskCacheDir.resolve("x-algorithm-profile.json").toString());
     }
 
     @AfterAll
@@ -299,8 +307,8 @@ class CommunityAnalyticsAndApiTest {
         assertThat(rapidExtCard.hasExternalLink()).isTrue();
         assertThat(rapidExtCard.rapidFirePenalty()).isTrue();
         assertThat(viralCard.algoScore()).isGreaterThan(rapidExtCard.algoScore() + 35);
-        assertThat(rapidExtCard.algoSignals()).anyMatch(s -> s.contains("25分（本地分-14）"));
-        assertThat(rapidExtCard.algoSignals()).contains("🔗 正文含外链（本地分-8）");
+        assertThat(rapidExtCard.algoSignals()).anyMatch(s -> s.contains("25分（本地分-12）"));
+        assertThat(rapidExtCard.algoSignals()).noneMatch(signal -> signal.contains("正文含外链（本地分"));
     }
 
     @Test
@@ -309,9 +317,17 @@ class CommunityAnalyticsAndApiTest {
         ResponseEntity<String> indexResp = restTemplate.getForEntity("/", String.class);
         assertThat(indexResp.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(indexResp.getBody())
-                .contains("登录 X 账号授权，查看您的专属运营报表")
-                .contains("5 分钟")
-                .contains("48小时动态窗口")
+                .contains("X 社区运营工作台")
+                .contains("24小时")
+                .contains("48小时")
+                .contains("7天")
+                .contains("30天")
+                .doesNotContain("HOURS_8")
+                .doesNotContain(">8小时<")
+                .contains("解锁")
+                .contains("满 1 小时后更新")
+                .contains("unlockGuideModal")
+                .contains(CommunityHubService.AUTHOR_COST_STORY)
                 .doesNotContain("settingsModal");
 
         ResponseEntity<ServerCapabilities> metaResp = restTemplate.getForEntity("/api/meta", ServerCapabilities.class);
@@ -357,10 +373,16 @@ class CommunityAnalyticsAndApiTest {
         assertThat(loginConn.getResponseCode()).isEqualTo(302);
         String preLoginSetCookie = loginConn.getHeaderField("Set-Cookie");
         assertThat(preLoginSetCookie).contains("JSESSIONID=");
+        assertThat(preLoginSetCookie).contains("Max-Age=34560000");
         String preLoginCookie = preLoginSetCookie.split(";", 2)[0];
 
         String authorizeLocation = loginConn.getHeaderField("Location");
         assertThat(authorizeLocation).startsWith("https://x.com/i/oauth2/authorize?");
+        String decodedScope = URLDecoder.decode(
+                extractQueryParam(URI.create(authorizeLocation).getRawQuery(), "scope"),
+                StandardCharsets.UTF_8
+        );
+        assertThat(decodedScope).isEqualTo("users.read tweet.read");
         String state = extractQueryParam(URI.create(authorizeLocation).getRawQuery(), "state");
 
         URI callbackUri = URI.create(restTemplate.getRootUri() + "/api/auth/x/callback?code=valid_code_123&state=" + state);
@@ -377,7 +399,7 @@ class CommunityAnalyticsAndApiTest {
         HttpHeaders authHeaders = new HttpHeaders();
         authHeaders.add(HttpHeaders.COOKIE, sessionCookie);
 
-        // 4. 已登录用户通过 /api/analyze/bundle 一次性获取同源三周期包，验证 fetchedAt 完全一致且 300 秒（5 分钟）服务端缓存生效
+        // 4. 已登录用户通过 /api/analyze/bundle 获取首日工作台包：默认选中并开放 HOURS_24，48h/7天/30天 锁定，每日限 1 次手动刷新
         ResponseEntity<MultiPeriodDashboardBundle> bundleResp = restTemplate.exchange(
                 "/api/analyze/bundle",
                 HttpMethod.GET,
@@ -388,21 +410,25 @@ class CommunityAnalyticsAndApiTest {
         assertThat(bundleResp.getHeaders().getCacheControl()).contains("no-store");
         MultiPeriodDashboardBundle bundleBody = bundleResp.getBody();
         assertThat(bundleBody).isNotNull();
-        CommunityDashboardReport firstBody = bundleBody.month();
+        CommunityDashboardReport firstBody = bundleBody.hours24();
+        assertThat(firstBody).isNotNull();
         assertThat(firstBody.profile().username()).isEqualTo("ops_member");
         assertThat(firstBody.fromCache()).isFalse();
         assertThat(firstBody.cacheTtlSeconds()).isEqualTo(300L);
         assertThat(firstBody.cacheRemainingSeconds()).isBetween(1L, 300L);
-        assertThat(bundleBody.month().periodLabel()).isEqualTo("30天动态窗口");
-        assertThat(bundleBody.week().periodCode()).isEqualTo("WEEK");
-        assertThat(bundleBody.week().periodLabel()).isEqualTo("7天动态窗口");
-        assertThat(bundleBody.day().periodCode()).isEqualTo("HOURS_48");
-        assertThat(bundleBody.day().periodLabel()).isEqualTo("48小时动态窗口");
-        assertThat(bundleBody.day().windowDays()).isEqualTo(2);
-        assertThat(bundleBody.week().fetchedAt()).isEqualTo(firstBody.fetchedAt());
-        assertThat(bundleBody.day().fetchedAt()).isEqualTo(firstBody.fetchedAt());
+        assertThat(firstBody.periodCode()).isEqualTo("HOURS_24");
+        assertThat(firstBody.periodLabel()).isEqualTo("24小时动态窗口");
+        assertThat(bundleBody.day()).isNull();
+        assertThat(bundleBody.week()).isNull();
+        assertThat(bundleBody.month()).isNull();
+        assertThat(bundleBody.accessPolicy()).isNotNull();
+        assertThat(bundleBody.accessPolicy().unlockedPeriods()).containsExactly("HOURS_24");
+        assertThat(bundleBody.accessPolicy().dailyRefreshLimit()).isEqualTo(1);
+        assertThat(bundleBody.accessPolicy().dailyRefreshRemaining()).isEqualTo(1);
+        assertThat(bundleBody.accessPolicy().authorStatement()).isEqualTo(CommunityHubService.AUTHOR_COST_STORY);
+        assertThat(bundleBody.accessPolicy().repoUrl()).isEqualTo(CommunityHubService.AUTHOR_REPO_URL);
 
-        // 4b. 默认不传 period/days 时，必须返回「48小时动态窗口」（HOURS_48）并直接命中 5 分钟缓存
+        // 4b. 默认不传 period/days 时，必须返回「24小时动态窗口」（HOURS_24）并直接命中 5 分钟缓存；未解锁维度返回 403
         ResponseEntity<CommunityDashboardReport> defaultPeriodResp = restTemplate.exchange(
                 "/api/analyze",
                 HttpMethod.GET,
@@ -411,21 +437,35 @@ class CommunityAnalyticsAndApiTest {
         );
         assertThat(defaultPeriodResp.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(defaultPeriodResp.getBody()).isNotNull();
-        assertThat(defaultPeriodResp.getBody().periodCode()).isEqualTo("HOURS_48");
-        assertThat(defaultPeriodResp.getBody().periodLabel()).isEqualTo("48小时动态窗口");
+        assertThat(defaultPeriodResp.getBody().periodCode()).isEqualTo("HOURS_24");
+        assertThat(defaultPeriodResp.getBody().periodLabel()).isEqualTo("24小时动态窗口");
         assertThat(defaultPeriodResp.getBody().fromCache()).isTrue();
 
-        // 5. 5 分钟缓存期内，即使前端传 refresh=true 也强制走缓存
-        ResponseEntity<CommunityDashboardReport> cachedWeekResp = restTemplate.exchange(
-                "/api/analyze?period=WEEK&refresh=true",
+        ResponseEntity<Map> lockedWeekResp = restTemplate.exchange(
+                "/api/analyze?period=WEEK",
+                HttpMethod.GET,
+                new HttpEntity<>(authHeaders),
+                Map.class
+        );
+        assertThat(lockedWeekResp.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+
+        // 同日重复检查允许返回工作台，其他账号仍受隔离。
+        ResponseEntity<CommunityDashboardReport> firstManualRefreshResp = restTemplate.exchange(
+                "/api/analyze?refresh=true",
                 HttpMethod.GET,
                 new HttpEntity<>(authHeaders),
                 CommunityDashboardReport.class
         );
-        assertThat(cachedWeekResp.getStatusCode()).isEqualTo(HttpStatus.OK);
-        assertThat(cachedWeekResp.getBody()).isNotNull();
-        assertThat(cachedWeekResp.getBody().fromCache()).isTrue();
-        assertThat(cachedWeekResp.getBody().periodCode()).isEqualTo("WEEK");
+        assertThat(firstManualRefreshResp.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(firstManualRefreshResp.getBody()).isNotNull();
+        assertThat(firstManualRefreshResp.getBody().fromCache()).isFalse();
+        assertThat(firstManualRefreshResp.getBody().periodCode()).isEqualTo("HOURS_24");
+
+        ResponseEntity<MultiPeriodDashboardBundle> secondManualRefreshResp = restTemplate.exchange(
+                "/api/analyze/bundle?refresh=true", HttpMethod.GET, new HttpEntity<>(authHeaders), MultiPeriodDashboardBundle.class);
+        assertThat(secondManualRefreshResp.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(secondManualRefreshResp.getBody().hours24().profile().id()).isEqualTo(firstBody.profile().id());
+        assertThat(secondManualRefreshResp.getBody().accessPolicy().dailyRefreshRemaining()).isEqualTo(1);
 
         // 6. 已登录 @elidlicom 尝试越权传参查询他人账号（如 @other_user）必须返回 403 FORBIDDEN
         ResponseEntity<Map> crossUserResp = restTemplate.exchange(

@@ -5,16 +5,21 @@ target/
 .DS_Store
 .idea/
 *.iml
-application-local.yml
+/application-local.yml
+/application-local.yaml
+/application-local.properties
 
 # Local sessions, installed builds, development tools, and secrets
-/.sessions/
+.sessions/
 /.local/
 /.serena/
 .env
 .env.*
 !.env.example
-application-local.yaml
+.token_master_key
+oauth_token_*.enc
+auth-sessions/
 *.pem
+*.key
 *.p12
 *.jks
