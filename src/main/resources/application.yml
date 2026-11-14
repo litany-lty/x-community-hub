@@ -1,0 +1,60 @@
+server:
+  port: ${PORT:8080}
+  compression:
+    enabled: true
+    mime-types: application/json,text/html,text/css,application/javascript,image/svg+xml
+  servlet:
+    session:
+      timeout: 7d
+      persistent: true
+      store-dir: ${X_SESSION_STORE_DIR:./.sessions}
+      cookie:
+        http-only: true
+        same-site: lax
+
+spring:
+  config:
+    import: "optional:file:./application-local.yml"
+  application:
+    name: x-community-hub
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false
+
+xops:
+  # 数据源模式：TWITTERAPI_IO（真实数据）| AUTO | X_OFFICIAL_V2 | DEMO
+  default-provider: ${X_PROVIDER:TWITTERAPI_IO}
+
+  # 访问控制：要求必须通过 X OAuth 2.0 登录授权，且每人仅允许查询当前登录的本人账号
+  require-login-self-only: ${X_REQUIRE_LOGIN_SELF_ONLY:true}
+
+  # TwitterAPI.io API Key（集中于服务端配置文件管理，不在前端暴露）
+  twitterapi-io-key: "${X_TWITTERAPI_IO_KEY:}"
+  twitterapi-io-base-url: ${X_TWITTERAPI_IO_BASE_URL:https://api.twitterapi.io}
+
+  # X OAuth 2.0 (PKCE) 登录授权配置（在 developer.x.com 创建应用，Callback URI 填 http://域名/api/auth/x/callback）
+  oauth-client-id: "${X_OAUTH_CLIENT_ID:}"
+  oauth-client-secret: "${X_OAUTH_CLIENT_SECRET:}"
+  oauth-redirect-uri: ${X_OAUTH_REDIRECT_URI:}
+
+  # 备选：X 官方 API v2 Bearer Token（同时作为 OAuth /2/users/me 基础网关地址）
+  official-bearer-token: ${X_OFFICIAL_BEARER_TOKEN:}
+  official-base-url: ${X_OFFICIAL_BASE_URL:https://api.x.com/2}
+
+  # 分页采样深度（四路并发采集 + 超过 30 天或达到精确总数立即停页省流 + 关注/粉丝未变跨小时免拉取）
+  max-timeline-pages: ${X_MAX_TIMELINE_PAGES:600}
+  max-mention-pages: ${X_MAX_MENTION_PAGES:600}
+  max-following-pages: ${X_MAX_FOLLOWING_PAGES:4}
+  max-follower-pages: ${X_MAX_FOLLOWER_PAGES:5}
+
+  # 共用外部 API 线程池（低峰期多路并发提速，高峰期有界队列 + 排队超时快速保护，防止请求堆积）
+  api-pool-core-size: ${X_API_POOL_CORE_SIZE:8}
+  api-pool-max-size: ${X_API_POOL_MAX_SIZE:14}
+  api-pool-queue-capacity: ${X_API_POOL_QUEUE_CAPACITY:64}
+  api-queue-timeout-ms: ${X_API_QUEUE_TIMEOUT_MS:4500}
+  api-max-parallel-slices: ${X_API_MAX_PARALLEL_SLICES:4}
+
+  # 服务端内存缓存时长：300 秒（5 分钟防重复查库/请求上游；30 天滚动数据落盘持久化）
+  cache-ttl-seconds: ${X_CACHE_TTL_SECONDS:300}
+  disk-cache-dir: ${X_DISK_CACHE_DIR:./.cache/snapshots}
+  timezone: ${X_TIMEZONE:Asia/Shanghai}

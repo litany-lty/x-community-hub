@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="lights-out">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" id="metaThemeColor" content="#000000" />
+    <title>X 社区运营工作台 · Community Ops Hub</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%23000'/%3E%3Cpath fill='%23fff' d='M17.53 3h2.93l-6.4 7.32L21.6 21h-5.9l-4.62-6.04L5.8 21H2.86l6.85-7.83L2.48 3h6.05l4.18 5.52L17.53 3zm-1.03 16.24h1.62L7.65 4.67H5.9l10.6 14.57z'/%3E%3C/svg%3E" />
+    <script>
+        try {
+            var t = localStorage.getItem("xops_theme");
+            if (t === "lights-out" || t === "dim" || t === "light") {
+                document.documentElement.setAttribute("data-theme", t);
+                var m = document.getElementById("metaThemeColor");
+                if (m) m.setAttribute("content", t === "light" ? "#ffffff" : t === "dim" ? "#15202b" : "#000000");
+            }
+        } catch (_) {}
+    </script>
+    <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+<div class="x-shell">
+    <!-- 左侧导航栏（复刻 X 主导航） -->
+    <aside class="left-rail">
+        <div class="left-rail-inner">
+            <div class="brand-row">
+                <button class="x-logo-btn" id="logoHomeBtn" type="button" title="X 社区运营工作台">
+                    <svg viewBox="0 0 24 24" aria-hidden="true" class="x-logo-svg">
+                        <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"></path>
+                    </svg>
+                    <span class="brand-title">运营工作台</span>
+                </button>
+            </div>
+
+            <nav class="nav-menu" id="leftNavMenu" aria-label="核心运营模块">
+                <button class="nav-item active" data-tab="activity" type="button">
+                    <svg viewBox="0 0 24 24" class="nav-icon"><path d="M8.75 21V3h2v18h-2zM18 21V8.5h2V21h-2zM4 21l.004-10h2L6 21H4zm9.248 0v-7h2v7h-2z"/></svg>
+                    <span class="nav-label">活跃</span>
+                </button>
+
+                <button class="nav-item" data-tab="interactions" type="button">
+                    <svg viewBox="0 0 24 24" class="nav-icon"><path d="M4.5 3.88l4.432 4.14-1.364 1.46L5.5 7.55V16c0 1.1.896 2 2 2H13v2H7.5c-2.209 0-4-1.79-4-4V7.55L1.432 9.48.068 8.02 4.5 3.88zM16.5 6H11V4h5.5c2.209 0 4 1.79 4 4v8.45l2.068-1.930 1.364 1.46-4.432 4.14-4.432-4.14 1.364-1.46 2.068 1.93V8c0-1.1-.896-2-2-2z"/></svg>
+                    <span class="nav-label">互动</span>
+                    <span class="nav-badge" id="navInteractBadge" hidden title="待你回复或回访的人数">0</span>
+                </button>
+
+                <button class="nav-item" data-tab="follow-audit" type="button">
+                    <svg viewBox="0 0 24 24" class="nav-icon"><path d="M10 4c-1.105 0-2 .9-2 2s.895 2 2 2 2-.9 2-2-.895-2-2-2zM6 6c0-2.21 1.791-4 4-4s4 1.79 4 4-1.791 4-4 4-4-1.79-4-4zm13 4v3h2v-3h3V8h-3V5h-2v3h-3v2h3zM3.651 19h12.698c-.337-1.8-1.023-3.210-1.945-4.19C13.318 13.65 11.838 13 10 13s-3.317.65-4.404 1.81c-.922.98-1.608 2.39-1.945 4.19zm.486-5.56C5.627 11.85 7.648 11 10 11s4.373.85 5.863 2.44c1.477 1.58 2.366 3.8 2.632 6.46l.11 1.1H1.395l.11-1.1c.266-2.66 1.155-4.88 2.632-6.46z"/></svg>
+                    <span class="nav-label">关注</span>
+                    <span class="nav-badge" id="navUnfollowBadge" hidden>0</span>
+                </button>
+
+                <button class="nav-item" data-tab="timing" type="button">
+                    <svg viewBox="0 0 24 24" class="nav-icon"><path d="M12 1.75C6.34 1.75 1.75 6.34 1.75 12S6.34 22.25 12 22.25 22.25 17.660 22.25 12 17.66 1.75 12 1.75zm0 18.5c-4.56 0-8.25-3.69-8.25-8.25S7.44 3.75 12 3.75s8.25 3.69 8.25 8.25-3.69 8.25-8.25 8.25zm.75-13h-1.5v5.69l4.28 2.57.77-1.29-3.55-2.13V7.25z"/></svg>
+                    <span class="nav-label">内容</span>
+                </button>
+
+                <button class="nav-item" data-tab="circle" type="button">
+                    <svg viewBox="0 0 24 24" class="nav-icon"><path d="M12 2l2.9 6.26L22 9.27l-5 4.87 1.18 6.86L12 17.77 5.82 21 7 14.14 2 9.27l7.1-1.01L12 2z"/></svg>
+                    <span class="nav-label">战报</span>
+                </button>
+            </nav>
+
+            <div class="rail-actions">
+                <div class="rail-utility-row single-col">
+                    <button class="utility-btn icon-only" id="cycleThemeBtn" type="button" title="切换主题" aria-label="切换主题">
+                        <svg viewBox="0 0 24 24" class="sm-icon" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.389 5.389 0 0 1-4.4 2.26 5.403 5.403 0 0 1-3.14-9.8c-.44-.06-.9-.1-1.36-.1z"/></svg>
+                        <span class="theme-btn-text">主题</span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- 左下角当前授权账号胶囊 -->
+            <div class="rail-account-pill" id="railAccountPill" hidden>
+                <div class="avatar-circle sm" id="railAvatar">X</div>
+                <div class="rail-account-meta">
+                    <div class="rail-account-name" id="railDisplayName">未授权登录</div>
+                    <div class="rail-account-handle" id="railHandle">请先登录本人 X 账号</div>
+                </div>
+                <button type="button" class="mini-logout-btn" id="railLogoutBtn" hidden title="退出 X 登录">退出</button>
+            </div>
+        </div>
+    </aside>
+
+    <!-- 中间主内容区 -->
+    <main class="center-feed">
+        <!-- 错误提示横幅 -->
+        <div id="errorToast" class="error-banner" role="alert" aria-live="assertive" hidden>
+            <span id="errorToastText" class="error-banner-text"></span>
+            <button type="button" id="errorToastCloseBtn" class="error-close-btn" aria-label="关闭提示" title="关闭提示">×</button>
+        </div>
+
+        <!-- ==================== 未登录状态：X 官方授权门禁卡片 ==================== -->
+        <section id="authGateSection" class="auth-gate-wrap">
+            <div class="auth-gate-card">
+                <div class="auth-gate-head">
+                    <div class="auth-gate-logo">
+                        <svg viewBox="0 0 24 24" aria-hidden="true">
+                            <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"></path>
+                        </svg>
+                    </div>
+                    <button class="utility-btn gate-theme-btn" id="gateThemeBtn" type="button" title="切换主题" aria-label="切换主题">
+                        <svg viewBox="0 0 24 24" class="sm-icon" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.389 5.389 0 0 1-4.4 2.26 5.403 5.403 0 0 1-3.14-9.8c-.44-.06-.9-.1-1.36-.1z"/></svg>
+                        <span class="theme-btn-text">纯黑</span>
+                    </button>
+                </div>
+                <h1 class="auth-gate-title">登录 X 账号授权，查看您的专属运营报表</h1>
+                <p class="auth-gate-desc">
+                    仅可查看你本人账号，默认展示「48小时动态窗口」，可切换 7 天 / 30 天。
+                </p>
+
+                <div class="auth-policy-grid">
+                    <div class="auth-policy-item">
+                        <div class="policy-head">仅限本人</div>
+                        <p>X 官方 OAuth 授权，只读 <code>users.read</code> / <code>tweet.read</code>，不发帖、不改关注、不读私信。</p>
+                    </div>
+                    <div class="auth-policy-item">
+                        <div class="policy-head">30 天入库 · 5 分钟缓存</div>
+                        <p>近 30 天数据保存在服务器，每次只拉取新增部分；5 分钟内重复打开直接读缓存。</p>
+                    </div>
+                </div>
+
+                <div class="auth-gate-cta-area">
+                    <button type="button" class="auth-gate-login-btn" id="gateLoginBtn">
+                        <svg viewBox="0 0 24 24" class="oauth-x-icon"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"></path></svg>
+                        <span>使用 X 账号授权登录</span>
+                    </button>
+                </div>
+
+                <!-- 若服务端 application.yml 尚未填写 oauth-client-id，向站长展示纯只读指引 -->
+                <div id="oauthAdminSetupHint" class="oauth-setup-hint" hidden>
+                    <div class="oauth-setup-title">服务端待配置 X OAuth 2.0 Client ID</div>
+                    <p>
+                        当前服务端配置文件 <code>application.yml</code> 的 <code>xops.oauth-client-id</code> 为空，暂无法跳转 X 授权页。请在
+                        <a href="https://developer.x.com/en/portal/dashboard" target="_blank" rel="noopener noreferrer">X Developer Portal ↗</a>
+                        开启 OAuth 2.0（Type 选 Web App），将 Callback URI 设为
+                        <code id="gateCallbackUriText">http://localhost:8080/api/auth/x/callback</code>，并将 Client ID 与 Client Secret 写入
+                        <code>application.yml</code> 后重启服务。
+                    </p>
+                </div>
+            </div>
+        </section>
+
+        <!-- ==================== 已登录状态：本人专属运营工作台 ==================== -->
+        <div id="authenticatedWorkspace" data-active-tab="activity" hidden>
+            <!-- 吸顶栏：动态窗口切换 + 缓存状态 -->
+            <header class="sticky-topbar">
+                <div class="self-topbar-row">
+                    <div class="window-seg" role="group" aria-label="统计时间范围">
+                        <button type="button" class="seg-btn active" data-period="HOURS_48" data-days="2" title="近 48 小时（按当前时间往前滚动）">48小时</button>
+                        <button type="button" class="seg-btn" data-period="WEEK" data-days="7" title="近 7 天（按当前时间往前滚动）">7天</button>
+                        <button type="button" class="seg-btn" data-period="MONTH" data-days="30" title="近 30 天（按当前时间往前滚动）">30天</button>
+                    </div>
+
+                    <div class="topbar-actions">
+                        <button type="button" class="refresh-status-btn" id="forceRefreshBtn" disabled title="数据 5 分钟内不重复拉取">更新中…</button>
+                        <button type="button" class="icon-circle-btn topbar-theme-only" id="topbarThemeBtn" title="切换主题" aria-label="切换主题">
+                            <svg viewBox="0 0 24 24" class="sm-icon" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.389 5.389 0 0 1-4.4 2.26 5.403 5.403 0 0 1-3.14-9.8c-.44-.06-.9-.1-1.36-.1z"/></svg>
+                        </button>
+                        <button type="button" class="mini-logout-btn topbar-logout-only" id="topbarLogoutBtn" title="退出登录">退出</button>
+                    </div>
+                </div>
+                <div class="window-range-hint" id="topbarWindowHint">统计窗口加载中…</div>
+                <div class="window-range-hint"><a id="storedReportLink" href="?stored=true">查看已入库报表</a></div>
+            </header>
+
+            <!-- 加载进度条与提示 -->
+            <div id="loadingBar" class="loading-progress" hidden>
+                <div class="loading-progress-inner"></div>
+            </div>
+            <div id="loadingSlowHint" class="notice-strip" style="margin:10px 16px;" hidden>
+                正在同步数据…
+            </div>
+
+            <!-- X 原生风格个人主页头部 -->
+            <section class="profile-hero" id="profileHero">
+                <div class="profile-cover" id="profileCover"></div>
+
+                <div class="profile-body">
+                    <div class="profile-avatar-row">
+                        <div class="avatar-circle xl" id="profileAvatar">X</div>
+                        <div class="profile-cta-group">
+                            <span class="health-score-chip" id="healthScoreChip" title="0–100，综合发帖稳定度、回复比、公开互动率计算；50 以上为良好">运营健康 --</span>
+                            <a class="x-outline-pill" id="visitXProfileLink" href="https://x.com" target="_blank" rel="noopener noreferrer">
+                                访问 X 主页 ↗
+                            </a>
+                        </div>
+                    </div>
+
+                    <div class="profile-title-block">
+                        <h1 class="profile-name-line">
+                            <span id="profileDisplayName">加载中…</span>
+                            <span id="profileVerifiedIcon" class="verified-badge" hidden title="X 蓝标认证">
+                                <svg viewBox="0 0 22 22"><path d="M20.396 11c-.018-.646-.215-1.275-.57-1.816-.354-.54-.852-.972-1.438-1.246.223-.607.27-1.264.14-1.897-.131-.634-.437-1.218-.882-1.687-.47-.445-1.053-.75-1.687-.882-.633-.13-1.29-.083-1.897.14-.273-.587-.704-1.086-1.245-1.44S11.647 1.62 11 1.604c-.646.017-1.273.213-1.813.568s-.969.854-1.24 1.44c-.608-.223-1.267-.272-1.902-.14-.635.13-1.22.436-1.69.882-.445.47-.749 1.055-.878 1.688-.13.633-.08 1.29.144 1.896-.587.274-1.087.705-1.443 1.245-.356.54-.555 1.17-.574 1.817.02.647.218 1.276.574 1.817.356.54.856.972 1.443 1.245-.224.606-.274 1.263-.144 1.896.13.634.433 1.218.877 1.688.47.443 1.054.747 1.687.878.633.132 1.29.084 1.897-.136.274.586.705 1.084 1.246 1.439.54.354 1.17.551 1.816.569.647-.016 1.276-.213 1.817-.567s.972-.854 1.245-1.44c.604.239 1.266.296 1.903.164.636-.132 1.22-.447 1.68-.907.46-.46.776-1.044.908-1.681s.075-1.299-.165-1.903c.586-.274 1.084-.705 1.439-1.246.354-.54.551-1.17.569-1.816zM9.662 14.85l-3.429-3.428 1.293-1.302 2.072 2.072 4.4-4.794 1.347 1.246z"/></svg>
+                            </span>
+                            <span class="persona-pill" id="profilePersonaTag">--</span>
+                        </h1>
+                        <div class="profile-handle-line" id="profileHandleText">@username</div>
+                    </div>
+
+                    <p class="profile-bio" id="profileBio">--</p>
+
+                    <div class="profile-stats-row">
+                        <div class="stat-inline"><strong id="profileFollowingNum">0</strong> <span>正在关注</span></div>
+                        <div class="stat-inline"><strong id="profileFollowersNum">0</strong> <span>关注者</span></div>
+                        <div class="stat-inline" title="我关注的人当中回关我的比例"><strong id="profileMutualRateNum">0%</strong> <span>关注回关率</span></div>
+                        <div class="stat-inline"><strong id="profileTotalTweetsNum">0</strong> <span>历史总推文</span></div>
+                    </div>
+
+                    <div class="notice-strip" id="bannerNoticeStrip"></div>
+                </div>
+            </section>
+
+            <!-- ==================== 模块 1：发帖与回复活跃度看板 ==================== -->
+            <section class="tab-panel active" id="panel-activity">
+                <div class="kpi-grid-4">
+                    <div class="kpi-card" title="原创主推文数量（不含在他人推文下的回复）">
+                        <div class="kpi-label" id="kpiPostsTitle">48h 原创发帖</div>
+                        <div class="kpi-value" id="kpiOriginalPosts">0</div>
+                        <div class="kpi-sub" id="kpiDailyPosts">日均 0 条（含引用）</div>
+                    </div>
+                    <div class="kpi-card" title="主动去其他推友评论区互动回复的条数，用于观察主动社区互动">
+                        <div class="kpi-label" id="kpiRepliesTitle">回复</div>
+                        <div class="kpi-value accent-blue" id="kpiReplies">0</div>
+                        <div class="kpi-sub" id="kpiDailyReplies">日均 0 条推友回复</div>
+                    </div>
+                    <div class="kpi-card" title="回复数 ÷ 原创推文数，建议 2–6 倍">
+                        <div class="kpi-label">回复 / 发帖比</div>
+                        <div class="kpi-value accent-green" id="kpiReplyRatio">0x</div>
+                        <div class="kpi-sub" id="kpiReplyShare">回复占总动态 0%</div>
+                    </div>
+                    <div class="kpi-card" title="公开互动率：(点赞+评论+转推/引用+收藏) ÷ 浏览量；不同于官方 Analytics 互动率">
+                        <div class="kpi-label">平均公开互动率</div>
+                        <div class="kpi-value accent-pink" id="kpiAvgEr">0%</div>
+                        <div class="kpi-sub" id="kpiAvgViews">单帖均浏览 0</div>
+                    </div>
+                </div>
+
+                <!-- 窄屏折叠右侧栏时自动显示的轻量分发自检条与本期行动 -->
+                <div class="mobile-algo-strip" id="mobileAlgoHealthStrip">
+                    <span id="mobileAlgoStatusText">等待样本分析</span>
+                    <a href="https://x.com/i/jf/under_the_hood" target="_blank" rel="noopener noreferrer" class="x-outline-pill sm">
+                        官方分发信息 ↗
+                    </a>
+                </div>
+
+                <div class="x-section-card mobile-ops-card" id="mobileOpsCard" hidden>
+                    <h2 class="section-title">本期行动</h2>
+                    <ul class="action-checklist" id="mobileOpsChecklist"></ul>
+                </div>
+
+                <div class="x-section-card">
+                    <div class="section-head">
+                        <div>
+                            <h2 class="section-title" id="diagnosisSectionTitle">节奏诊断</h2>
+                            <p class="section-desc" id="activityAdviceText">--</p>
+                        </div>
+                        <span class="subtle-tag" id="activeDaysBadge">活跃 --</span>
+                    </div>
+
+                    <div class="mix-bar-wrap">
+                        <div class="mix-bar-track" id="actionMixBar"></div>
+                        <div class="mix-legend" id="actionMixLegend"></div>
+                    </div>
+                </div>
+
+                <div class="x-section-card">
+                    <div class="section-head">
+                        <div>
+                            <h2 class="section-title" id="trendChartTitle">发帖 vs 回复趋势</h2>
+                            <p class="section-desc" id="trendChartSubtitle">点按或悬停柱体查看明细</p>
+                            <p class="section-desc" id="activityMetricTotals" title="包含原创、回复、引用与串推楼层，排除纯转推；总互动为点赞、评论、转推/引用与收藏之和">本周期非纯转推指标待加载</p>
+                        </div>
+                        <div class="chart-legend-inline">
+                            <span><i class="dot blue"></i>回复</span>
+                            <span><i class="dot white"></i>原创/引用/串推</span>
+                        </div>
+                    </div>
+                    <div class="daily-chart-box" id="dailyTrendChart"></div>
+                </div>
+            </section>
+
+            <!-- ==================== 模块 2：互动（1帖=1次） ==================== -->
+            <section class="tab-panel" id="panel-interactions">
+                <div class="x-section-card no-bottom-pad">
+                    <div class="section-head wrap-gap">
+                        <div>
+                            <h2 class="section-title">互动关系</h2>
+                            <p class="section-desc" id="interactionSummaryDesc">--</p>
+                        </div>
+                        <div class="toolbar-right">
+                            <input type="search" id="peerSearchInput" class="x-mini-input" placeholder="搜索 @用户名" aria-label="搜索推友" />
+                            <select id="peerSortSelect" class="x-select" aria-label="排序方式">
+                                <option value="intimacy">默认排序</option>
+                                <option value="iOweFirst">我没回的优先</option>
+                                <option value="theyOweFirst">没回我的优先</option>
+                                <option value="outbound">我去评最多</option>
+                                <option value="inbound">TA 来评最多</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="filter-pills-row" id="interactionTypePills">
+                        <button class="pill-chip" data-rel-filter="I_OWE" id="pillIOweBtn" type="button" title="我的推文下 TA 来评论过，但我没有去 TA 发布过的推文下评论">我没回谁</button>
+                        <button class="pill-chip" data-rel-filter="UNREPLIED_POST" id="pillUnrepliedBtn" type="button" title="别人评论了我，但我还没有回复 TA">评论待回复</button>
+                        <button class="pill-chip" data-rel-filter="THEY_OWE" id="pillTheyOweBtn" type="button" title="我去 TA 发布过的推文下评论过，但 TA 没有来我的推文下评论过">谁没回我</button>
+                        <button class="pill-chip" data-rel-filter="MUTUAL" id="pillMutualBtn" type="button" title="我去过 TA 推文下评论，TA 也来过我的推文下评论">互相评论</button>
+                        <button class="pill-chip active" data-rel-filter="ALL" type="button">全部</button>
+                    </div>
+                    <p class="list-hint">点击一行查看详情 · 1 个帖子算 1 次</p>
+
+                    <div class="x-user-list" id="peerInteractionList"></div>
+                </div>
+            </section>
+
+            <!-- ==================== 模块 3：关注关系 ==================== -->
+            <section class="tab-panel" id="panel-follow-audit">
+                <div class="x-section-card no-bottom-pad">
+                    <div class="section-head wrap-gap">
+                        <div>
+                            <div class="sub-seg-group" id="followStateTabs">
+                                <button class="seg-tab active" data-fstate="NOT_FOLLOWING_BACK" type="button" title="我关注了 TA，但 TA 未回关我">TA未回关</button>
+                                <button class="seg-tab" data-fstate="FAN_ONLY" type="button" title="TA 关注了我，但我未回关 TA">我未回关</button>
+                                <button class="seg-tab" data-fstate="MUTUAL" type="button" title="双方互相关注">互关</button>
+                            </div>
+                            <p class="section-desc" id="followScopeNote" style="margin-top:8px;"></p>
+                        </div>
+
+                        <div class="toolbar-right">
+                            <input type="search" id="followFilterInput" class="x-mini-input" placeholder="搜索昵称 / @用户名" aria-label="搜索关注账号" />
+                            <button type="button" class="x-outline-pill sm" id="exportFollowCsvBtn">导出 CSV</button>
+                        </div>
+                    </div>
+
+                    <div class="filter-pills-row" id="unfollowCategoryPills">
+                        <button class="pill-chip active" data-ucall="ALL" type="button">全部</button>
+                        <button class="pill-chip" data-ucall="SUGGEST_CLEAN" id="suggestCleanPillBtn" type="button">建议取关</button>
+                        <button class="pill-chip" data-ucall="ONE_WAY_EFFORT" type="button">互动过仍未回关</button>
+                        <button class="pill-chip" data-ucall="BIG_ACCOUNT" type="button">大V</button>
+                        <button class="pill-chip" data-ucall="WHITELIST" id="whitelistPillBtn" type="button" hidden>已保留</button>
+                    </div>
+
+                    <div id="relationshipContinueControls" class="notice-strip" hidden>
+                        <button type="button" class="x-outline-pill sm" id="continueRelationshipsBtn">继续核验关系</button>
+                        <span>每次最多核验 100 人，可能调用付费接口；不会更改关注关系。</span>
+                    </div>
+
+                    <div class="x-user-list" id="followAuditList"></div>
+                </div>
+            </section>
+
+            <!-- ==================== 模块 4：黄金发帖时段与爆款内容诊断 ==================== -->
+            <section class="tab-panel" id="panel-timing">
+                <div class="x-section-card">
+                    <div class="section-head wrap-gap">
+                        <div>
+                            <h2 class="section-title">黄金发帖时段</h2>
+                            <p class="section-desc" id="timingPeriodDesc">按已采集浏览与公开互动率计算（北京时间）</p>
+                        </div>
+                        <span class="subtle-tag" id="nextGoldenWindowBadge" hidden>计算中…</span>
+                    </div>
+                    <div class="golden-slots-grid" id="goldenSlotsGrid"></div>
+
+                    <div class="heatmap-container">
+                        <div class="heatmap-header-row">
+                            <span class="hm-day-spacer"></span>
+                            <span>00:00</span><span>03:00</span><span>06:00</span><span>09:00</span>
+                            <span>12:00</span><span>15:00</span><span>18:00</span><span>21:00</span>
+                        </div>
+                        <div id="heatmapGridRows" class="heatmap-rows"></div>
+                    </div>
+                </div>
+
+                <div class="x-section-card">
+                    <div class="section-head">
+                        <div>
+                            <h2 class="section-title">内容体裁对比</h2>
+                            <p class="section-desc">短推、图文/视频、长推 Thread 的公开浏览与互动</p>
+                        </div>
+                    </div>
+                    <div class="format-cards-grid" id="formatCardsGrid"></div>
+                </div>
+
+                <div class="x-section-card" id="algoPoolSection">
+                    <div class="section-head wrap-gap">
+                        <div>
+                            <h2 class="section-title">浏览与粉丝数对比</h2>
+                            <p class="section-desc">按单帖浏览 ÷ 粉丝数分组；不能确定观看者身份、For You 来源或限流状态</p>
+                        </div>
+                    </div>
+                    <div class="format-cards-grid" id="algoReachPoolsGrid"></div>
+                    <div class="algo-plain-tips" id="algoPlainTipsBox"></div>
+                </div>
+
+                <div class="x-section-card" id="prePostSimulatorCard">
+                    <div class="section-head wrap-gap">
+                        <div>
+                            <h2 class="section-title">发推前草稿体检</h2>
+                            <p class="section-desc" id="draftLiveTimingHint">粘贴草稿，检查连发间隔、外链与互动钩子</p>
+                        </div>
+                        <label class="draft-media-toggle" title="勾选后按附带图片或视频计算">
+                            <input type="checkbox" id="draftHasMediaCheck" />
+                            <span>含图/视频</span>
+                        </label>
+                    </div>
+                    <textarea
+                        id="draftSimulatorInput"
+                        class="draft-textarea"
+                        rows="2"
+                        placeholder="粘贴准备发的推文…"
+                    ></textarea>
+                    <div id="draftSimulatorResult" class="draft-result-box" hidden></div>
+                </div>
+
+                <div class="x-section-card no-bottom-pad">
+                    <div class="section-head wrap-gap">
+                        <div>
+                            <h2 class="section-title" id="topPostsTitle">代表推文</h2>
+                            <p class="section-desc">每条附推荐分（0–100）及加减分原因</p>
+                        </div>
+                        <select id="topPostSortSelect" class="x-select" aria-label="代表推文排序维度">
+                            <option value="composite">综合影响力</option>
+                            <option value="algoScore">本站规则分</option>
+                            <option value="views">浏览量</option>
+                            <option value="er">公开互动率</option>
+                            <option value="bookmarks">收藏</option>
+                            <option value="replies">评论</option>
+                        </select>
+                    </div>
+                    <div class="filter-pills-row" id="topPostFormatPills">
+                        <button class="pill-chip active" data-tformat="ALL" type="button">全部</button>
+                        <button class="pill-chip" data-tformat="TEXT" type="button">纯文本</button>
+                        <button class="pill-chip" data-tformat="MEDIA" type="button">图文/视频</button>
+                        <button class="pill-chip" data-tformat="THREAD" type="button">长推</button>
+                    </div>
+                    <div class="tweet-feed-list" id="topTweetsList"></div>
+                </div>
+            </section>
+
+            <!-- ==================== 模块 5：战报卡与核心铁粉 ==================== -->
+            <section class="tab-panel" id="panel-circle">
+                <div class="x-section-card">
+                    <div class="section-head wrap-gap">
+                        <div>
+                            <h2 class="section-title" id="shareCardSectionTitle">运营战报卡</h2>
+                            <p class="section-desc">随顶部时间窗自动生成，可下载或直接发推</p>
+                        </div>
+                        <div class="share-btn-row">
+                            <button type="button" class="x-outline-pill sm" id="toggleSharePrivacyBtn" title="不想公开回关率时，改为展示总浏览">
+                                隐藏回关率
+                            </button>
+                            <button type="button" class="x-outline-pill sm" id="downloadCardPngBtn">下载 PNG</button>
+                            <button type="button" class="x-outline-pill sm" id="copyShareTextBtn">复制文案</button>
+                            <a class="x-blue-pill sm" id="postToXIntentLink" href="https://x.com/intent/tweet" target="_blank" rel="noopener noreferrer">
+                                发推 ↗
+                            </a>
+                        </div>
+                    </div>
+
+                    <div class="share-canvas-preview-wrap">
+                        <canvas id="shareCardCanvas" width="1080" height="600" class="share-canvas"></canvas>
+                    </div>
+                </div>
+
+                <div class="x-section-card">
+                    <div class="section-head">
+                        <div>
+                            <h2 class="section-title">核心铁粉</h2>
+                            <p class="section-desc">本周期最常来你评论区的推友</p>
+                        </div>
+                    </div>
+                    <div class="circle-cards-grid" id="coreFansGrid"></div>
+                </div>
+                <div class="x-section-card">
+                    <div class="section-head">
+                        <div>
+                            <h2 class="section-title">活跃互暖伙伴</h2>
+                            <p class="section-desc">本周期有双向主帖评论的推友</p>
+                        </div>
+                    </div>
+                    <div class="circle-cards-grid" id="activeMutualsGrid"></div>
+                </div>
+                <div class="x-section-card">
+                    <div class="section-head">
+                        <div>
+                            <h2 class="section-title">待回访固粉清单</h2>
+                            <p class="section-desc">来评过你，但仍有评论待回复或较少收到你回访的推友</p>
+                        </div>
+                    </div>
+                    <div class="circle-cards-grid" id="needWarmupPeersGrid"></div>
+                </div>
+            </section>
+        </div>
+    </main>
+
+    <!-- 右侧边栏 -->
+    <aside class="right-rail">
+        <!-- 已登录后的实时行动栏 -->
+        <div class="right-rail-sticky" id="authenticatedRightRail" hidden>
+            <div class="side-widget algo-health-widget" id="sideAlgoHealthWidget">
+                <h3 class="widget-title">分发样本观察</h3>
+                <div class="algo-status-banner" id="sideAlgoStatusBanner">等待样本分析</div>
+                <p class="algo-side-summary" id="sideAlgoSummaryText">诊断中…</p>
+                <div class="side-funnel-metrics">
+                    <div class="funnel-row" title="单帖浏览量超过粉丝数的比例">
+                        <span>超粉丝浏览</span><strong id="sideOonRateVal">0%</strong>
+                    </div>
+                    <div class="funnel-row" title="按本站 3 小时参考检查连发节奏；不能确认平台折叠或降权">
+                        <span>连发间隔</span><strong id="sideRapidFireVal">正常</strong>
+                    </div>
+                    <div class="funnel-row" title="外链与非外链样本的浏览对比；差异不证明因果">
+                        <span>外链样本</span><strong id="sideExtLinkVal">待分析</strong>
+                    </div>
+                </div>
+                <a class="x-outline-pill sm full-w" id="underTheHoodBtn" href="https://x.com/i/jf/under_the_hood" target="_blank" rel="noopener noreferrer">
+                    查看官方分发信息 ↗
+                </a>
+            </div>
+
+            <div class="side-widget">
+                <h3 class="widget-title" id="opsChecklistTitle">本期行动</h3>
+                <ul class="action-checklist" id="opsChecklist"></ul>
+            </div>
+
+            <div class="side-widget">
+                <h3 class="widget-title">待回访</h3>
+                <div class="mini-user-list" id="sidebarPriorityPeers"></div>
+            </div>
+
+            <p class="shortcut-footnote">快捷键：<kbd>1</kbd>–<kbd>5</kbd> 切换页面 · <kbd>D</kbd> <kbd>W</kbd> <kbd>M</kbd> 切换 48小时 / 7天 / 30天</p>
+        </div>
+    </aside>
+<!-- 窄屏底部导航（左栏隐藏时出现，与 X 手机版一致） -->
+    <nav class="mobile-bottom-nav" aria-label="页面切换">
+        <button class="bottom-tab active" data-tab="activity" type="button"><svg viewBox="0 0 24 24"><path d="M8.75 21V3h2v18h-2zM18 21V8.5h2V21h-2zM4 21l.004-10h2L6 21H4zm9.248 0v-7h2v7h-2z"/></svg><span>活跃</span></button>
+        <button class="bottom-tab" data-tab="interactions" type="button"><svg viewBox="0 0 24 24"><path d="M4.5 3.88l4.43 4.14-1.36 1.46L5.5 7.55V16c0 1.1.9 2 2 2H13v2H7.5c-2.21 0-4-1.79-4-4V7.55L1.43 9.48.07 8.02 4.5 3.88zM16.5 6H11V4h5.5c2.21 0 4 1.79 4 4v8.45l2.07-1.93 1.36 1.46-4.43 4.14-4.43-4.14 1.36-1.46 2.07 1.93V8c0-1.1-.9-2-2-2z"/></svg><span>互动</span><i class="bottom-badge" id="mobileInteractBadge" hidden>0</i></button>
+        <button class="bottom-tab" data-tab="follow-audit" type="button"><svg viewBox="0 0 24 24"><path d="M10 4c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zM6 6c0-2.21 1.79-4 4-4s4 1.79 4 4-1.79 4-4 4-4-1.79-4-4zm13 4v3h2v-3h3V8h-3V5h-2v3h-3v2h3zM3.65 19h12.7c-.34-1.8-1.02-3.21-1.95-4.19C13.32 13.65 11.84 13 10 13s-3.32.65-4.4 1.81c-.93.98-1.61 2.39-1.95 4.19zm.49-5.56C5.63 11.85 7.65 11 10 11s4.37.85 5.86 2.44c1.48 1.58 2.37 3.8 2.63 6.46l.11 1.1H1.4l.11-1.1c.26-2.66 1.15-4.88 2.63-6.46z"/></svg><span>关注</span></button>
+        <button class="bottom-tab" data-tab="timing" type="button"><svg viewBox="0 0 24 24"><path d="M12 1.75C6.34 1.75 1.75 6.34 1.75 12S6.34 22.25 12 22.25 22.25 17.66 22.25 12 17.66 1.75 12 1.75zm0 18.5c-4.56 0-8.25-3.69-8.25-8.25S7.44 3.75 12 3.75s8.25 3.69 8.25 8.25-3.69 8.25-8.25 8.25zm.75-13h-1.5v5.69l4.28 2.57.77-1.29-3.55-2.13V7.25z"/></svg><span>内容</span></button>
+        <button class="bottom-tab" data-tab="circle" type="button"><svg viewBox="0 0 24 24"><path d="M12 2l2.9 6.26L22 9.27l-5 4.87 1.18 6.86L12 17.77 5.82 21 7 14.14 2 9.27l7.1-1.01L12 2z"/></svg><span>战报</span></button>
+    </nav>
+</div>
+
+<div id="authorPromptModal" class="author-modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="authorModalTitle" hidden>
+    <div class="author-modal-card">
+        <div class="author-modal-cover">
+            <span class="author-modal-badge" id="authorModalBadge">第 3 次使用 · 作者说明</span>
+            <button type="button" class="author-modal-close" id="authorModalCloseBtn" aria-label="关闭弹窗" title="关闭">×</button>
+        </div>
+        <div class="author-modal-body">
+            <div class="author-profile-row">
+                <div id="authorModalAvatarSlot">
+                    <div class="avatar-circle xl" id="authorModalAvatar">
+                        <img src="/author-avatar.webp" alt="elidlicom" />
+                    </div>
+                </div>
+                <span class="mini-tag green" id="authorModalFollowedTag" hidden>✓ 已关注</span>
+            </div>
+            <div class="author-ident-block">
+                <div class="author-name-line">
+                    <span id="authorModalDisplayName">Litany（李丰一）</span>
+                    <span id="authorModalVerified" hidden></span>
+                </div>
+                <div class="author-handle-line" id="authorModalHandle">@elidlicom</div>
+            </div>
+            <p class="author-bio-text" id="authorModalBio">Java Dev | Studying Chinese Metaphysics(Dao·道) ䷀ · 易道心学创始人 · elidli.com</p>
+            <div class="author-stats-row" id="authorModalStatsRow" hidden>
+                <span><strong id="authorModalFollowers">0</strong> 关注者</span>
+                <span><strong id="authorModalPosts">0</strong> 推文</span>
+            </div>
+            <div class="author-note-box">
+                <h2 class="author-note-title" id="authorModalTitle">你好，我是作者 @elidlicom</h2>
+                <p class="author-note-msg" id="authorModalMessage"></p>
+            </div>
+            <div class="author-modal-actions">
+                <a id="authorModalFollowBtn" class="auth-gate-login-btn author-follow-cta" href="https://x.com/intent/follow?screen_name=elidlicom" target="_blank" rel="noopener noreferrer">
+                    <svg viewBox="0 0 24 24" class="oauth-x-icon" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"></path></svg>
+                    <span id="authorModalFollowBtnText">关注 @elidlicom ↗</span>
+                </a>
+                <div class="author-modal-sub-actions">
+                    <a id="authorModalProfileLink" class="x-outline-pill sm" href="https://x.com/elidlicom" target="_blank" rel="noopener noreferrer">查看 @elidlicom 主页 ↗</a>
+                    <button type="button" id="authorModalLaterBtn" class="x-outline-pill sm">稍后再说</button>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div id="copyToast" class="bottom-toast" role="status" aria-live="polite" hidden>已复制到剪贴板</div>
+<script src="/app.js"></script>
+</body>
+</html>

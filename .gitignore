@@ -1,0 +1,20 @@
+target/
+.cache/
+.xops-local.properties
+*.log
+.DS_Store
+.idea/
+*.iml
+application-local.yml
+
+# Local sessions, installed builds, development tools, and secrets
+/.sessions/
+/.local/
+/.serena/
+.env
+.env.*
+!.env.example
+application-local.yaml
+*.pem
+*.p12
+*.jks
