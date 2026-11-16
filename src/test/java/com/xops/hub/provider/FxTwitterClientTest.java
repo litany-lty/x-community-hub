@@ -10,6 +10,9 @@ import com.xops.hub.config.XOpsProperties;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
@@ -193,6 +196,104 @@ class FxTwitterClientTest {
         assertFailed(searchUrl(query, ""));
         handler = exchange -> json(page("", mention, quote));
         assertThat(fetch(searchUrl(query, ""), new AtomicBoolean()).path("tweets")).hasSize(2);
+    }
+
+    @Test
+    void twoNewRepliesShareOneFreeThreadLookupAcrossPagesAndKeepTheirDirectParent() throws Exception {
+        ObjectNode first = status("110", 210);
+        ObjectNode second = status("109", 209);
+        ObjectNode parent = status("98", 198);
+        for (var child : List.of(first, second)) {
+            child.putObject("replying_to").put("status", "98").put("screen_name", "Self");
+        }
+        parent.putObject("replying_to").put("status", "90").put("screen_name", "Self");
+        ObjectNode thread = mapper.createObjectNode().put("code", 200);
+        thread.set("status", parent);
+        thread.putArray("thread").add(status("77", 77)).add(status("90", 180)).add(parent);
+        handler = exchange -> exchange.getRequestURI().getPath().equals("/2/search")
+                ? json(page("", first, second)) : json(thread);
+
+        var roots = SearchReplyRoots.empty();
+        String url = "https://paid.example" + searchUrl("from:Self since_time:200 until_time:220", "");
+        for (int i = 0; i < 2; i++) {
+            JsonNode tweets = client.fetchAsync(url, Instant.now().plusSeconds(5), null, roots).join().path("tweets");
+            assertThat(tweets).hasSize(2);
+            for (var tweet : tweets) {
+                assertThat(tweet.path("conversationId").asText()).isEqualTo("90");
+                assertThat(tweet.path("inReplyToId").asText()).isEqualTo("98");
+            }
+        }
+        assertThat(seen).filteredOn(req -> req.uri().equals("/2/thread/98")).hasSize(1);
+    }
+
+    @Test
+    void truncatedThreadCannotClaimUnconnectedRootAndIsNotRequestedTwiceInSameSync() {
+        ObjectNode reply = status("110", 210);
+        reply.putObject("replying_to").put("status", "98").put("screen_name", "Self");
+        ObjectNode parent = status("98", 198);
+        parent.putObject("replying_to").put("status", "95").put("screen_name", "Self");
+        ObjectNode truncated = mapper.createObjectNode().put("code", 200);
+        truncated.set("status", parent);
+        truncated.putArray("thread").add(status("90", 180));
+        handler = exchange -> exchange.getRequestURI().getPath().equals("/2/search")
+                ? json(page("", reply)) : json(truncated);
+        var roots = SearchReplyRoots.empty();
+        String url = "https://paid.example" + searchUrl("from:Self since_time:200 until_time:220", "");
+        for (int i = 0; i < 2; i++) {
+            assertThatThrownBy(() -> client.fetchAsync(url, Instant.now().plusSeconds(5), null, roots).join())
+                    .hasCauseInstanceOf(XDataProviderException.class);
+        }
+        assertThat(seen).filteredOn(req -> req.uri().equals("/2/thread/98")).hasSize(1);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"search", "metrics"})
+    void stalledFreeReadLeavesTimeToSendPaidFallback(String kind) throws Exception {
+        String base = "http://127.0.0.1:" + server.getAddress().getPort();
+        properties.setTwitterapiIoBaseUrl(base);
+        properties.setDiskCacheDir("");
+        var provider = new TwitterApiIoProvider(properties, mapper, pool);
+        Object pacer = ReflectionTestUtils.invokeMethod(provider, "pacerFor", "fixture-key");
+        CountDownLatch freeStarted = new CountDownLatch(1), unblockFree = new CountDownLatch(1);
+        CountDownLatch paidStarted = new CountDownLatch(1);
+        List<String> paidUris = new CopyOnWriteArrayList<>();
+        handler = exchange -> {
+            freeStarted.countDown();
+            try {
+                unblockFree.await(5, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return new Reply(503, "{}");
+        };
+        server.createContext("/twitter/", exchange -> {
+            paidUris.add(exchange.getRequestURI().toString());
+            paidStarted.countDown();
+            byte[] body = "{\"tweets\":[{\"id\":\"101\"}],\"has_next_page\":false}".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            try (var out = exchange.getResponseBody()) { out.write(body); }
+            finally { exchange.close(); }
+        });
+        String path = kind.equals("search") ? searchUrl("from:Self", "fx:page2") : "/twitter/tweets?tweet_ids=101";
+        Instant deadline = Instant.now().plusMillis(2700);
+        CompletableFuture<JsonNode> result = kind.equals("search")
+                ? ReflectionTestUtils.invokeMethod(provider, "getJsonWithRetryAsync", base + path, "fixture-key",
+                        pacer, deadline, SearchReplyRoots.empty())
+                : ReflectionTestUtils.invokeMethod(provider, "getJsonOnceBeforeAsync", base + path, "fixture-key",
+                        pacer, deadline, new AtomicBoolean(), 3000L, true, new AtomicBoolean());
+        try {
+            assertThat(freeStarted.await(800, TimeUnit.MILLISECONDS)).isTrue();
+            long waitMs = java.time.Duration.between(Instant.now(), deadline.minusMillis(350)).toMillis();
+            assertThat(paidStarted.await(waitMs, TimeUnit.MILLISECONDS)).as("paid HTTP started with time remaining").isTrue();
+            assertThat(result.get(2, TimeUnit.SECONDS).path("tweets").get(0).path("id").asText()).isEqualTo("101");
+            assertThat(paidUris).singleElement().satisfies(uri -> {
+                assertThat(uri).startsWith(kind.equals("search") ? "/twitter/tweet/advanced_search?" : "/twitter/tweets?");
+                assertThat(uri).doesNotContain("cursor=");
+            });
+        } finally {
+            result.cancel(true);
+            unblockFree.countDown();
+        }
     }
 
     @Test

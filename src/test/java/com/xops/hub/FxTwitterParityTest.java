@@ -109,7 +109,7 @@ class FxTwitterParityTest {
         soft.assertAll();
     }
 
-    @Test void repliesAndExistingThreadRootsMatchPaidReportsAfterMissingRootFallback() throws Exception {
+    @Test void repliesWithVerifiedStoredRootsMatchPaidReportsWithoutFallback() throws Exception {
         Instant anchor = Instant.now().minusSeconds(30).truncatedTo(ChronoUnit.SECONDS);
         WirePair root = post("101", anchor.minusSeconds(18000), "My thread root");
         WirePair selfReply = post("104", anchor.minusSeconds(14400), "A later floor of my thread");
@@ -131,8 +131,8 @@ class FxTwitterParityTest {
         Scenario scenario = new Scenario(anchor, List.of(root, selfReply, regularReply), List.of(incomingReply), base(anchor, cached, cachedInbound));
         Result result = run(scenario);
         assertThat(result.freeCalls()).isEqualTo(3);
-        assertThat(result.freeRunPaidRequests()).as("Missing roots require only the two paid searches")
-                .hasSize(2).allSatisfy(uri -> assertThat(uri.getPath()).isEqualTo("/twitter/tweet/advanced_search"));
+        assertThat(result.freeRunPaidRequests()).as("Verified snapshot evidence resolves both pages")
+                .isEmpty();
         SoftAssertions soft = new SoftAssertions();
         verifyParity(result, scenario, soft);
         soft.assertThat(result.free().store().tweets()).filteredOn(t -> t.id().equals("104")).singleElement()
@@ -140,6 +140,23 @@ class FxTwitterParityTest {
         soft.assertThat(result.free().store().tweets()).filteredOn(t -> t.id().equals("105")).singleElement()
                 .satisfies(t -> soft.assertThat(t.conversationId()).isEqualTo("900"));
         soft.assertThat(result.free().store().inbound()).singleElement().satisfies(i -> soft.assertThat(i.conversationId()).isEqualTo("101"));
+        soft.assertAll();
+    }
+
+    @Test void changedReplyParentForTheSamePostRequiresPaidSearch() throws Exception {
+        Instant anchor = Instant.now().minusSeconds(30).truncatedTo(ChronoUnit.SECONDS);
+        Instant at = anchor.minusSeconds(600);
+        RawTweet old = new RawTweet("105", "previous", at, TweetKind.REPLY, "peer", PEER, List.of(),
+                false, false, 10, 1, 0, 0, 0, false, "900", "901");
+        WirePair current = post("105", at, "corrected reply");
+        reply(current, "peer", "912", "910");
+        Scenario scenario = new Scenario(anchor, List.of(current), List.of(), base(anchor, List.of(old), List.of()));
+        Result result = run(scenario);
+        assertThat(result.freeRunPaidRequests()).singleElement()
+                .satisfies(uri -> assertThat(uri.getPath()).isEqualTo("/twitter/tweet/advanced_search"));
+        SoftAssertions soft = new SoftAssertions();
+        verifyParity(result, scenario, soft);
+        soft.assertThat(result.free().store().tweets().get(0).conversationId()).isEqualTo("910");
         soft.assertAll();
     }
 

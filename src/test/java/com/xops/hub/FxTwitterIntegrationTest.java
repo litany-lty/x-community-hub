@@ -155,7 +155,7 @@ class FxTwitterIntegrationTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"repost", "foreign-author", "out-of-order"})
+    @ValueSource(strings = {"repost", "foreign-author", "same-handle-wrong-id", "out-of-order"})
     void invalidFreeSearchPageRestartsPaidWindowWithoutLeakingFreeCursor(String mode) throws Exception {
         Instant now = Instant.now().truncatedTo(ChronoUnit.SECONDS);
         // Keep the remaining span below five minutes so this exercises cursor continuation, not adaptive shards.
@@ -180,7 +180,7 @@ class FxTwitterIntegrationTest {
                     return search("", freeStatus("203", now.minusSeconds(95)), freeStatus("204", now.minusSeconds(80)));
                 }
                 ObjectNode invalid = freeStatus("999", now.minusSeconds(90));
-                invalid.set("author", freeUser("200", "peer"));
+                invalid.set("author", freeUser("200", mode.equals("same-handle-wrong-id") ? "self" : "peer"));
                 if (mode.equals("repost")) invalid.set("reposted_by", freeUser("100", "self"));
                 return search("", invalid);
             }

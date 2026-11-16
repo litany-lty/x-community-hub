@@ -48,7 +48,7 @@ class FxTwitterIdentityMetricParityTest {
         try (Fixture f = new Fixture(uri -> paidRows(), id -> detail(conflicting))) {
             var result = f.sync(old, true);
             assertThat(f.freeDetailIds).containsExactly("101");
-            assertThat(f.paidDetailQueries).isEmpty();
+            assertThat(f.paidDetailQueries).containsExactly("tweet_ids=101");
             assertUnchanged(tweet(old, "101"), tweet(result.store(), "101"));
             assertThat(result.degraded()).isTrue();
             assertThat(result.dailyDataComplete()).isFalse();
@@ -64,7 +64,7 @@ class FxTwitterIdentityMetricParityTest {
         try (Fixture f = new Fixture(uri -> paidRows(), id -> detail(conflicting))) {
             var result = f.sync(old, false);
             assertThat(f.freeDetailIds).containsExactly("101");
-            assertThat(f.paidDetailQueries).isEmpty();
+            assertThat(f.paidDetailQueries).containsExactly("tweet_ids=101");
             assertUnchanged(tweet(old, "101"), tweet(result.store(), "101"));
             assertThat(result.degraded()).isTrue();
         }
@@ -117,15 +117,15 @@ class FxTwitterIdentityMetricParityTest {
         var old = store(synced, List.of(post("101", created)));
         ObjectNode otherIdentity = freeStatus("101", created);
         otherIdentity.set("author", freeUser("200", "self"));
-        try (Fixture f = new Fixture(uri -> paidRows(), id -> detail(otherIdentity))) {
+        try (Fixture f = new Fixture(uri -> paidRows(paidStatus("101", created)), id -> detail(otherIdentity))) {
             var result = f.sync(old, true);
             assertThat(f.freeDetailIds).containsExactly("101");
-            assertThat(f.paidDetailQueries).isEmpty();
-            assertUnchanged(tweet(old, "101"), tweet(result.store(), "101"));
+            assertThat(f.paidDetailQueries).containsExactly("tweet_ids=101");
+            assertThat(tweet(result.store(), "101").text()).isEqualTo("paid update 101");
             assertThat(result.store().profile().id()).isEqualTo("100");
-            assertThat(result.incompleteDailyMetricUpdates()).isEqualTo(1);
-            assertThat(result.degraded()).isTrue();
-            assertThat(result.dailyDataComplete()).isFalse();
+            assertThat(result.incompleteDailyMetricUpdates()).isZero();
+            assertThat(result.degraded()).isFalse();
+            assertThat(result.dailyDataComplete()).isTrue();
         }
     }
 

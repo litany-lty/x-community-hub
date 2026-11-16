@@ -15,6 +15,8 @@ import com.xops.hub.provider.TwitterApiIoProvider;
 import com.xops.hub.provider.UpstreamBudgetGuard;
 import com.xops.hub.store.AccountStore;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 import org.springframework.test.util.ReflectionTestUtils;
@@ -50,7 +52,9 @@ class FxTwitterRecoveryParityTest {
     private static final XUserSummary SELF = new XUserSummary("100", "self", "Self", "", "", false, 0, 0, 20, "");
     @TempDir Path temp;
 
-    @Test void repeatedCursorAcrossSeveralPagesStopsWithoutClaimingUnseenCoverage() throws Exception {
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void repeatedFreeCursorFallsBackAndOnlyVerifiedPaidCompletionClosesGap(boolean paidSucceeds) throws Exception {
         Instant now = Instant.now().truncatedTo(ChronoUnit.SECONDS);
         Instant anchor = now.minusSeconds(120);
         var old = store(anchor, List.of());
@@ -58,6 +62,7 @@ class FxTwitterRecoveryParityTest {
         AtomicInteger paidReads = new AtomicInteger();
         try (var paid = new MockServer(uri -> {
             paidReads.incrementAndGet();
+            if (paidSucceeds) return paidRows(paidStatus("204", anchor.plusSeconds(1)), paidStatus("203", anchor));
             return new Reply(500, "{}");
         }); var free = new MockServer(uri -> {
             if (uri.getPath().equals("/2/profile/self")) return profile();
@@ -77,13 +82,12 @@ class FxTwitterRecoveryParityTest {
         }); var f = new Fixture(paid, free, false)) {
             var result = f.provider.syncStoreByHours("self", old, 24, true, true, null, "100");
             assertThat(ownCursors).containsExactly("", "A", "B");
-            assertThat(paidReads.get()).isZero();
-            assertThat(result.degraded()).isTrue();
-            assertThat(result.dailyDataComplete()).isFalse();
+            assertThat(paidReads.get()).isOne();
+            assertThat(result.degraded()).isEqualTo(!paidSucceeds);
             assertThat(result.store().tweets()).extracting(AccountStore.StoredTweet::id)
-                    .containsExactlyInAnyOrder("201", "202", "203");
-            assertThat(AccountStore.missingRanges(result.store().tweetCoverage(),
-                    anchor.getEpochSecond(), result.store().syncedAt())).isNotEmpty();
+                    .containsExactlyInAnyOrderElementsOf(paidSucceeds ? List.of("201", "202", "203", "204") : List.of("201", "202", "203"));
+            var gaps = AccountStore.missingRanges(result.store().tweetCoverage(), anchor.getEpochSecond(), result.store().syncedAt());
+            assertThat(gaps.isEmpty()).isEqualTo(paidSucceeds);
         }
     }
 

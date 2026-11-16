@@ -36,6 +36,9 @@ import java.util.regex.Pattern;
 /** Public read adapter. It never receives or sends a paid API key. */
 public final class FxTwitterClient {
     private static final Logger log = LoggerFactory.getLogger(FxTwitterClient.class);
+    // Spend at most one concurrent wave on missing parents, leaving time for the verified fallback.
+    private static final int MAX_THREAD_LOOKUPS_PER_PAGE = 4;
+    private static final long THREAD_LOOKUP_BUDGET_MS = 1500;
     private static final String CURSOR_PREFIX = "fx:";
     private static final Pattern TWEET_ID = Pattern.compile("[0-9]{2,20}");
     private static final Pattern USER_ID = Pattern.compile("[0-9]{1,20}");
@@ -74,6 +77,11 @@ public final class FxTwitterClient {
     }
 
     public CompletableFuture<JsonNode> fetchAsync(String paidUrl, Instant deadline, AtomicBoolean requestStarted) {
+        return fetchAsync(paidUrl, deadline, requestStarted, SearchReplyRoots.empty());
+    }
+
+    CompletableFuture<JsonNode> fetchAsync(String paidUrl, Instant deadline, AtomicBoolean requestStarted,
+                                         SearchReplyRoots searchRoots) {
         if (!supports(paidUrl)) return CompletableFuture.failedFuture(invalid("不支持此公开数据请求"));
         Route route = route(paidUrl);
         return switch (route.path()) {
@@ -96,7 +104,10 @@ public final class FxTwitterClient {
                 if (cursor.equals(CURSOR_PREFIX)) yield CompletableFuture.failedFuture(invalid("公开数据分页游标无效"));
                 String path = "/search?q=" + encode(query) + "&feed=latest&count=30"
                         + (cursor.isEmpty() ? "" : "&cursor=" + encode(cursor.substring(CURSOR_PREFIX.length())));
-                yield mapCancellable(request(path, deadline, requestStarted, null), fetched -> search(fetched, query, cursor));
+                yield TwitterApiIoProvider.handleComposeCancellable(request(path, deadline, requestStarted, null), (fetched, error) -> {
+                    if (error != null) return CompletableFuture.failedFuture(error);
+                    return search(fetched, query, cursor, searchRoots, deadline);
+                });
             }
             case "/twitter/tweets" -> metrics(tweetIds(route.query().get("tweet_ids")), deadline, requestStarted);
             default -> CompletableFuture.failedFuture(invalid("不支持此公开数据请求"));
@@ -123,7 +134,7 @@ public final class FxTwitterClient {
                 if (json == null || !json.isObject() || !json.path("code").isIntegralNumber()
                         || json.path("code").asInt() != 200) throw invalid("公开数据服务返回异常状态");
                 log.debug("FxTwitter {} read succeeded", path.startsWith("/profile/") ? "profile"
-                        : path.startsWith("/status/") ? "status" : "search");
+                        : path.startsWith("/status/") ? "status" : path.startsWith("/thread/") ? "thread" : "search");
                 return new Fetched(json, observedAt);
             } catch (InterruptedException ex) {
                 Thread.currentThread().interrupt();
@@ -136,7 +147,8 @@ public final class FxTwitterClient {
         return future.orTimeout(remaining, TimeUnit.MILLISECONDS);
     }
 
-    private JsonNode search(Fetched fetched, String query, String requestedCursor) {
+    private CompletableFuture<JsonNode> search(Fetched fetched, String query, String requestedCursor,
+                                               SearchReplyRoots roots, Instant deadline) {
         JsonNode rows = fetched.body().get("results");
         JsonNode cursors = fetched.body().get("cursor");
         if (rows == null || !rows.isArray() || cursors == null || !cursors.isObject()
@@ -158,15 +170,13 @@ public final class FxTwitterClient {
         Set<String> quotedIds = terms(query, "(?<![\\w:-])quoted_user_id:([0-9]{1,20})(?![0-9])");
         ObjectNode out = envelope();
         ArrayNode tweets = out.putArray("tweets");
+        SearchReplyRoots.Page page = roots.new Page();
+        boolean hasReplies = false;
         long previous = Long.MAX_VALUE;
         for (JsonNode raw : rows) {
             ObjectNode tweet = tweet(raw, null, fetched.observedAt());
-            // Search inserts new records and advances coverage. Fx exposes the immediate parent,
-            // but not the conversation root needed by thread and engagement attribution.
-            // Reject the page so the original provider can supply that evidence for every row.
-            if (tweet.path("isReply").asBoolean()) {
-                throw invalid("公开搜索缺少回复的根会话，需使用完整数据源");
-            }
+            if (!raw.has("replying_to")) throw SearchReplyRoots.invalid();
+            hasReplies |= tweet.path("isReply").asBoolean();
             long timestamp = raw.path("created_timestamp").asLong();
             String author = tweet.path("author").path("userName").asText().toLowerCase(Locale.ROOT);
             if (timestamp < since || timestamp >= until || timestamp > previous
@@ -176,11 +186,79 @@ public final class FxTwitterClient {
             if ((!to.isEmpty() || !mentions.isEmpty() || !quotedIds.isEmpty())
                     && !related(raw, to, mentions, quotedIds)) throw invalid("公开搜索返回了无法确认相关的互动");
             previous = timestamp;
+            page.add(SearchReplyRoots.Post.fromNormalized(tweet, timestamp));
             tweets.add(tweet);
         }
         out.put("has_next_page", !bottom.isEmpty());
         out.put("next_cursor", bottom.isEmpty() ? "" : CURSOR_PREFIX + bottom);
-        return out;
+        if (!hasReplies) return CompletableFuture.completedFuture(out);
+        Set<String> missing = page.fill(tweets);
+        if (missing.isEmpty()) return CompletableFuture.completedFuture(out);
+        Set<String> fetchParents = new LinkedHashSet<>();
+        for (String id : missing) {
+            List<SearchReplyRoots.Post> cached = roots.thread(id);
+            if (cached == null) fetchParents.add(id);
+            else cached.forEach(page::add);
+        }
+        missing = page.fill(tweets);
+        if (missing.isEmpty()) return CompletableFuture.completedFuture(out);
+        if (!fetchParents.containsAll(missing) || missing.size() > MAX_THREAD_LOOKUPS_PER_PAGE) throw SearchReplyRoots.invalid();
+
+        Instant now = Instant.now();
+        long availableMs = Duration.between(now, deadline).toMillis();
+        if (availableMs <= 0) throw SearchReplyRoots.invalid();
+        Instant threadDeadline = now.plusMillis(Math.min(THREAD_LOOKUP_BUDGET_MS, availableMs));
+        List<CompletableFuture<List<SearchReplyRoots.Post>>> lookups = new ArrayList<>();
+        for (String id : missing) {
+            var lookup = mapCancellable(request("/thread/" + id, threadDeadline, null, null),
+                    fetchedThread -> threadAncestors(id, fetchedThread));
+            lookup.whenComplete((chain, error) -> {
+                if (!lookup.isCancelled()) roots.rememberThread(id, error == null ? chain : List.of());
+            });
+            lookups.add(lookup);
+        }
+        var wave = CompletableFuture.allOf(lookups.toArray(CompletableFuture[]::new));
+        wave.whenComplete((v, error) -> {
+            if (error != null) lookups.forEach(f -> f.cancel(true));
+        });
+        for (var lookup : lookups) {
+            lookup.whenComplete((chain, error) -> {
+                if (error != null) wave.completeExceptionally(error);
+            });
+        }
+        return mapCancellable(wave, unused -> {
+            for (var lookup : lookups) lookup.join().forEach(page::add);
+            if (!page.fill(tweets).isEmpty()) throw SearchReplyRoots.invalid();
+            return out;
+        });
+    }
+
+    private List<SearchReplyRoots.Post> threadAncestors(String expectedId, Fetched fetched) {
+        JsonNode focal = fetched.body().path("status");
+        if (!expectedId.equals(focal.path("id").asText())) throw SearchReplyRoots.invalid();
+        Map<String, JsonNode> candidates = new LinkedHashMap<>();
+        for (JsonNode node : fetched.body().path("thread")) {
+            if (!"status".equals(node.path("type").asText())) continue;
+            String id = node.path("id").asText();
+            if (candidates.putIfAbsent(id, node) != null) throw SearchReplyRoots.invalid();
+        }
+        JsonNode repeatedFocal = candidates.get(expectedId);
+        if (repeatedFocal != null && (!repeatedFocal.path("replying_to").equals(focal.path("replying_to"))
+                || !repeatedFocal.path("author").path("id").equals(focal.path("author").path("id"))
+                || !repeatedFocal.path("created_timestamp").equals(focal.path("created_timestamp")))) {
+            throw SearchReplyRoots.invalid();
+        }
+        Set<String> seen = new LinkedHashSet<>();
+        List<SearchReplyRoots.Post> chain = new ArrayList<>();
+        JsonNode current = focal;
+        while (current != null) {
+            if (!current.has("replying_to") || !seen.add(current.path("id").asText())) throw SearchReplyRoots.invalid();
+            ObjectNode normalized = tweet(current, null, fetched.observedAt());
+            var post = SearchReplyRoots.Post.fromNormalized(normalized, current.path("created_timestamp").asLong());
+            chain.add(post);
+            current = candidates.get(post.parent());
+        }
+        return chain;
     }
 
     private boolean related(JsonNode raw, Set<String> to, Set<String> mentions, Set<String> quotedIds) {
