@@ -53,20 +53,14 @@ public class BlueVerifiedCache {
     }
 
     public Boolean resolveValid(String userId, String username, long nowEpochSecond) {
-        Entry byId = validEntry(idKey(userId), nowEpochSecond);
-        if (byId != null) {
-            return byId.verified();
-        }
-        Entry byHandle = validEntry(handleKey(username), nowEpochSecond);
-        return byHandle != null ? byHandle.verified() : null;
+        Entry entry = resolveValidEntry(userId, username, nowEpochSecond);
+        return entry == null ? null : entry.verified();
     }
 
     public Entry resolveValidEntry(String userId, String username, long nowEpochSecond) {
-        Entry byId = validEntry(idKey(userId), nowEpochSecond);
-        if (byId != null) {
-            return byId;
-        }
-        return validEntry(handleKey(username), nowEpochSecond);
+        // A reused handle cannot supply the badge for a different stable user ID.
+        String key = idKey(userId);
+        return validEntry(key != null ? key : handleKey(username), nowEpochSecond);
     }
 
     /**

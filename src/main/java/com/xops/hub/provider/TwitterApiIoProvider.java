@@ -373,6 +373,7 @@ public class TwitterApiIoProvider {
                 ? Instant.now().plusSeconds(60)
                 : Instant.now().plusSeconds(SNAPSHOT_SOFT_DEADLINE_SECONDS);
         AtomicBoolean degraded = new AtomicBoolean(false);
+        Map<String, CompletableFuture<List<FxTwitterClient.Badge>>> badgePages = new LinkedHashMap<>();
         if (initialFetch) {
             pacer.activeInitialFetches.incrementAndGet();
         }
@@ -398,6 +399,10 @@ public class TwitterApiIoProvider {
             requireSameAccountId(verifiedProfile, boundId);
         }
         final XUserSummary preflightProfile = verifiedProfile;
+        boolean refreshBadges = !lightweightDailyOnly || doHead;
+        if (refreshBadges && warmExisting && preflightProfile != null && preflightProfile.id().equals(existing.profile().id())) {
+            startBadgePages(badgePages, existing, baseUrl, deadline);
+        }
         SearchReplyRoots searchRoots = properties.isFxtwitterEnabled()
                 ? SearchReplyRoots.from(existing, boundId, username) : SearchReplyRoots.empty();
 
@@ -734,8 +739,19 @@ public class TwitterApiIoProvider {
 
         long nowSec = Instant.now().getEpochSecond();
         int blueLimit = initialFetch ? 200 : 100;
-        List<String> missingBlueIds = !lightweightDailyOnly || doHead
-                ? collectUncachedInteractionUserIds(merged, nowSec, blueLimit, lightweightDailyOnly ? nowSec - 86400L : Long.MIN_VALUE)
+        if (refreshBadges) {
+            startBadgePages(badgePages, merged, baseUrl, deadline);
+            for (var pending : badgePages.values()) {
+                for (var badge : pending.exceptionally(error -> List.of()).join()) {
+                    var user = merged.users().get(badge.handle().toLowerCase(Locale.ROOT));
+                    if (user != null && badge.id().equals(user.id())) {
+                        blueVerifiedCache.observeAuthoritative(badge.id(), badge.handle(), badge.blue(), nowSec);
+                    }
+                }
+            }
+        }
+        List<String> missingBlueIds = refreshBadges
+                ? collectUncachedBadgeUserIds(merged, nowSec, blueLimit, lightweightDailyOnly ? nowSec - 86400L : Long.MIN_VALUE)
                 : List.of();
         if (!missingBlueIds.isEmpty() && !Instant.now().isAfter(deadline)) {
             int blueChunkSize = (initialFetch && !pacer.freeTierSlowMode && missingBlueIds.size() > 25) ? 25 : missingBlueIds.size();
@@ -748,10 +764,16 @@ public class TwitterApiIoProvider {
                         batchUrl, apiKey, pacer, deadline, new AtomicBoolean(false), 8_000, false));
             }
             CompletableFuture.allOf(blueFutures.toArray(CompletableFuture[]::new)).join();
-            for (CompletableFuture<JsonNode> bf : blueFutures) {
-                JsonNode batchRoot = bf.join();
+            for (int i = 0; i < blueFutures.size(); i++) {
+                List<String> requested = missingBlueIds.subList(i * blueChunkSize, Math.min((i + 1) * blueChunkSize, missingBlueIds.size()));
+                JsonNode batchRoot = blueFutures.get(i).join();
                 for (JsonNode uNode : extractArray(batchRoot, "users", "data")) {
                     if (uNode.path("unavailable").asBoolean(false)) continue;
+                    String id = uNode.path("id").asText("");
+                    String handle = firstNonBlank(uNode.path("userName").asText(""), uNode.path("screen_name").asText(""),
+                            uNode.path("username").asText("")).toLowerCase(Locale.ROOT);
+                    var known = merged.users().get(handle);
+                    if (!requested.contains(id) || known == null || !id.equals(known.id())) continue;
                     XUserSummary enriched = parseUserNode(uNode, "");
                     if (!enriched.username().isBlank()) {
                         extraUsers.put(enriched.username().toLowerCase(Locale.ROOT), enriched);
@@ -791,6 +813,7 @@ public class TwitterApiIoProvider {
         return new SyncOutcome(merged, progressed, degraded.get(), doHead && graphReusable, pages,
                 pendingDailyMetrics, incompleteDailyMetrics, dailyComplete, dailyMetricBatchFailed);
         } finally {
+            badgePages.values().forEach(f -> f.cancel(true));
             if (initialFetch) {
                 pacer.activeInitialFetches.decrementAndGet();
             }
@@ -2145,20 +2168,18 @@ public class TwitterApiIoProvider {
                 node.path("description").asText(""),
                 node.path("bio").asText("")
         );
-        boolean hasExplicitBlueField = node.has("isBlueVerified")
-                || node.has("blue_verified")
-                || node.has("is_blue_verified")
-                || node.has("ext_is_blue_verified");
-        boolean parsedBlue = node.path("isBlueVerified").asBoolean(false)
-                || node.path("blue_verified").asBoolean(false)
-                || node.path("is_blue_verified").asBoolean(false)
-                || node.path("ext_is_blue_verified").asBoolean(false)
-                || node.path("verified").asBoolean(false);
+        Boolean blue = null;
+        for (String field : List.of("isBlueVerified", "blue_verified", "is_blue_verified", "ext_is_blue_verified")) {
+            if (node.path(field).isBoolean()) {
+                blue = node.get(field).booleanValue();
+                break;
+            }
+        }
         String uid = node.path("id").asText("");
         long nowSec = Instant.now().getEpochSecond();
         boolean verified;
-        if (hasExplicitBlueField || parsedBlue) {
-            verified = blueVerifiedCache.observeAuthoritative(uid, uname, parsedBlue, nowSec);
+        if (blue != null) {
+            verified = blueVerifiedCache.observeAuthoritative(uid, uname, blue, nowSec);
         } else {
             Boolean cached = blueVerifiedCache.resolveValid(uid, uname, nowSec);
             verified = cached != null ? cached : false;
@@ -2182,7 +2203,31 @@ public class TwitterApiIoProvider {
         );
     }
 
-    private List<String> collectUncachedInteractionUserIds(AccountStore.StoredAccount merged, long nowSec, int limit, long activityCutoff) {
+    private void startBadgePages(Map<String, CompletableFuture<List<FxTwitterClient.Badge>>> pages,
+                                 AccountStore.StoredAccount store, String baseUrl, Instant deadline) {
+        String ownerId = store.profile().id();
+        if (ownerId == null || !useFreeSource(baseUrl + "/twitter/user/info?userName=id%3A" + ownerId)) return;
+        Instant now = Instant.now();
+        Instant stop = deadline.minusMillis(PAID_FALLBACK_RESERVE_MS);
+        if (!stop.isAfter(now)) return;
+        Instant pageDeadline = now.plusMillis(1500);
+        if (pageDeadline.isAfter(stop)) pageDeadline = stop;
+        for (String direction : List.of("following", "followers")) {
+            if (pages.containsKey(direction)) continue;
+            List<String> handles = direction.equals("following") ? store.followings() : store.followers();
+            if (handles.stream().anyMatch(h -> needsBadge(store.users().get(h), h, now.getEpochSecond()))) {
+                pages.put(direction, fxTwitterClient.readBadgePage(ownerId, direction, pageDeadline));
+            }
+        }
+    }
+
+    private boolean needsBadge(AccountStore.StoredUser user, String handle, long now) {
+        return user != null && user.id() != null && !user.id().isBlank()
+                && (user.verifiedAt() <= 0 || now - user.verifiedAt() >= BlueVerifiedCache.TTL_SECONDS)
+                && blueVerifiedCache.resolveValid(user.id(), handle, now) == null;
+    }
+
+    private List<String> collectUncachedBadgeUserIds(AccountStore.StoredAccount merged, long nowSec, int limit, long activityCutoff) {
         if (merged == null || merged.users() == null || merged.users().isEmpty()) {
             return List.of();
         }
@@ -2203,14 +2248,12 @@ public class TwitterApiIoProvider {
                 }
             }
         }
-        Set<String> ids = new java.util.LinkedHashSet<>();
+        peerHandles.addAll(merged.followings());
+        peerHandles.addAll(merged.followers());
+        Set<String> ids = new LinkedHashSet<>();
         for (String h : peerHandles) {
             AccountStore.StoredUser u = merged.users().get(h);
-            if (u == null || u.id() == null || u.id().isBlank()) {
-                continue;
-            }
-            if (!u.verified() && u.verifiedAt() == 0L
-                    && blueVerifiedCache.resolveValid(u.id(), h, nowSec) == null) {
+            if (needsBadge(u, h, nowSec)) {
                 ids.add(u.id());
                 if (ids.size() >= limit) {
                     break;

@@ -31,6 +31,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -215,6 +216,51 @@ class FxTwitterIntegrationTest {
                     .satisfies(ex -> assertThat(((XDataProviderException) ex).getStatusCode()).isEqualTo(401));
             assertThat(paidCalls.get()).isEqualTo(1);
             assertThat(freeCalls.get()).isZero();
+        }
+    }
+
+    @Test void relationshipOnlyAccountsRecoverBadgesFromPublicProfilesAndBoundPaidFallback() throws Exception {
+        Instant at = Instant.now().minusSeconds(120);
+        var owner = new XUserSummary("100", "self", "Self", "", "", false, 1, 2, 20, "");
+        var blue = new XUserSummary("610", "blue_peer", "Blue", "", "", false, 10, 0, 0, "");
+        var plain = new XUserSummary("611", "plain_peer", "Plain", "", "", false, 8, 0, 0, "");
+        var fan = new XUserSummary("612", "fan_peer", "Fan", "", "", false, 7, 0, 0, "");
+        var graph = new AccountStore.GraphUpdate(List.of(blue, plain), List.of(fan), Set.of(), false, false, false, false);
+        var old = AccountStore.merge(null, owner, at, List.of(), List.of(), List.of(), List.of(), graph);
+        List<String> batchIds = new CopyOnWriteArrayList<>();
+        List<String> badgePages = new CopyOnWriteArrayList<>();
+        try (var paid = new MockServer(uri -> {
+            if (!uri.getPath().endsWith("/batch_info_by_ids")) return new Reply(500, "{}");
+            batchIds.add(query(uri).get("userIds"));
+            return new Reply(200, "{\"status\":\"success\",\"users\":[{\"id\":\"612\",\"userName\":\"fan_peer\",\"isBlueVerified\":true}]}");
+        }); var free = new MockServer(uri -> {
+            if (uri.getPath().equals("/2/profile/self")) {
+                var user = freeUser("100", "self").put("following", 2).put("followers", 1);
+                return new Reply(200, MAPPER.createObjectNode().put("code", 200).set("user", user).toString());
+            }
+            if (uri.getPath().equals("/2/search")) return search("");
+            badgePages.add(uri.getPath());
+            var page = MAPPER.createObjectNode().put("code", 200);
+            var rows = page.putArray("results");
+            if (uri.getPath().endsWith("/following")) {
+                var confirmed = freeUser("610", "blue_peer");
+                confirmed.withObject("/verification").put("verified", true).put("type", "individual");
+                rows.add(confirmed); rows.add(freeUser("611", "plain_peer"));
+            } else {
+                rows.add(freeUser("999", "fan_peer")); // Recycled handle cannot supply evidence for ID 612.
+            }
+            return new Reply(200, page.toString());
+        }); var f = new ProviderFixture(paid, free)) {
+            var updated = f.provider.syncStoreByHours("self", old, 24, true, true, null, "100").store();
+            assertThat(badgePages).hasSize(2);
+            assertThat(batchIds).containsExactly("612");
+            var snapshot = AccountStore.toSnapshot(updated, "", false, 1);
+            assertThat(snapshot.relationships()).filteredOn(r -> r.user().verified())
+                    .extracting(r -> r.user().id()).containsExactlyInAnyOrder("610", "612");
+            assertThat(updated.users().get("plain_peer").verifiedAt()).isPositive();
+            f.provider.syncStoreByHours("self", updated, 24, true, true, null, "100");
+            assertThat(badgePages).hasSize(2);
+            assertThat(batchIds).hasSize(1);
         }
     }
 

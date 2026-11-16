@@ -409,6 +409,34 @@ public final class FxTwitterClient {
         return out;
     }
 
+    record Badge(String id, String handle, boolean blue) {}
+
+    /** Read badge evidence only; this page does not establish membership or change pagination in the relationship graph. */
+    CompletableFuture<List<Badge>> readBadgePage(String ownerId, String direction, Instant deadline) {
+        String path = "/profile/" + encode("id:" + ownerId) + "/" + direction + "?count=100";
+        return mapCancellable(request(path, deadline, null, null), fetched -> {
+            List<Badge> badges = new ArrayList<>();
+            JsonNode rows = fetched.body().path("results");
+            if (!rows.isArray()) throw invalid("公开名单缺少资料");
+            for (JsonNode raw : rows) {
+                String handle = raw.path("screen_name").asText("");
+                if (!"profile".equals(raw.path("type").asText()) || !validId(raw.get("id"), USER_ID)
+                        || !HANDLE.matcher(handle).matches()) continue;
+                Boolean blue = individualBlue(raw);
+                if (blue != null) badges.add(new Badge(raw.get("id").textValue(), handle, blue));
+            }
+            return badges;
+        });
+    }
+
+    private static Boolean individualBlue(JsonNode raw) {
+        JsonNode verification = raw.path("verification");
+        JsonNode verified = verification.path("verified");
+        if (!verified.isBoolean()) return null;
+        if (!verified.booleanValue()) return false;
+        return "individual".equals(verification.path("type").asText()) ? Boolean.TRUE : null;
+    }
+
     private ObjectNode user(JsonNode raw) {
         if (!raw.isObject() || !validId(raw.get("id"), USER_ID)
                 || !HANDLE.matcher(raw.path("screen_name").asText("")).matches()) throw invalid("公开账号身份字段无效");
@@ -421,11 +449,8 @@ public final class FxTwitterClient {
         copyCount(raw, "followers", out, "followers", true, Integer.MAX_VALUE);
         copyCount(raw, "following", out, "following", true, Integer.MAX_VALUE);
         copyCount(raw, "statuses", out, "statusesCount", true, Integer.MAX_VALUE);
-        JsonNode verified = raw.path("verification").path("verified");
-        if (verified.isBoolean() && !verified.asBoolean()) out.put("isBlueVerified", false);
-        else if (verified.isBoolean() && "individual".equals(raw.path("verification").path("type").asText())) {
-            out.put("isBlueVerified", true);
-        }
+        Boolean blue = individualBlue(raw);
+        if (blue != null) out.put("isBlueVerified", blue.booleanValue());
         return out;
     }
 

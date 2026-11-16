@@ -46,6 +46,7 @@ class AccumulationAndInteractionRulesTest {
         assertThat(cache.observeAuthoritative("u1", "peer_blue", true, t0)).isTrue();
         // Within 15 days, conflicting false must not overwrite the first observation
         assertThat(cache.observeAuthoritative("u1", "peer_blue", false, t0 + 14L * 86_400L)).isTrue();
+        assertThat(cache.resolveValid("another-id", "peer_blue", t0)).isNull();
         cache.flushIfDirty();
 
         // Reload from disk and verify TTL persistence
@@ -82,7 +83,7 @@ class AccumulationAndInteractionRulesTest {
                     {"status":"success","data":{"id":"100","userName":"me_acc","name":"Me Acc","followers_count":50,"following_count":20,"statusesCount":10,"isBlueVerified":false}}
                     """));
             upstream.createContext("/twitter/user/followings", ex -> writeJson(ex, """
-                    {"status":"success","followings":[{"id":"3002","userName":"peer_batch","name":"Peer Batch"}],"has_next_page":false}
+                    {"status":"success","followings":[{"id":"3002","userName":"peer_batch","name":"Peer Batch","isBlueVerified":null}],"has_next_page":false}
                     """));
             upstream.createContext("/twitter/user/followers", ex -> writeJson(ex, """
                     {"status":"success","followers":[],"has_next_page":false}
