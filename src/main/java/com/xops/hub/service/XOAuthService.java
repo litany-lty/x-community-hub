@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.xops.hub.config.XOpsProperties;
 import com.xops.hub.model.AnalyticsReportModels.AuthenticatedXUser;
 import com.xops.hub.provider.SharedApiExecutor;
+import com.xops.hub.provider.UpstreamBudgetGuard;
 import com.xops.hub.provider.XDataProviderException;
 import com.xops.hub.store.XOAuthTokenStore;
 import com.xops.hub.store.XOAuthTokenStore.StoredOAuthToken;
@@ -79,26 +80,43 @@ public class XOAuthService {
     private final XOpsProperties properties;
     private final ObjectMapper objectMapper;
     private final SharedApiExecutor sharedExecutor;
+    private final UpstreamBudgetGuard budgetGuard;
     private final XOAuthTokenStore tokenStore;
     private final HttpClient httpClient;
     private final SecureRandom secureRandom = new SecureRandom();
     private final ConcurrentHashMap<String, PkceChallengeState> pendingStates = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, PendingAuthMeta> pendingAuthMeta = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<String, Object> tokenRefreshLocks = new ConcurrentHashMap<>();
+
+    private static final int LOCK_STRIPES = 64;
+    private final Object[] accountLocks;
 
     public XOAuthService(XOpsProperties properties, ObjectMapper objectMapper) {
-        this(properties, objectMapper, new SharedApiExecutor(properties));
+        this(properties, objectMapper, new SharedApiExecutor(properties), new UpstreamBudgetGuard(properties));
+    }
+
+    public XOAuthService(XOpsProperties properties, ObjectMapper objectMapper, SharedApiExecutor sharedExecutor) {
+        this(properties, objectMapper, sharedExecutor, new UpstreamBudgetGuard(properties));
     }
 
     @Autowired
-    public XOAuthService(XOpsProperties properties, ObjectMapper objectMapper, SharedApiExecutor sharedExecutor) {
+    public XOAuthService(
+            XOpsProperties properties,
+            ObjectMapper objectMapper,
+            SharedApiExecutor sharedExecutor,
+            @Autowired(required = false) UpstreamBudgetGuard budgetGuard
+    ) {
         this.properties = properties;
         this.objectMapper = objectMapper;
         this.sharedExecutor = sharedExecutor;
+        this.budgetGuard = budgetGuard != null ? budgetGuard : new UpstreamBudgetGuard(properties);
         this.tokenStore = new XOAuthTokenStore(properties, objectMapper);
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(10))
                 .build();
+        this.accountLocks = new Object[LOCK_STRIPES];
+        for (int i = 0; i < LOCK_STRIPES; i++) {
+            this.accountLocks[i] = new Object();
+        }
     }
 
     public String resolveCallbackUrl(String baseOrigin) {
@@ -283,6 +301,9 @@ public class XOAuthService {
                     Instant.now().getEpochSecond()
             );
             tokenStore.save(updated);
+            if (!updated.hasWriteScope() || (requireMediaWrite && !updated.hasMediaWriteScope())) {
+                throw new XDataProviderException(403, "X 授权范围已变更，请重新完成定时发布二次授权");
+            }
             return updated.accessToken();
         }
     }
@@ -347,10 +368,10 @@ public class XOAuthService {
     }
 
     private Object lockForAccount(String accountId) {
-        if (tokenRefreshLocks.size() > 2048) {
-            tokenRefreshLocks.clear();
+        if (accountId == null) {
+            return accountLocks[0];
         }
-        return tokenRefreshLocks.computeIfAbsent(accountId, k -> new Object());
+        return accountLocks[(accountId.hashCode() & 0x7fffffff) % LOCK_STRIPES];
     }
 
     private TokenGrant exchangeCodeForTokenGrant(String code, String codeVerifier, String redirectUri) {
@@ -427,9 +448,10 @@ public class XOAuthService {
 
         try {
             HttpRequest tokenReq = reqBuilder.POST(HttpRequest.BodyPublishers.ofString(form.toString())).build();
-            HttpResponse<String> resp = sharedExecutor.execute(() ->
-                    httpClient.send(tokenReq, HttpResponse.BodyHandlers.ofString())
-            );
+            HttpResponse<String> resp = sharedExecutor.execute(() -> {
+                budgetGuard.acquirePermit(tokenReq.uri(), "x_oauth_token");
+                return httpClient.send(tokenReq, HttpResponse.BodyHandlers.ofString());
+            });
             JsonNode json;
             try {
                 json = objectMapper.readTree(resp.body());
@@ -464,16 +486,18 @@ public class XOAuthService {
                         .header("Accept", "application/json")
                         .GET()
                         .build();
-                HttpResponse<String> resp = sharedExecutor.execute(() ->
-                        httpClient.send(req, HttpResponse.BodyHandlers.ofString())
-                );
+                HttpResponse<String> resp = sharedExecutor.execute(() -> {
+                    budgetGuard.acquirePermit(req.uri(), "x_oauth_user_me");
+                    return httpClient.send(req, HttpResponse.BodyHandlers.ofString());
+                });
                 if (resp.statusCode() >= 500 && attempt == 0) {
                     Thread.sleep(350L);
                     continue;
                 }
                 JsonNode root = objectMapper.readTree(resp.body());
                 JsonNode data = root.path("data");
-                if (resp.statusCode() >= 400 || data.isMissingNode() || data.path("username").asText("").isBlank()) {
+                if (resp.statusCode() >= 400 || data.isMissingNode() || data.path("id").asText("").isBlank()
+                        || data.path("username").asText("").isBlank()) {
                     throw new XDataProviderException(401, "获取已授权 X 账号资料失败（HTTP " + resp.statusCode() + "，请确认开发者后台账户状态正常）");
                 }
                 String avatar = data.path("profile_image_url").asText("").replace("_normal.", "_400x400.");

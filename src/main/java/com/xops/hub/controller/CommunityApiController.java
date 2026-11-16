@@ -1,5 +1,7 @@
 package com.xops.hub.controller;
 
+import com.xops.hub.config.RequestSecuritySupport;
+import com.xops.hub.config.UserConcurrencyThrottleFilter;
 import com.xops.hub.config.XOpsProperties;
 import com.xops.hub.model.AnalyticsReportModels.AuthenticatedXUser;
 import com.xops.hub.model.AnalyticsReportModels.CommunityDashboardReport;
@@ -7,6 +9,7 @@ import com.xops.hub.model.AnalyticsReportModels.MultiPeriodDashboardBundle;
 import com.xops.hub.model.AnalyticsReportModels.ServerCapabilities;
 import com.xops.hub.model.AnalyticsReportModels.UsageCheckinResponse;
 import com.xops.hub.provider.SharedApiExecutor;
+import com.xops.hub.provider.UpstreamBudgetGuard;
 import com.xops.hub.provider.XDataProviderException;
 import com.xops.hub.service.CommunityAnalyticsEngine;
 import com.xops.hub.service.CommunityHubService;
@@ -26,17 +29,25 @@ public class CommunityApiController {
 
     private final XOpsProperties properties;
     private final CommunityHubService hubService;
-    private final SharedApiExecutor sharedApiExecutor;
 
     public CommunityApiController(XOpsProperties properties, CommunityHubService hubService) {
-        this(properties, hubService, new SharedApiExecutor(properties));
+        this(properties, hubService, null, null, null);
+    }
+
+    public CommunityApiController(XOpsProperties properties, CommunityHubService hubService, SharedApiExecutor sharedApiExecutor) {
+        this(properties, hubService, sharedApiExecutor, null, null);
     }
 
     @Autowired
-    public CommunityApiController(XOpsProperties properties, CommunityHubService hubService, SharedApiExecutor sharedApiExecutor) {
+    public CommunityApiController(
+            XOpsProperties properties,
+            CommunityHubService hubService,
+            SharedApiExecutor sharedApiExecutor,
+            @Autowired(required = false) UserConcurrencyThrottleFilter concurrencyThrottleFilter,
+            @Autowired(required = false) UpstreamBudgetGuard budgetGuard
+    ) {
         this.properties = properties;
         this.hubService = hubService;
-        this.sharedApiExecutor = sharedApiExecutor;
     }
 
     @GetMapping("/meta")
@@ -48,12 +59,6 @@ public class CommunityApiController {
     public java.util.Map<String, Object> getHealth() {
         java.util.Map<String, Object> health = new java.util.LinkedHashMap<>();
         health.put("status", "UP");
-        health.put("provider", hubService.getActiveProviderName());
-        health.put("oauthConfigured", properties.hasOAuthClient());
-        health.put("requireLoginSelfOnly", properties.isRequireLoginSelfOnly());
-        health.put("cacheTtlSeconds", Math.max(0L, properties.getCacheTtlSeconds()));
-        health.put("activeCachedAccounts", hubService.getActiveCacheSize());
-        health.put("apiPool", sharedApiExecutor.snapshotMetrics());
         health.put("timestamp", java.time.Instant.now().toString());
         return health;
     }
@@ -116,6 +121,7 @@ public class CommunityApiController {
             jakarta.servlet.http.HttpServletResponse response
     ) {
         applyPrivateNoStoreHeaders(response);
+        RequestSecuritySupport.verifySameOriginForMutation(request);
         String authorizedUsername = resolveAuthorizedTargetUsername(username, request);
         return hubService.recordUsageCheckin(authorizedUsername, resolveAuthorizedAccountId(authorizedUsername, request));
     }
@@ -138,6 +144,7 @@ public class CommunityApiController {
             jakarta.servlet.http.HttpServletResponse response
     ) {
         applyPrivateNoStoreHeaders(response);
+        RequestSecuritySupport.verifySameOriginForMutation(request);
         String authorizedUsername = resolveAuthorizedTargetUsername(username, request);
         return hubService.markAuthorFollowedOptimistically(authorizedUsername, resolveAuthorizedAccountId(authorizedUsername, request));
     }
@@ -228,30 +235,10 @@ public class CommunityApiController {
     }
 
     private String extractClientIp(HttpServletRequest request) {
-        String remote = request.getRemoteAddr();
-        // 仅当直连来源为本机或内网反向代理时才信任 X-Forwarded-For，防止公网伪造请求头绕过限流与撑爆内存
-        if (isTrustedProxyAddress(remote)) {
-            String xff = request.getHeader("X-Forwarded-For");
-            if (xff != null && !xff.isBlank()) {
-                int commaIdx = xff.indexOf(',');
-                String candidate = (commaIdx > 0 ? xff.substring(0, commaIdx) : xff).trim();
-                if (!candidate.isEmpty() && candidate.length() <= 64) {
-                    return candidate;
-                }
-            }
-        }
-        return remote;
+        return RequestSecuritySupport.extractClientIp(request);
     }
 
     public static boolean isTrustedProxyAddress(String ip) {
-        if (ip == null || ip.isBlank()) {
-            return false;
-        }
-        return "127.0.0.1".equals(ip)
-                || "::1".equals(ip)
-                || "0:0:0:0:0:0:0:1".equals(ip)
-                || ip.startsWith("10.")
-                || ip.startsWith("192.168.")
-                || ip.matches("^172\\.(1[6-9]|2\\d|3[0-1])\\..*");
+        return RequestSecuritySupport.isTrustedProxyAddress(ip);
     }
 }

@@ -181,6 +181,15 @@ public class BlueVerifiedCache {
         }
         long now = System.currentTimeMillis() / 1000L;
         entries.entrySet().removeIf(e -> e.getValue() == null || now - e.getValue().firstObservedAt() >= TTL_SECONDS);
+        if (entries.size() > MAX_DISK_ENTRIES) {
+            int excess = entries.size() - MAX_DISK_ENTRIES;
+            entries.entrySet().stream()
+                    .sorted(java.util.Comparator.comparingLong(e -> e.getValue() != null ? e.getValue().firstObservedAt() : 0L))
+                    .limit(excess)
+                    .map(Map.Entry::getKey)
+                    .toList()
+                    .forEach(entries::remove);
+        }
     }
 
     private static String idKey(String userId) {

@@ -11,6 +11,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import java.net.URI;
+import java.net.URLDecoder;
 import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -30,11 +31,13 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.Locale;
 import java.util.Set;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BiFunction;
 import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -138,23 +141,36 @@ public class TwitterApiIoProvider {
     private final XOpsProperties properties;
     private final ObjectMapper objectMapper;
     private final SharedApiExecutor sharedExecutor;
+    private final UpstreamBudgetGuard budgetGuard;
     private final HttpClient httpClient;
     private final BlueVerifiedCache blueVerifiedCache;
+    private final FxTwitterClient fxTwitterClient;
     private final ConcurrentHashMap<String, KeyPacer> pacersByKey = new ConcurrentHashMap<>();
 
     public TwitterApiIoProvider(XOpsProperties properties, ObjectMapper objectMapper) {
-        this(properties, objectMapper, new SharedApiExecutor(properties));
+        this(properties, objectMapper, new SharedApiExecutor(properties), new UpstreamBudgetGuard(properties));
+    }
+
+    public TwitterApiIoProvider(XOpsProperties properties, ObjectMapper objectMapper, SharedApiExecutor sharedExecutor) {
+        this(properties, objectMapper, sharedExecutor, new UpstreamBudgetGuard(properties));
     }
 
     @Autowired
-    public TwitterApiIoProvider(XOpsProperties properties, ObjectMapper objectMapper, SharedApiExecutor sharedExecutor) {
+    public TwitterApiIoProvider(
+            XOpsProperties properties,
+            ObjectMapper objectMapper,
+            SharedApiExecutor sharedExecutor,
+            @Autowired(required = false) UpstreamBudgetGuard budgetGuard
+    ) {
         this.properties = properties;
         this.objectMapper = objectMapper;
         this.sharedExecutor = sharedExecutor;
+        this.budgetGuard = budgetGuard != null ? budgetGuard : new UpstreamBudgetGuard(properties);
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(8))
                 .build();
         this.blueVerifiedCache = new BlueVerifiedCache(properties != null ? properties.getDiskCacheDir() : "", objectMapper);
+        this.fxTwitterClient = new FxTwitterClient(properties, objectMapper, sharedExecutor);
     }
 
     public BlueVerifiedCache getBlueVerifiedCache() {
@@ -170,7 +186,14 @@ public class TwitterApiIoProvider {
         }
         String baseUrl = trimTrailingSlash(properties.getTwitterapiIoBaseUrl());
         KeyPacer pacer = pacerFor(apiKey);
-        JsonNode root = getJsonWithRetry(baseUrl + "/twitter/user/info?userName=X", apiKey, pacer);
+        // 密钥校验必须实际访问付费服务，不能被免 Key 的资料接口误判成功。
+        JsonNode root;
+        try {
+            root = attemptGetJsonAsync(baseUrl + "/twitter/user/info?userName=X", apiKey, pacer, isLocalMockBaseUrl(), 0).join();
+        } catch (CompletionException ex) {
+            if (ex.getCause() instanceof RuntimeException cause) throw cause;
+            throw ex;
+        }
         JsonNode userNode = root.hasNonNull("data") ? root.get("data") : root;
         String uname = firstNonBlank(userNode.path("userName").asText(""), userNode.path("username").asText("X"));
         return pacer.freeTierSlowMode
@@ -454,7 +477,7 @@ public class TwitterApiIoProvider {
                                     AccountStore.followingUsers(existing),
                                     new HashSet<>(existing.explicitFollowedBy()),
                                     existing.followingsTruncated(),
-                                    false))
+                                    false, existing.followingOrderById()))
                             : (freshProfile.followingCount() > 0
                                     ? fetchPagedUsersAsync(
                                             baseUrl + "/twitter/user/followings?userName=" + encodedUser + "&pageSize=200",
@@ -466,7 +489,7 @@ public class TwitterApiIoProvider {
                                     AccountStore.followerUsers(existing),
                                     Set.of(),
                                     existing.followersTruncated(),
-                                    false))
+                                    false, existing.followerOrderById()))
                             : (freshProfile.followersCount() > 0
                                     ? fetchFollowersAsync(
                                             baseUrl, encodedUser, freshProfile.id(),
@@ -554,7 +577,10 @@ public class TwitterApiIoProvider {
             graph = new AccountStore.GraphUpdate(fg, fr,
                     followings != null ? followings.explicitFollowedByKeys() : Set.of(), truncated,
                     (followings != null && followings.truncated()) || profile.followingCount() != fg.size(),
-                    followings != null && followings.failed(), followers != null && followers.failed());
+                    followings != null && followings.failed(), followers != null && followers.failed(),
+                    List.of(), Map.of(),
+                    followings != null ? followings.orderById() : Map.of(),
+                    followers != null ? followers.orderById() : Map.of());
         }
 
         if (!lightweightDailyOnly && graph != null && graph.followersTruncated() && !graph.followingsFailed()) {
@@ -566,7 +592,8 @@ public class TwitterApiIoProvider {
             boolean followingChanged = exact.stream().anyMatch(e -> !e.following());
             graph = new AccountStore.GraphUpdate(graph.followings(), graph.followers(), graph.explicitFollowedBy(),
                     graph.followersTruncated(), graph.followingsTruncated() || followingChanged,
-                    graph.followingsFailed(), graph.followersFailed(), exact, attemptedAt);
+                    graph.followingsFailed(), graph.followersFailed(), exact, attemptedAt,
+                    graph.followingOrderById(), graph.followerOrderById());
         }
 
         List<RawTweet> streamTweets = new ArrayList<>(tweets.items().size());
@@ -616,6 +643,10 @@ public class TwitterApiIoProvider {
                 JsonNode refreshed = getJsonOnceBeforeAsync(baseUrl + "/twitter/tweets?tweet_ids="
                         + URLEncoder.encode(String.join(",", refreshIds), StandardCharsets.UTF_8),
                         apiKey, pacer, deadline, degraded, 15_000, false, metricsRequestStarted).join();
+                if (includesFreeData(refreshed)) {
+                    refreshIds = jsonIds(refreshed, "__attempted_ids");
+                    if (!jsonIds(refreshed, "__incomplete_ids").isEmpty()) degraded.set(true);
+                }
                 long observedAt = Instant.now().getEpochSecond();
                 Set<String> returned = new HashSet<>();
                 for (JsonNode node : extractArray(refreshed, "tweets", "data")) {
@@ -626,14 +657,14 @@ public class TwitterApiIoProvider {
                             degraded.set(true);
                             continue;
                         }
-                        RawTweet parsed = parseRawTweet(node, profile.username());
+                        RawTweet parsed = parseMetricTweet(node, profile.username(), existing, includesFreeData(refreshed));
                         if (parsed == null || parsed.createdAt() == null) {
                             degraded.set(true);
                             continue;
                         }
                         returned.add(parsed.id());
                         newTweets.add(parsed);
-                        metricsObservedAt.put(parsed.id(), observedAt);
+                        metricsObservedAt.put(parsed.id(), observedAt(node, observedAt));
                         if (author != null && !author.username().isBlank()) {
                             extraUsers.put(author.username().toLowerCase(Locale.ROOT), author);
                         }
@@ -861,6 +892,13 @@ public class TwitterApiIoProvider {
             if (waitMs > 0) Thread.sleep(waitMs);
             budgetMs = Duration.between(Instant.now(), deadline).toMillis();
             if (budgetMs <= 0) return null;
+            budgetGuard.acquirePermit(url, "twitterapi_io_relation");
+            // 预算落盘也可能排队；实际发送前重新计算期限，过期预留不退款。
+            budgetMs = Duration.between(Instant.now(), deadline).toMillis();
+            if (Thread.currentThread().isInterrupted() || budgetMs <= 0) {
+                degraded.set(true);
+                return null;
+            }
             HttpRequest request = HttpRequest.newBuilder(URI.create(url))
                     .timeout(Duration.ofMillis(Math.min(10_000, budgetMs)))
                     .header("X-API-Key", apiKey).header("Accept", "application/json").GET().build();
@@ -1014,16 +1052,21 @@ public class TwitterApiIoProvider {
                 }
                 anyStarted = true;
                 List<String> chunkIds = chunks.get(c);
-                attemptedIds.addAll(chunkIds);
                 JsonNode refreshed = chunkFutures.get(c).join();
+                attemptedIds.addAll(includesFreeData(refreshed) ? jsonIds(refreshed, "__attempted_ids") : chunkIds);
                 if (refreshed == null || !hasArray(refreshed, "tweets", "data")) {
                     degraded.set(true);
                     anyBatchFailed = true;
                     continue;
                 }
+                if (includesFreeData(refreshed) && !jsonIds(refreshed, "__incomplete_ids").isEmpty()) {
+                    degraded.set(true);
+                    anyBatchFailed = true;
+                }
                 long observedAt = Instant.now().getEpochSecond();
                 Set<String> chunkSet = new HashSet<>(chunkIds);
                 Set<String> presentIds = new HashSet<>();
+                Set<String> paidConfirmedMissing = new HashSet<>(jsonIds(refreshed, "__confirmed_deleted_ids"));
                 boolean chunkRejectedAny = false;
                 int validCount = 0;
                 for (JsonNode node : extractArray(refreshed, "tweets", "data")) {
@@ -1039,7 +1082,7 @@ public class TwitterApiIoProvider {
                         chunkRejectedAny = true;
                         continue;
                     }
-                    RawTweet parsed = parseRawTweet(node, selfUsername);
+                    RawTweet parsed = parseMetricTweet(node, selfUsername, existing, includesFreeData(refreshed));
                     if (parsed == null || parsed.createdAt() == null) {
                         degraded.set(true);
                         chunkRejectedAny = true;
@@ -1047,14 +1090,15 @@ public class TwitterApiIoProvider {
                     }
                     validCount++;
                     refreshedTweets.add(parsed);
-                    observedAtById.put(parsed.id(), observedAt);
+                    observedAtById.put(parsed.id(), observedAt(node, observedAt));
                     if (author != null && !author.username().isBlank()) {
                         extraUsers.put(author.username().toLowerCase(Locale.ROOT), author);
                     }
                 }
                 int deletedInChunk = 0;
                 for (String reqId : chunkIds) {
-                    if (!presentIds.contains(reqId)) {
+                    if (!presentIds.contains(reqId)
+                            && (!includesFreeData(refreshed) || paidConfirmedMissing.contains(reqId))) {
                         confirmedDeletedIds.add(reqId);
                         deletedInChunk++;
                     }
@@ -1209,7 +1253,7 @@ public class TwitterApiIoProvider {
         }
         String url = ctx.nativeUrl()
                 + (cursor.isEmpty() ? "" : "&cursor=" + URLEncoder.encode(cursor, StandardCharsets.UTF_8));
-        return getJsonOptionalAsync(url, ctx.apiKey(), ctx.pacer(), ctx.degraded()).thenCompose(root -> {
+        return getJsonOptionalAsync(url, ctx.apiKey(), ctx.pacer(), ctx.degraded(), ctx.deadline()).thenCompose(root -> {
             if (root.path("__degraded").asBoolean(false)) {
                 recordPartialIfAny(ctx, a, b, tailSoFar);
                 return CompletableFuture.completedFuture(null);
@@ -1251,7 +1295,7 @@ public class TwitterApiIoProvider {
             return CompletableFuture.completedFuture(null);
         }
         String probeUrl = buildSearchUrl(ctx.baseUrl(), ctx.sliceQuery(), a, b + 1, "");
-        return getJsonOptionalAsync(probeUrl, ctx.apiKey(), ctx.pacer(), ctx.degraded()).thenCompose(root -> {
+        return getJsonOptionalAsync(probeUrl, ctx.apiKey(), ctx.pacer(), ctx.degraded(), ctx.deadline()).thenCompose(root -> {
             if (root.path("__degraded").asBoolean(false)) {
                 return CompletableFuture.completedFuture(null);
             }
@@ -1265,7 +1309,8 @@ public class TwitterApiIoProvider {
             Instant probeTail = collected.tail();
             String next = extractNextCursor(root);
 
-            if ((probeTail != null && probeTail.getEpochSecond() <= a) || batch.isEmpty() || next.isEmpty()) {
+            // since_time is inclusive: a page ending at that second may have more rows on the next page.
+            if ((probeTail != null && probeTail.getEpochSecond() < a) || batch.isEmpty() || next.isEmpty()) {
                 ctx.newCoverage().add(new long[]{a, b});
                 return CompletableFuture.completedFuture(null);
             }
@@ -1287,13 +1332,13 @@ public class TwitterApiIoProvider {
                         long subA = a + (remSpan * i) / shards;
                         long subB = (i == shards - 1) ? remB : (a + (remSpan * (i + 1)) / shards);
                         if (subB > subA) {
-                            shardFutures.add(runSearchSliceLoopAsync(ctx, subA, subB, subB + 1, "", null));
+                            shardFutures.add(runSearchSliceLoopAsync(ctx, subA, subB, subB + 1, "", null, new HashSet<>()));
                         }
                     }
                     return CompletableFuture.allOf(shardFutures.toArray(CompletableFuture[]::new));
                 }
             }
-            return runSearchSliceLoopAsync(ctx, a, b, b + 1, next, probeTail);
+            return runSearchSliceLoopAsync(ctx, a, b, b + 1, next, probeTail, new HashSet<>());
         });
     }
 
@@ -1303,14 +1348,21 @@ public class TwitterApiIoProvider {
             long subB,
             long untilExclusive,
             String cursor,
-            Instant tailSoFar
+            Instant tailSoFar,
+            Set<String> seenCursors
     ) {
+        // Cursors belong to this query window; parallel shards must keep independent histories.
+        if (!seenCursors.add(cursor)) {
+            ctx.degraded().set(true);
+            recordPartialIfAny(ctx, subA, subB, tailSoFar);
+            return CompletableFuture.completedFuture(null);
+        }
         if (!tryAcquirePage(ctx)) {
             recordPartialIfAny(ctx, subA, subB, tailSoFar);
             return CompletableFuture.completedFuture(null);
         }
         String url = buildSearchUrl(ctx.baseUrl(), ctx.sliceQuery(), subA, untilExclusive, cursor);
-        return getJsonOptionalAsync(url, ctx.apiKey(), ctx.pacer(), ctx.degraded()).thenCompose(root -> {
+        return getJsonOptionalAsync(url, ctx.apiKey(), ctx.pacer(), ctx.degraded(), ctx.deadline()).thenCompose(root -> {
             if (root.path("__degraded").asBoolean(false)) {
                 recordPartialIfAny(ctx, subA, subB, tailSoFar);
                 return CompletableFuture.completedFuture(null);
@@ -1324,18 +1376,18 @@ public class TwitterApiIoProvider {
             if (!collected.valid()) return CompletableFuture.completedFuture(null);
             Instant tail = collected.tail();
             String next = extractNextCursor(root);
-            if (!next.isEmpty() && next.equals(cursor)) {
+            if (!next.isEmpty() && seenCursors.contains(next)) {
                 ctx.degraded().set(true);
                 recordPartialIfAny(ctx, subA, subB, tailSoFar);
                 return CompletableFuture.completedFuture(null);
             }
-            if ((tail != null && tail.getEpochSecond() <= subA)
+            if ((tail != null && tail.getEpochSecond() < subA)
                     || batch.isEmpty()
                     || next.isEmpty()) {
                 ctx.newCoverage().add(new long[]{subA, subB});
                 return CompletableFuture.completedFuture(null);
             }
-            return runSearchSliceLoopAsync(ctx, subA, subB, untilExclusive, next, tail);
+            return runSearchSliceLoopAsync(ctx, subA, subB, untilExclusive, next, tail, seenCursors);
         });
     }
 
@@ -1373,7 +1425,7 @@ public class TwitterApiIoProvider {
             if (p.item() != null && p.createdAt() != null && !p.createdAt().isBefore(ctx.cutoff30())) {
                 synchronized (ctx.items()) {
                     ctx.items().add(p.item());
-                    if (p.item() instanceof RawTweet tweet) ctx.metricsObservedAt().put(tweet.id(), observedAt);
+                    if (p.item() instanceof RawTweet tweet) ctx.metricsObservedAt().put(tweet.id(), observedAt(batch.get(idx), observedAt));
                 }
             }
             boolean pinnedLike = p.pinned()
@@ -1386,7 +1438,8 @@ public class TwitterApiIoProvider {
     }
 
     private static void recordPartialIfAny(StreamContext ctx, long a, long b, Instant tail) {
-        if (tail != null && tail.getEpochSecond() < b) {
+        // A failed continuation at the inclusive lower-bound second has not covered the whole window.
+        if (tail != null && tail.getEpochSecond() > a && tail.getEpochSecond() < b) {
             ctx.newCoverage().add(new long[]{Math.max(a, tail.getEpochSecond()), b});
         }
     }
@@ -1436,8 +1489,27 @@ public class TwitterApiIoProvider {
             List<XUserSummary> users,
             Set<String> explicitFollowedByKeys,
             boolean truncated,
-            boolean failed
+            boolean failed,
+            Map<String, Integer> orderById
     ) {
+        private PagedUserResult {
+            orderById = orderById != null ? Map.copyOf(orderById) : Map.of();
+        }
+
+        // Only direct followers/followings pagination has the provider's documented newest-first order.
+        private PagedUserResult(List<XUserSummary> users, Set<String> explicitFollowedByKeys,
+                                boolean truncated, boolean failed) {
+            this(users, explicitFollowedByKeys, truncated, failed, listedOrder(users));
+        }
+
+        private static Map<String, Integer> listedOrder(List<XUserSummary> users) {
+            Map<String, Integer> order = new LinkedHashMap<>();
+            for (int i = 0; i < users.size(); i++) {
+                XUserSummary user = users.get(i);
+                if (user != null && user.id() != null && !user.id().isBlank()) order.putIfAbsent(user.id(), i);
+            }
+            return order;
+        }
     }
 
     private CompletableFuture<PagedUserResult> fetchFollowersAsync(
@@ -1456,7 +1528,8 @@ public class TwitterApiIoProvider {
     private CompletableFuture<PagedUserResult> supplementFollowersAsync(
             String baseUrl, String selfId, PagedUserResult listed, int expectedTotal,
             String apiKey, KeyPacer pacer, Instant deadline, AtomicBoolean degraded) {
-        PagedUserResult incomplete = new PagedUserResult(listed.users(), listed.explicitFollowedByKeys(), true, false);
+        PagedUserResult incomplete = new PagedUserResult(listed.users(), listed.explicitFollowedByKeys(),
+                true, false, listed.orderById());
         String idsUrl = baseUrl + "/twitter/user/followers_ids?userId="
                 + URLEncoder.encode(selfId, StandardCharsets.UTF_8) + "&count=5000";
         return getJsonOnceBeforeAsync(idsUrl, apiKey, pacer, deadline, degraded).thenCompose(idsRoot -> {
@@ -1497,7 +1570,8 @@ public class TwitterApiIoProvider {
                     users.add(user);
                 }
                 boolean complete = ids.size() == expectedTotal && knownIds.equals(ids);
-                return new PagedUserResult(users, listed.explicitFollowedByKeys(), !complete, false);
+                // Batch-info additions prove membership but carry no follow-order provenance.
+                return new PagedUserResult(users, listed.explicitFollowedByKeys(), !complete, false, listed.orderById());
             });
         });
     }
@@ -1517,24 +1591,67 @@ public class TwitterApiIoProvider {
     private CompletableFuture<JsonNode> getJsonOnceBeforeAsync(
             String url, String apiKey, KeyPacer pacer, Instant deadline, AtomicBoolean degraded,
             long requestTimeoutMs, boolean finishBeforeDeadline, AtomicBoolean requestStarted) {
-        return sharedExecutor.<JsonNode>submitAsync(() -> {
+        if (useFreeSource(url)) {
+            return handleComposeCancellable(fxTwitterClient.fetchAsync(url, deadline, requestStarted),
+                    (free, error) -> {
+                        if (error != null) {
+                            logFreeFallback(url, error);
+                            return getPaidJsonOnceBeforeAsync(withoutFreeCursor(url), apiKey, pacer, deadline,
+                                    degraded, requestTimeoutMs, finishBeforeDeadline, requestStarted);
+                        }
+                        List<String> missing = jsonIds(free, "__incomplete_ids");
+                        if (missing.isEmpty()) return CompletableFuture.completedFuture(free);
+                        if (!Instant.now().isBefore(deadline)) {
+                            degraded.set(true);
+                            return CompletableFuture.completedFuture(free);
+                        }
+                        String missingUrl = trimTrailingSlash(properties.getTwitterapiIoBaseUrl())
+                                + "/twitter/tweets?tweet_ids="
+                                + URLEncoder.encode(String.join(",", missing), StandardCharsets.UTF_8);
+                        AtomicBoolean paidStarted = new AtomicBoolean(false);
+                        log.info("x_read_fallback source=fxtwitter target=twitterapi_io path=/twitter/tweets missing={}", missing.size());
+                        return handleComposeCancellable(getPaidJsonOnceBeforeAsync(missingUrl, apiKey, pacer, deadline, degraded,
+                                requestTimeoutMs, finishBeforeDeadline, paidStarted), (paid, paidError) -> {
+                                    if (paidError != null) degraded.set(true);
+                                    if (paidStarted.get() && requestStarted != null) requestStarted.set(true);
+                                    return CompletableFuture.completedFuture(
+                                            mergeFreeMetricResults(free, paid, missing, paidStarted.get(), degraded));
+                                });
+                    });
+        }
+        return getPaidJsonOnceBeforeAsync(url, apiKey, pacer, deadline, degraded,
+                requestTimeoutMs, finishBeforeDeadline, requestStarted);
+    }
+
+    private CompletableFuture<JsonNode> getPaidJsonOnceBeforeAsync(
+            String url, String apiKey, KeyPacer pacer, Instant deadline, AtomicBoolean degraded,
+            long requestTimeoutMs, boolean finishBeforeDeadline, AtomicBoolean requestStarted) {
+        CompletableFuture<JsonNode> request = sharedExecutor.submitAsync(() -> {
             long waitMs = pacer.reserveWaitMsBefore(isLocalMockBaseUrl(), deadline.toEpochMilli());
             if (waitMs < 0) return null;
             if (waitMs > 0) Thread.sleep(waitMs);
             long remainingMs = Duration.between(Instant.now(), deadline).toMillis();
             if (remainingMs <= 0) return null;
-            HttpRequest request = HttpRequest.newBuilder(URI.create(url))
+            budgetGuard.acquirePermit(url, "twitterapi_io_read");
+            remainingMs = Duration.between(Instant.now(), deadline).toMillis();
+            if (Thread.currentThread().isInterrupted() || remainingMs <= 0) {
+                degraded.set(true);
+                return null;
+            }
+            HttpRequest httpRequest = HttpRequest.newBuilder(URI.create(url))
                     .timeout(Duration.ofMillis(finishBeforeDeadline ? Math.min(requestTimeoutMs, remainingMs) : requestTimeoutMs))
                     .header("X-API-Key", apiKey).header("Accept", "application/json").GET().build();
             if (requestStarted != null) requestStarted.set(true);
-            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+            HttpResponse<String> response = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofString());
             if (response.statusCode() == 429) pacer.onRateLimited429(isLocalMockBaseUrl());
             return parseValidatedResponse(response, pacer);
-        }).exceptionally(ex -> {
+        });
+        return handleComposeCancellable(request, (root, ex) -> {
+            if (ex == null) return CompletableFuture.completedFuture(root);
             Throwable cause = ex instanceof CompletionException && ex.getCause() != null ? ex.getCause() : ex;
             if (cause instanceof XDataProviderException xe && (xe.getStatusCode() == 401 || xe.getStatusCode() == 402)) throw xe;
             degraded.set(true);
-            return null;
+            return CompletableFuture.completedFuture(null);
         });
     }
 
@@ -1660,7 +1777,144 @@ public class TwitterApiIoProvider {
     }
 
     private CompletableFuture<JsonNode> getJsonWithRetryAsync(String url, String apiKey, KeyPacer pacer) {
+        return getJsonWithRetryAsync(url, apiKey, pacer, Instant.now().plusSeconds(SNAPSHOT_SOFT_DEADLINE_SECONDS));
+    }
+
+    private CompletableFuture<JsonNode> getJsonWithRetryAsync(String url, String apiKey, KeyPacer pacer, Instant deadline) {
+        if (useFreeSource(url)) {
+            return handleComposeCancellable(fxTwitterClient.fetchAsync(url, deadline, null), (root, error) -> {
+                if (error == null) return CompletableFuture.completedFuture(root);
+                logFreeFallback(url, error);
+                if (!Instant.now().isBefore(deadline)) {
+                    return CompletableFuture.<JsonNode>failedFuture(new XDataProviderException(504,
+                            "免费数据读取超时，已保留原数据，请稍后继续更新"));
+                }
+                return attemptGetJsonAsync(withoutFreeCursor(url), apiKey, pacer, isLocalMockBaseUrl(), 0);
+            });
+        }
         return attemptGetJsonAsync(url, apiKey, pacer, isLocalMockBaseUrl(), 0);
+    }
+
+    /** Keep cancellation attached to the active request, including a newly scheduled fallback or retry. */
+    private static <T, U> CompletableFuture<U> handleComposeCancellable(
+            CompletableFuture<T> source,
+            BiFunction<? super T, Throwable, CompletableFuture<U>> transition) {
+        CompletableFuture<U> result = new CompletableFuture<>();
+        Object gate = new Object();
+        CompletableFuture<?>[] active = {source}; // Guarded by gate across the source-to-fallback transition.
+        result.whenComplete((value, error) -> {
+            if (result.isCancelled()) {
+                final CompletableFuture<?> request;
+                synchronized (gate) {
+                    request = active[0];
+                }
+                request.cancel(true);
+            }
+        });
+        source.whenComplete((value, error) -> {
+            final CompletableFuture<U> next;
+            try {
+                synchronized (gate) {
+                    if (result.isDone()) return;
+                    next = isCancellation(error) ? CompletableFuture.failedFuture(error) : transition.apply(value, error);
+                    active[0] = next;
+                }
+            } catch (Throwable failure) {
+                result.completeExceptionally(failure);
+                return;
+            }
+            // cancel() can mark the result while waiting for this transition's gate.
+            // Complete/cancel children outside the gate to avoid nested chain lock inversion.
+            if (result.isCancelled()) {
+                next.cancel(true);
+                return;
+            }
+            next.whenComplete((mapped, failure) -> {
+                if (failure == null) result.complete(mapped);
+                else if (isCancellation(failure)) result.cancel(true);
+                else result.completeExceptionally(failure);
+            });
+        });
+        return result;
+    }
+
+    private static boolean isCancellation(Throwable error) {
+        while (error instanceof CompletionException && error.getCause() != null) error = error.getCause();
+        return error instanceof CancellationException;
+    }
+
+    private boolean useFreeSource(String url) {
+        // 旧的本地模拟端点不能因启用默认配置而发出真实网络请求；免费模拟端点须显式配置。
+        return fxTwitterClient.supports(url)
+                && (!isLocalMockBaseUrl() || isLoopbackUrl(properties.getFxtwitterBaseUrl()));
+    }
+
+    private static boolean isLoopbackUrl(String value) {
+        try {
+            String host = URI.create(value).getHost();
+            return "localhost".equalsIgnoreCase(host) || "127.0.0.1".equals(host) || "[::1]".equals(host);
+        } catch (RuntimeException ex) {
+            return false;
+        }
+    }
+
+    private static String withoutFreeCursor(String url) {
+        int question = url.indexOf('?');
+        if (question < 0) return url;
+        List<String> query = new ArrayList<>();
+        for (String part : url.substring(question + 1).split("&")) {
+            String[] pair = part.split("=", 2);
+            if ("cursor".equals(pair[0]) && pair.length == 2
+                    && URLDecoder.decode(pair[1], StandardCharsets.UTF_8).startsWith("fx:")) continue;
+            query.add(part);
+        }
+        return url.substring(0, question) + (query.isEmpty() ? "" : "?" + String.join("&", query));
+    }
+
+    private static void logFreeFallback(String url, Throwable error) {
+        Throwable cause = error instanceof CompletionException && error.getCause() != null ? error.getCause() : error;
+        // 只记端点和错误类别，查询文本、密钥与用户正文不写入日志。
+        log.info("x_read_fallback source=fxtwitter target=twitterapi_io path={} reason={}",
+                URI.create(url).getPath(), cause.getClass().getSimpleName());
+    }
+
+    private static boolean includesFreeData(JsonNode root) {
+        return root != null && root.path("_source").asText("").startsWith("fxtwitter");
+    }
+
+    private static List<String> jsonIds(JsonNode root, String name) {
+        if (root == null || !root.path(name).isArray()) return List.of();
+        List<String> ids = new ArrayList<>();
+        for (JsonNode id : root.path(name)) if (id.isTextual() && !id.asText().isBlank()) ids.add(id.asText());
+        return ids;
+    }
+
+    private JsonNode mergeFreeMetricResults(JsonNode free, JsonNode paid, List<String> requested,
+            boolean paidStarted, AtomicBoolean degraded) {
+        var merged = ((com.fasterxml.jackson.databind.node.ObjectNode) free).deepCopy();
+        Set<String> pending = new LinkedHashSet<>(requested);
+        Set<String> attempts = new LinkedHashSet<>(jsonIds(free, "__attempted_ids"));
+        if (paidStarted) attempts.addAll(requested);
+        var tweets = merged.withArray("tweets");
+        boolean paidBatchComplete = paidStarted && hasArray(paid, "tweets", "data");
+        for (JsonNode tweet : extractArray(paid, "tweets", "data")) {
+            if (pending.remove(tweet.path("id").asText(""))) tweets.add(tweet);
+            else paidBatchComplete = false;
+        }
+        merged.put("_source", "fxtwitter+twitterapi_io");
+        var attempted = merged.putArray("__attempted_ids");
+        attempts.forEach(attempted::add);
+        var confirmedDeleted = merged.putArray("__confirmed_deleted_ids");
+        // Only the original paid provider's successful batch can apply its existing absence policy.
+        // Free 404s, failed/unsent paid requests and malformed responses remain unconfirmed.
+        if (paidBatchComplete) {
+            pending.forEach(confirmedDeleted::add);
+            pending.clear();
+        }
+        var incomplete = merged.putArray("__incomplete_ids");
+        pending.forEach(incomplete::add);
+        if (!pending.isEmpty()) degraded.set(true);
+        return merged;
     }
 
     private CompletableFuture<JsonNode> attemptGetJsonAsync(
@@ -1670,23 +1924,29 @@ public class TwitterApiIoProvider {
             boolean localMock,
             int attempt
     ) {
-        return sharedExecutor.submitAsync(() -> {
+        CompletableFuture<HttpResponse<String>> request = sharedExecutor.submitAsync(() -> {
             pacer.acquireSlot(localMock);
             try {
-                HttpRequest request = HttpRequest.newBuilder()
+                HttpRequest httpRequest = HttpRequest.newBuilder()
                         .uri(URI.create(url))
                         .timeout(Duration.ofSeconds(10))
                         .header("X-API-Key", apiKey)
                         .header("Accept", "application/json")
                         .GET()
                         .build();
-                return httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+                budgetGuard.acquirePermit(url, "twitterapi_io_read");
+                if (Thread.currentThread().isInterrupted()) {
+                    throw new XDataProviderException(503, "外部请求已中止，未发送付费请求");
+                }
+                return httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofString());
             } catch (XDataProviderException e) {
                 throw e;
             } catch (Exception e) {
                 throw new XDataProviderException(502, "连接 TwitterAPI.io 失败：" + e.getMessage(), e);
             }
-        }).thenCompose(resp -> {
+        });
+        return handleComposeCancellable(request, (resp, error) -> {
+            if (error != null) return CompletableFuture.failedFuture(error);
             if (resp.statusCode() == 429) {
                 pacer.onRateLimited429(localMock);
                 if (attempt < MAX_429_RETRIES) {
@@ -1731,7 +1991,14 @@ public class TwitterApiIoProvider {
             KeyPacer pacer,
             AtomicBoolean partialDegraded
     ) {
-        return getJsonWithRetryAsync(url, apiKey, pacer).exceptionally(ex -> {
+        return getJsonOptionalAsync(url, apiKey, pacer, partialDegraded,
+                Instant.now().plusSeconds(SNAPSHOT_SOFT_DEADLINE_SECONDS));
+    }
+
+    private CompletableFuture<JsonNode> getJsonOptionalAsync(
+            String url, String apiKey, KeyPacer pacer, AtomicBoolean partialDegraded, Instant deadline) {
+        return handleComposeCancellable(getJsonWithRetryAsync(url, apiKey, pacer, deadline), (root, ex) -> {
+            if (ex == null) return CompletableFuture.completedFuture(root);
             Throwable cause = (ex instanceof CompletionException && ex.getCause() != null) ? ex.getCause() : ex;
             if (cause instanceof XDataProviderException xe && (xe.getStatusCode() == 401 || xe.getStatusCode() == 402)) {
                 throw xe;
@@ -1741,7 +2008,7 @@ public class TwitterApiIoProvider {
             }
             com.fasterxml.jackson.databind.node.ObjectNode fallback = objectMapper.createObjectNode();
             fallback.put("__degraded", true);
-            return fallback;
+            return CompletableFuture.completedFuture(fallback);
         });
     }
 
@@ -1802,6 +2069,9 @@ public class TwitterApiIoProvider {
                 node.path("profilePicture").asText(""),
                 node.path("profile_image_url_https").asText("")
         ).replace("_normal.", "_400x400.");
+        if (avatar.startsWith("https://pbs.twimg.com/profile_images/")) {
+            avatar = avatar.replace("_200x200.", "_400x400.");
+        }
         String banner = firstNonBlank(
                 node.path("coverPicture").asText(""),
                 node.path("profile_banner_url").asText(""),
@@ -1900,6 +2170,33 @@ public class TwitterApiIoProvider {
     private static boolean matchesTweetAuthor(XUserSummary author, XUserSummary expected) {
         return author == null || ((author.id().isBlank() || author.id().equals(expected.id()))
                 && (author.username().isBlank() || author.username().equalsIgnoreCase(expected.username())));
+    }
+
+    private static long observedAt(JsonNode node, long fallback) {
+        JsonNode value = node.path("__observed_at");
+        return value.isIntegralNumber() && value.asLong() > 0 && value.asLong() <= fallback
+                ? value.asLong() : fallback;
+    }
+
+    private RawTweet parseMetricTweet(JsonNode node, String self, AccountStore.StoredAccount existing, boolean fromFree) {
+        RawTweet tweet = parseRawTweet(node, self);
+        if (!fromFree || tweet == null || tweet.createdAt() == null || existing == null) return tweet;
+        AccountStore.StoredTweet previous = existing.tweets().stream()
+                .filter(t -> t.id().equals(tweet.id())).findFirst().orElse(null);
+        if (previous == null) return tweet;
+        if (previous.createdAt() != tweet.createdAt().getEpochSecond()) return null;
+        // A metric response cannot change a previously known parent or turn a reply into a main post.
+        // An older record without parent evidence may still be completed by a valid new response.
+        if (previous.inReplyToId() != null && !previous.inReplyToId().isBlank()
+                && !previous.inReplyToId().equals(tweet.inReplyToId())) return null;
+        String knownConversation = previous.conversationId() == null ? previous.id()
+                : "-".equals(previous.conversationId()) ? "" : previous.conversationId();
+        if (!tweet.conversationId().isBlank() || knownConversation.isBlank()) return tweet;
+        // FxTwitter 给出直接父帖，未提供根会话；更新指标时保留已有的根会话证据。
+        return new RawTweet(tweet.id(), tweet.text(), tweet.createdAt(), tweet.kind(), tweet.targetUsername(),
+                tweet.targetUser(), tweet.mentionedUsernames(), tweet.hasMedia(), tweet.isThread(),
+                tweet.viewCount(), tweet.likeCount(), tweet.replyCount(), tweet.retweetCount(), tweet.bookmarkCount(),
+                tweet.selfThreadReply(), knownConversation, tweet.inReplyToId(), tweet.unavailableMetrics());
     }
 
     private RawTweet parseRawTweet(JsonNode t, String selfUsername) {

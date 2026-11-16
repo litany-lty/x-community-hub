@@ -307,11 +307,15 @@ public class CommunityAnalyticsEngine {
                 // 逐人双向核验比列表中的在场/缺席证据更直接，不能把已核验的 false 与旧 true 合并。
                 RelationshipEntry verified = entry.relationshipVerified() ? entry
                         : (prev.relationshipVerified() ? prev : null);
+                boolean sameIdentity = prev.user().id() != null && !prev.user().id().isBlank()
+                        && prev.user().id().equals(entry.user().id());
                 map.put(key, new RelationshipEntry(
                         preferRicherUser(prev.user(), entry.user()),
                         verified != null ? verified.iFollowThem() : prev.iFollowThem() || entry.iFollowThem(),
                         verified != null ? verified.theyFollowMe() : prev.theyFollowMe() || entry.theyFollowMe(),
-                        verified != null
+                        verified != null,
+                        sameIdentity ? (prev.followingOrder() != null ? prev.followingOrder() : entry.followingOrder()) : null,
+                        sameIdentity ? (prev.followerOrder() != null ? prev.followerOrder() : entry.followerOrder()) : null
                 ));
             }
         }
@@ -1258,6 +1262,9 @@ public class CommunityAnalyticsEngine {
             RelationshipEntry rel = entry.getValue();
 
             PeerInteractionStat stat = statByKey.get(key);
+            double intimacyScore = stat != null ? stat.intimacyScore() : 0.0;
+            // A relationship check can change its category, but cannot invent membership in an ordered source list.
+            Integer relationshipOrder = rel.iFollowThem() ? rel.followingOrder() : rel.followerOrder();
             int myOut = stat != null ? stat.myRepliesToPeer() : 0;
             int theirIn = stat != null ? stat.peerRepliesToMe() : 0;
             int quotes = stat != null
@@ -1309,7 +1316,7 @@ public class CommunityAnalyticsEngine {
                 }
                 notFollowingBack.add(new FollowAuditItem(
                         u, "NOT_FOLLOWING_BACK", true, false,
-                        myOut, theirIn, totalInter, category, label, rec, url
+                        myOut, theirIn, totalInter, category, label, rec, url, relationshipOrder, intimacyScore
                 ));
             } else if (!rel.iFollowThem() && rel.theyFollowMe()) {
                 if (followingsTruncated && !rel.relationshipVerified()) {
@@ -1323,7 +1330,7 @@ public class CommunityAnalyticsEngine {
                         : "对方已关注你，若主页方向同频可礼貌回关";
                 fansNotFollowedBack.add(new FollowAuditItem(
                         u, "FAN_ONLY", false, true,
-                        myOut, theirIn, totalInter, category, label, rec, url
+                        myOut, theirIn, totalInter, category, label, rec, url, relationshipOrder, intimacyScore
                 ));
             } else if (rel.iFollowThem() && rel.theyFollowMe()) {
                 String category;
@@ -1348,7 +1355,7 @@ public class CommunityAnalyticsEngine {
                 }
                 mutuals.add(new FollowAuditItem(
                         u, "MUTUAL", true, true,
-                        myOut, theirIn, totalInter, category, label, rec, url
+                        myOut, theirIn, totalInter, category, label, rec, url, relationshipOrder, intimacyScore
                 ));
             }
         }
@@ -2267,6 +2274,7 @@ public class CommunityAnalyticsEngine {
         EmpiricalAlgoCalibration calibration = buildEmpiricalCalibration(
                 profile,
                 allTimeline,
+                windowMain,
                 mainPostGapMinutesById,
                 authorEngagedMainPostIds,
                 interactions,
@@ -2646,18 +2654,19 @@ public class CommunityAnalyticsEngine {
             ));
         }
 
-        if (calibration != null && !calibration.residualAnomalies().isEmpty()) {
-            ResidualAnomalyPost topAnom = calibration.residualAnomalies().get(0);
-            items.add(new OpsRecommendationItem(
-                    "RESIDUAL_ANOMALY_REVIEW",
-                    "MEDIUM",
-                    "复盘",
-                    String.format("有 %d 条推文互动很高但曝光偏低", calibration.residualAnomalies().size()),
-                    String.format("如 %s 发布的「%s」互动热烈但仅 %d 浏览（按互动水平通常可达 %d 以上），可检查是否带了短链、敏感词或过窄的行话。",
-                            topAnom.createdLabel(), topAnom.textPreview(), topAnom.actualViews(), topAnom.expectedViewsFloor()),
-                    "tab:timing|scrollId:algoCalibrationPanel",
-                    null
-            ));
+        if (calibration != null) {
+            for (ResidualAnomalyPost post : calibration.residualAnomalies()) {
+                items.add(new OpsRecommendationItem(
+                        "REVIEW_LOW_VIEW_POST",
+                        "LOW",
+                        "复盘",
+                        "浏览量低于历史常态",
+                        String.format("%s「%s」；已采集浏览 %d，历史单帖中位数 %d。",
+                                post.createdLabel(), post.textPreview(), post.actualViews(), calibration.medianViews()),
+                        null,
+                        post.tweetUrl()
+                ));
+            }
         }
 
         if (activity != null && !activity.sampleCapped() && followAudit != null && followAudit.suggestedUnfollowCount() > 0) {
@@ -2677,6 +2686,8 @@ public class CommunityAnalyticsEngine {
     }
 
     private static final int MIN_CALIBRATION_POSTS = 6;
+    private static final double CALIBRATION_PRIOR_VIEWS = 100.0;
+    private static final long MIN_REVIEW_OBSERVATION_MINUTES = 180L;
     private static final Set<String> KNOWN_URL_SHORTENERS = Set.of(
             "bit.ly", "tinyurl.com", "t.cn", "is.gd", "cutt.ly", "buff.ly",
             "ow.ly", "rebrand.ly", "shorturl.at", "rb.gy", "soo.gd"
@@ -2691,6 +2702,7 @@ public class CommunityAnalyticsEngine {
     private EmpiricalAlgoCalibration buildEmpiricalCalibration(
             XUserSummary profile,
             List<RawTweet> allTimeline,
+            List<RawTweet> windowMain,
             Map<String, Long> mainPostGapMinutesById,
             Set<String> authorEngagedMainPostIds,
             InteractionOverview interactions,
@@ -2787,12 +2799,13 @@ public class CommunityAnalyticsEngine {
         double priorReplyRate = sumViews > 0 ? (double) sumReplies / sumViews : 0.005;
         double priorRepostRate = sumViews > 0 ? (double) sumReposts / sumViews : 0.003;
         double priorLikeRate = sumViews > 0 ? (double) sumLikes / sumViews : 0.015;
-        double priorViewsStrength = 100.0;
+        double priorViewsStrength = CALIBRATION_PRIOR_VIEWS;
         // 公开 API repost 计数包含纯转推(1.0)与部分引用(5.0)，采用无夸大的保守合成系数
         double compositeRepostVmWeight = 0.75 * ev.retweetWeight() + 0.25 * ev.quoteWeight();
 
         int n = validMain.size();
         double[] utilities = new double[n];
+        double[] observedUtilities = new double[n];
         long[] viewsArr = new long[n];
         for (int i = 0; i < n; i++) {
             RawTweet t = validMain.get(i);
@@ -2805,6 +2818,10 @@ public class CommunityAnalyticsEngine {
                     + compositeRepostVmWeight * pRepost
                     + ev.favoriteWeight() * pLike);
             utilities[i] = round2(utilPer1k);
+            observedUtilities[i] = 1000.0 * (
+                    effectiveReplyWeight * Math.max(0, t.replyCount())
+                    + compositeRepostVmWeight * Math.max(0, t.retweetCount())
+                    + ev.favoriteWeight() * Math.max(0, t.likeCount())) / v;
         }
 
         // 计算分位统计量与每条样本的综合历史分位（0..100）
@@ -2884,9 +2901,14 @@ public class CommunityAnalyticsEngine {
             avgHalfBand = Math.max(10, Math.min(22, (int) Math.round((double) bandSum / n)));
         }
 
-        // 7. 识别高后验互动价值但低实际曝光的负残差异常主推（ResidualAnomalyPost）
+        // 历史样本继续作基线；只将当前统计周期内、已有足够观测的主推列为复盘线索。
+        Set<String> currentPeriodIds = new HashSet<>();
+        for (RawTweet post : windowMain) {
+            if (post.id() != null) currentPeriodIds.add(post.id());
+        }
         List<ResidualAnomalyPost> anomalies = unlocked
-                ? detectResidualAnomalies(validMain, allSamples, mainPostGapMinutesById, rules.minRecommendedGapMinutes(), medianUtil, p25Views)
+                ? detectResidualAnomalies(validMain, allSamples, observedUtilities, currentPeriodIds,
+                        mainPostGapMinutesById, rules.minRecommendedGapMinutes(), refNow, medianUtil, p25Views, medianViews)
                 : List.of();
 
         List<CalibrationPostSample> exportedCorpus = n <= 40
@@ -2971,10 +2993,14 @@ public class CommunityAnalyticsEngine {
     private static List<ResidualAnomalyPost> detectResidualAnomalies(
             List<RawTweet> validMain,
             List<CalibrationPostSample> samples,
+            double[] observedUtilities,
+            Set<String> currentPeriodIds,
             Map<String, Long> gapMap,
             long minGapMinutes,
+            Instant refNow,
             double medianUtil,
-            long p25Views
+            long p25Views,
+            long medianViews
     ) {
         // 仅在非连发样本上拟合 OLS: log10(views + 10) = a + b * log10(util + 1)
         List<Integer> cleanIdx = new ArrayList<>();
@@ -3007,14 +3033,21 @@ public class CommunityAnalyticsEngine {
         double slope = sxx > 1e-6 ? Math.max(0.0, Math.min(2.5, sxy / sxx)) : 0.0;
         double intercept = meanY - slope * meanX;
 
+        Instant observedSince = refNow.minus(Duration.ofMinutes(
+                Math.max(MIN_REVIEW_OBSERVATION_MINUTES, minGapMinutes)));
         List<ResidualAnomalyPost> found = new ArrayList<>();
         for (int idx : cleanIdx) {
             CalibrationPostSample s = samples.get(idx);
-            if (s.realizedVmUtilityPer1k() < Math.max(1.0, medianUtil)) {
+            RawTweet post = validMain.get(idx);
+            if (!currentPeriodIds.contains(s.id()) || post.createdAt().isAfter(observedSince)
+                    || s.viewCount() < CALIBRATION_PRIOR_VIEWS || s.viewCount() >= medianViews
+                    || observedUtilities[idx] < Math.max(1.0, medianUtil)
+                    || s.realizedVmUtilityPer1k() < Math.max(1.0, medianUtil)) {
                 continue;
             }
             double expectedLogV = intercept + slope * Math.log10(s.realizedVmUtilityPer1k() + 1.0);
             double expectedV = Math.max(20.0, Math.pow(10.0, expectedLogV) - 10.0);
+            // Fixed comparison threshold for candidate selection, not a confidence interval.
             long expectedFloor = Math.round(expectedV * 0.45);
             if (expectedFloor >= 30L && s.viewCount() < expectedFloor && s.viewCount() <= p25Views) {
                 found.add(new ResidualAnomalyPost(
@@ -3025,7 +3058,7 @@ public class CommunityAnalyticsEngine {
                         expectedFloor,
                         s.realizedVmUtilityPer1k(),
                         s.tweetUrl(),
-                        "公开互动价值高于本账号中位数，但实际曝光显著低于回归下界（负残差异常）；建议排查受众面冷门词、外链域名信誉或易触发 not_interested / mute 的表述"
+                        String.format("已采集浏览 %d，历史单帖中位数 %d。", s.viewCount(), medianViews)
                 ));
             }
         }

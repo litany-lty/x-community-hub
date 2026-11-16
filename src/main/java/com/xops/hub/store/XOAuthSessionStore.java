@@ -10,6 +10,9 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.attribute.FileTime;
+import java.util.Objects;
 import java.security.MessageDigest;
 import java.time.Instant;
 import java.util.HashMap;
@@ -17,7 +20,6 @@ import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Stream;
 
@@ -28,11 +30,15 @@ import java.util.stream.Stream;
 public class XOAuthSessionStore {
 
     public static final long MAX_SESSION_LIFETIME_SECONDS = 400L * 24 * 3600;
+    // 持久登录凭据与内存对象寿命分开，空闲会话由加密存储按需恢复。
+    public static final int MAX_IN_MEMORY_IDLE_SECONDS = 3600;
     public static final long SLIDE_THRESHOLD_SECONDS = 24L * 3600;
     private static final long RESTORE_GRACE_SECONDS = 60L;
     private static final long CLEANUP_INTERVAL_SECONDS = 3600L;
     private static final String CIPHER_PREFIX = "s1:";
     private static final String FILE_SUFFIX = ".enc";
+    private static final int LOCK_STRIPES = 64;
+    private static final int MAX_HOT_SESSIONS = 1024;
 
     public record StoredAuthUser(
             String id,
@@ -65,8 +71,18 @@ public class XOAuthSessionStore {
             StoredAuthUser user,
             long createdAtEpochSec,
             long expiresAtEpochSec,
-            String replacedBySessionHash
+            String replacedBySessionHash,
+            String familyHash
     ) {
+        public StoredAuthSession {
+            familyHash = familyHash == null || familyHash.isBlank() ? sessionHash : familyHash;
+        }
+
+        public StoredAuthSession(String sessionHash, StoredAuthUser user, long createdAtEpochSec,
+                                 long expiresAtEpochSec, String replacedBySessionHash) {
+            this(sessionHash, user, createdAtEpochSec, expiresAtEpochSec, replacedBySessionHash, sessionHash);
+        }
+
         public AuthenticatedXUser toAuthenticatedXUser() {
             return user != null ? user.toAuthenticatedXUser() : null;
         }
@@ -75,7 +91,12 @@ public class XOAuthSessionStore {
     private final XOpsProperties properties;
     private final ObjectMapper objectMapper;
     private final XOAuthTokenStore cryptoHelper;
-    private final ConcurrentHashMap<String, Object> sessionLocks = new ConcurrentHashMap<>();
+    private final Object[] sessionLocks;
+    private record CachedSessionRecord(Path path, FileTime modifiedAt, long size, Object fileKey,
+                                       StoredAuthSession session) { }
+
+    private final Object sessionLifecycleLock = new Object();
+    private final ConcurrentHashMap<String, CachedSessionRecord> hotSessions = new ConcurrentHashMap<>();
     private final AtomicLong lastCleanupEpochSec = new AtomicLong(0L);
 
     @Autowired
@@ -83,6 +104,10 @@ public class XOAuthSessionStore {
         this.properties = properties;
         this.objectMapper = objectMapper;
         this.cryptoHelper = new XOAuthTokenStore(properties, objectMapper);
+        this.sessionLocks = new Object[LOCK_STRIPES];
+        for (int i = 0; i < LOCK_STRIPES; i++) {
+            this.sessionLocks[i] = new Object();
+        }
     }
 
     public void saveSession(String sessionId, AuthenticatedXUser user, long nowEpochSec) {
@@ -117,36 +142,35 @@ public class XOAuthSessionStore {
             return false;
         }
         StoredAuthUser storedUser = StoredAuthUser.from(user);
-        synchronized (lockForHash(hash)) {
-            StoredAuthSession existing = readRecordLocked(file);
-            if (existing == null) {
+        synchronized (sessionLifecycleLock) {
+            synchronized (lockForHash(hash)) {
+                StoredAuthSession existing = readRecordLocked(file);
+                // A status request authenticated before logout must not recreate revoked credentials.
+                // Initial login and restoration persist explicitly through saveSession/rotateOnRestore.
+                if (existing == null) {
+                    return false;
+                }
+                if (nowEpochSec >= existing.expiresAtEpochSec()) {
+                    deleteQuietly(file);
+                    return false;
+                }
+                if (existing.replacedBySessionHash() != null) return false;
+                long remaining = existing.expiresAtEpochSec() - nowEpochSec;
+                boolean stale = remaining < (MAX_SESSION_LIFETIME_SECONDS - SLIDE_THRESHOLD_SECONDS);
+                boolean userChanged = !storedUser.equals(existing.user());
+                if (!stale && !userChanged) {
+                    return false;
+                }
                 writeRecordLocked(file, new StoredAuthSession(
                         hash,
                         storedUser,
-                        nowEpochSec,
+                        existing.createdAtEpochSec(),
                         nowEpochSec + MAX_SESSION_LIFETIME_SECONDS,
-                        null
+                        existing.replacedBySessionHash(),
+                        existing.familyHash()
                 ));
                 return true;
             }
-            if (nowEpochSec >= existing.expiresAtEpochSec()) {
-                deleteQuietly(file);
-                return false;
-            }
-            long remaining = existing.expiresAtEpochSec() - nowEpochSec;
-            boolean stale = remaining < (MAX_SESSION_LIFETIME_SECONDS - SLIDE_THRESHOLD_SECONDS);
-            boolean userChanged = !storedUser.equals(existing.user());
-            if (!stale && !userChanged) {
-                return false;
-            }
-            writeRecordLocked(file, new StoredAuthSession(
-                    hash,
-                    storedUser,
-                    existing.createdAtEpochSec(),
-                    nowEpochSec + MAX_SESSION_LIFETIME_SECONDS,
-                    existing.replacedBySessionHash()
-            ));
-            return true;
         }
     }
 
@@ -172,41 +196,44 @@ public class XOAuthSessionStore {
         }
     }
 
+    public boolean isPersistenceEnabled() {
+        return resolveSessionDir() != null;
+    }
+
     public void rotateOnRestore(String oldSessionId, String newSessionId, AuthenticatedXUser user, long nowEpochSec) {
-        if (newSessionId == null || newSessionId.isBlank() || user == null) {
-            return;
-        }
-        saveSession(newSessionId, user, nowEpochSec);
+        if (newSessionId == null || newSessionId.isBlank() || user == null || !isPersistenceEnabled()) return;
         if (oldSessionId == null || oldSessionId.isBlank() || oldSessionId.equals(newSessionId)) {
+            saveSession(newSessionId, user, nowEpochSec);
             return;
         }
-        String oldHash = sha256Hex(oldSessionId);
-        String newHash = sha256Hex(newSessionId);
-        Path oldFile = resolveSessionFile(oldHash);
-        if (oldFile == null) {
-            return;
-        }
-        synchronized (lockForHash(oldHash)) {
-            StoredAuthSession oldRecord = readRecordLocked(oldFile);
-            long created = oldRecord != null ? oldRecord.createdAtEpochSec() : nowEpochSec;
-            long graceExpiry = oldRecord != null
-                    ? Math.min(oldRecord.expiresAtEpochSec(), nowEpochSec + RESTORE_GRACE_SECONDS)
-                    : nowEpochSec + RESTORE_GRACE_SECONDS;
-            if (graceExpiry <= nowEpochSec) {
-                deleteQuietly(oldFile);
-                return;
+        synchronized (sessionLifecycleLock) {
+            StoredAuthSession oldRecord = loadValid(oldSessionId, nowEpochSec);
+            if (oldRecord == null || oldRecord.user() == null || !Objects.equals(oldRecord.user().id(), user.id())) {
+                throw new IllegalStateException("登录会话已失效，请重新登录");
             }
-            writeRecordLocked(oldFile, new StoredAuthSession(
-                    oldHash,
-                    StoredAuthUser.from(user),
-                    created,
-                    graceExpiry,
-                    newHash
-            ));
+            String oldHash = sha256Hex(oldSessionId);
+            String newHash = sha256Hex(newSessionId);
+            synchronized (lockForHash(newHash)) {
+                writeRecordLocked(resolveSessionFile(newHash), new StoredAuthSession(
+                        newHash, StoredAuthUser.from(user), nowEpochSec,
+                        nowEpochSec + MAX_SESSION_LIFETIME_SECONDS, null, oldRecord.familyHash()));
+            }
+            synchronized (lockForHash(oldHash)) {
+                writeRecordLocked(resolveSessionFile(oldHash), new StoredAuthSession(
+                        oldHash, StoredAuthUser.from(user), oldRecord.createdAtEpochSec(),
+                        Math.min(oldRecord.expiresAtEpochSec(), nowEpochSec + RESTORE_GRACE_SECONDS),
+                        newHash, oldRecord.familyHash()));
+            }
         }
     }
 
     public void revokeSession(String... sessionIds) {
+        synchronized (sessionLifecycleLock) {
+            revokeSessionLocked(sessionIds);
+        }
+    }
+
+    private void revokeSessionLocked(String... sessionIds) {
         Path dir = resolveSessionDir();
         if (dir == null || sessionIds == null) {
             return;
@@ -221,7 +248,15 @@ public class XOAuthSessionStore {
             return;
         }
 
-        // 沿 replacedBySessionHash 正向追踪删除已轮换的子会话
+        Set<String> revokedFamilies = new HashSet<>(revokedHashes);
+        for (String hash : revokedHashes) {
+            synchronized (lockForHash(hash)) {
+                StoredAuthSession record = readRecordLocked(dir.resolve(hash + FILE_SUFFIX));
+                if (record != null) revokedFamilies.add(record.familyHash());
+            }
+        }
+
+        // Keep legacy chain traversal, and also revoke all restored siblings in this family.
         Set<String> queue = new HashSet<>(revokedHashes);
         while (!queue.isEmpty()) {
             Set<String> next = new HashSet<>();
@@ -233,7 +268,7 @@ public class XOAuthSessionStore {
                             && revokedHashes.add(rec.replacedBySessionHash())) {
                         next.add(rec.replacedBySessionHash());
                     }
-                    deleteQuietly(file);
+                    deleteForRevocation(file);
                 }
             }
             queue = next;
@@ -251,13 +286,18 @@ public class XOAuthSessionStore {
                         String hash = fileName.substring(0, fileName.length() - FILE_SUFFIX.length());
                         synchronized (lockForHash(hash)) {
                             StoredAuthSession rec = readRecordLocked(p);
+                            if (rec != null && revokedFamilies.contains(rec.familyHash())) {
+                                revokedHashes.add(hash);
+                                deleteForRevocation(p);
+                            }
                             if (rec != null && rec.replacedBySessionHash() != null
                                     && !rec.replacedBySessionHash().isBlank()) {
                                 parentToChild.put(hash, rec.replacedBySessionHash());
                             }
                         }
                     });
-        } catch (IOException ignored) {
+        } catch (IOException ex) {
+            throw new IllegalStateException("无法完整撤销登录会话，请稍后重试", ex);
         }
 
         Set<String> ancestorHashes = new HashSet<>();
@@ -273,7 +313,7 @@ public class XOAuthSessionStore {
         }
         for (String hash : ancestorHashes) {
             synchronized (lockForHash(hash)) {
-                deleteQuietly(dir.resolve(hash + FILE_SUFFIX));
+                deleteForRevocation(dir.resolve(hash + FILE_SUFFIX));
             }
         }
     }
@@ -307,36 +347,63 @@ public class XOAuthSessionStore {
     }
 
     private StoredAuthSession readRecordLocked(Path file) {
-        if (file == null || !Files.exists(file)) {
-            return null;
-        }
+        if (file == null) return null;
+        String fileName = file.getFileName().toString();
+        String hash = fileName.endsWith(FILE_SUFFIX)
+                ? fileName.substring(0, fileName.length() - FILE_SUFFIX.length()) : fileName;
         try {
+            BasicFileAttributes attrs = Files.readAttributes(file, BasicFileAttributes.class);
+            CachedSessionRecord cached = hotSessions.get(hash);
+            if (cached != null && Objects.equals(cached.path(), file)
+                    && cached.modifiedAt().equals(attrs.lastModifiedTime()) && cached.size() == attrs.size()
+                    && Objects.equals(cached.fileKey(), attrs.fileKey())) return cached.session();
             String raw = Files.readString(file, StandardCharsets.UTF_8).trim();
-            if (raw.isEmpty()) {
-                return null;
-            }
+            if (raw.isEmpty()) return null;
             String json = cryptoHelper.decryptWithPrefix(CIPHER_PREFIX, raw);
-            return objectMapper.readValue(json, StoredAuthSession.class);
+            StoredAuthSession parsed = objectMapper.readValue(json, StoredAuthSession.class);
+            if (parsed == null || !hash.equals(parsed.sessionHash())) return null;
+            putHotSession(hash, new CachedSessionRecord(file, attrs.lastModifiedTime(), attrs.size(), attrs.fileKey(), parsed));
+            return parsed;
         } catch (Exception ex) {
+            hotSessions.remove(hash);
             return null;
         }
     }
 
     private void writeRecordLocked(Path file, StoredAuthSession record) {
+        Path tmp = null;
         try {
             Files.createDirectories(file.getParent());
             String json = objectMapper.writeValueAsString(record);
             String encrypted = cryptoHelper.encryptWithPrefix(CIPHER_PREFIX, json);
-            Path tmp = file.resolveSibling(
-                    record.sessionHash() + "." + ThreadLocalRandom.current().nextLong(1_000_000_000L) + ".tmp"
-            );
-            Files.writeString(tmp, encrypted, StandardCharsets.UTF_8);
+            tmp = Files.createTempFile(file.getParent(), record.sessionHash() + ".", ".tmp");
             XOAuthTokenStore.setOwnerOnlyPermissions(tmp);
+            Files.writeString(tmp, encrypted, StandardCharsets.UTF_8);
             XOAuthTokenStore.atomicReplace(tmp, file);
             XOAuthTokenStore.setOwnerOnlyPermissions(file);
+            hotSessions.remove(record.sessionHash());
         } catch (Exception ex) {
+            hotSessions.remove(record.sessionHash());
             throw new IllegalStateException("持久化登录会话失败：" + ex.getMessage(), ex);
+        } finally {
+            if (tmp != null) {
+                try {
+                    Files.deleteIfExists(tmp);
+                } catch (IOException ignored) {
+                }
+            }
         }
+    }
+
+    private void putHotSession(String hash, CachedSessionRecord record) {
+        if (hotSessions.size() >= MAX_HOT_SESSIONS && !hotSessions.containsKey(hash)) {
+            var it = hotSessions.keySet().iterator();
+            if (it.hasNext()) {
+                it.next();
+                it.remove();
+            }
+        }
+        hotSessions.put(hash, record);
     }
 
     private Path resolveSessionDir() {
@@ -356,15 +423,30 @@ public class XOAuthSessionStore {
     }
 
     private Object lockForHash(String hash) {
-        if (sessionLocks.size() > 2048) {
-            sessionLocks.clear();
-        }
-        return sessionLocks.computeIfAbsent(hash, k -> new Object());
+        return sessionLocks[(hash.hashCode() & 0x7fffffff) % LOCK_STRIPES];
     }
 
-    private static void deleteQuietly(Path file) {
+    private void deleteForRevocation(Path file) {
+        String fileName = file.getFileName().toString();
+        hotSessions.remove(fileName.substring(0, fileName.length() - FILE_SUFFIX.length()));
         try {
             Files.deleteIfExists(file);
+        } catch (IOException ex) {
+            throw new IllegalStateException("撤销登录会话失败，请稍后重试", ex);
+        }
+    }
+
+    private void deleteQuietly(Path file) {
+        if (file != null) {
+            String fileName = file.getFileName().toString();
+            if (fileName.endsWith(FILE_SUFFIX)) {
+                hotSessions.remove(fileName.substring(0, fileName.length() - FILE_SUFFIX.length()));
+            }
+        }
+        try {
+            if (file != null) {
+                Files.deleteIfExists(file);
+            }
         } catch (IOException ignored) {
         }
     }

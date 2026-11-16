@@ -1,11 +1,23 @@
 server:
   port: ${PORT:8080}
+  max-http-request-header-size: 16KB
   compression:
     enabled: true
+    min-response-size: 2048
     mime-types: application/json,text/html,text/css,application/javascript,image/svg+xml
+  tomcat:
+    threads:
+      max: ${X_TOMCAT_MAX_THREADS:300}
+      min-spare: ${X_TOMCAT_MIN_SPARE_THREADS:16}
+    max-connections: ${X_TOMCAT_MAX_CONNECTIONS:2048}
+    accept-count: ${X_TOMCAT_ACCEPT_COUNT:256}
+    connection-timeout: 15s
+    max-http-form-post-size: 2MB
+    max-swallow-size: 2MB
   servlet:
     session:
-      timeout: ${X_SESSION_TIMEOUT:400d}
+      tracking-modes: cookie
+      timeout: ${X_SESSION_TIMEOUT:1h}
       persistent: true
       store-dir: ${X_SESSION_STORE_DIR:./.sessions}
       cookie:
@@ -37,6 +49,10 @@ xops:
   twitterapi-io-key: "${X_TWITTERAPI_IO_KEY:}"
   twitterapi-io-base-url: ${X_TWITTERAPI_IO_BASE_URL:https://api.twitterapi.io}
 
+  # 公开资料、时间窗搜索与推文指标优先使用免 Key 的 FxTwitter；不支持或失败时沿用付费接口与预算限制
+  fxtwitter-enabled: ${X_FXTWITTER_ENABLED:true}
+  fxtwitter-base-url: ${X_FXTWITTER_BASE_URL:https://api.fxtwitter.com/2}
+
   # X OAuth 2.0 (PKCE) 登录授权配置（在 developer.x.com 创建应用，Callback URI 填 http://域名/api/auth/x/callback）
   oauth-client-id: "${X_OAUTH_CLIENT_ID:}"
   oauth-client-secret: "${X_OAUTH_CLIENT_SECRET:}"
@@ -52,12 +68,31 @@ xops:
   max-following-pages: ${X_MAX_FOLLOWING_PAGES:4}
   max-follower-pages: ${X_MAX_FOLLOWER_PAGES:5}
 
-  # 共用外部 API 线程池（首次拉取双倍并发加速，低峰期多路并发提速，高峰期有界队列 + 排队超时快速保护）
-  api-pool-core-size: ${X_API_POOL_CORE_SIZE:16}
-  api-pool-max-size: ${X_API_POOL_MAX_SIZE:28}
-  api-pool-queue-capacity: ${X_API_POOL_QUEUE_CAPACITY:128}
-  api-queue-timeout-ms: ${X_API_QUEUE_TIMEOUT_MS:4500}
+  # 共用外部 API 线程池（有界队列与取消；真实吞吐取决于上游延迟和服务器资源）
+  api-pool-core-size: ${X_API_POOL_CORE_SIZE:20}
+  api-pool-max-size: ${X_API_POOL_MAX_SIZE:36}
+  api-pool-queue-capacity: ${X_API_POOL_QUEUE_CAPACITY:320}
+  api-queue-timeout-ms: ${X_API_QUEUE_TIMEOUT_MS:12000}
   api-max-parallel-slices: ${X_API_MAX_PARALLEL_SLICES:4}
+
+  # 50 活跃用户席位 + 超员平滑排队；队列满/等待超时返回可重试 503，恶意请求直接拦截
+  max-concurrent-users: ${X_MAX_CONCURRENT_USERS:50}
+  max-throttle-queue-size: ${X_MAX_THROTTLE_QUEUE_SIZE:150}
+  max-throttle-wait-ms: ${X_MAX_THROTTLE_WAIT_MS:15000}
+  active-user-window-seconds: ${X_ACTIVE_USER_WINDOW_SECONDS:30}
+  over-capacity-base-delay-ms: ${X_OVER_CAPACITY_BASE_DELAY_MS:100}
+  over-capacity-max-delay-ms: ${X_OVER_CAPACITY_MAX_DELAY_MS:1200}
+  ip-api-flood-limit-per-minute: ${X_IP_API_FLOOD_LIMIT_PER_MINUTE:6000}
+  ip-auth-limit-per-minute: ${X_IP_AUTH_LIMIT_PER_MINUTE:150}
+  hourly-upstream-api-budget: ${X_HOURLY_UPSTREAM_API_BUDGET:6000}
+  daily-upstream-api-budget: ${X_DAILY_UPSTREAM_API_BUDGET:30000}
+  # 本地保护默认值（USD预留额，不是账单或付费授权）；部署前按实际预算调整，并设置供应商消费上限。
+  # 0 表示停止外部调用，不表示无限额度。OAuth/媒体未公开单价按显式保守预留值计算。
+  hourly-upstream-usd-budget: ${X_HOURLY_UPSTREAM_USD_BUDGET:10.00}
+  daily-upstream-usd-budget: ${X_DAILY_UPSTREAM_USD_BUDGET:30.00}
+  monthly-upstream-usd-budget: ${X_MONTHLY_UPSTREAM_USD_BUDGET:100.00}
+  unpriced-upstream-request-reserve-usd: ${X_UNPRICED_UPSTREAM_REQUEST_RESERVE_USD:0.20}
+  daily-tweet-publish-limit-per-user: ${X_DAILY_TWEET_PUBLISH_LIMIT_PER_USER:24}
 
   # 服务端内存缓存时长：300 秒（5 分钟防重复查库/请求上游；30 天滚动数据落盘持久化）
   cache-ttl-seconds: ${X_CACHE_TTL_SECONDS:300}

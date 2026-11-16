@@ -242,8 +242,8 @@ class DailyMetricRefreshTest {
         var defaultPool = new com.xops.hub.provider.SharedApiExecutor(defaultProps);
         try {
             var poolMetrics = defaultPool.snapshotMetrics();
-            assertThat(poolMetrics.get("corePoolSize")).isEqualTo(16);
-            assertThat(poolMetrics.get("maxPoolSize")).isEqualTo(28);
+            assertThat(poolMetrics.get("corePoolSize")).isEqualTo(20);
+            assertThat(poolMetrics.get("maxPoolSize")).isEqualTo(36);
             assertThat(poolMetrics.get("maxParallelSlices")).isEqualTo(4);
             assertThat(poolMetrics.get("initialMaxParallelSlices")).isEqualTo(8);
 

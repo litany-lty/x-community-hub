@@ -613,7 +613,7 @@ async function main() {
         assert.equal(interCheck.searchCleared, true);
 
         // ==================== JOURNEY 5: Tab 3 (Follow Audit) ====================
-        console.log("6. Auditing Tab 3 (Follow Audit) Tabs, Whitelist Toggle, CSV Export...");
+        console.log("6. Auditing Tab 3 (Follow Audit) Tabs, Whitelist Toggle, Sorting...");
         const followCheck = await page.eval(`
             function $(id) { return document.getElementById(id); }
             document.querySelector('.nav-item[data-tab="follow-audit"]').click();
@@ -629,19 +629,26 @@ async function main() {
                 const wlBtn2 = document.querySelector("#followAuditList [data-wl-toggle]");
                 if (wlBtn2) wlBtn2.click();
             }
-            $("exportFollowCsvBtn").click();
-            const exportToast = $("copyToast").textContent;
+            const sortSelect = $("followSortSelect");
+            const sortOptions = [...sortSelect.options].map(option => option.value);
+            const sortRows = sortOptions.map(value => {
+                sortSelect.value = value;
+                sortSelect.dispatchEvent(new Event("change", { bubbles: true }));
+                return document.querySelectorAll("#followAuditList .x-user-row").length;
+            });
             // Switch through FAN_ONLY and MUTUAL tabs
             const segTabs = document.querySelectorAll("#followStateTabs .seg-tab");
             segTabs[1].click();
             const pillsHiddenOnFan = $("unfollowCategoryPills").hidden;
             segTabs[2].click();
             segTabs[0].click();
-            return { wlToggled, exportToast, pillsHiddenOnFan };
+            return { wlToggled, sortOptions, sortRows, sortAfterTabs: sortSelect.value, pillsHiddenOnFan };
         `);
         assert.equal(followCheck.wlToggled, true);
         assert.equal(followCheck.pillsHiddenOnFan, true);
-        assert.match(followCheck.exportToast, /导出/);
+        assert.deepEqual(followCheck.sortOptions, ["recent", "intimacy", "followers"]);
+        assert.ok(followCheck.sortRows.every(count => count > 0));
+        assert.equal(followCheck.sortAfterTabs, "followers");
 
         // ==================== JOURNEY 6: Tab 4 (Timing, Heatmap, Ops Buttons, Simulator, Algo Config) ====================
         console.log("7. Auditing Tab 4 (Timing, Heatmap Readout, Ops Playbook Actions, Simulator, Algo Config)...");

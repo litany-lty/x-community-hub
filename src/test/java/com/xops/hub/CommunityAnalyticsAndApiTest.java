@@ -307,7 +307,7 @@ class CommunityAnalyticsAndApiTest {
         assertThat(rapidExtCard.hasExternalLink()).isTrue();
         assertThat(rapidExtCard.rapidFirePenalty()).isTrue();
         assertThat(viralCard.algoScore()).isGreaterThan(rapidExtCard.algoScore() + 35);
-        assertThat(rapidExtCard.algoSignals()).anyMatch(s -> s.contains("25分（本地分-12）"));
+        assertThat(rapidExtCard.algoSignals()).anyMatch(s -> s.contains("距上条仅 25 分钟"));
         assertThat(rapidExtCard.algoSignals()).noneMatch(signal -> signal.contains("正文含外链（本地分"));
     }
 

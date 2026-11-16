@@ -1,5 +1,6 @@
 package com.xops.hub.controller;
 
+import com.xops.hub.config.RequestSecuritySupport;
 import com.xops.hub.config.XOpsProperties;
 import com.xops.hub.model.AnalyticsReportModels.AuthenticatedXUser;
 import com.xops.hub.model.XAlgorithmProfile;
@@ -94,15 +95,9 @@ public class XAlgorithmController {
             }
         }
         if (!properties.isRequireLoginSelfOnly() && request != null) {
-            return isLoopbackAddress(request.getRemoteAddr());
+            return RequestSecuritySupport.isLoopbackAddress(request.getRemoteAddr());
         }
         return false;
-    }
-
-    private static boolean isLoopbackAddress(String ip) {
-        return "127.0.0.1".equals(ip)
-                || "::1".equals(ip)
-                || "0:0:0:0:0:0:0:1".equals(ip);
     }
 
     private static AlgorithmProfileResponse toResponse(XAlgorithmProfileRegistry.ProfileState state, boolean canManage) {

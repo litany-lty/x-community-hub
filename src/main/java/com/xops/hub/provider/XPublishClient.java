@@ -53,17 +53,28 @@ public class XPublishClient {
     private final XOpsProperties properties;
     private final ObjectMapper objectMapper;
     private final SharedApiExecutor sharedExecutor;
+    private final UpstreamBudgetGuard budgetGuard;
     private final HttpClient httpClient;
 
     public XPublishClient(XOpsProperties properties, ObjectMapper objectMapper) {
-        this(properties, objectMapper, new SharedApiExecutor(properties));
+        this(properties, objectMapper, new SharedApiExecutor(properties), new UpstreamBudgetGuard(properties));
+    }
+
+    public XPublishClient(XOpsProperties properties, ObjectMapper objectMapper, SharedApiExecutor sharedExecutor) {
+        this(properties, objectMapper, sharedExecutor, new UpstreamBudgetGuard(properties));
     }
 
     @Autowired
-    public XPublishClient(XOpsProperties properties, ObjectMapper objectMapper, SharedApiExecutor sharedExecutor) {
+    public XPublishClient(
+            XOpsProperties properties,
+            ObjectMapper objectMapper,
+            SharedApiExecutor sharedExecutor,
+            @Autowired(required = false) UpstreamBudgetGuard budgetGuard
+    ) {
         this.properties = properties;
         this.objectMapper = objectMapper;
         this.sharedExecutor = sharedExecutor;
+        this.budgetGuard = budgetGuard != null ? budgetGuard : new UpstreamBudgetGuard(properties);
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(10))
                 .build();
@@ -118,6 +129,11 @@ public class XPublishClient {
                 .build();
 
         HttpResponse<String> resp = sharedExecutor.execute(() -> {
+            try {
+                budgetGuard.acquirePermit(req.uri(), "x_tweet_create");
+            } catch (XDataProviderException ex) {
+                throw new XPublishException(ex.getStatusCode(), ex.getMessage(), ex, false);
+            }
             try {
                 return httpClient.send(req, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
             } catch (HttpTimeoutException ex) {
@@ -285,6 +301,11 @@ public class XPublishClient {
 
     private HttpResponse<String> sendMediaRequest(HttpRequest req, String actionLabel) {
         return sharedExecutor.execute(() -> {
+            try {
+                budgetGuard.acquirePermit(req.uri(), "x_media_upload");
+            } catch (XDataProviderException ex) {
+                throw new XPublishException(ex.getStatusCode(), ex.getMessage(), ex, false);
+            }
             try {
                 return httpClient.send(req, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
             } catch (IOException ex) {

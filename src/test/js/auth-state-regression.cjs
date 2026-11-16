@@ -9,6 +9,7 @@ function section(start, end) {
     assert.ok(a >= 0 && b > a, `Cannot locate production section: ${start}`);
     return source.slice(a, b);
 }
+const requestCode = section('    async function requestJsonWithin(', '    function syncAuthConnectionUI(');
 const resetCode = section('    function cancelReportRequest()', '    // 已精简移除的元素');
 const identityCode = section('    function stableUserId(', '    function getSelfStorageKey(');
 const profileCacheCode = section('    function getProfileHeaderCacheKey(', '    function saveProfileHeaderCache(')
@@ -22,21 +23,24 @@ const dailyStatusCode = section('    function renderDailyCacheStatus(', '    fun
 const noop = () => {};
 function context() {
     const state = {authStatus: {loggedIn: true, user: {id: '1001', username: 'alice'}}, period: 'HOURS_48', days: 2,
-        report: null, bundle: null, reportRequestGeneration: 0, authStatusGeneration: 0};
+        report: null, bundle: null, userScopeGeneration: 0, reportRequestGeneration: 0, authStatusGeneration: 0};
     const element = {classList: {remove: noop}, hidden: false};
     const removedStorageKeys = [];
     const ctx = {state, LIST_PAGE_SIZE: 50, PERIOD_META: {HOURS_48: {badgePrefix: '48h'}}, Date, Number,
         Boolean, Set, AbortController, Intl,
         removedStorageKeys, localStorage: {removeItem: key => removedStorageKeys.push(key)},
+        document: {querySelectorAll: () => [], getElementById: () => null},
         $: () => element, setTimeout: () => 1, clearTimeout: noop, setInterval: () => 1, clearInterval: noop,
         isLoggedIn: () => Boolean(state.authStatus?.loggedIn), syncAuthGateAndWorkspaceUI: noop,
         updateRefreshButtonState: noop, hideError: noop, showLoadingSkeleton: noop,
         showError: msg => {ctx.error = msg;}, closeAuthorPromptModal: noop,
+        cancelScheduleDraftPersistence: noop, clearPersistedScheduleDraft: async () => {},
+        closeUnlockGuideModal: noop, closeConfirmResendModal: noop,
         safeParseJson: async r => r.body, fmtMonthDay: () => '', startCacheCooldownTicker: noop,
         applyLoadedPeriodReport: r => {state.report = r;}, fetchServerAndAuthStatus: async () => {},
         showToast: msg => {ctx.toast = msg;}};
     vm.createContext(ctx);
-    vm.runInContext(identityCode + profileCacheCode + resetCode + loadCode + logoutCode + timingCode + dailyStatusCode, ctx);
+    vm.runInContext(identityCode + profileCacheCode + resetCode + loadCode + requestCode + logoutCode + timingCode + dailyStatusCode, ctx);
     return ctx;
 }
 function response(username = 'alice', id = '1001') {
@@ -91,22 +95,24 @@ function response(username = 'alice', id = '1001') {
     const failed = context();
     failed.fetch = async () => ({status: 500, ok: false});
     await failed.doLogout();
-    assert.equal(failed.toast, undefined);
+    assert.equal(failed.error, undefined, 'logout failures stay visible in the current viewport');
     assert.equal(failed.state.authStatus.loggedIn, true);
-    assert.match(failed.error, /HTTP 500/);
+    assert.match(failed.toast, /HTTP 500/);
     assert.deepEqual(failed.removedStorageKeys, [], 'failed logout must not remove the profile cache');
 
     const stillLoggedIn = context();
     stillLoggedIn.fetch = async () => ({status: 200, ok: true});
     await stillLoggedIn.doLogout();
-    assert.equal(stillLoggedIn.toast, undefined);
-    assert.match(stillLoggedIn.error, /仍保持登录/);
+    assert.equal(stillLoggedIn.error, undefined);
+    assert.match(stillLoggedIn.toast, /退出尚未生效/);
+    assert.equal(stillLoggedIn.state.authStatus.loggedIn, true);
 
     const network = context();
     network.fetch = async () => {throw new Error('offline');};
     await network.doLogout();
-    assert.equal(network.toast, undefined);
-    assert.match(network.error, /offline/);
+    assert.equal(network.error, undefined);
+    assert.match(network.toast, /offline/);
+    assert.equal(network.state.authStatus.loggedIn, true);
 
     const success = context();
     success.fetch = async () => ({status: 200, ok: true});

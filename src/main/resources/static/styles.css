@@ -10,7 +10,7 @@
     --bg-input: #202327;
     --border-color: #2f3336;
     --text-primary: #e7e9ea;
-    --text-secondary: #71767b;
+    --text-secondary: #8b9198;
     --cta-bg: #eff3f4;
     --cta-text: #0f1419;
     --cta-hover: #d7dbdc;
@@ -99,7 +99,8 @@ button:focus-visible,
 a:focus-visible,
 input:focus-visible,
 select:focus-visible,
-textarea:focus-visible {
+textarea:focus-visible,
+summary:focus-visible {
     outline: 2px solid var(--x-blue);
     outline-offset: 2px;
 }
@@ -312,6 +313,12 @@ a {
 
 .rail-account-meta {
     min-width: 0;
+    flex: 1;
+}
+
+.rail-account-pill .mini-logout-btn {
+    flex: 0 0 auto;
+    white-space: nowrap;
 }
 
 .rail-account-name {
@@ -688,6 +695,11 @@ a {
     border: 1px solid var(--border-color);
 }
 
+.notice-strip:empty,
+.section-desc:empty {
+    display: none;
+}
+
 /* ==================== 模块标签页显隐 ==================== */
 .tab-panel {
     display: none;
@@ -737,7 +749,7 @@ a {
 }
 
 .x-section-card {
-    padding: 16px;
+    padding: 14px 16px;
     border-bottom: 1px solid var(--border-color);
 }
 
@@ -750,7 +762,7 @@ a {
     justify-content: space-between;
     align-items: flex-start;
     gap: 12px;
-    margin-bottom: 14px;
+    margin-bottom: 12px;
 }
 
 .section-head.wrap-gap {
@@ -1070,6 +1082,8 @@ a {
 }
 
 .golden-card {
+    min-width: 0;
+    overflow-wrap: anywhere;
     background: var(--bg-elevated);
     border: 1px solid var(--border-color);
     border-radius: 14px;
@@ -1152,18 +1166,19 @@ a {
 }
 
 .format-card {
+    min-width: 0;
+    overflow-wrap: anywhere;
     background: var(--bg-elevated);
     border: 1px solid var(--border-color);
     border-radius: 14px;
-    padding: 13px;
+    padding: 10px 12px;
     display: flex;
     flex-direction: column;
     gap: 2px;
 }
 
 .format-card.is-winning-format {
-    border-color: rgba(0, 186, 124, 0.45);
-    box-shadow: inset 0 1px 0 rgba(0, 186, 124, 0.22);
+    border-color: var(--x-blue);
 }
 
 .format-head-row {
@@ -2111,15 +2126,6 @@ a {
     color: var(--text-primary);
 }
 
-.algo-cal-extra-line a {
-    color: var(--x-blue);
-    text-decoration: none;
-}
-
-.algo-cal-extra-line a:hover {
-    text-decoration: underline;
-}
-
 .draft-nn-block {
     margin-top: 10px;
     padding-top: 10px;
@@ -2490,6 +2496,7 @@ a {
     font-size: 12px;
     color: var(--text-secondary);
     line-height: 1.45;
+    overflow-wrap: anywhere;
 }
 
 .algo-ops-badge {
@@ -2549,15 +2556,19 @@ a {
     .kpi-grid-4 {
         grid-template-columns: repeat(2, minmax(0, 1fr));
     }
-    .golden-slots-grid,
+    .golden-slots-grid {
+        grid-template-columns: repeat(auto-fit, minmax(min(100%, 10rem), 1fr));
+    }
     .format-cards-grid,
     .circle-cards-grid {
         grid-template-columns: minmax(0, 1fr);
     }
-    .section-head.wrap-gap > div:first-child {
+    #panel-interactions .section-head.wrap-gap > div:first-child,
+    #panel-follow-audit .section-head.wrap-gap > div:first-child {
         width: 100%;
     }
-    .toolbar-right {
+    #panel-interactions .toolbar-right,
+    #panel-follow-audit .toolbar-right {
         width: 100%;
         flex-wrap: wrap;
     }
@@ -2637,7 +2648,9 @@ a {
     .kpi-grid-4 {
         grid-template-columns: repeat(2, minmax(0, 1fr));
     }
-    .golden-slots-grid,
+    .golden-slots-grid {
+        grid-template-columns: repeat(auto-fit, minmax(min(100%, 10rem), 1fr));
+    }
     .format-cards-grid,
     .circle-cards-grid {
         grid-template-columns: minmax(0, 1fr);
@@ -2687,7 +2700,7 @@ a {
 }
 
 .section-title {
-    font-size: 20px;
+    font-size: 18px;
     letter-spacing: -0.01em;
 }
 
@@ -2701,7 +2714,7 @@ a {
 }
 
 .kpi-value {
-    font-size: 26px;
+    font-size: 24px;
 }
 
 /* X 风格筛选胶囊：选中态实心反色 */
@@ -2732,7 +2745,7 @@ a {
 }
 
 .side-widget .widget-title {
-    font-size: 20px;
+    font-size: 18px;
     font-weight: 800;
 }
 
@@ -3187,7 +3200,9 @@ kbd {
     }
     .bottom-tab {
         position: relative;
-        flex: 1;
+        flex: 1 1 0%;
+        min-width: 0;
+        overflow-wrap: anywhere;
         min-height: 50px;
         display: flex;
         flex-direction: column;
@@ -3216,7 +3231,7 @@ kbd {
         fill: var(--x-blue);
     }
     .bottom-tab.active::before {
-        content: "";
+        content: none;
         position: absolute;
         top: -2px;
         left: 50%;
@@ -3226,8 +3241,8 @@ kbd {
         border-radius: 999px;
         background: var(--x-blue);
     }
-    .bottom-tab:active svg {
-        transform: scale(0.92);
+    .bottom-tab:active {
+        background: var(--bg-hover);
     }
     .bottom-badge {
         position: absolute;
@@ -3315,6 +3330,30 @@ body.is-guest .auth-gate-wrap {
 
 .auth-gate-head .auth-gate-logo {
     margin-bottom: 0;
+}
+
+.auth-gate-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+}
+
+.language-select {
+    flex: 0 0 auto;
+    max-width: 8em;
+    min-height: 36px;
+    color: var(--x-blue);
+}
+
+.language-select:focus-visible {
+    outline: 2px solid var(--x-blue);
+    outline-offset: 2px;
+}
+
+.language-select option {
+    color: var(--text-primary);
+    background: var(--bg-input);
 }
 
 .gate-theme-btn {
@@ -3502,7 +3541,6 @@ label,
 .mini-mark-btn:active,
 .utility-btn:active,
 .icon-circle-btn:active,
-.unlock-info-btn:active,
 .refresh-status-btn:active,
 .action-item:active {
     transform: scale(0.97);
@@ -3786,16 +3824,19 @@ label,
 
 /* ==================== 模块 6：图文定时发布工作台与二次确认弹窗 ==================== */
 .overdue-banner {
-    margin: 10px 16px 0;
+    margin: 0;
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 10px;
     flex-wrap: wrap;
-    border-color: var(--x-amber);
-    background: var(--x-amber-soft);
+    border: 0;
+    border-bottom: 1px solid var(--border-color);
+    border-left: 3px solid var(--x-amber);
+    border-radius: 0;
+    background: var(--bg-card-subtle);
     color: var(--text-primary);
-    font-weight: 600;
+    font-weight: 500;
 }
 
 .schedule-reauth-card {
@@ -3821,6 +3862,7 @@ label,
 
 .schedule-textarea {
     width: 100%;
+    height: calc(4.5em + 24px);
     min-height: 92px;
     max-height: 260px;
     resize: vertical;
@@ -3931,13 +3973,17 @@ label,
 
 .schedule-queue-head {
     align-items: center;
+    flex-wrap: wrap;
 }
 
 .schedule-queue-actions {
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    flex-shrink: 0;
+    flex-wrap: wrap;
+    margin-left: auto;
+    min-width: 0;
+    max-width: 100%;
 }
 
 .schedule-draft-remove-btn {
@@ -4073,6 +4119,24 @@ label,
     margin-top: 10px;
 }
 
+/* Published and queued times sit beside the existing scheduling presets. */
+.schedule-timing-context {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 18px;
+    margin-top: 10px;
+    color: var(--text-secondary);
+    font-size: 12.5px;
+    font-variant-numeric: tabular-nums;
+}
+.schedule-timing-context:empty {
+    display: none;
+}
+.schedule-timing-context time {
+    color: var(--text-primary);
+    white-space: nowrap;
+}
+
 .schedule-footnote {
     margin: 10px 0 0;
     font-size: 12px;
@@ -4082,6 +4146,7 @@ label,
 .schedule-job-list {
     display: flex;
     flex-direction: column;
+    margin: 0 -16px;
 }
 
 .schedule-job-card {
@@ -4166,6 +4231,53 @@ label,
     border: 1px solid var(--border-color);
 }
 
+.inline-feedback {
+    margin: 8px 0;
+    color: var(--text-secondary);
+    font-size: 13px;
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+}
+.inline-feedback.is-error,
+.confirm-resend-reason.is-error {
+    color: var(--x-danger);
+}
+[data-theme="light"] .inline-feedback.is-error,
+[data-theme="light"] .confirm-resend-reason.is-error {
+    color: #c8102e;
+}
+#scheduleQueueFeedback {
+    margin: 8px 0;
+}
+.schedule-textarea[aria-invalid="true"],
+.schedule-time-input[aria-invalid="true"] {
+    border-color: var(--x-danger);
+}
+.schedule-draft-item,
+.schedule-reschedule-box,
+.inline-feedback {
+    scroll-margin-block: 100px;
+}
+.schedule-job-actions [data-job-action="delete"] {
+    margin-left: auto;
+    color: var(--x-danger);
+}
+
+.schedule-reschedule-error {
+    flex: 1 0 100%;
+    margin: 0;
+    color: var(--x-danger);
+    font-size: 13px;
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+}
+.schedule-reschedule-box input[aria-invalid="true"] {
+    border-color: var(--x-danger);
+}
+[data-theme="light"] .schedule-reschedule-error {
+    color: #c8102e;
+}
+
 .mini-tag.danger {
     background: rgba(244, 33, 46, 0.14);
     color: var(--x-danger);
@@ -4246,7 +4358,7 @@ label,
     margin-top: 4px;
 }
 
-/* ==================== 每日累计解锁引导、作者开源声明与顶部 5 维度 ==================== */
+/* ==================== 每日累计解锁引导、作者开源声明与顶部时间范围 ==================== */
 .author-note-msg {
     white-space: pre-line;
 }
@@ -4260,6 +4372,7 @@ label,
 }
 
 .window-seg-wrap .window-seg {
+    min-width: 0;
     overflow-x: auto;
     scrollbar-width: none;
     max-width: 100%;
@@ -4278,25 +4391,6 @@ label,
 .seg-btn.is-locked:hover {
     opacity: 1;
     color: var(--text-primary);
-}
-
-.unlock-info-btn {
-    flex-shrink: 0;
-    border: 1px solid var(--x-blue);
-    background: var(--x-blue-soft);
-    color: var(--x-blue);
-    border-radius: 999px;
-    padding: 5px 10px;
-    font-size: 12px;
-    font-weight: 700;
-    line-height: 1.2;
-    cursor: pointer;
-    white-space: nowrap;
-    transition: background 0.15s, transform 0.1s;
-}
-
-.unlock-info-btn:hover {
-    background: rgba(29, 155, 240, 0.22);
 }
 
 .topbar-sub-links {
@@ -4480,23 +4574,32 @@ body.modal-open {
         padding: max(8px, env(safe-area-inset-top)) 12px 6px;
     }
     .self-topbar-row {
-        flex-wrap: nowrap;
+        flex-wrap: wrap;
         justify-content: space-between;
         gap: 6px;
         min-width: 0;
     }
+    .window-seg-wrap {
+        flex: 1 1 174px;
+        min-width: 0;
+    }
     .seg-btn {
         min-height: 34px;
-        min-width: 44px;
+        min-width: 42px;
         display: inline-flex;
         align-items: center;
         justify-content: center;
-        padding: 5px 10px;
-        font-size: 12.5px;
+        padding: 5px 8px;
+        font-size: 12px;
     }
     .topbar-actions {
         gap: 5px;
         min-width: 0;
+        max-width: 100%;
+        margin-left: auto;
+        flex-shrink: 1;
+        flex-wrap: wrap;
+        justify-content: flex-end;
     }
     .refresh-status-btn {
         min-height: 34px;
@@ -4515,8 +4618,10 @@ body.modal-open {
         min-height: 34px;
         padding: 4px 10px;
         font-size: 12px;
-        max-width: none;
-        flex-shrink: 0;
+        max-width: min(12rem, 100%);
+        white-space: normal;
+        overflow-wrap: anywhere;
+        flex-shrink: 1;
     }
     .topbar-theme-only {
         display: inline-flex;
@@ -4557,15 +4662,11 @@ body.modal-open {
         flex-wrap: nowrap;
         gap: 5px;
     }
-    #storedReportLink,
     #openAuthorStoryBtn {
         min-height: 26px;
         display: inline-flex;
         align-items: center;
         white-space: nowrap;
-    }
-    #storedReportLink {
-        padding: 3px 2px;
     }
     #openAuthorStoryBtn {
         padding: 2px 9px;
@@ -4618,7 +4719,8 @@ body.modal-open {
     }
     .profile-cta-group {
         gap: 6px;
-        flex-wrap: nowrap;
+        flex-wrap: wrap;
+        min-width: 0;
         margin-left: auto;
     }
     .health-score-chip {
@@ -4648,13 +4750,26 @@ body.modal-open {
         overflow-wrap: anywhere;
     }
     .persona-pill {
-        white-space: nowrap;
-        flex-shrink: 0;
+        white-space: normal;
+        max-width: 100%;
+        overflow-wrap: anywhere;
+        flex-shrink: 1;
         font-size: 11.5px;
         padding: 2px 8px;
     }
+    .x-section-card {
+        padding: 12px 14px;
+    }
+    .x-section-card.no-bottom-pad {
+        padding-bottom: 0;
+    }
+    .x-user-list,
+    .tweet-feed-list,
+    .schedule-job-list {
+        margin: 0 -14px;
+    }
     .section-head {
-        margin-bottom: 10px;
+        margin-bottom: 8px;
         gap: 8px;
     }
     .section-title {
@@ -4772,7 +4887,7 @@ body.modal-open {
     .x-outline-pill.sm,
     .x-blue-pill.sm,
     .pill-chip {
-        min-height: 36px;
+        min-height: 44px;
         display: inline-flex;
         align-items: center;
         justify-content: center;
@@ -4780,8 +4895,11 @@ body.modal-open {
 
     /* 4. 分段栏与搜索工具栏撑满宽度，输入框 16px 防止移动端聚焦自动缩放 */
     .section-head.wrap-gap > div:first-child {
-        width: 100%;
         min-width: 0;
+    }
+    #panel-interactions .section-head.wrap-gap > div:first-child,
+    #panel-follow-audit .section-head.wrap-gap > div:first-child {
+        width: 100%;
     }
     #followStateTabs {
         display: flex;
@@ -4797,16 +4915,11 @@ body.modal-open {
         align-items: center;
         justify-content: center;
         text-align: center;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        padding: 6px 6px;
+        white-space: normal;
+        overflow-wrap: anywhere;
+        padding: 6px;
         font-size: 12.5px;
-    }
-    .toolbar-right #exportFollowCsvBtn {
-        min-height: 38px;
-        flex-shrink: 0;
-        padding: 6px 12px;
+        line-height: 1.3;
     }
     #relationshipContinueControls {
         margin: 0 0 10px;
@@ -4817,9 +4930,16 @@ body.modal-open {
         padding: 8px 12px;
     }
     .toolbar-right {
+        flex-wrap: wrap;
+        gap: 6px;
+    }
+    #panel-interactions .toolbar-right,
+    #panel-follow-audit .toolbar-right {
         width: 100%;
         flex-wrap: nowrap;
-        gap: 6px;
+    }
+    #scheduleComposeCard .toolbar-right {
+        margin-left: auto;
     }
     .toolbar-right .x-mini-input {
         flex: 1 1 0%;
@@ -4829,7 +4949,7 @@ body.modal-open {
     }
     .toolbar-right .x-select {
         flex: 0 0 auto;
-        max-width: 124px;
+        max-width: 48%;
         min-height: 38px;
         padding: 6px 26px 6px 10px;
     }
@@ -4845,8 +4965,8 @@ body.modal-open {
     }
     .schedule-draft-remove-btn,
     .schedule-media-remove {
-        width: 34px;
-        height: 34px;
+        width: 44px;
+        height: 44px;
     }
     .schedule-media-grid {
         grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -4896,7 +5016,9 @@ body.modal-open {
     }
     #createScheduleBtn {
         width: 100%;
-        min-height: 42px;
+        min-height: 44px;
+        white-space: normal;
+        overflow-wrap: anywhere;
         font-size: 14.5px;
         font-weight: 800;
     }
@@ -4991,9 +5113,7 @@ body.modal-open {
         font-size: 22px;
     }
     .kpi-sub {
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
+        overflow-wrap: anywhere;
     }
     .daily-chart-box {
         gap: 2px;
@@ -5032,10 +5152,10 @@ body.modal-open {
     }
     .golden-slots-grid {
         gap: 8px;
-        margin-bottom: 12px;
+        margin-bottom: 10px;
     }
     .golden-card {
-        padding: 10px 12px;
+        padding: 8px 10px;
     }
     .golden-time {
         font-size: 14.5px;
@@ -5069,7 +5189,7 @@ body.modal-open {
     }
     #topPostSortSelect {
         min-height: 36px;
-        max-width: 124px;
+        max-width: min(55%, 12rem);
         padding: 5px 26px 5px 10px;
     }
     .x-tweet-card .tweet-top-meta {
@@ -5237,12 +5357,13 @@ body.modal-open {
     }
     .schedule-reschedule-box input[type="datetime-local"] {
         width: 100%;
-        min-height: 40px;
+        min-height: 44px;
         border-radius: 10px;
+        font-size: 16px;
     }
     .schedule-reschedule-box button {
         flex: 1 1 0%;
-        min-height: 38px;
+        min-height: 44px;
     }
     .bottom-toast {
         bottom: calc(64px + env(safe-area-inset-bottom));
@@ -5254,35 +5375,6 @@ body.modal-open {
         text-align: center;
         line-height: 1.4;
         overflow-wrap: anywhere;
-    }
-}
-
-@media (max-width: 720px) {
-    .self-topbar-row {
-        flex-wrap: nowrap;
-        gap: 6px;
-    }
-    .window-seg-wrap {
-        flex: 1 1 auto;
-        min-width: 0;
-    }
-    .topbar-actions {
-        margin-left: auto;
-        flex-shrink: 0;
-    }
-    .seg-btn {
-        min-height: 34px;
-        min-width: 42px;
-        padding: 5px 8px;
-        font-size: 12px;
-    }
-    .unlock-info-btn {
-        min-height: 34px;
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        padding: 4px 9px;
-        font-size: 11.5px;
     }
 }
 
@@ -5350,13 +5442,14 @@ body.modal-open {
         font-size: 11.5px;
     }
     .x-section-card {
-        padding: 14px 12px;
+        padding: 12px;
     }
     .x-section-card.no-bottom-pad {
         padding-bottom: 0;
     }
     .x-user-list,
-    .tweet-feed-list {
+    .tweet-feed-list,
+    .schedule-job-list {
         margin: 0 -12px;
     }
     .peer-item .x-user-row.peer-row,
@@ -5529,4 +5622,219 @@ body.modal-open {
     .golden-sched-hint {
         opacity: 0.92;
     }
+}
+
+
+/* Shared workspace controls: one settings entry, quiet metadata and X-style dividers. */
+.sticky-topbar .self-topbar-row {
+    flex-wrap: nowrap;
+    gap: 8px;
+}
+
+.sticky-topbar .window-seg-wrap {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+.sticky-topbar .window-seg {
+    background: transparent;
+    border-radius: 0;
+    padding: 0;
+    gap: 2px;
+    overflow: visible;
+}
+
+.sticky-topbar .seg-btn {
+    position: relative;
+    min-height: 42px;
+    min-width: 0;
+    padding: 0 12px;
+    border-radius: 0;
+    font-size: 13px;
+    background: transparent;
+    color: var(--text-secondary);
+    opacity: 1;
+    letter-spacing: normal;
+}
+
+.sticky-topbar .seg-btn:hover { background: var(--bg-hover); }
+.sticky-topbar .seg-btn.active { color: var(--text-primary); }
+.sticky-topbar .seg-btn.active::after {
+    content: "";
+    position: absolute;
+    bottom: 0;
+    left: 12px;
+    right: 12px;
+    height: 3px;
+    border-radius: 999px;
+    background: var(--x-blue);
+}
+
+.sticky-topbar .topbar-actions {
+    flex: 0 0 auto;
+    flex-wrap: nowrap;
+    gap: 4px;
+}
+
+.sticky-topbar .refresh-status-btn {
+    min-height: 40px;
+    max-width: none;
+    padding: 6px 12px;
+    border: 0;
+    border-radius: 999px;
+    font-size: 13px;
+    white-space: nowrap;
+    flex-shrink: 0;
+}
+
+.sticky-topbar .topbar-meta-row { margin-top: 4px; }
+.sticky-topbar #topbarWindowHint { font-size: 12px; line-height: 18px; }
+.workspace-settings { position: relative; flex: 0 0 auto; }
+.workspace-settings > summary {
+    width: 42px;
+    height: 42px;
+    border: 0;
+    list-style: none;
+    color: var(--text-secondary);
+}
+.workspace-settings > summary::-webkit-details-marker,
+.sync-status > summary::-webkit-details-marker { display: none; }
+.workspace-settings > summary .sm-icon {
+    width: 20px;
+    height: 20px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.6;
+    stroke-linejoin: round;
+}
+.workspace-settings[open] > summary { background: var(--bg-hover); color: var(--text-primary); }
+.settings-menu {
+    position: absolute;
+    z-index: 60;
+    right: 0;
+    top: calc(100% + 8px);
+    width: 232px;
+    max-width: calc(100vw - 32px);
+    padding: 6px;
+    border: 1px solid var(--border-color);
+    border-radius: 14px;
+    background: var(--bg-main);
+    box-shadow: var(--shadow-modal);
+}
+.settings-language-row,
+.settings-menu-item {
+    width: 100%;
+    min-height: 44px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 8px 12px;
+    font: inherit;
+    font-size: 14px;
+    text-align: left;
+    color: var(--text-primary);
+}
+.settings-menu-item { border: 0; border-radius: 8px; background: transparent; cursor: pointer; }
+.settings-menu-item:hover { background: var(--bg-hover); }
+.settings-menu .theme-btn-text { font-size: 13px; color: var(--text-secondary); }
+.settings-menu .settings-logout { border-top: 1px solid var(--border-color); border-radius: 0 0 8px 8px; margin-top: 4px; }
+.settings-menu .language-select { min-width: 0; width: 114px; min-height: 40px; font-size: 16px; color: var(--text-primary); border-radius: 8px; background-color: transparent; }
+.auth-gate-actions .language-select { font-size: 14px; color: var(--text-secondary); background-color: transparent; }
+
+.profile-cta-group .health-score-chip {
+    padding: 4px 0;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 12px;
+    font-weight: 500;
+    gap: 6px;
+    display: inline-flex;
+    align-items: center;
+}
+.health-score-chip::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--text-secondary); }
+.health-score-chip.judge-good::before { background: var(--x-green); }
+.health-score-chip.judge-warn::before { background: var(--x-amber); }
+.profile-cta-group { gap: 14px; }
+.sync-status { padding: 0 16px; border-bottom: 1px solid var(--border-color); color: var(--text-secondary); font-size: 12px; }
+.sync-status.is-attention > summary { color: var(--x-amber); }
+#authenticatedWorkspace:not([data-active-tab="activity"]) > .sync-status:not(.is-attention) { display: none; }
+.sync-status > summary {
+    min-height: 36px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    cursor: pointer;
+    list-style: none;
+}
+.sync-status > summary:hover { color: var(--text-primary); }
+.sync-status > summary svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.8; flex-shrink: 0; }
+.sync-status[open] > summary svg { transform: rotate(90deg); }
+.sync-status-content { padding: 4px 0 8px; line-height: 1.6; overflow-wrap: anywhere; }
+.sync-status-content .notice-strip { margin: 0; padding: 0; border: 0; border-radius: 0; background: none; font-size: inherit; }
+.sync-status-content .window-range-hint,
+.sync-status-content .profile-persona { margin-top: 6px; font-size: inherit; color: inherit; }
+
+.kpi-grid-4 { gap: 0; padding: 0 16px; }
+.kpi-grid-4 .kpi-card { min-width: 0; padding: 16px 12px; background: transparent; border: 0; border-radius: 0; }
+.kpi-grid-4 .kpi-card + .kpi-card { border-left: 1px solid var(--border-color); }
+.kpi-grid-4 .kpi-value { font-size: 26px; color: var(--text-primary); font-weight: 750; line-height: 1.25; margin: 6px 0 4px; }
+.kpi-grid-4 .kpi-label { font-size: 13px; font-weight: 500; }
+.kpi-grid-4 .kpi-sub.judge-good { color: var(--text-secondary); }
+.kpi-grid-4 .kpi-sub.judge-warn { color: var(--x-amber); }
+
+#followAuditList .mini-tag,
+.tweet-top-meta .mini-tag,
+.algo-sig-chip { padding: 0; border: 0; background: transparent; color: var(--text-secondary); font-weight: 400; }
+.format-win-badge.mini-tag { background: transparent; padding: 0; color: var(--x-blue); font-weight: 600; }
+.format-card,
+.circle-card { background: transparent; border-radius: 12px; }
+.side-widget { background: transparent; border-radius: 16px; }
+.subtle-tag { border: 0; padding: 0; border-radius: 0; background: transparent; }
+.overdue-banner { margin: 0; padding: 8px 16px; gap: 12px; }
+.overdue-banner .x-blue-pill { color: var(--text-primary); background: transparent; border-color: var(--border-color); }
+.mobile-algo-strip.level-good { border-left-color: transparent; background: transparent; color: var(--text-secondary); }
+.algo-status-banner.level-good { background: transparent; border: 0; padding-left: 0; padding-right: 0; color: var(--text-secondary); }
+#mobileAlgoRefLink { border: 0; padding: 0 4px; color: var(--text-secondary); }
+#authorModalBadge,
+#authorModalHeaderLink { display: none; }
+.x-select,
+.x-mini-input { min-height: 40px; }
+
+@container feed (max-width: 580px) {
+    .kpi-grid-4 .kpi-card:nth-child(odd) { border-left: 0; }
+    .kpi-grid-4 .kpi-card:nth-child(n+3) { border-top: 1px solid var(--border-color); }
+}
+
+@media (max-width: 720px) {
+    .sticky-topbar { padding: max(6px, env(safe-area-inset-top)) 12px 6px; }
+    .sticky-topbar .self-topbar-row { gap: 4px; }
+    .sticky-topbar .window-seg { width: 100%; gap: 0; }
+    .sticky-topbar .seg-btn { flex: 1 1 0; padding: 0 4px; font-size: 12px; min-height: 44px; }
+    .sticky-topbar .seg-btn.active::after { left: 8px; right: 8px; }
+    .sticky-topbar .refresh-status-btn { font-size: 12px; padding: 4px 8px; min-height: 44px; }
+    .workspace-settings > summary { width: 40px; height: 44px; }
+    .profile-body { padding-bottom: 6px; }
+    .profile-cta-group .x-outline-pill { min-height: 36px; }
+    .profile-cta-group { gap: 12px; }
+    .sync-status > summary { min-height: 44px; }
+    .kpi-grid-4 { padding: 0 14px; }
+    .kpi-grid-4 .kpi-card { padding: 14px 10px; }
+    .kpi-grid-4 .kpi-card:nth-child(odd) { border-left: 0; }
+    .kpi-grid-4 .kpi-card:nth-child(n+3) { border-top: 1px solid var(--border-color); }
+    .toolbar-right .x-mini-input,
+    .toolbar-right .x-select,
+    #followStateTabs .seg-tab { min-height: 44px; }
+    .x-select { border-radius: 12px; }
+    .settings-menu .language-select { border-radius: 8px; }
+    .mobile-bottom-nav { background: var(--bg-main); }
+    .bottom-tab { min-height: 54px; }
+    .bottom-badge { top: 2px; border: 2px solid var(--bg-main); line-height: 15px; min-width: 19px; }
+    .overdue-banner { margin: 0; padding: 6px 14px; }
+    .algo-ops-go,
+    .tweet-draft-check-btn { min-height: 44px; display: inline-flex; align-items: center; }
+    #toggleAlgoConfigBtn { min-height: 44px; }
 }

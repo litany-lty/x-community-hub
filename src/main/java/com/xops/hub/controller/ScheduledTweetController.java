@@ -2,6 +2,7 @@ package com.xops.hub.controller;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.xops.hub.config.RequestSecuritySupport;
 import com.xops.hub.model.AnalyticsReportModels.AuthenticatedXUser;
 import com.xops.hub.model.ScheduledTweetModels.BatchConfirmRequest;
 import com.xops.hub.model.ScheduledTweetModels.BatchCreateItemMeta;
@@ -35,7 +36,6 @@ import org.springframework.web.multipart.MultipartFile;
 import org.springframework.web.multipart.MultipartHttpServletRequest;
 
 import java.io.IOException;
-import java.net.URI;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -243,34 +243,6 @@ public class ScheduledTweetController {
     }
 
     static void verifySameOriginIfPresent(HttpServletRequest request) {
-        String originHeader = request.getHeader("Origin");
-        if (originHeader == null || originHeader.isBlank()) {
-            return;
-        }
-        try {
-            URI originUri = URI.create(originHeader.trim());
-            URI expectedUri = URI.create(XOAuthController.resolveBaseOrigin(request));
-            if (!sameOrigin(originUri, expectedUri)) {
-                throw new XDataProviderException(403, "跨站请求来源校验未通过");
-            }
-        } catch (IllegalArgumentException ex) {
-            throw new XDataProviderException(403, "跨站请求来源校验未通过");
-        }
-    }
-
-    private static boolean sameOrigin(URI a, URI b) {
-        if (a.getScheme() == null || b.getScheme() == null || a.getHost() == null || b.getHost() == null) {
-            return false;
-        }
-        return a.getScheme().equalsIgnoreCase(b.getScheme())
-                && a.getHost().equalsIgnoreCase(b.getHost())
-                && effectivePort(a) == effectivePort(b);
-    }
-
-    private static int effectivePort(URI uri) {
-        if (uri.getPort() > 0) {
-            return uri.getPort();
-        }
-        return "https".equalsIgnoreCase(uri.getScheme()) ? 443 : 80;
+        RequestSecuritySupport.verifySameOriginForMutation(request);
     }
 }

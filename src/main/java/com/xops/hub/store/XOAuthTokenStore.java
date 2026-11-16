@@ -13,17 +13,23 @@ import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.attribute.FileTime;
 import java.nio.file.attribute.PosixFilePermission;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.util.Base64;
 import java.util.EnumSet;
+import java.util.Iterator;
+import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.regex.Pattern;
 
 /**
  * 持久化单账号 X OAuth 2.0 访问令牌与刷新令牌（AES-GCM 加密落盘，绝不进入 HttpSession）。
+ * 内置基于 (mtime, size) 校验的内存热缓存与密钥派生缓存，消除高频状态轮询时的重复磁盘读取与解密开销。
  */
 public class XOAuthTokenStore {
 
@@ -31,6 +37,7 @@ public class XOAuthTokenStore {
     private static final String CIPHER_PREFIX = "v1:";
     private static final int GCM_IV_LEN = 12;
     private static final int GCM_TAG_BITS = 128;
+    private static final int MAX_HOT_CACHE_ENTRIES = 1024;
     private static final Pattern SAFE_ACCOUNT_ID = Pattern.compile("^[A-Za-z0-9_-]{1,64}$");
     private static final Set<PosixFilePermission> OWNER_RW_ONLY = EnumSet.of(
             PosixFilePermission.OWNER_READ,
@@ -71,11 +78,19 @@ public class XOAuthTokenStore {
         }
     }
 
+    private record CachedTokenRecord(Path path, FileTime modifiedAt, long size, Object fileKey, StoredOAuthToken token) {
+    }
+
+    private record CachedSecretKeyHolder(String sourceKey, SecretKey secretKey) {
+    }
+
     private static final Object MASTER_KEY_LOCK = new Object();
 
     private final XOpsProperties properties;
     private final ObjectMapper objectMapper;
     private final SecureRandom secureRandom = new SecureRandom();
+    private final ConcurrentHashMap<String, CachedTokenRecord> hotCache = new ConcurrentHashMap<>();
+    private volatile CachedSecretKeyHolder cachedSecretKey;
 
     public XOAuthTokenStore(XOpsProperties properties, ObjectMapper objectMapper) {
         this.properties = properties;
@@ -84,17 +99,37 @@ public class XOAuthTokenStore {
 
     public StoredOAuthToken load(String accountId) {
         Path file = resolveTokenFile(accountId);
-        if (file == null || !Files.exists(file)) {
+        if (file == null) {
             return null;
         }
+        String cacheKey = accountId.trim();
         try {
+            if (!Files.exists(file)) {
+                hotCache.remove(cacheKey);
+                return null;
+            }
+            BasicFileAttributes attrs = Files.readAttributes(file, BasicFileAttributes.class);
+            long size = attrs.size();
+            CachedTokenRecord hit = hotCache.get(cacheKey);
+            if (hit != null && hit.modifiedAt().equals(attrs.lastModifiedTime()) && hit.size() == size
+                    && Objects.equals(hit.fileKey(), attrs.fileKey()) && Objects.equals(hit.path(), file)) {
+                return hit.token();
+            }
             String raw = Files.readString(file, StandardCharsets.UTF_8).trim();
             if (raw.isEmpty()) {
+                hotCache.remove(cacheKey);
                 return null;
             }
             String json = decrypt(raw);
-            return objectMapper.readValue(json, StoredOAuthToken.class);
+            StoredOAuthToken parsed = objectMapper.readValue(json, StoredOAuthToken.class);
+            if (parsed == null || !cacheKey.equals(parsed.accountId())) {
+                hotCache.remove(cacheKey);
+                return null;
+            }
+            putHotCache(cacheKey, new CachedTokenRecord(file, attrs.lastModifiedTime(), size, attrs.fileKey(), parsed));
+            return parsed;
         } catch (Exception ex) {
+            hotCache.remove(cacheKey);
             return null;
         }
     }
@@ -107,31 +142,46 @@ public class XOAuthTokenStore {
         if (file == null) {
             return;
         }
+        String cacheKey = token.accountId().trim();
+        Path tmp = null;
         try {
             Files.createDirectories(file.getParent());
             String json = objectMapper.writeValueAsString(token);
             String encrypted = encrypt(json);
-            Path tmp = file.resolveSibling(
-                    "oauth_token_v1." + ThreadLocalRandom.current().nextLong(1_000_000_000L) + ".tmp"
-            );
-            Files.writeString(tmp, encrypted, StandardCharsets.UTF_8);
+            tmp = Files.createTempFile(file.getParent(), "oauth_token_v1.", ".tmp");
             setOwnerOnlyPermissions(tmp);
+            Files.writeString(tmp, encrypted, StandardCharsets.UTF_8);
             atomicReplace(tmp, file);
             setOwnerOnlyPermissions(file);
+            hotCache.remove(cacheKey);
         } catch (Exception ex) {
+            hotCache.remove(cacheKey);
             throw new IllegalStateException("持久化 X OAuth 授权令牌失败：" + ex.getMessage(), ex);
+        } finally {
+            deleteQuietly(tmp);
         }
     }
 
     public void delete(String accountId) {
+        if (accountId != null) {
+            hotCache.remove(accountId.trim());
+        }
         Path file = resolveTokenFile(accountId);
         if (file == null) {
             return;
         }
-        try {
-            Files.deleteIfExists(file);
-        } catch (IOException ignored) {
+        deleteQuietly(file);
+    }
+
+    private void putHotCache(String key, CachedTokenRecord record) {
+        if (hotCache.size() >= MAX_HOT_CACHE_ENTRIES && !hotCache.containsKey(key)) {
+            Iterator<String> it = hotCache.keySet().iterator();
+            if (it.hasNext()) {
+                it.next();
+                it.remove();
+            }
         }
+        hotCache.put(key, record);
     }
 
     Path resolveTokenFile(String accountId) {
@@ -183,18 +233,35 @@ public class XOAuthTokenStore {
     }
 
     private SecretKey resolveSecretKey() throws Exception {
-        byte[] material;
         String configuredSecret = properties.getTokenEncryptionSecret();
+        String clientSecret = properties.getOauthClientSecret();
+        String diskDir = properties.getDiskCacheDir();
+        String sourceTag;
+        if (configuredSecret != null && !configuredSecret.isBlank()) {
+            sourceTag = "cfg:" + configuredSecret.trim();
+        } else if (clientSecret != null && !clientSecret.isBlank()) {
+            sourceTag = "oauth:" + clientSecret.trim();
+        } else {
+            sourceTag = "file:" + (diskDir != null ? diskDir.trim() : "");
+        }
+
+        CachedSecretKeyHolder holder = this.cachedSecretKey;
+        if (holder != null && sourceTag.equals(holder.sourceKey())) {
+            return holder.secretKey();
+        }
+
+        byte[] material;
         if (configuredSecret != null && !configuredSecret.isBlank()) {
             material = configuredSecret.trim().getBytes(StandardCharsets.UTF_8);
-        } else if (properties.getOauthClientSecret() != null && !properties.getOauthClientSecret().isBlank()) {
-            material = ("xops-oauth-token-v1:" + properties.getOauthClientSecret().trim())
-                    .getBytes(StandardCharsets.UTF_8);
+        } else if (clientSecret != null && !clientSecret.isBlank()) {
+            material = ("xops-oauth-token-v1:" + clientSecret.trim()).getBytes(StandardCharsets.UTF_8);
         } else {
             material = loadOrCreateMasterKeyBytes();
         }
         byte[] keyBytes = MessageDigest.getInstance("SHA-256").digest(material);
-        return new SecretKeySpec(keyBytes, "AES");
+        SecretKey derived = new SecretKeySpec(keyBytes, "AES");
+        this.cachedSecretKey = new CachedSecretKeyHolder(sourceTag, derived);
+        return derived;
     }
 
     private byte[] loadOrCreateMasterKeyBytes() throws IOException {
@@ -216,11 +283,15 @@ public class XOAuthTokenStore {
             Path tmp = keyFile.resolveSibling(
                     ".token_master_key." + ThreadLocalRandom.current().nextLong(1_000_000_000L) + ".tmp"
             );
-            Files.write(tmp, generated);
-            setOwnerOnlyPermissions(tmp);
-            atomicReplace(tmp, keyFile);
-            setOwnerOnlyPermissions(keyFile);
-            return generated;
+            try {
+                Files.write(tmp, generated);
+                setOwnerOnlyPermissions(tmp);
+                atomicReplace(tmp, keyFile);
+                setOwnerOnlyPermissions(keyFile);
+                return generated;
+            } finally {
+                deleteQuietly(tmp);
+            }
         }
     }
 
@@ -236,6 +307,16 @@ public class XOAuthTokenStore {
         try {
             Files.setPosixFilePermissions(path, OWNER_RW_ONLY);
         } catch (UnsupportedOperationException | IOException ignored) {
+        }
+    }
+
+    private static void deleteQuietly(Path path) {
+        if (path == null) {
+            return;
+        }
+        try {
+            Files.deleteIfExists(path);
+        } catch (IOException ignored) {
         }
     }
 }

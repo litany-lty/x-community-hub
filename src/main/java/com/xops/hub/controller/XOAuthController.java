@@ -1,6 +1,7 @@
 package com.xops.hub.controller;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.xops.hub.config.RequestSecuritySupport;
 import com.xops.hub.config.XOpsProperties;
 import com.xops.hub.model.AnalyticsReportModels.AuthStatusResponse;
 import com.xops.hub.model.AnalyticsReportModels.AuthenticatedXUser;
@@ -29,7 +30,6 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.regex.Pattern;
 
 @RestController
 @RequestMapping("/api/auth/x")
@@ -41,8 +41,7 @@ public class XOAuthController {
     public static final String SESSION_PUBLISH_OAUTH_STATES = "XOPS_PUBLISH_OAUTH_STATES";
     public static final String SESSION_COOKIE_TOUCHED_AT = "XOPS_COOKIE_TOUCHED_AT";
     private static final int SESSION_MAX_AGE_SECONDS = (int) XOAuthSessionStore.MAX_SESSION_LIFETIME_SECONDS;
-    private static final Pattern SAFE_HOST_PATTERN =
-            Pattern.compile("^[A-Za-z0-9.-]+(:[0-9]{1,5})?$");
+    private static final int PRE_AUTH_SESSION_MAX_AGE_SECONDS = 600;
 
     private final XOpsProperties properties;
     private final XOAuthService oauthService;
@@ -95,7 +94,7 @@ public class XOAuthController {
             boolean cookieStale = lastTouchedSec <= 0L
                     || (nowSec - lastTouchedSec) >= XOAuthSessionStore.SLIDE_THRESHOLD_SECONDS;
             if (storeTouched || cookieStale) {
-                session.setMaxInactiveInterval(SESSION_MAX_AGE_SECONDS);
+                session.setMaxInactiveInterval(XOAuthSessionStore.MAX_IN_MEMORY_IDLE_SECONDS);
                 session.setAttribute(SESSION_COOKIE_TOUCHED_AT, nowSec);
                 writeSessionCookie(request, response, session.getId(), SESSION_MAX_AGE_SECONDS);
             }
@@ -128,6 +127,9 @@ public class XOAuthController {
             XOAuthService.AuthorizationRequestInfo reqInfo =
                     oauthService.createAuthorizationRequest(resolveBaseOrigin(request));
             HttpSession session = request.getSession(true);
+            if (session.getAttribute(SESSION_AUTH_USER) == null) {
+                session.setMaxInactiveInterval(PRE_AUTH_SESSION_MAX_AGE_SECONDS);
+            }
             rememberOAuthStateInSession(session, reqInfo.state());
             response.sendRedirect(reqInfo.authorizationUrl());
         } catch (Exception ex) {
@@ -214,26 +216,12 @@ public class XOAuthController {
             }
             XOAuthService.CallbackResult cb = oauthService.handleCallbackResult(code, state);
             AuthenticatedXUser user = cb.user();
-            HttpSession session = request.getSession(true);
-            boolean hadLoggedInUser = session.getAttribute(SESSION_AUTH_USER) != null;
-            String oldSessionId = session.getId();
-            session.removeAttribute(SESSION_AUTH_USER);
-            try {
-                request.changeSessionId();
-            } catch (IllegalStateException ignored) {
+            // Logout may have invalidated the pending OAuth session while the upstream callback ran.
+            HttpSession session = request.getSession(false);
+            if (session == null) {
+                throw new IllegalStateException("登录会话已失效，请重新登录");
             }
-            long nowSec = Instant.now().getEpochSecond();
-            session.setMaxInactiveInterval(SESSION_MAX_AGE_SECONDS);
-            session.setAttribute(SESSION_AUTH_USER, user);
-            session.setAttribute(SESSION_COOKIE_TOUCHED_AT, nowSec);
-            if (sessionStore != null) {
-                if (hadLoggedInUser && !oldSessionId.equals(session.getId())) {
-                    sessionStore.rotateOnRestore(oldSessionId, session.getId(), user, nowSec);
-                } else {
-                    sessionStore.saveSession(session.getId(), user, nowSec);
-                }
-            }
-            writeSessionCookie(request, response, session.getId(), SESSION_MAX_AGE_SECONDS);
+            promoteAuthenticatedSession(request, response, session, user);
             if (cb.purpose() == XOAuthService.AuthPurpose.PUBLISH || publishFlow) {
                 log.info("X OAuth 2.0 publish step-up authorization succeeded for @{}", user.username());
                 response.sendRedirect("/?auth=publish_ok&tab=schedule");
@@ -249,6 +237,56 @@ public class XOAuthController {
                 response.sendRedirect("/?tab=schedule&publish_auth_error=" + msg);
             } else {
                 response.sendRedirect("/?auth_error=" + msg);
+            }
+        }
+    }
+
+    private void promoteAuthenticatedSession(HttpServletRequest request, HttpServletResponse response,
+                                             HttpSession session, AuthenticatedXUser user) {
+        // The same monitor protects logout and serializes concurrent credential rotations.
+        // Upstream OAuth requests run before this lock; only the local identity commit is serialized.
+        synchronized (session) {
+            String promotingSessionId = null;
+            try {
+                if (request.getSession(false) == null) {
+                    throw new IllegalStateException("登录会话已失效，请重新登录");
+                }
+                boolean hadLoggedInUser = session.getAttribute(SESSION_AUTH_USER) != null;
+                String oldSessionId = session.getId();
+                // Keep the prior identity readable to requests already admitted by the filter.
+                // Success replaces it after persistence; failure invalidates the whole session below.
+                request.changeSessionId();
+                promotingSessionId = session.getId();
+                long nowSec = Instant.now().getEpochSecond();
+                if (sessionStore != null) {
+                    if (hadLoggedInUser && !oldSessionId.equals(promotingSessionId)) {
+                        sessionStore.rotateOnRestore(oldSessionId, promotingSessionId, user, nowSec);
+                    } else {
+                        sessionStore.saveSession(promotingSessionId, user, nowSec);
+                    }
+                }
+                // Expose the identity only after its persistent credential is committed.
+                session.setMaxInactiveInterval(XOAuthSessionStore.MAX_IN_MEMORY_IDLE_SECONDS);
+                session.setAttribute(SESSION_COOKIE_TOUCHED_AT, nowSec);
+                session.setAttribute(SESSION_AUTH_USER, user);
+                writeSessionCookie(request, response, promotingSessionId, SESSION_MAX_AGE_SECONDS);
+            } catch (RuntimeException ex) {
+                // Keep partial-write cleanup under this monitor so it cannot revoke a later callback.
+                if (sessionStore != null && promotingSessionId != null) {
+                    try {
+                        sessionStore.revokeSession(promotingSessionId);
+                    } catch (RuntimeException cleanupFailure) {
+                        ex.addSuppressed(cleanupFailure);
+                        log.warn("Failed to revoke incomplete OAuth session: {}", cleanupFailure.getMessage());
+                    }
+                }
+                try {
+                    session.invalidate();
+                } catch (IllegalStateException ignored) {
+                    // A concurrent logout already invalidated it before this callback acquired the monitor.
+                }
+                writeSessionCookie(request, response, "", 0L);
+                throw ex;
             }
         }
     }
@@ -297,14 +335,22 @@ public class XOAuthController {
 
     @PostMapping("/logout")
     public Map<String, Object> logout(HttpServletRequest request, HttpServletResponse response) {
+        RequestSecuritySupport.verifySameOriginForMutation(request);
         HttpSession session = request.getSession(false);
-        String requestedId = request.getRequestedSessionId();
-        String currentId = session != null ? session.getId() : null;
-        if (sessionStore != null) {
-            sessionStore.revokeSession(requestedId, currentId);
-        }
         if (session != null) {
-            session.invalidate();
+            synchronized (session) {
+                // Capture the current ID after any in-flight callback finishes rotating this session.
+                if (sessionStore != null) {
+                    sessionStore.revokeSession(request.getRequestedSessionId(), session.getId());
+                }
+                try {
+                    session.invalidate();
+                } catch (IllegalStateException ignored) {
+                    // Another logout already invalidated the same session.
+                }
+            }
+        } else if (sessionStore != null) {
+            sessionStore.revokeSession(request.getRequestedSessionId());
         }
         if (response != null) {
             writeSessionCookie(request, response, "", 0L);
@@ -333,37 +379,6 @@ public class XOAuthController {
     }
 
     static String resolveBaseOrigin(HttpServletRequest req) {
-        boolean trustedProxy = CommunityApiController.isTrustedProxyAddress(req.getRemoteAddr());
-        String proto = req.getScheme();
-        if (trustedProxy) {
-            String xfp = req.getHeader("X-Forwarded-Proto");
-            if (xfp != null && !xfp.isBlank()) {
-                String firstProto = xfp.split(",", 2)[0].trim().toLowerCase();
-                if ("https".equals(firstProto) || "http".equals(firstProto)) {
-                    proto = firstProto;
-                }
-            }
-        }
-
-        String host = null;
-        if (trustedProxy) {
-            String xfh = req.getHeader("X-Forwarded-Host");
-            if (xfh != null && !xfh.isBlank()) {
-                String candidate = xfh.split(",", 2)[0].trim();
-                if (SAFE_HOST_PATTERN.matcher(candidate).matches()) {
-                    host = candidate;
-                }
-            }
-        }
-        if (host == null) {
-            host = req.getServerName();
-            int port = req.getServerPort();
-            boolean standardPort = ("http".equalsIgnoreCase(proto) && port == 80)
-                    || ("https".equalsIgnoreCase(proto) && port == 443);
-            if (!standardPort && port > 0) {
-                host = host + ":" + port;
-            }
-        }
-        return proto + "://" + host;
+        return RequestSecuritySupport.resolveBaseOrigin(req);
     }
 }

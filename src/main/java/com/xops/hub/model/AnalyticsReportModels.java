@@ -146,8 +146,17 @@ public final class AnalyticsReportModels {
             String auditCategory,
             String auditLabel,
             String recommendation,
-            String profileUrl
+            String profileUrl,
+            Integer relationshipOrder,
+            double intimacyScore
     ) {
+        public FollowAuditItem(RawSnapshotModels.XUserSummary user, String relationState,
+                               boolean iFollowThem, boolean theyFollowMe, int myRepliesToThem,
+                               int theirRepliesToMe, int totalInteractions, String auditCategory,
+                               String auditLabel, String recommendation, String profileUrl) {
+            this(user, relationState, iFollowThem, theyFollowMe, myRepliesToThem, theirRepliesToMe,
+                    totalInteractions, auditCategory, auditLabel, recommendation, profileUrl, null, 0.0);
+        }
     }
 
     // followBackRatePct 保留样本数值以兼容消费者；展示与分享应使用含完整性说明的 followBackRateLabel。
@@ -663,8 +672,13 @@ public final class AnalyticsReportModels {
             boolean oauthConfigured,
             boolean requireLoginSelfOnly,
             long cacheTtlSeconds,
-            String timezone
+            String timezone,
+            boolean freePublicDataEnabled
     ) {
+        public ServerCapabilities(boolean oauthConfigured, boolean requireLoginSelfOnly,
+                long cacheTtlSeconds, String timezone) {
+            this(oauthConfigured, requireLoginSelfOnly, cacheTtlSeconds, timezone, false);
+        }
     }
 
     public record PresetAccount(

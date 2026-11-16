@@ -18,7 +18,7 @@
             }
         } catch (_) {}
     </script>
-    <link rel="stylesheet" href="/styles.css?v=20261115j" />
+    <link rel="stylesheet" href="/styles.css?v=20261116e" />
 </head>
 <body>
 <div class="x-shell">
@@ -69,25 +69,12 @@
                 </button>
             </nav>
 
-            <div class="rail-actions">
-                <div class="rail-utility-row">
-                    <button class="utility-btn icon-only" id="cycleThemeBtn" type="button" title="切换主题" aria-label="切换主题">
-                        <svg viewBox="0 0 24 24" class="sm-icon" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.389 5.389 0 0 1-4.4 2.26 5.403 5.403 0 0 1-3.14-9.8c-.44-.06-.9-.1-1.36-.1z"/></svg>
-                        <span class="theme-btn-text">主题</span>
-                    </button>
-                    <button class="utility-btn" id="railAuthorBtn" type="button" title="查看作者 @elidlicom 主页介绍与开源说明" aria-label="查看作者信息">
-                        <svg viewBox="0 0 24 24" class="sm-icon" aria-hidden="true"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 4a3 3 0 1 1 0 6 3 3 0 0 1 0-6zm0 14a7.96 7.96 0 0 1-6-2.72c.03-1.99 4-3.08 6-3.08 1.99 0 5.97 1.09 6 3.08A7.96 7.96 0 0 1 12 20z"/></svg>
-                        <span class="rail-author-btn-text">作者信息</span>
-                    </button>
-                </div>
-            </div>
-
             <!-- 左下角当前授权账号胶囊 -->
             <div class="rail-account-pill" id="railAccountPill" hidden>
-                <div class="avatar-circle sm" id="railAvatar">X</div>
+                <div class="avatar-circle sm" id="railAvatar" data-i18n-ignore>X</div>
                 <div class="rail-account-meta">
-                    <div class="rail-account-name" id="railDisplayName">未授权登录</div>
-                    <div class="rail-account-handle" id="railHandle">请先登录本人 X 账号</div>
+                    <div class="rail-account-name" id="railDisplayName" data-i18n-ignore>未授权登录</div>
+                    <div class="rail-account-handle" id="railHandle" data-i18n-ignore>请先登录本人 X 账号</div>
                 </div>
                 <button type="button" class="mini-logout-btn" id="railLogoutBtn" hidden title="退出 X 登录">退出</button>
             </div>
@@ -111,10 +98,18 @@
                             <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"></path>
                         </svg>
                     </div>
-                    <button class="utility-btn gate-theme-btn" id="gateThemeBtn" type="button" title="切换主题" aria-label="切换主题">
-                        <svg viewBox="0 0 24 24" class="sm-icon" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.389 5.389 0 0 1-4.4 2.26 5.403 5.403 0 0 1-3.14-9.8c-.44-.06-.9-.1-1.36-.1z"/></svg>
-                        <span class="theme-btn-text">纯黑</span>
-                    </button>
+                    <div class="auth-gate-actions">
+                        <select id="gateLanguageSelect" class="x-select language-select" aria-label="选择语言">
+                            <option value="zh-CN" lang="zh-CN" data-i18n-ignore>中文</option>
+                            <option value="en" lang="en" data-i18n-ignore>English</option>
+                            <option value="ja" lang="ja" data-i18n-ignore>日本語</option>
+                            <option value="ko" lang="ko" data-i18n-ignore>한국어</option>
+                        </select>
+                        <button class="utility-btn gate-theme-btn" id="gateThemeBtn" type="button" title="切换主题" aria-label="切换主题">
+                            <svg viewBox="0 0 24 24" class="sm-icon" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.389 5.389 0 0 1-4.4 2.26 5.403 5.403 0 0 1-3.14-9.8c-.44-.06-.9-.1-1.36-.1z"/></svg>
+                            <span class="theme-btn-text">纯黑</span>
+                        </button>
+                    </div>
                 </div>
                 <h1 class="auth-gate-title">X 运营工作台</h1>
 
@@ -130,10 +125,11 @@
                 </div>
 
                 <div class="auth-gate-cta-area">
-                    <button type="button" class="auth-gate-login-btn" id="gateLoginBtn">
+                    <button type="button" class="auth-gate-login-btn" id="gateLoginBtn" disabled aria-busy="true">
                         <svg viewBox="0 0 24 24" class="oauth-x-icon"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"></path></svg>
-                        <span>使用 X 账号授权登录</span>
+                        <span>正在连接…</span>
                     </button>
+                    <p id="authGateFeedback" class="inline-feedback is-error" role="alert" hidden></p>
                 </div>
 
                 <div class="auth-gate-footer">
@@ -164,26 +160,36 @@
                             <button type="button" class="seg-btn" data-period="WEEK" data-days="7" data-label="7天" title="近 7 天">7天</button>
                             <button type="button" class="seg-btn" data-period="MONTH" data-days="30" data-label="30天" title="近 30 天">30天</button>
                         </div>
-                        <button type="button" class="unlock-info-btn" id="periodUnlockHelpBtn" title="时间维度解锁进度与规则">解锁</button>
                     </div>
 
                     <div class="topbar-actions">
                         <button type="button" class="refresh-status-btn" id="forceRefreshBtn" title="数据同步状态">同步中…</button>
-                        <button type="button" class="icon-circle-btn topbar-theme-only" id="topbarThemeBtn" title="切换主题" aria-label="切换主题">
-                            <svg viewBox="0 0 24 24" class="sm-icon" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.389 5.389 0 0 1-4.4 2.26 5.403 5.403 0 0 1-3.14-9.8c-.44-.06-.9-.1-1.36-.1z"/></svg>
-                        </button>
-                        <button type="button" class="mini-logout-btn topbar-logout-only" id="topbarLogoutBtn" title="退出登录">退出</button>
+                        <details class="workspace-settings" id="workspaceSettings">
+                            <summary class="icon-circle-btn" id="workspaceSettingsToggle" aria-label="设置" title="设置">
+                                <svg viewBox="0 0 24 24" class="sm-icon" aria-hidden="true" fill="none"><path d="m9.5 3-.6 2.1-1.8 1L5 5.6 2.5 9.9 4 11.4v2L2.5 15 5 19.3l2.1-.5 1.8 1 .6 2.2h5l.6-2.2 1.8-1 2.1.5 2.5-4.3-1.5-1.6v-2l1.5-1.5L19 5.6l-2.1.5-1.8-1-.6-2.1h-5Z"/><circle cx="12" cy="12.5" r="3"/></svg>
+                            </summary>
+                            <div class="settings-menu" role="group" aria-label="工作台设置">
+                                <label class="settings-language-row" for="languageSelect">
+                                    <span>语言</span>
+                                    <select id="languageSelect" class="x-select language-select" aria-label="选择语言">
+                                        <option value="zh-CN" lang="zh-CN" data-i18n-ignore>中文</option>
+                                        <option value="en" lang="en" data-i18n-ignore>English</option>
+                                        <option value="ja" lang="ja" data-i18n-ignore>日本語</option>
+                                        <option value="ko" lang="ko" data-i18n-ignore>한국어</option>
+                                    </select>
+                                </label>
+                                <button type="button" class="settings-menu-item" id="topbarThemeBtn" title="切换主题" aria-label="切换主题">
+                                    <span>主题</span><span class="theme-btn-text">纯黑</span>
+                                </button>
+                                <button type="button" class="settings-menu-item" id="openAuthorStoryBtn">关于此应用</button>
+                                <button type="button" class="settings-menu-item settings-logout" id="topbarLogoutBtn">退出</button>
+                            </div>
+                        </details>
                     </div>
                 </div>
                 <div class="topbar-meta-row">
                     <div class="window-range-hint" id="topbarWindowHint">加载中…</div>
-                    <div class="window-range-hint topbar-sub-links">
-                        <a id="storedReportLink" href="?stored=true">已入库报表</a>
-                        <span class="sub-link-dot" aria-hidden="true">·</span>
-                        <button type="button" class="link-inline-btn topbar-author-chip" id="openAuthorStoryBtn">作者信息</button>
-                    </div>
                 </div>
-                <div class="window-range-hint" id="dailyCacheStatusHint" hidden></div>
             </header>
 
             <!-- 加载进度条与提示 -->
@@ -204,10 +210,9 @@
 
                 <div class="profile-body">
                     <div class="profile-avatar-row">
-                        <div class="avatar-circle xl" id="profileAvatar">X</div>
+                        <div class="avatar-circle xl" id="profileAvatar" data-i18n-ignore>X</div>
                         <div class="profile-cta-group">
                             <span class="health-score-chip" id="healthScoreChip" title="0–100，综合发帖稳定度、回复比、公开互动率">健康 --</span>
-                            <button type="button" class="x-outline-pill author-hero-pill" id="heroAuthorInfoBtn" title="查看作者 @elidlicom 介绍与开源说明">作者信息</button>
                             <a class="x-outline-pill" id="visitXProfileLink" href="https://x.com" target="_blank" rel="noopener noreferrer">
                                 X 主页 ↗
                             </a>
@@ -216,16 +221,15 @@
 
                     <div class="profile-title-block">
                         <h1 class="profile-name-line">
-                            <span id="profileDisplayName">加载中…</span>
+                            <span id="profileDisplayName" data-i18n-ignore>加载中…</span>
                             <span id="profileVerifiedIcon" class="verified-badge" hidden title="X 蓝标认证">
                                 <svg viewBox="0 0 22 22"><path d="M20.396 11c-.018-.646-.215-1.275-.57-1.816-.354-.54-.852-.972-1.438-1.246.223-.607.27-1.264.14-1.897-.131-.634-.437-1.218-.882-1.687-.47-.445-1.053-.75-1.687-.882-.633-.13-1.29-.083-1.897.14-.273-.587-.704-1.086-1.245-1.44S11.647 1.62 11 1.604c-.646.017-1.273.213-1.813.568s-.969.854-1.24 1.44c-.608-.223-1.267-.272-1.902-.14-.635.13-1.22.436-1.69.882-.445.47-.749 1.055-.878 1.688-.13.633-.08 1.29.144 1.896-.587.274-1.087.705-1.443 1.245-.356.54-.555 1.17-.574 1.817.02.647.218 1.276.574 1.817.356.54.856.972 1.443 1.245-.224.606-.274 1.263-.144 1.896.13.634.433 1.218.877 1.688.47.443 1.054.747 1.687.878.633.132 1.29.084 1.897-.136.274.586.705 1.084 1.246 1.439.54.354 1.17.551 1.816.569.647-.016 1.276-.213 1.817-.567s.972-.854 1.245-1.44c.604.239 1.266.296 1.903.164.636-.132 1.22-.447 1.68-.907.46-.46.776-1.044.908-1.681s.075-1.299-.165-1.903c.586-.274 1.084-.705 1.439-1.246.354-.54.551-1.17.569-1.816zM9.662 14.85l-3.429-3.428 1.293-1.302 2.072 2.072 4.4-4.794 1.347 1.246z"/></svg>
                             </span>
-                            <span class="persona-pill" id="profilePersonaTag">--</span>
                         </h1>
-                        <div class="profile-handle-line" id="profileHandleText">@username</div>
+                        <div class="profile-handle-line" id="profileHandleText" data-i18n-ignore>@username</div>
                     </div>
 
-                    <p class="profile-bio" id="profileBio" hidden></p>
+                    <p class="profile-bio" id="profileBio" data-i18n-ignore hidden></p>
 
                     <div class="profile-stats-row">
                         <div class="stat-inline"><strong id="profileFollowingNum">0</strong> <span>关注</span></div>
@@ -234,9 +238,17 @@
                         <div class="stat-inline"><strong id="profileTotalTweetsNum">0</strong> <span>推文</span></div>
                     </div>
 
-                    <div class="notice-strip" id="bannerNoticeStrip"></div>
                 </div>
             </section>
+
+            <details class="sync-status" id="syncStatusDetails">
+                <summary><span id="syncStatusSummary">数据状态</span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 5 7 7-7 7"/></svg></summary>
+                <div class="sync-status-content">
+                    <div class="notice-strip" id="bannerNoticeStrip"></div>
+                    <div class="window-range-hint" id="dailyCacheStatusHint" hidden></div>
+                    <div class="profile-persona" id="profilePersonaTag">--</div>
+                </div>
+            </details>
 
             <!-- ==================== 模块 1：发帖与回复活跃度看板 ==================== -->
             <section class="tab-panel active" id="panel-activity">
@@ -327,9 +339,9 @@
                     </div>
 
                     <div class="filter-pills-row" id="interactionTypePills">
-                        <button class="pill-chip" data-rel-filter="I_OWE" id="pillIOweBtn" type="button" title="TA 来评过我但我没去评 TA，或双方主帖评论差额 > 5 帖且 TA 评我更多">我没回谁</button>
+                        <button class="pill-chip" data-rel-filter="I_OWE" id="pillIOweBtn" type="button" title="TA 来评过我但我没去评 TA，或双方主帖评论差额 > 5 帖且 TA 评我更多">待回访</button>
                         <button class="pill-chip" data-rel-filter="UNREPLIED_POST" id="pillUnrepliedBtn" type="button" title="别人评论了我，但我还没有回复 TA">待回复</button>
-                        <button class="pill-chip" data-rel-filter="THEY_OWE" id="pillTheyOweBtn" type="button" title="我去评过 TA 但 TA 没来评我，或双方主帖评论差额 > 5 帖且我去评更多">谁没回我</button>
+                        <button class="pill-chip" data-rel-filter="THEY_OWE" id="pillTheyOweBtn" type="button" title="我去评过 TA 但 TA 没来评我，或双方主帖评论差额 > 5 帖且我去评更多">未回访我</button>
                         <button class="pill-chip active" data-rel-filter="MUTUAL" id="pillMutualBtn" type="button" title="双方均有主帖评论且贴数差额 <= 5 帖">互相评论</button>
                     </div>
 
@@ -352,7 +364,11 @@
 
                         <div class="toolbar-right">
                             <input type="search" id="followFilterInput" class="x-mini-input" placeholder="搜索昵称 / @用户名" aria-label="搜索关注账号" />
-                            <button type="button" class="x-outline-pill sm" id="exportFollowCsvBtn" title="导出当前列表 CSV">CSV</button>
+                            <select id="followSortSelect" class="x-select" aria-label="关注列表排序">
+                                <option value="recent">最近关注</option>
+                                <option value="intimacy">亲密度</option>
+                                <option value="followers">粉丝数量</option>
+                            </select>
                         </div>
                     </div>
 
@@ -449,7 +465,8 @@
                         id="draftSimulatorInput"
                         class="draft-textarea"
                         rows="3"
-                        placeholder="粘贴草稿，自动检查限流风险并预估浏览量…"
+                        placeholder="输入草稿，查看发布建议…"
+                        aria-label="草稿正文"
                     ></textarea>
                     <div id="draftSimulatorResult" class="draft-result-box" hidden></div>
                 </div>
@@ -485,11 +502,11 @@
                             <button type="button" class="x-outline-pill sm" id="toggleSharePrivacyBtn" title="切换展示回关率或周期总浏览">
                                 隐藏回关率
                             </button>
-                            <button type="button" class="x-outline-pill sm" id="downloadCardPngBtn">下载 PNG</button>
+                            <button type="button" class="x-outline-pill sm" id="downloadCardPngBtn">下载图片</button>
                             <button type="button" class="x-outline-pill sm" id="copyShareTextBtn">复制文案</button>
                             <button type="button" class="x-outline-pill sm" id="scheduleShareCardBtn">定时发布</button>
                             <a class="x-blue-pill sm" id="postToXIntentLink" href="https://x.com/intent/tweet" target="_blank" rel="noopener noreferrer">
-                                发推 ↗
+                                发布文案 ↗
                             </a>
                         </div>
                     </div>
@@ -537,6 +554,7 @@
                         <div>
                             <h2 class="section-title" id="scheduleWriteAuthTitle">需开启发推授权</h2>
                             <p class="section-desc" id="scheduleWriteAuthDesc">单独授予发推、传图与自动续期权限。</p>
+                            <p id="schedulePublishAuthError" class="inline-feedback is-error" role="alert" hidden></p>
                         </div>
                         <button type="button" class="x-blue-pill sm" id="triggerPublishAuthBtn">去授权</button>
                     </div>
@@ -546,19 +564,21 @@
                     <div class="section-head wrap-gap">
                         <h2 class="section-title">新建定时推文</h2>
                         <div class="toolbar-right">
-                            <button type="button" class="x-outline-pill sm" id="alignScheduleGapBtn" hidden>对齐 1h</button>
-                            <button type="button" class="x-outline-pill sm" id="addScheduleDraftItemBtn">+ 加一条 (+1h)</button>
+                            <button type="button" class="x-outline-pill sm" id="alignScheduleGapBtn" hidden>间隔 1 小时</button>
+                            <button type="button" class="x-outline-pill sm" id="addScheduleDraftItemBtn">添加推文</button>
                         </div>
                     </div>
 
                     <div id="scheduleDraftItemsList" class="schedule-draft-stack"></div>
                     <input type="file" id="scheduleMediaFileInput" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden />
 
+                    <div class="schedule-timing-context" id="scheduleTimingContext" aria-live="polite"></div>
                     <div class="schedule-quick-chips" id="scheduleQuickSlotChips"></div>
 
+                    <p id="scheduleComposeError" class="inline-feedback is-error" role="alert" hidden></p>
                     <div class="schedule-compose-toolbar">
                         <div class="schedule-compose-left">
-                            <button type="button" class="x-outline-pill sm" id="clearScheduleDraftBtn">清空</button>
+                            <button type="button" class="x-outline-pill sm" id="clearScheduleDraftBtn">清空草稿</button>
                         </div>
                         <div class="schedule-compose-right">
                             <button type="button" class="x-blue-pill sm" id="createScheduleBtn">加入定时队列</button>
@@ -575,6 +595,7 @@
                         </div>
                     </div>
 
+                    <p id="scheduleQueueFeedback" class="inline-feedback" role="status" aria-live="polite" hidden></p>
                     <div class="filter-pills-row" id="scheduleStatusFilterPills">
                         <button class="pill-chip active" data-sfilter="ALL" type="button">全部</button>
                         <button class="pill-chip" data-sfilter="ACTION_NEEDED" type="button">待处理</button>
@@ -645,7 +666,7 @@
         </div>
         <div class="author-modal-body">
             <div class="author-profile-row">
-                <div id="authorModalAvatarSlot">
+                <div id="authorModalAvatarSlot" data-i18n-ignore>
                     <div class="avatar-circle xl" id="authorModalAvatar">
                         <img src="/author-avatar.webp" alt="elidlicom" />
                     </div>
@@ -653,17 +674,17 @@
                 <div class="author-profile-tags">
                     <span class="mini-tag blue" id="authorModalSelfTag" hidden>作者本人</span>
                     <span class="mini-tag green" id="authorModalFollowedTag" hidden>✓ 已关注</span>
-                    <a id="authorModalHeaderLink" class="x-outline-pill sm" href="https://x.com/elidlicom" target="_blank" rel="noopener noreferrer">@elidlicom ↗</a>
+                    <a id="authorModalHeaderLink" data-i18n-ignore class="x-outline-pill sm" href="https://x.com/elidlicom" target="_blank" rel="noopener noreferrer">@elidlicom ↗</a>
                 </div>
             </div>
             <div class="author-ident-block">
                 <div class="author-name-line">
-                    <span id="authorModalDisplayName">Litany（李丰一）</span>
+                    <span id="authorModalDisplayName" data-i18n-ignore>Litany（李丰一）</span>
                     <span id="authorModalVerified" hidden></span>
                 </div>
-                <div class="author-handle-line" id="authorModalHandle">@elidlicom</div>
+                <div class="author-handle-line" id="authorModalHandle" data-i18n-ignore>@elidlicom</div>
             </div>
-            <p class="author-bio-text" id="authorModalBio">Java Dev &amp; AI | Studying Chinese Metaphysics(Dao·道) ䷊</p>
+            <p class="author-bio-text" id="authorModalBio" data-i18n-ignore>Java Dev &amp; AI | Studying Chinese Metaphysics(Dao·道) ䷊</p>
             <div class="author-stats-row" id="authorModalStatsRow" hidden>
                 <span id="authorModalFollowingWrap"><strong id="authorModalFollowing">0</strong> 关注</span>
                 <span><strong id="authorModalFollowers">0</strong> 关注者</span>
@@ -734,7 +755,7 @@
                 <a id="confirmResendProfileLink" class="x-outline-pill sm" href="https://x.com" target="_blank" rel="noopener noreferrer">去 X 主页核对 ↗</a>
             </div>
             <div class="confirm-resend-meta" id="confirmResendMeta"></div>
-            <div class="confirm-resend-preview" id="confirmResendTextPreview"></div>
+            <div class="confirm-resend-preview" id="confirmResendTextPreview" data-i18n-ignore></div>
             <div class="confirm-resend-media-grid" id="confirmResendMediaPreview" hidden></div>
             <div class="confirm-resend-actions">
                 <button type="button" class="x-outline-pill sm" id="confirmResendCancelBtn">暂不补发</button>
@@ -745,6 +766,8 @@
 </div>
 
 <div id="copyToast" class="bottom-toast" role="status" aria-live="polite" hidden>已复制到剪贴板</div>
-<script src="/app.js?v=20261115m"></script>
+<script src="/i18n-messages.js?v=20261116e"></script>
+<script src="/i18n.js?v=20261116e"></script>
+<script src="/app.js?v=20261116e"></script>
 </body>
 </html>

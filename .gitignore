@@ -23,3 +23,6 @@ auth-sessions/
 *.key
 *.p12
 *.jks
+
+# Local reports derived from real account data
+/FREE_DATA_CROSSCHECK_*.md

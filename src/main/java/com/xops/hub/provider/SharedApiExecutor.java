@@ -11,11 +11,14 @@ import java.util.Map;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
-import java.util.concurrent.Executors;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -100,88 +103,111 @@ public class SharedApiExecutor {
                         rejectedCount.incrementAndGet();
                         throw new RejectedExecutionException("Shared API queue saturated");
                     }
+                    if (tp.isShutdown() && tp.remove(r)) {
+                        rejectedCount.incrementAndGet();
+                        throw new RejectedExecutionException("Shared API executor shut down during admission");
+                    }
                 }
         );
         this.workQueue.bind(this.executor);
 
-        this.queueWatchdog = Executors.newSingleThreadScheduledExecutor(r -> {
+        ScheduledThreadPoolExecutor watchdog = new ScheduledThreadPoolExecutor(1, r -> {
             Thread t = new Thread(r, "xops-api-qwatch-" + poolId);
             t.setDaemon(true);
             return t;
         });
+        watchdog.setRemoveOnCancelPolicy(true);
+        this.queueWatchdog = watchdog;
     }
 
     public <T> CompletableFuture<T> submitAsync(Callable<T> apiCall) {
         submittedCount.incrementAndGet();
         long enqueuedNanos = System.nanoTime();
         AtomicBoolean claimed = new AtomicBoolean(false);
+        AtomicReference<ScheduledFuture<?>> timeout = new AtomicReference<>();
         CompletableFuture<T> future = new CompletableFuture<>();
-
-        ScheduledFuture<?> timeoutHandle = queueTimeoutMs > 0
-                ? queueWatchdog.schedule(() -> {
-                    if (claimed.compareAndSet(false, true)) {
-                        long waitedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - enqueuedNanos);
-                        queueTimedOutCount.incrementAndGet();
-                        future.completeExceptionally(new XDataProviderException(
-                                503, "当前访问高峰请求排队等待超限（" + waitedMs + "ms），已自动保护返回，请稍后再试"));
-                    }
-                }, queueTimeoutMs, TimeUnit.MILLISECONDS)
-                : null;
-
-        try {
-            executor.execute(() -> {
-                if (!claimed.compareAndSet(false, true)) {
-                    return;
-                }
-                if (timeoutHandle != null) {
-                    timeoutHandle.cancel(false);
-                }
-                if (future.isCancelled()) {
+        FutureTask<T> task = new FutureTask<>(apiCall) {
+            @Override
+            public void run() {
+                if (!claimed.compareAndSet(false, true)) return;
+                ScheduledFuture<?> timer = timeout.get();
+                if (timer != null) timer.cancel(false);
+                if (future.isDone()) {
+                    cancel(false);
                     return;
                 }
                 long waitedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - enqueuedNanos);
                 if (queueTimeoutMs > 0 && waitedMs > queueTimeoutMs) {
                     queueTimedOutCount.incrementAndGet();
-                    future.completeExceptionally(new XDataProviderException(
-                            503, "当前访问高峰请求排队等待超限（" + waitedMs + "ms），已自动保护返回，请稍后再试"));
+                    future.completeExceptionally(new XDataProviderException(503, "当前请求排队等待超时，请稍后再试"));
+                    cancel(false);
                     return;
                 }
+                super.run();
+            }
+            @Override
+            protected void done() {
                 try {
-                    T res = apiCall.call();
-                    completedCount.incrementAndGet();
-                    future.complete(res);
-                } catch (Throwable ex) {
+                    if (isCancelled()) {
+                        future.cancel(false);
+                    } else {
+                        T value = get();
+                        completedCount.incrementAndGet();
+                        future.complete(value);
+                    }
+                } catch (ExecutionException ex) {
+                    future.completeExceptionally(ex.getCause());
+                } catch (InterruptedException ex) {
+                    Thread.currentThread().interrupt();
                     future.completeExceptionally(ex);
                 }
-            });
-        } catch (RejectedExecutionException rex) {
-            if (timeoutHandle != null) {
-                timeoutHandle.cancel(false);
             }
-            if (claimed.compareAndSet(false, true)) {
-                future.completeExceptionally(new XDataProviderException(
-                        503, "当前访问高峰并发队列已满，请稍候几秒再试"));
+        };
+        future.whenComplete((value, failure) -> {
+            ScheduledFuture<?> timer = timeout.get();
+            if (timer != null) timer.cancel(false);
+            // A cancelled/timed-out caller must release queue space and cannot start paid work later.
+            if (!task.isDone()) task.cancel(true);
+            executor.remove(task);
+        });
+        try {
+            if (queueTimeoutMs > 0) {
+                ScheduledFuture<?> timer = queueWatchdog.schedule(() -> {
+                    if (claimed.compareAndSet(false, true)) {
+                        queueTimedOutCount.incrementAndGet();
+                        future.completeExceptionally(new XDataProviderException(503, "当前请求排队等待超时，请稍后再试"));
+                    }
+                }, queueTimeoutMs, TimeUnit.MILLISECONDS);
+                timeout.set(timer);
+                if (future.isDone()) timer.cancel(false);
             }
+            if (!future.isDone()) {
+                executor.execute(task);
+                // Completion may race between the precheck and queue admission.
+                if (future.isDone()) executor.remove(task);
+            }
+        } catch (RejectedExecutionException ex) {
+            claimed.set(true);
+            future.completeExceptionally(new XDataProviderException(503, "当前外部请求队列繁忙，请稍后再试"));
         }
         return future;
     }
 
     public <T> T execute(Callable<T> apiCall) {
+        CompletableFuture<T> future = submitAsync(apiCall);
         try {
-            return submitAsync(apiCall).join();
-        } catch (CompletionException ce) {
-            Throwable cause = ce.getCause();
-            if (cause instanceof RuntimeException re) {
-                throw re;
-            }
-            if (cause instanceof Error err) {
-                throw err;
-            }
-            throw new XDataProviderException(
-                    502,
-                    "执行外部 API 调用失败：" + (cause != null ? cause.getMessage() : ce.getMessage()),
-                    cause
-            );
+            return future.get();
+        } catch (InterruptedException ex) {
+            future.cancel(true);
+            Thread.currentThread().interrupt();
+            throw new XDataProviderException(503, "外部调用等待已中断", ex);
+        } catch (ExecutionException ex) {
+            Throwable cause = ex.getCause();
+            if (cause instanceof RuntimeException re) throw re;
+            if (cause instanceof Error error) throw error;
+            throw new XDataProviderException(502, "执行外部 API 调用失败", cause);
+        } catch (CancellationException ex) {
+            throw new XDataProviderException(503, "外部调用已取消", ex);
         }
     }
 
@@ -208,7 +234,7 @@ public class SharedApiExecutor {
         }
         int queued = workQueue.size();
         int active = executor.getActiveCount();
-        if (queued >= Math.max(2, queueCapacity / 8) || active >= Math.max(1, maxSize - 2)) {
+        if (queued >= Math.max(2, queueCapacity / 16) || active >= Math.max(1, (maxSize * 3) / 4)) {
             return 1;
         }
         int spanCap;
@@ -220,8 +246,8 @@ public class SharedApiExecutor {
                     : (remainingSpanSeconds >= 6 * 3600L ? Math.min(sliceCap, 3) : 2);
         }
         int desired = Math.min(spanCap, Math.min(estimatedPages, Math.max(1, remainingBudget / 2)));
-        if (queued > 0 || active > maxSize / 2) {
-            return Math.min(initialFetch ? 4 : 2, desired);
+        if (queued > 0 || active > maxSize / 3) {
+            return Math.min(initialFetch ? 3 : 2, desired);
         }
         return Math.max(1, desired);
     }
@@ -250,11 +276,15 @@ public class SharedApiExecutor {
         executor.shutdown();
         try {
             if (!executor.awaitTermination(3, TimeUnit.SECONDS)) {
-                executor.shutdownNow();
+                executor.shutdownNow().forEach(task -> {
+                    if (task instanceof FutureTask<?> pending) pending.cancel(false);
+                });
             }
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
-            executor.shutdownNow();
+            executor.shutdownNow().forEach(task -> {
+                if (task instanceof FutureTask<?> pending) pending.cancel(false);
+            });
         }
         log.debug("SharedApiExecutor shut down cleanly");
     }

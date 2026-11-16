@@ -5,6 +5,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
@@ -24,6 +26,27 @@ public class ApiExceptionHandler {
         return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(Map.of(
                 "error", "INVALID_INPUT",
                 "message", msg,
+                "timestamp", Instant.now().toString()
+        ));
+    }
+
+    @ExceptionHandler(HttpMessageNotReadableException.class)
+    public ResponseEntity<Map<String, Object>> handleUnreadableRequest(HttpMessageNotReadableException ex) {
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(Map.of(
+                "error", "INVALID_INPUT",
+                "message", "请求内容格式不正确，请检查发布时间等字段后重试",
+                "timestamp", Instant.now().toString()
+        ));
+    }
+
+    @ExceptionHandler(MethodArgumentTypeMismatchException.class)
+    public ResponseEntity<Map<String, Object>> handleInvalidParameter(MethodArgumentTypeMismatchException ex) {
+        String message = "scheduledAtEpochMs".equals(ex.getName())
+                ? "发布时间格式不正确，请重新选择时间"
+                : "请求参数格式不正确，请检查输入后重试";
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(Map.of(
+                "error", "INVALID_INPUT",
+                "message", message,
                 "timestamp", Instant.now().toString()
         ));
     }
@@ -76,7 +99,7 @@ public class ApiExceptionHandler {
         log.error("Unexpected API exception: {}", detail, ex);
         return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of(
                 "error", "INTERNAL_ERROR",
-                "message", "服务器处理请求时发生异常：" + detail,
+                "message", "服务器处理请求时发生内部异常，请稍后重试",
                 "timestamp", Instant.now().toString()
         ));
     }

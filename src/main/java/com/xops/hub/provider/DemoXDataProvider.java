@@ -125,16 +125,18 @@ public class DemoXDataProvider {
 
         // 构建关注关系：前 8 个互关，8..19 我关注但对方未回关（含大V、单向暖场、零互动），20..25 粉丝关注我但我未回关
         List<RelationshipEntry> relationships = new ArrayList<>();
+        int followingOrder = 0;
+        int followerOrder = 0;
         for (int i = 0; i < peers.size(); i++) {
             XUserSummary p = peers.get(i);
             if (i < 9) {
-                relationships.add(new RelationshipEntry(p, true, true));
+                relationships.add(new RelationshipEntry(p, true, true, false, followingOrder++, followerOrder++));
             } else if (i < 20) {
-                relationships.add(new RelationshipEntry(p, true, false));
+                relationships.add(new RelationshipEntry(p, true, false, false, followingOrder++, null));
             } else if (i < 24) {
-                relationships.add(new RelationshipEntry(p, false, true));
+                relationships.add(new RelationshipEntry(p, false, true, false, null, followerOrder++));
             } else {
-                relationships.add(new RelationshipEntry(p, true, false));
+                relationships.add(new RelationshipEntry(p, true, false, false, followingOrder++, null));
             }
         }
 

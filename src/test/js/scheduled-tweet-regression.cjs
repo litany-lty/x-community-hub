@@ -28,14 +28,20 @@ const helpersSlice = sliceBetween(
 
 const batchHelpersSlice = sliceBetween(
     appJs,
-    "    const MIN_SCHEDULE_INTERVAL_MS =",
+    "    function formatEpochToDatetimeLocalValue(",
     "    function formatScheduleEpochLabel("
+);
+const recommendationHelpersSlice = sliceBetween(
+    appJs,
+    "    function getQueuedScheduledEpochsMs(",
+    "    function createScheduleDraftItem("
 );
 
 const harnessCode = `
 ${urlTokenReSlice};
 ${helpersSlice}
 ${batchHelpersSlice}
+${recommendationHelpersSlice}
 this.__exports = {
     computeWeightedTweetLength,
     validateAndMergeScheduleFiles,
@@ -45,19 +51,54 @@ this.__exports = {
     MIN_SCHEDULE_INTERVAL_MS,
     computeNextAvailableScheduleMs,
     validateBatchScheduleEpochs,
-    alignBatchScheduleEpochs
+    alignBatchScheduleEpochs,
+    formatEpochToDatetimeLocalValue,
+    parseDraftItemEpochMs,
+    getLatestPublishedEpochMs,
+    getRecommendedScheduleGapMs,
+    getRecommendedScheduleEpochMs,
+    buildScheduleQuickPresets,
+    formatScheduleLocalTime,
+    refreshAutomaticScheduleTimes
 };
 `;
 
+const MINUTE = 60_000;
+let clockNowMs = Date.UTC(2026, 10, 14, 12, 0, 0);
+class HarnessDate extends Date {
+    constructor(...args) { super(...(args.length ? args : [clockNowMs])); }
+    static now() { return clockNowMs; }
+}
+const state = {};
+let activeProfile = {};
+const timeInputs = new Map();
+const documentStub = {
+    activeElement: null,
+    querySelector(selector) {
+        const match = String(selector).match(/data-draft-time=["'](\d+)["']/);
+        return match ? timeInputs.get(Number(match[1])) || null : null;
+    },
+    querySelectorAll() { return Array.from(timeInputs.values()); },
+    getElementById() { return null; }
+};
 const context = vm.createContext({
     URL: { createObjectURL: () => "blob:mock" },
     Intl,
-    Date,
+    Date: HarnessDate,
     Math,
     Number,
     String,
     Array,
-    Set
+    Set,
+    state,
+    document: documentStub,
+    isLoggedIn: () => Boolean(state.authStatus?.loggedIn),
+    stableUserId: (user) => String(user?.id || ""),
+    getActiveAlgoProfile: () => activeProfile,
+    rotateComposerRequestId: () => {
+        state.composerRotationCount = (state.composerRotationCount || 0) + 1;
+        state.composerClientRequestId = "rotated-" + state.composerRotationCount;
+    }
 });
 
 vm.runInContext(harnessCode, context, { filename: "app-scheduled-tweet-helpers.js" });
@@ -69,8 +110,45 @@ const {
     MIN_SCHEDULE_INTERVAL_MS,
     computeNextAvailableScheduleMs,
     validateBatchScheduleEpochs,
-    alignBatchScheduleEpochs
+    alignBatchScheduleEpochs,
+    formatEpochToDatetimeLocalValue,
+    parseDraftItemEpochMs,
+    getLatestPublishedEpochMs,
+    getRecommendedScheduleGapMs,
+    getRecommendedScheduleEpochMs,
+    buildScheduleQuickPresets,
+    formatScheduleLocalTime,
+    refreshAutomaticScheduleTimes
 } = context.__exports;
+
+function resetScheduleState(now = Date.UTC(2026, 10, 14, 12, 0, 0)) {
+    clockNowMs = now;
+    Object.assign(state, {
+        authStatus: { loggedIn: true, user: { id: "self" } },
+        report: null,
+        scheduleJobs: [],
+        scheduleDraftItems: [],
+        scheduleMutations: new Set(),
+        composerRotationCount: 0,
+        composerClientRequestId: "initial",
+        activeScheduleDraftIdx: 0,
+        scheduleServerTz: Intl.DateTimeFormat().resolvedOptions().timeZone
+    });
+    activeProfile = { cadenceAndReach: { minRecommendedGapMinutes: 180 } };
+    timeInputs.clear();
+    documentStub.activeElement = null;
+}
+function liveReport(lastMs, userId = "self") {
+    return {
+        liveData: true,
+        profile: { id: userId },
+        algorithmHealth: { latestMainPostAt: new Date(lastMs).toISOString() },
+        contentTiming: { goldenSlots: [] }
+    };
+}
+function draftAt(epochMs, timeTouched = false, text = "") {
+    return { scheduledAtValue: formatEpochToDatetimeLocalValue(epochMs), timeTouched, text, files: [] };
+}
 
 function makeFile(name, type, size) {
     return { name, type, size };
@@ -207,5 +285,150 @@ const aligned = alignBatchScheduleEpochs(
 assert.equal(aligned.length, 3);
 const alignedCheck = validateBatchScheduleEpochs(aligned, [baseMs + 90 * 60_000], baseMs, MIN_SCHEDULE_INTERVAL_MS);
 assert.equal(alignedCheck.ok, true, `Expected aligned epochs to have zero conflicts, got: ${alignedCheck.error}`);
+
+// 5. Last actual publication is scoped to the signed-in account and known successful data.
+resetScheduleState(baseMs);
+state.report = liveReport(baseMs - 90 * MINUTE);
+state.scheduleJobs = [
+    { accountId: "self", status: "PUBLISHED", publishedAtEpochMs: baseMs - 20 * MINUTE },
+    { accountId: "other", status: "PUBLISHED", publishedAtEpochMs: baseMs - MINUTE },
+    { accountId: "self", status: "SENDING", publishedAtEpochMs: baseMs - MINUTE },
+    { accountId: "self", status: "SCHEDULED", scheduledAtEpochMs: baseMs - MINUTE },
+    { accountId: "self", status: "PUBLISHED", publishedAtEpochMs: baseMs + MINUTE },
+    { accountId: "self", status: "PUBLISHED", publishedAtEpochMs: "invalid" }
+];
+assert.equal(getLatestPublishedEpochMs(baseMs), baseMs - 20 * MINUTE);
+state.scheduleJobs = [];
+assert.equal(getLatestPublishedEpochMs(baseMs), baseMs - 90 * MINUTE);
+state.report.liveData = false;
+assert.equal(getLatestPublishedEpochMs(baseMs), 0, "Stored/demo reports must not become the current account's last post");
+state.report = liveReport(baseMs - MINUTE, "other");
+assert.equal(getLatestPublishedEpochMs(baseMs), 0);
+state.report = liveReport(baseMs + MINUTE);
+assert.equal(getLatestPublishedEpochMs(baseMs), 0);
+state.report.algorithmHealth.latestMainPostAt = "invalid";
+assert.equal(getLatestPublishedEpochMs(baseMs), 0);
+state.scheduleJobs = [{ accountId: "self", status: "PUBLISHED", publishedAtEpochMs: baseMs - MINUTE }];
+state.authStatus.loggedIn = false;
+assert.equal(getLatestPublishedEpochMs(baseMs), 0);
+
+// 6. Recommendations use the existing soft gap while preserving the 1-hour hard minimum.
+resetScheduleState(baseMs);
+assert.equal(getRecommendedScheduleGapMs(), 180 * MINUTE);
+activeProfile = {};
+assert.equal(getRecommendedScheduleGapMs(), 180 * MINUTE);
+activeProfile = { cadenceAndReach: { minRecommendedGapMinutes: 30 } };
+assert.equal(getRecommendedScheduleGapMs(), MIN_SCHEDULE_INTERVAL_MS);
+activeProfile.cadenceAndReach.minRecommendedGapMinutes = 180;
+state.report = liveReport(baseMs - 30 * MINUTE);
+assert.equal(getRecommendedScheduleEpochMs(baseMs + 30 * MINUTE, { nowMs: baseMs }), baseMs + 150 * MINUTE);
+
+activeProfile.cadenceAndReach.minRecommendedGapMinutes = 60;
+state.scheduleJobs = [
+    { accountId: "self", status: "SCHEDULED", scheduledAtEpochMs: baseMs + 60 * MINUTE },
+    { accountId: "other", status: "SCHEDULED", scheduledAtEpochMs: baseMs + 210 * MINUTE }
+];
+state.scheduleDraftItems = [draftAt(baseMs + 210 * MINUTE), draftAt(baseMs + 150 * MINUTE, true)];
+assert.equal(
+    getRecommendedScheduleEpochMs(baseMs + 5 * MINUTE, { draftIndex: 0, nowMs: baseMs }),
+    baseMs + 210 * MINUTE,
+    "Resolve last-post, queue and peer-draft conflicts without reserving the active draft or another account's queue"
+);
+state.report = null;
+state.scheduleDraftItems = [];
+state.scheduleJobs = [{ accountId: "self", status: "SCHEDULED", scheduledAtEpochMs: baseMs + 48 * 60 * MINUTE }];
+assert.equal(getRecommendedScheduleEpochMs(baseMs + 30 * MINUTE, { nowMs: baseMs }), baseMs + 30 * MINUTE,
+    "A distant queue entry must leave the earlier free slot usable");
+state.scheduleJobs = [
+    { accountId: "self", status: "SENDING", scheduledAtEpochMs: baseMs - 48 * 60 * MINUTE },
+    { accountId: "self", status: "RESEND_QUEUED", scheduledAtEpochMs: baseMs - 24 * 60 * MINUTE }
+];
+assert.equal(getLatestPublishedEpochMs(baseMs), 0);
+assert.equal(getRecommendedScheduleEpochMs(baseMs + 5 * MINUTE, { nowMs: baseMs }), baseMs + 60 * MINUTE,
+    "In-flight work reserves the present without being reported as successfully published");
+
+// 7. Automatic ordering ignores later automatic drafts, but respects manual and focused inputs.
+state.scheduleJobs = [];
+state.scheduleDraftItems = [draftAt(baseMs + 5 * MINUTE), draftAt(baseMs + 120 * MINUTE), draftAt(baseMs + 60 * MINUTE, true)];
+assert.equal(getRecommendedScheduleEpochMs(baseMs + 5 * MINUTE,
+    { draftIndex: 0, nowMs: baseMs, includeLaterAutoDrafts: false }), baseMs + 120 * MINUTE);
+assert.equal(getRecommendedScheduleEpochMs(baseMs + 5 * MINUTE,
+    { draftIndex: 0, nowMs: baseMs }), baseMs + 180 * MINUTE);
+state.scheduleDraftItems = [
+    draftAt(baseMs + 5 * MINUTE, false, "Keep first body"),
+    draftAt(baseMs + 120 * MINUTE, true, "Keep manual body"),
+    draftAt(baseMs + 125 * MINUTE, false, "Keep following body"),
+    draftAt(baseMs + 400 * MINUTE, false, "Keep focused body")
+];
+const preservedFiles = [makeFile("kept.png", "image/png", 100)];
+state.scheduleDraftItems[2].files = preservedFiles;
+state.scheduleDraftItems.forEach((item, index) => timeInputs.set(index, { value: item.scheduledAtValue }));
+const manualValue = state.scheduleDraftItems[1].scheduledAtValue;
+const focusedValue = state.scheduleDraftItems[3].scheduledAtValue;
+documentStub.activeElement = timeInputs.get(3);
+documentStub.activeElement.value = ""; // A date input temporarily cleared while its user is editing.
+refreshAutomaticScheduleTimes(0, baseMs);
+assert.equal(state.scheduleDraftItems[1].scheduledAtValue, manualValue);
+assert.equal(timeInputs.get(1).value, manualValue);
+assert.equal(state.scheduleDraftItems[3].scheduledAtValue, focusedValue);
+assert.equal(timeInputs.get(3).value, "");
+assert.ok(parseDraftItemEpochMs(state.scheduleDraftItems[2]) >= baseMs + 180 * MINUTE);
+assert.equal(timeInputs.get(2).value, state.scheduleDraftItems[2].scheduledAtValue);
+assert.equal(state.scheduleDraftItems[2].text, "Keep following body");
+assert.equal(state.scheduleDraftItems[2].files, preservedFiles);
+const settledTimes = state.scheduleDraftItems.map((item) => item.scheduledAtValue);
+refreshAutomaticScheduleTimes(0, baseMs);
+assert.deepEqual(state.scheduleDraftItems.map((item) => item.scheduledAtValue), settledTimes,
+    "Repeated queue refreshes must not keep pushing automatic drafts forward");
+
+// A successful create may appear in the refreshed queue before its draft is cleared.
+resetScheduleState(baseMs);
+activeProfile.cadenceAndReach.minRecommendedGapMinutes = 60;
+state.scheduleDraftItems = [draftAt(baseMs + 30 * MINUTE, false, "Submitted body")];
+state.scheduleJobs = [{ accountId: "self", status: "SCHEDULED", scheduledAtEpochMs: baseMs + 30 * MINUTE }];
+const submittingValue = state.scheduleDraftItems[0].scheduledAtValue;
+timeInputs.set(0, { value: submittingValue });
+state.scheduleMutations.add("create");
+const submittingId = state.composerClientRequestId;
+const submittingRotations = state.composerRotationCount;
+assert.equal(refreshAutomaticScheduleTimes(0, baseMs), false);
+assert.equal(state.scheduleDraftItems[0].scheduledAtValue, submittingValue);
+assert.equal(timeInputs.get(0).value, submittingValue);
+assert.equal(state.composerClientRequestId, submittingId);
+assert.equal(state.composerRotationCount, submittingRotations);
+state.scheduleMutations.delete("create");
+assert.equal(refreshAutomaticScheduleTimes(0, baseMs), true);
+assert.equal(parseDraftItemEpochMs(state.scheduleDraftItems[0]), baseMs + 90 * MINUTE);
+assert.equal(timeInputs.get(0).value, state.scheduleDraftItems[0].scheduledAtValue);
+assert.equal(state.composerRotationCount, submittingRotations + 1);
+
+// 8. Preset labels describe resolved local time, deduplicate, and remain correct across a year boundary.
+const presetNowMs = new Date(2026, 10, 14, 19, 30).getTime();
+resetScheduleState(presetNowMs);
+state.report = liveReport(presetNowMs - 10 * MINUTE);
+state.report.contentTiming.goldenSlots = [{ label: "周六 20:00–22:00" }, { label: "周六 20:00–22:00" }];
+state.scheduleDraftItems = [draftAt(presetNowMs + 5 * MINUTE)];
+const presets = Array.from(buildScheduleQuickPresets(presetNowMs));
+assert.ok(presets.length > 0);
+assert.equal(new Set(presets.map((preset) => preset.epochMs)).size, presets.length);
+const recommended = presets.find((preset) => preset.epochMs === presetNowMs + 170 * MINUTE);
+assert.ok(recommended, "The recent post shifts the earliest preset to 22:20");
+assert.match(recommended.label, /22:20/);
+assert.equal(presets.some((preset) => preset.isGolden), false,
+    "A recommendation shifted past the golden window must not retain its golden label");
+for (const preset of presets) {
+    assert.ok(preset.label.includes(formatScheduleLocalTime(preset.epochMs, presetNowMs)));
+}
+const yearEnd = new Date(2026, 11, 31, 23, 45).getTime();
+assert.match(formatScheduleLocalTime(new Date(2026, 11, 31, 23, 50).getTime(), yearEnd), /今天.*23:50/);
+assert.match(formatScheduleLocalTime(new Date(2027, 0, 1, 0, 15).getTime(), yearEnd), /明天.*00:15/);
+assert.match(formatScheduleLocalTime(new Date(2027, 0, 2, 9, 0).getTime(), yearEnd), /01[/-]02.*09:00/);
+const crossDayInput = formatEpochToDatetimeLocalValue(new Date(2027, 0, 1, 0, 15).getTime());
+assert.equal(parseDraftItemEpochMs({ scheduledAtValue: crossDayInput }), new Date(2027, 0, 1, 0, 15).getTime());
+
+// 9. A dense queue with more than 200 collisions must still return a free time.
+const denseOccupied = Array.from({ length: 240 }, (_, i) => baseMs + i * 30 * MINUTE).reverse();
+assert.equal(computeNextAvailableScheduleMs(baseMs, denseOccupied),
+    baseMs + 239 * 30 * MINUTE + MIN_SCHEDULE_INTERVAL_MS);
 
 console.log("scheduled-tweet-regression: passed");

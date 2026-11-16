@@ -191,8 +191,20 @@ public final class RawSnapshotModels {
             XUserSummary user,
             boolean iFollowThem,
             boolean theyFollowMe,
-            boolean relationshipVerified
+            boolean relationshipVerified,
+            Integer followingOrder,
+            Integer followerOrder
     ) {
+        public RelationshipEntry {
+            followingOrder = followingOrder != null && followingOrder >= 0 ? followingOrder : null;
+            followerOrder = followerOrder != null && followerOrder >= 0 ? followerOrder : null;
+        }
+
+        public RelationshipEntry(XUserSummary user, boolean iFollowThem, boolean theyFollowMe,
+                                 boolean relationshipVerified) {
+            this(user, iFollowThem, theyFollowMe, relationshipVerified, null, null);
+        }
+
         public RelationshipEntry(XUserSummary user, boolean iFollowThem, boolean theyFollowMe) {
             this(user, iFollowThem, theyFollowMe, false);
         }

@@ -34,17 +34,28 @@ public class OfficialXApiV2Provider {
     private final XOpsProperties properties;
     private final ObjectMapper objectMapper;
     private final SharedApiExecutor sharedExecutor;
+    private final UpstreamBudgetGuard budgetGuard;
     private final HttpClient httpClient;
 
     public OfficialXApiV2Provider(XOpsProperties properties, ObjectMapper objectMapper) {
-        this(properties, objectMapper, new SharedApiExecutor(properties));
+        this(properties, objectMapper, new SharedApiExecutor(properties), new UpstreamBudgetGuard(properties));
+    }
+
+    public OfficialXApiV2Provider(XOpsProperties properties, ObjectMapper objectMapper, SharedApiExecutor sharedExecutor) {
+        this(properties, objectMapper, sharedExecutor, new UpstreamBudgetGuard(properties));
     }
 
     @Autowired
-    public OfficialXApiV2Provider(XOpsProperties properties, ObjectMapper objectMapper, SharedApiExecutor sharedExecutor) {
+    public OfficialXApiV2Provider(
+            XOpsProperties properties,
+            ObjectMapper objectMapper,
+            SharedApiExecutor sharedExecutor,
+            @Autowired(required = false) UpstreamBudgetGuard budgetGuard
+    ) {
         this.properties = properties;
         this.objectMapper = objectMapper;
         this.sharedExecutor = sharedExecutor;
+        this.budgetGuard = budgetGuard != null ? budgetGuard : new UpstreamBudgetGuard(properties);
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(10))
                 .build();
@@ -303,6 +314,7 @@ public class OfficialXApiV2Provider {
                     .header("Accept", "application/json")
                     .GET()
                     .build();
+            budgetGuard.acquirePermit(request.uri(), "x_official_read");
             HttpResponse<String> resp = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
             if (resp.statusCode() == 401) {
                 throw new XDataProviderException(401, "X 官方 API Bearer Token 无效或已过期（HTTP 401）");

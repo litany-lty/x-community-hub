@@ -397,7 +397,7 @@ class XAlgorithmProfileAndOpsRecommendationTest {
     }
 
     @Test
-    void empiricalCalibrationInvertsEffectiveReplyWeightRunsLoocvDetectsAnomaliesAndReplyTemplates() {
+    void empiricalCalibrationPreservesBaselineAndRejectsSmallSampleReview() {
         XUserSummary self = user("u-cal", "cal_ops");
         XUserSummary mutualPeer = user("u-mp", "mutual_peer");
         XUserSummary fanOnlyPeer = user("u-fp", "fan_only_peer");
@@ -482,18 +482,17 @@ class XAlgorithmProfileAndOpsRecommendationTest {
         assertThat(cal.replyTemplateRisk().copyPastaRiskTriggered()).isTrue();
         assertThat(cal.replyTemplateRisk().maxClusterSize()).isEqualTo(3);
 
+        // 35 次浏览仍不足以形成可靠复盘候选；高平滑互动率不能抵消样本量不足。
         assertThat(cal.residualAnomalies())
                 .extracting(ResidualAnomalyPost::id)
-                .contains("c7");
+                .doesNotContain("c7");
 
         assertThat(report.algorithmHealth().opsRecommendations())
                 .extracting(OpsRecommendationItem::code)
-                .contains("REPLY_TEMPLATE_DEDUP", "RESIDUAL_ANOMALY_REVIEW");
-
-        OpsRecommendationItem anomalyRec = report.algorithmHealth().opsRecommendations().stream()
-                .filter(i -> "RESIDUAL_ANOMALY_REVIEW".equals(i.code()))
-                .findFirst().orElseThrow();
-        assertThat(anomalyRec.actionTarget()).isEqualTo("tab:timing|scrollId:algoCalibrationPanel");
+                .contains("REPLY_TEMPLATE_DEDUP")
+                .doesNotContain("RESIDUAL_ANOMALY_REVIEW");
+        assertThat(report.algorithmHealth().opsRecommendations())
+                .noneMatch(item -> item.externalUrl() != null && item.externalUrl().endsWith("/c7"));
 
         report.algorithmHealth().opsRecommendations().stream()
                 .filter(i -> "GOLDEN_SLOT_LAUNCH".equals(i.code()))

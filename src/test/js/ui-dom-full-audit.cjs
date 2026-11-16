@@ -57,6 +57,7 @@ function slice(startMarker, endMarker) {
     assert.deepEqual(staticUnboundDescs, [], "index.html should not contain static unbound .section-desc explanation blocks");
     assert.equal(/class="sidebar-desc"/.test(htmlSrc), false, "index.html should not contain redundant .sidebar-desc blocks");
     assert.equal(htmlIds.has("topbarPeriodBadge"), false, "redundant topbarPeriodBadge should be removed");
+    assert.equal(htmlIds.has("periodUnlockHelpBtn"), false, "unlock explanation belongs to the selected unavailable period");
     assert.equal(htmlIds.has("scheduleQueueSummaryDesc"), false, "redundant scheduleQueueSummaryDesc should be removed");
 })();
 
@@ -103,7 +104,6 @@ function slice(startMarker, endMarker) {
     ];
 
     const elementsById = {
-        periodUnlockHelpBtn: { hidden: false },
         authorPromptModal: { hidden: true },
         unlockGuideModal: { hidden: true },
         confirmResendModal: { hidden: true }
@@ -173,6 +173,29 @@ this.__exports = { state, PERIOD_META, normalizePeriod, isPeriodUnlocked, syncPe
     segBtns[1].click();
     assert.equal(unlockedModalCalls.length, 0);
     assert.ok(toasts.at(-1).includes("正在同步账号权限"));
+    handlePeriodShortcut({ key: "w" });
+    assert.equal(unlockedModalCalls.length, 0);
+    assert.ok(toasts.at(-1).includes("正在同步账号权限"));
+
+    // 请求结束但权限仍未知，包括不完整权限响应和缺少存档时，不应冒充未解锁。
+    state.isFetching = false;
+    for (const policy of [null, {}]) {
+        state.accessPolicy = policy;
+        for (const storedMode of [false, true]) {
+            state.storedMode = storedMode;
+            state.bundle = null;
+            syncPeriodButtons();
+            assert.ok(segBtns.every((button) => !button.classList.contains("is-locked")));
+            segBtns[1].click();
+            assert.ok(toasts.at(-1).includes("暂时无法确认可用时间范围"));
+            handlePeriodShortcut({ key: "w" });
+            assert.ok(toasts.at(-1).includes("暂时无法确认可用时间范围"));
+            assert.equal(unlockedModalCalls.length, 0);
+            assert.equal(state.period, "HOURS_24");
+            assert.equal(loadReportCalls.length, 0);
+        }
+    }
+    state.storedMode = false;
 
     // 2c. 首日默认解锁 24小时，48h/7d/30d 未累计满时锁定；累计满 2 天后可在 24小时 与 48小时 间自由切换
     state.isFetching = false;
@@ -184,10 +207,11 @@ this.__exports = { state, PERIOD_META, normalizePeriod, isPeriodUnlocked, syncPe
         }
     };
     syncPeriodButtons();
-    assert.equal(elementsById.periodUnlockHelpBtn.hidden, false);
     assert.equal(segBtns[0].textContent, "24小时");
     assert.equal(segBtns[1].textContent, "48小时");
-    assert.equal(segBtns[2].textContent, "🔒 7天");
+    assert.equal(segBtns[2].textContent, "7天");
+    assert.equal(segBtns[2].getAttribute("aria-disabled"), "true");
+    assert.equal(segBtns[2].getAttribute("aria-label"), "7天，未解锁");
     assert.equal(segBtns[2].classList.contains("is-locked"), true);
 
     segBtns[1].click();
@@ -212,13 +236,12 @@ this.__exports = { state, PERIOD_META, normalizePeriod, isPeriodUnlocked, syncPe
     handlePeriodShortcut({ key: "t" });
     assert.equal(state.period, "HOURS_24");
 
-    // 2d. 全部 4 个时间窗已解锁时，顶栏「解锁」按钮自动隐藏（避免无意义辅助按钮）
+    // 2d. 全部 4 个时间窗已解锁时，四个选项均恢复普通可选状态
     state.accessPolicy = {
         unlockedPeriods: ["HOURS_24", "HOURS_48", "WEEK", "MONTH"],
         lockedReasons: {}
     };
     syncPeriodButtons();
-    assert.equal(elementsById.periodUnlockHelpBtn.hidden, true);
     assert.ok(segBtns.every((b) => !b.classList.contains("is-locked") && !b.textContent.startsWith("🔒")));
 
     // 2e. 弹窗滚动锁同步测试
@@ -229,6 +252,102 @@ this.__exports = { state, PERIOD_META, normalizePeriod, isPeriodUnlocked, syncPe
     elementsById.unlockGuideModal.hidden = true;
     syncBodyModalLock();
     assert.equal(bodyClassList.contains("modal-open"), false);
+})();
+
+// 3. 关注列表在筛选后、分页前排序；切换排序不重读上游也不改原报表。
+(function testFollowSortingAndPagination() {
+    const item = (username, relationshipOrder, intimacyScore, followersCount) => Object.freeze({
+        user: Object.freeze({ username, displayName: username, bio: "", followersCount }),
+        relationshipOrder, intimacyScore, auditCategory: "ZERO_INTERACTION"
+    });
+    const rows = Object.freeze([
+        item("older", 8, 12, 900),
+        item("unknown", null, 10, 800),
+        item("recent", 0, 3, 200),
+        item("close", 4, 60, 30)
+    ]);
+    const report = { followAudit: {
+        notFollowingBackList: rows, fansNotFollowedBackList: rows, mutualList: rows
+    }};
+    const state = {
+        report, followStateTab: "NOT_FOLLOWING_BACK", unfollowCategory: "ALL",
+        followSearchQuery: "", followSortBy: "recent", followRenderLimit: 130,
+        whitelistSet: new Set()
+    };
+    let changeSort;
+    let renderCalls = 0;
+    const context = {
+        state, LIST_PAGE_SIZE: 50,
+        $: (id) => {
+            assert.equal(id, "followSortSelect");
+            return { addEventListener: (event, callback) => {
+                assert.equal(event, "change");
+                changeSort = callback;
+            }};
+        },
+        renderFollowAuditPanel: (value) => {
+            assert.equal(value, report);
+            renderCalls++;
+        }
+    };
+    vm.runInNewContext(
+        slice("    function getFilteredFollowItems(", "    function computeEffectiveSuggestUnfollowCount(")
+        + '\nthis.filterFollow = getFilteredFollowItems;\n'
+        + slice('        $("followSortSelect").addEventListener(', '        $("continueRelationshipsBtn").addEventListener('),
+        context
+    );
+    const names = () => Array.from(context.filterFollow(report), row => row.user.username);
+    const expected = {
+        recent: ["recent", "close", "older", "unknown"],
+        intimacy: ["close", "older", "unknown", "recent"],
+        followers: ["older", "unknown", "recent", "close"]
+    };
+    for (const tab of ["NOT_FOLLOWING_BACK", "FAN_ONLY", "MUTUAL"]) {
+        state.followStateTab = tab;
+        for (const sort of ["recent", "intimacy", "followers"]) {
+            state.followRenderLimit = 130;
+            changeSort({ target: { value: sort } });
+            assert.deepEqual(names(), expected[sort], tab + ": " + sort);
+            assert.equal(state.followRenderLimit, 50);
+            assert.equal(state.followStateTab, tab);
+        }
+    }
+    assert.equal(renderCalls, 9);
+    assert.deepEqual(rows.map(row => row.user.username), ["older", "unknown", "recent", "close"]);
+
+    state.followStateTab = "NOT_FOLLOWING_BACK";
+    state.followSearchQuery = "@clo";
+    assert.deepEqual(names(), ["close"]);
+    state.followSearchQuery = "";
+    state.unfollowCategory = "WHITELIST";
+    state.whitelistSet.add("recent");
+    assert.deepEqual(names(), ["recent"]);
+    state.unfollowCategory = "SUGGEST_CLEAN";
+    assert.deepEqual(names(), ["older", "unknown", "close"]);
+    state.unfollowCategory = "ALL";
+
+    // 最高粉丝数在原始数组第63位，必须排进首屏；不能只排序当前可见50条。
+    report.followAudit.notFollowingBackList = Object.freeze(
+        Array.from({ length: 63 }, (_, i) => item("peer" + i, 62 - i, 0, i))
+    );
+    const firstPage = context.filterFollow(report).slice(0, state.followRenderLimit);
+    assert.equal(firstPage.length, 50);
+    assert.equal(firstPage[0].user.username, "peer62");
+    assert.equal(firstPage[49].user.username, "peer13");
+
+    // 同值保持可靠关注顺序；均无来源的旧记录保持原次序。
+    report.followAudit.notFollowingBackList = Object.freeze([
+        item("legacyA", undefined, 0, 10), item("legacyB", null, 0, 10),
+        item("known", 0, 0, 10)
+    ]);
+    assert.deepEqual(names(), ["known", "legacyA", "legacyB"]);
+    state.followSortBy = "recent";
+    assert.deepEqual(names(), ["known", "legacyA", "legacyB"]);
+
+    const select = htmlSrc.match(/<select\b[^>]*id="followSortSelect"[\s\S]*?<\/select>/);
+    assert.ok(select, "follow sorting control is present");
+    assert.deepEqual([...select[0].matchAll(/<option value="([^"]+)"/g)].map(match => match[1]),
+        ["recent", "intimacy", "followers"]);
 })();
 
 console.log("ui-dom-full-audit: passed");

@@ -30,6 +30,7 @@ import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.time.Clock;
 import java.time.Instant;
+import java.time.LocalDate;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
@@ -45,8 +46,8 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -69,6 +70,10 @@ public class ScheduledTweetService {
     public static final long MIN_SCHEDULE_LEAD_MS = 15_000L;
     public static final long MIN_TWEET_INTERVAL_MS = 3_600_000L;
     public static final int MAX_BATCH_CREATE_ITEMS = 20;
+    public static final int MAX_ACTIVE_JOBS_PER_ACCOUNT = 60;
+    public static final int MAX_STORED_JOBS_PER_ACCOUNT = 500;
+    public static final long MAX_STORED_MEDIA_BYTES_PER_ACCOUNT = 256L * 1024 * 1024;
+    private static final long MIN_FREE_DISK_BYTES = 512L * 1024 * 1024;
     public static final long DUPLICATE_WINDOW_MS = 60_000L;
     public static final long MEDIA_REUSE_TTL_MS = 20L * 3600_000L;
     private static final int MAX_CLIENT_REQUEST_CACHE = 200;
@@ -90,6 +95,9 @@ public class ScheduledTweetService {
     }
 
     private record DetectedImageFormat(String mimeType, String extension, long maxBytes) {
+    }
+
+    private record DailyPublishCounter(String accountId, String localDate, int count) {
     }
 
     private record QueueStorage(
@@ -116,10 +124,14 @@ public class ScheduledTweetService {
     private final XOAuthService oauthService;
     private final XPublishClient publishClient;
     private final CommunityHubService communityHubService;
+    private static final int LOCK_STRIPES = 64;
     private final Clock clock;
-    private final ConcurrentHashMap<String, Object> accountLocks = new ConcurrentHashMap<>();
+    private final Object[] accountLocks;
+    private final Set<String> dispatchingAccounts = ConcurrentHashMap.newKeySet();
     private final ExecutorService dispatchExecutor;
     private final AtomicBoolean bootRecovered = new AtomicBoolean(false);
+    private final Object mediaSpaceLock = new Object();
+    private long reservedMediaBytes;
 
     @Autowired
     public ScheduledTweetService(
@@ -163,12 +175,15 @@ public class ScheduledTweetService {
         this.publishClient = publishClient;
         this.communityHubService = communityHubService;
         this.clock = clock != null ? clock : Clock.systemUTC();
+        this.accountLocks = new Object[LOCK_STRIPES];
+        for (int i = 0; i < accountLocks.length; i++) accountLocks[i] = new Object();
         AtomicInteger seq = new AtomicInteger(1);
-        this.dispatchExecutor = Executors.newFixedThreadPool(2, r -> {
-            Thread t = new Thread(r, "xops-sched-dispatch-" + seq.getAndIncrement());
-            t.setDaemon(true);
-            return t;
-        });
+        this.dispatchExecutor = new ThreadPoolExecutor(2, 2, 0L, TimeUnit.MILLISECONDS,
+                new ArrayBlockingQueue<>(128), r -> {
+                    Thread t = new Thread(r, "xops-sched-dispatch-" + seq.getAndIncrement());
+                    t.setDaemon(true);
+                    return t;
+                }, new ThreadPoolExecutor.AbortPolicy());
     }
 
     @EventListener(ApplicationReadyEvent.class)
@@ -191,7 +206,7 @@ public class ScheduledTweetService {
         }
         for (String accountId : discoverScheduledAccountIds()) {
             try {
-                processDueJobsForAccount(accountId);
+                triggerAsyncDispatch(accountId);
             } catch (Exception ex) {
                 log.warn("Scheduled tweet tick failed for account {}: {}", accountId, ex.getMessage());
             }
@@ -215,32 +230,36 @@ public class ScheduledTweetService {
         bootRecovered.set(true);
         long nowMs = clock.millis();
         for (String accountId : discoverScheduledAccountIds()) {
-            synchronized (accountLock(accountId)) {
-                QueueStorage queue = loadQueueLocked(accountId, "");
-                boolean changed = false;
-                for (int i = 0; i < queue.jobs().size(); i++) {
-                    ScheduledTweetJob job = queue.jobs().get(i);
-                    if (job.status() == ScheduledTweetStatus.SENDING) {
-                        boolean uncertain = job.postRequestDispatched();
-                        String err = uncertain
-                                ? "服务重启前推文请求已发出但未收到回执，请先查看 X 主页确认未发出后再点击确认补发"
-                                : "服务重启中断了发送流程，二次确认后将自动补发";
-                        queue.jobs().set(i, job.markOverdueConfirmRequired(
-                                OverdueReason.INTERRUPTED_SENDING,
-                                uncertain,
-                                UUID.randomUUID().toString(),
-                                err,
-                                nowMs
-                        ));
+            try {
+                synchronized (accountLock(accountId)) {
+                    QueueStorage queue = loadQueueLocked(accountId, "");
+                    boolean changed = false;
+                    for (int i = 0; i < queue.jobs().size(); i++) {
+                        ScheduledTweetJob job = queue.jobs().get(i);
+                        if (job.status() == ScheduledTweetStatus.SENDING) {
+                            boolean uncertain = job.postRequestDispatched();
+                            String err = uncertain
+                                    ? "服务重启前推文请求已发出但未收到回执，请先查看 X 主页确认未发出后再点击确认补发"
+                                    : "服务重启中断了发送流程，二次确认后将自动补发";
+                            queue.jobs().set(i, job.markOverdueConfirmRequired(
+                                    OverdueReason.INTERRUPTED_SENDING,
+                                    uncertain,
+                                    UUID.randomUUID().toString(),
+                                    err,
+                                    nowMs
+                            ));
+                            changed = true;
+                        }
+                    }
+                    if (promoteOverdueLocked(queue, nowMs)) {
                         changed = true;
                     }
+                    if (changed) {
+                        saveQueueLocked(queue);
+                    }
                 }
-                if (promoteOverdueLocked(queue, nowMs)) {
-                    changed = true;
-                }
-                if (changed) {
-                    saveQueueLocked(queue);
-                }
+            } catch (RuntimeException ex) {
+                log.warn("Scheduled queue recovery stopped for account {}: {}", accountId, ex.getMessage());
             }
         }
     }
@@ -318,8 +337,8 @@ public class ScheduledTweetService {
             throw new XDataProviderException(403, "当前账号尚未授予图片上传权限（media.write），请先点击「前往 X 二次授权」补充授权");
         }
 
-        long nowMs = clock.millis();
         String normalizedReqId = clientRequestId == null ? "" : clientRequestId.trim();
+        if (normalizedReqId.length() > 128) throw new IllegalArgumentException("请求标识不能超过 128 个字符");
         List<String> mediaShaList = new ArrayList<>(mediaInputs.size());
         for (MediaUploadInput input : mediaInputs) {
             mediaShaList.add(sha256Hex(input.bytes()));
@@ -328,6 +347,7 @@ public class ScheduledTweetService {
 
         synchronized (accountLock(accountId)) {
             QueueStorage queue = loadQueueLocked(accountId, username);
+            long nowMs = clock.millis();
             boolean overduePromoted = promoteOverdueLocked(queue, nowMs);
             if (!normalizedReqId.isEmpty()) {
                 String existingJobId = queue.clientRequestMap().get(normalizedReqId);
@@ -345,6 +365,12 @@ public class ScheduledTweetService {
             if (scheduledAtEpochMs < nowMs + MIN_SCHEDULE_LEAD_MS) {
                 throw new IllegalArgumentException("定时发布时间需晚于当前时间至少 15 秒");
             }
+            assertActiveQueueCapacityLocked(queue, 1);
+            long mediaBytes = mediaInputs.stream().mapToLong(input -> input.bytes().length).sum();
+            assertStoredQueueCapacityLocked(queue, 1, mediaBytes);
+            if (localDateStringFor(scheduledAtEpochMs).equals(localDateStringFor(nowMs))) {
+                assertDailyPublishQuotaAvailableLocked(queue, nowMs, 1);
+            }
 
             for (ScheduledTweetJob active : queue.jobs()) {
                 if (isActiveStatus(active.status())
@@ -357,6 +383,7 @@ public class ScheduledTweetService {
 
             String jobId = UUID.randomUUID().toString();
             List<ScheduledMediaAsset> assets = new ArrayList<>(mediaInputs.size());
+            reserveMediaSpace(mediaBytes);
             try {
                 for (int i = 0; i < mediaInputs.size(); i++) {
                     MediaUploadInput input = mediaInputs.get(i);
@@ -413,6 +440,8 @@ public class ScheduledTweetService {
             } catch (Exception ex) {
                 deleteDirectoryQuietly(resolveJobMediaDir(accountId, jobId));
                 throw new IllegalStateException("保存定时推文媒体文件失败：" + ex.getMessage(), ex);
+            } finally {
+                releaseMediaSpace(mediaBytes);
             }
         }
     }
@@ -468,6 +497,7 @@ public class ScheduledTweetService {
             }
             List<DetectedImageFormat> detectedFormats = validateMediaUploads(mediaInputs);
             String reqId = d.clientRequestId() == null ? "" : d.clientRequestId().trim();
+            if (reqId.length() > 128) throw new IllegalArgumentException("请求标识不能超过 128 个字符");
             if (!reqId.isEmpty() && !seenReqIds.add(reqId)) {
                 throw new IllegalArgumentException("批量提交中包含重复的请求标识");
             }
@@ -509,9 +539,9 @@ public class ScheduledTweetService {
             throw new XDataProviderException(403, "当前账号尚未授予图片上传权限（media.write），请先点击「前往 X 授权」补充授权");
         }
 
-        long nowMs = clock.millis();
         synchronized (accountLock(accountId)) {
             QueueStorage queue = loadQueueLocked(accountId, username);
+            long nowMs = clock.millis();
             boolean overduePromoted = promoteOverdueLocked(queue, nowMs);
 
             // 整批幂等重放：若全部 clientRequestId 均已存在，直接返回原已创建的记录列表
@@ -538,6 +568,20 @@ public class ScheduledTweetService {
             if (hitCount > 0) {
                 throw new XDataProviderException(409, "批次中包含已提交过的请求记录，请刷新队列后重试");
             }
+            assertActiveQueueCapacityLocked(queue, prepared.size());
+            long mediaBytes = prepared.stream().flatMap(item -> item.mediaInputs().stream())
+                    .mapToLong(input -> input.bytes().length).sum();
+            assertStoredQueueCapacityLocked(queue, prepared.size(), mediaBytes);
+            String todayDate = localDateStringFor(nowMs);
+            int scheduledForToday = 0;
+            for (PreparedDraftItem item : prepared) {
+                if (todayDate.equals(localDateStringFor(item.scheduledAtEpochMs()))) {
+                    scheduledForToday++;
+                }
+            }
+            if (scheduledForToday > 0) {
+                assertDailyPublishQuotaAvailableLocked(queue, nowMs, scheduledForToday);
+            }
 
             for (int i = 0; i < prepared.size(); i++) {
                 PreparedDraftItem item = prepared.get(i);
@@ -559,6 +603,7 @@ public class ScheduledTweetService {
 
             List<Path> createdDirs = new ArrayList<>(prepared.size());
             List<ScheduledTweetJob> createdJobs = new ArrayList<>(prepared.size());
+            reserveMediaSpace(mediaBytes);
             try {
                 for (int idx = 0; idx < prepared.size(); idx++) {
                     PreparedDraftItem item = prepared.get(idx);
@@ -629,6 +674,8 @@ public class ScheduledTweetService {
                     deleteDirectoryQuietly(dir);
                 }
                 throw new IllegalStateException("保存批量定时推文媒体文件失败：" + ex.getMessage(), ex);
+            } finally {
+                releaseMediaSpace(mediaBytes);
             }
         }
     }
@@ -664,6 +711,8 @@ public class ScheduledTweetService {
             if (confirmToken == null || confirmToken.isBlank() || !confirmToken.equals(current.confirmToken())) {
                 throw new XDataProviderException(409, "二次确认凭证已更新或已在其他页面确认，请刷新后查看");
             }
+            assertDailyPublishQuotaAvailableLocked(queue, nowMs, 1);
+            if (!isActiveStatus(current.status())) assertActiveQueueCapacityLocked(queue, 1);
             updated = current.markResendQueued(nowMs);
             queue.jobs().set(idx, updated);
             saveQueueLocked(queue);
@@ -715,6 +764,9 @@ public class ScheduledTweetService {
                 if (!targetIndices.contains(idx)) {
                     targetIndices.add(idx);
                 }
+            }
+            if (!targetIndices.isEmpty()) {
+                assertDailyPublishQuotaAvailableLocked(queue, nowMs, targetIndices.size());
             }
             for (int idx : targetIndices) {
                 ScheduledTweetJob job = queue.jobs().get(idx);
@@ -772,12 +824,12 @@ public class ScheduledTweetService {
         validateSafeId(accountId, "accountId");
         validateSafeId(jobId, "jobId");
         requireScheduledPublishEligible(accountId, username);
-        long nowMs = clock.millis();
-        if (scheduledAtEpochMs < nowMs + MIN_SCHEDULE_LEAD_MS) {
-            throw new IllegalArgumentException("定时发布时间需晚于当前时间至少 15 秒");
-        }
         synchronized (accountLock(accountId)) {
             QueueStorage queue = loadQueueLocked(accountId, "");
+            long nowMs = clock.millis();
+            if (scheduledAtEpochMs < nowMs + MIN_SCHEDULE_LEAD_MS) {
+                throw new IllegalArgumentException("定时发布时间需晚于当前时间至少 15 秒");
+            }
             promoteOverdueLocked(queue, nowMs);
             int idx = findJobIndex(queue, jobId);
             if (idx < 0) {
@@ -811,6 +863,15 @@ public class ScheduledTweetService {
             }
             assertMinOneHourIntervalLocked(queue, scheduledAtEpochMs, jobId, "");
 
+            String todayDate = localDateStringFor(nowMs);
+            if (todayDate.equals(localDateStringFor(scheduledAtEpochMs))
+                    && (current.status() != ScheduledTweetStatus.SCHEDULED
+                    || !todayDate.equals(localDateStringFor(current.scheduledAtEpochMs())))) {
+                // Reuse the create-time allowance check only when admitting a task into today.
+                // Editing an existing task for today must not reserve or count it a second time.
+                assertDailyPublishQuotaAvailableLocked(queue, nowMs, 1);
+            }
+            if (!isActiveStatus(current.status())) assertActiveQueueCapacityLocked(queue, 1);
             ScheduledTweetJob updated = current.reschedule(scheduledAtEpochMs, nextText, nextFingerprint, nowMs);
             queue.jobs().set(idx, updated);
             saveQueueLocked(queue);
@@ -831,6 +892,10 @@ public class ScheduledTweetService {
             if (current.status() == ScheduledTweetStatus.SENDING || current.status() == ScheduledTweetStatus.RESEND_QUEUED) {
                 throw new XDataProviderException(409, "推文正在发送中，暂不可删除");
             }
+            Path accountDir = resolveAccountDir(accountId);
+            writeDurableJson(accountDir.resolve("scheduled_publish_budget_v1.json"),
+                    new DailyPublishCounter(accountId, localDateStringFor(clock.millis()),
+                            dailyPublishUsedLocked(queue, clock.millis())));
             queue.jobs().remove(idx);
             saveQueueLocked(queue);
             deleteDirectoryQuietly(resolveJobMediaDir(accountId, jobId));
@@ -871,7 +936,7 @@ public class ScheduledTweetService {
 
     public void processDueJobsForAccount(String accountId) {
         validateSafeId(accountId, "accountId");
-        while (true) {
+        while (!Thread.currentThread().isInterrupted()) {
             ScheduledTweetJob claimed = claimNextExecutableJob(accountId);
             if (claimed == null) {
                 return;
@@ -881,25 +946,34 @@ public class ScheduledTweetService {
     }
 
     private void triggerAsyncDispatch(String accountId) {
+        if (!dispatchingAccounts.add(accountId)) return;
         try {
             dispatchExecutor.execute(() -> {
                 try {
                     processDueJobsForAccount(accountId);
                 } catch (Exception ex) {
                     log.warn("Async scheduled tweet dispatch failed for account {}: {}", accountId, ex.getMessage());
+                } finally {
+                    dispatchingAccounts.remove(accountId);
                 }
             });
-        } catch (Exception ex) {
-            log.warn("Failed to enqueue async dispatch for account {}: {}", accountId, ex.getMessage());
+        } catch (java.util.concurrent.RejectedExecutionException ex) {
+            dispatchingAccounts.remove(accountId);
+            // The durable queued jobs remain available to the next scheduler tick.
+            log.debug("Scheduled dispatch queue is busy; account {} will be retried by the next tick", accountId);
         }
     }
 
     private ScheduledTweetJob claimNextExecutableJob(String accountId) {
-        long nowMs = clock.millis();
         long graceMs = Math.max(10_000L, properties.getScheduleGraceWindowSeconds() * 1000L);
         synchronized (accountLock(accountId)) {
             QueueStorage queue = loadQueueLocked(accountId, "");
+            long nowMs = clock.millis();
             boolean changed = promoteOverdueLocked(queue, nowMs);
+            if (queue.jobs().stream().anyMatch(job -> job.status() == ScheduledTweetStatus.SENDING)) {
+                if (changed) saveQueueLocked(queue);
+                return null;
+            }
             int candidateIdx = -1;
             long bestSortTime = Long.MAX_VALUE;
             for (int i = 0; i < queue.jobs().size(); i++) {
@@ -950,6 +1024,10 @@ public class ScheduledTweetService {
                     }
                 }
                 return;
+            }
+            synchronized (accountLock(accountId)) {
+                QueueStorage quotaQueue = loadQueueLocked(accountId, "");
+                reserveDailyPublishQuotaLocked(quotaQueue, clock.millis());
             }
             boolean hasMedia = !claimed.media().isEmpty();
             String accessToken = oauthService.getValidWriteAccessToken(accountId, hasMedia);
@@ -1008,7 +1086,7 @@ public class ScheduledTweetService {
         } catch (Exception ex) {
             long failMs = clock.millis();
             boolean uncertain = dispatchedToTweetEndpoint
-                    && (ex instanceof XPublishException pex ? pex.isDeliveryUncertain() : false);
+                    && (!(ex instanceof XPublishException pex) || pex.isDeliveryUncertain());
             synchronized (accountLock(accountId)) {
                 QueueStorage queue = loadQueueLocked(accountId, "");
                 int idx = findJobIndex(queue, claimed.id());
@@ -1083,7 +1161,15 @@ public class ScheduledTweetService {
             throw new XPublishException(404, "本地暂存的媒体图片缺失：" + asset.fileName(), false);
         }
         try {
-            return Files.readAllBytes(file);
+            long limit = "image/gif".equals(asset.mimeType()) ? MAX_GIF_BYTES : MAX_STATIC_IMAGE_BYTES;
+            if (Files.size(file) != asset.sizeBytes() || asset.sizeBytes() <= 0 || asset.sizeBytes() > limit) {
+                throw new IOException("媒体文件大小与保存记录不一致");
+            }
+            byte[] bytes = Files.readAllBytes(file);
+            if (bytes.length != asset.sizeBytes() || !sha256Hex(bytes).equals(asset.sha256())) {
+                throw new IOException("媒体文件校验失败");
+            }
+            return bytes;
         } catch (IOException ex) {
             throw new XPublishException(500, "读取本地暂存图片失败：" + ex.getMessage(), ex, false);
         }
@@ -1187,31 +1273,48 @@ public class ScheduledTweetService {
         }
         try {
             QueueStorage raw = objectMapper.readValue(file.toFile(), QueueStorage.class);
-            return raw != null ? raw.mutableCopy(fallbackUsername) : QueueStorage.empty(accountId, fallbackUsername);
-        } catch (Exception ex) {
-            log.warn("Failed to read scheduled tweets queue for account {}: {}", accountId, ex.getMessage());
-            return QueueStorage.empty(accountId, fallbackUsername);
+            if (raw == null || raw.version() != QUEUE_VERSION || !accountId.equals(raw.accountId())
+                    || raw.jobs() == null || raw.jobs().stream().anyMatch(job -> job == null
+                    || !accountId.equals(job.accountId()) || job.id() == null
+                    || !SAFE_ID_PATTERN.matcher(job.id()).matches())) {
+                throw new IOException("Invalid scheduled queue ownership or format");
+            }
+            return raw.mutableCopy(fallbackUsername);
+        } catch (IOException ex) {
+            throw new IllegalStateException("定时推文队列读取失败，已停止操作以保护现有记录", ex);
         }
     }
 
     private void saveQueueLocked(QueueStorage queue) {
         Path file = resolveQueueFile(queue.accountId());
         if (file == null) {
-            return;
+            throw new IllegalStateException("未配置磁盘缓存目录，无法保存定时推文队列");
         }
+        writeDurableJson(file, queue);
+    }
+
+    private void writeDurableJson(Path file, Object value) {
+        Path tmp = null;
         try {
             Files.createDirectories(file.getParent());
-            Path tmp = file.resolveSibling(
-                    "scheduled_tweets_v1." + ThreadLocalRandom.current().nextLong(1_000_000_000L) + ".tmp"
-            );
-            objectMapper.writeValue(tmp.toFile(), queue);
+            tmp = Files.createTempFile(file.getParent(), file.getFileName().toString() + ".", ".tmp");
+            byte[] bytes = objectMapper.writeValueAsBytes(value);
+            try (var channel = java.nio.channels.FileChannel.open(tmp, java.nio.file.StandardOpenOption.WRITE)) {
+                var buffer = java.nio.ByteBuffer.wrap(bytes);
+                while (buffer.hasRemaining()) channel.write(buffer);
+                channel.force(true);
+            }
             try {
                 Files.move(tmp, file, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
             } catch (AtomicMoveNotSupportedException ex) {
                 Files.move(tmp, file, StandardCopyOption.REPLACE_EXISTING);
             }
         } catch (IOException ex) {
-            throw new IllegalStateException("持久化定时推文队列失败：" + ex.getMessage(), ex);
+            throw new IllegalStateException("持久化定时推文记录失败，已停止本次操作", ex);
+        } finally {
+            if (tmp != null) {
+                try { Files.deleteIfExists(tmp); } catch (IOException ignored) { }
+            }
         }
     }
 
@@ -1268,10 +1371,7 @@ public class ScheduledTweetService {
     }
 
     private Object accountLock(String accountId) {
-        if (accountLocks.size() > 2048) {
-            accountLocks.clear();
-        }
-        return accountLocks.computeIfAbsent(accountId, k -> new Object());
+        return accountLocks[(accountId.hashCode() & 0x7fffffff) % accountLocks.length];
     }
 
     private static ScheduledTweetJob findJob(QueueStorage queue, String jobId) {
@@ -1317,13 +1417,113 @@ public class ScheduledTweetService {
     }
 
     private String formatScheduledTimeForMessage(long epochMs) {
-        ZoneId zone;
+        return Instant.ofEpochMilli(epochMs).atZone(resolveConfiguredZone()).format(CONFLICT_TIME_FMT);
+    }
+
+    private ZoneId resolveConfiguredZone() {
         try {
-            zone = ZoneId.of(properties.getTimezone());
+            String raw = properties.getTimezone();
+            if (raw != null && !raw.isBlank()) {
+                return ZoneId.of(raw.trim());
+            }
         } catch (Exception ignored) {
-            zone = ZoneId.of("Asia/Shanghai");
         }
-        return Instant.ofEpochMilli(epochMs).atZone(zone).format(CONFLICT_TIME_FMT);
+        return ZoneId.of("Asia/Shanghai");
+    }
+
+    private String localDateStringFor(long epochMs) {
+        return LocalDate.ofInstant(Instant.ofEpochMilli(epochMs), resolveConfiguredZone()).toString();
+    }
+
+    private void assertActiveQueueCapacityLocked(QueueStorage queue, int addingCount) {
+        int activeCount = 0;
+        for (ScheduledTweetJob job : queue.jobs()) {
+            if (isActiveStatus(job.status())) {
+                activeCount++;
+            }
+        }
+        if (activeCount + addingCount > MAX_ACTIVE_JOBS_PER_ACCOUNT) {
+            throw new XDataProviderException(
+                    429,
+                    "待发定时推文队列已达上限（最多保留 " + MAX_ACTIVE_JOBS_PER_ACCOUNT + " 条待发任务），请等待部分发送完成后再添加"
+            );
+        }
+    }
+
+    private void assertStoredQueueCapacityLocked(QueueStorage queue, int adding, long mediaBytes) {
+        long storedBytes = queue.jobs().stream().flatMap(job -> job.media().stream())
+                .mapToLong(asset -> Math.max(0L, asset.sizeBytes())).sum();
+        if ((long) queue.jobs().size() + adding > MAX_STORED_JOBS_PER_ACCOUNT
+                || storedBytes + mediaBytes > MAX_STORED_MEDIA_BYTES_PER_ACCOUNT) {
+            throw new XDataProviderException(429, "定时推文保存空间已满，请删除不再需要的历史记录后重试");
+        }
+    }
+
+    private void reserveMediaSpace(long bytes) {
+        if (bytes == 0L) return;
+        synchronized (mediaSpaceLock) {
+            try {
+                Path root = Path.of(properties.getDiskCacheDir());
+                Files.createDirectories(root);
+                if (Files.getFileStore(root).getUsableSpace() - reservedMediaBytes - bytes < MIN_FREE_DISK_BYTES) {
+                    throw new XDataProviderException(503, "服务器保存空间不足，请稍后再试");
+                }
+                reservedMediaBytes += bytes;
+            } catch (IOException ex) {
+                throw new IllegalStateException("无法检查媒体保存空间，已停止上传", ex);
+            }
+        }
+    }
+
+    private void releaseMediaSpace(long bytes) {
+        synchronized (mediaSpaceLock) { reservedMediaBytes -= bytes; }
+    }
+
+    private int dailyPublishUsedLocked(QueueStorage queue, long nowMs) {
+        String todayDate = localDateStringFor(nowMs);
+        int publishedInQueueToday = 0;
+        for (ScheduledTweetJob job : queue.jobs()) {
+            if (job.status() == ScheduledTweetStatus.PUBLISHED && job.publishedAtEpochMs() > 0L
+                    && todayDate.equals(localDateStringFor(job.publishedAtEpochMs()))) {
+                publishedInQueueToday++;
+            }
+        }
+        Path accountDir = resolveAccountDir(queue.accountId());
+        if (accountDir == null) return publishedInQueueToday;
+        Path file = accountDir.resolve("scheduled_publish_budget_v1.json");
+        if (!Files.exists(file)) return publishedInQueueToday;
+        try {
+            DailyPublishCounter counter = objectMapper.readValue(file.toFile(), DailyPublishCounter.class);
+            if (counter == null || !queue.accountId().equals(counter.accountId()) || counter.count() < 0
+                    || counter.localDate() == null || counter.localDate().compareTo(todayDate) > 0) {
+                throw new IOException("Invalid daily publish budget");
+            }
+            return todayDate.equals(counter.localDate())
+                    ? Math.max(publishedInQueueToday, counter.count()) : publishedInQueueToday;
+        } catch (IOException ex) {
+            throw new IllegalStateException("定时发布额度记录读取失败，已停止发送以保护预算", ex);
+        }
+    }
+
+    private void assertDailyPublishQuotaAvailableLocked(QueueStorage queue, long nowMs, int addingToday) {
+        int limit = properties.getDailyTweetPublishLimitPerUser();
+        if (limit <= 0) throw new XDataProviderException(429, "定时发布额度已关闭");
+        int used = dailyPublishUsedLocked(queue, nowMs);
+        if ((long) used + Math.max(1, addingToday) > limit) {
+            throw new XDataProviderException(429,
+                    "今日定时发布额度已达上限（每日最多 " + limit + " 次发送尝试），请改期至明日");
+        }
+    }
+
+    private void reserveDailyPublishQuotaLocked(QueueStorage queue, long nowMs) {
+        assertDailyPublishQuotaAvailableLocked(queue, nowMs, 1);
+        int used = dailyPublishUsedLocked(queue, nowMs);
+        Path accountDir = resolveAccountDir(queue.accountId());
+        if (accountDir == null) throw new IllegalStateException("未配置定时发布持久化目录");
+        // Reserve before token refresh, media upload or publishing. Failures and uncertain delivery
+        // remain charged; deleting jobs or restarting must never restore a paid-call allowance.
+        writeDurableJson(accountDir.resolve("scheduled_publish_budget_v1.json"),
+                new DailyPublishCounter(queue.accountId(), localDateStringFor(nowMs), Math.addExact(used, 1)));
     }
 
     private static boolean isActiveStatus(ScheduledTweetStatus status) {

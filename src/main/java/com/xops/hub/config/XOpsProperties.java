@@ -8,6 +8,8 @@ public class XOpsProperties {
     private String defaultProvider = "TWITTERAPI_IO";
     private String twitterapiIoKey = "";
     private String twitterapiIoBaseUrl = "https://api.twitterapi.io";
+    private boolean fxtwitterEnabled = false;
+    private String fxtwitterBaseUrl = "https://api.fxtwitter.com/2";
     private String oauthClientId = "";
     private String oauthClientSecret = "";
     private String oauthRedirectUri = "";
@@ -17,10 +19,10 @@ public class XOpsProperties {
     private int maxMentionPages = 600;
     private int maxFollowingPages = 4;
     private int maxFollowerPages = 5;
-    private int apiPoolCoreSize = 16;
-    private int apiPoolMaxSize = 28;
-    private int apiPoolQueueCapacity = 128;
-    private long apiQueueTimeoutMs = 4500L;
+    private int apiPoolCoreSize = 20;
+    private int apiPoolMaxSize = 36;
+    private int apiPoolQueueCapacity = 320;
+    private long apiQueueTimeoutMs = 12000L;
     private int apiMaxParallelSlices = 4;
     private long cacheTtlSeconds = 300;
     private String diskCacheDir = "./.cache/snapshots";
@@ -33,6 +35,21 @@ public class XOpsProperties {
     private boolean top50AutoSyncEnabled = true;
     private String top50AutoSyncCron = "0 20 23 * * *";
     private String algoProfilePath = "./.cache/x-algorithm-profile.json";
+    private int maxConcurrentUsers = 50;
+    private int maxThrottleQueueSize = 150;
+    private long maxThrottleWaitMs = 15000L;
+    private long activeUserWindowSeconds = 30L;
+    private long overCapacityBaseDelayMs = 100L;
+    private long overCapacityMaxDelayMs = 1200L;
+    private int ipApiFloodLimitPerMinute = 6000;
+    private int ipAuthLimitPerMinute = 150;
+    private int hourlyUpstreamApiBudget = 6000;
+    private int dailyUpstreamApiBudget = 30000;
+    private int dailyTweetPublishLimitPerUser = 24;
+    private String hourlyUpstreamUsdBudget = "10.00";
+    private String dailyUpstreamUsdBudget = "30.00";
+    private String monthlyUpstreamUsdBudget = "100.00";
+    private String unpricedUpstreamRequestReserveUsd = "0.20";
 
     public String getDefaultProvider() {
         return defaultProvider;
@@ -56,6 +73,22 @@ public class XOpsProperties {
 
     public void setTwitterapiIoBaseUrl(String twitterapiIoBaseUrl) {
         this.twitterapiIoBaseUrl = twitterapiIoBaseUrl;
+    }
+
+    public boolean isFxtwitterEnabled() {
+        return fxtwitterEnabled;
+    }
+
+    public void setFxtwitterEnabled(boolean fxtwitterEnabled) {
+        this.fxtwitterEnabled = fxtwitterEnabled;
+    }
+
+    public String getFxtwitterBaseUrl() {
+        return fxtwitterBaseUrl;
+    }
+
+    public void setFxtwitterBaseUrl(String fxtwitterBaseUrl) {
+        this.fxtwitterBaseUrl = fxtwitterBaseUrl;
     }
 
     public String getOauthClientId() {
@@ -257,6 +290,103 @@ public class XOpsProperties {
     public void setAlgoProfilePath(String algoProfilePath) {
         this.algoProfilePath = algoProfilePath;
     }
+
+    public int getMaxConcurrentUsers() {
+        return maxConcurrentUsers;
+    }
+
+    public void setMaxConcurrentUsers(int maxConcurrentUsers) {
+        this.maxConcurrentUsers = maxConcurrentUsers;
+    }
+
+    public int getMaxThrottleQueueSize() {
+        return maxThrottleQueueSize;
+    }
+
+    public void setMaxThrottleQueueSize(int maxThrottleQueueSize) {
+        this.maxThrottleQueueSize = maxThrottleQueueSize;
+    }
+
+    public long getMaxThrottleWaitMs() {
+        return maxThrottleWaitMs;
+    }
+
+    public void setMaxThrottleWaitMs(long maxThrottleWaitMs) {
+        this.maxThrottleWaitMs = maxThrottleWaitMs;
+    }
+
+    public long getActiveUserWindowSeconds() {
+        return activeUserWindowSeconds;
+    }
+
+    public void setActiveUserWindowSeconds(long activeUserWindowSeconds) {
+        this.activeUserWindowSeconds = activeUserWindowSeconds;
+    }
+
+    public long getOverCapacityBaseDelayMs() {
+        return overCapacityBaseDelayMs;
+    }
+
+    public void setOverCapacityBaseDelayMs(long overCapacityBaseDelayMs) {
+        this.overCapacityBaseDelayMs = overCapacityBaseDelayMs;
+    }
+
+    public long getOverCapacityMaxDelayMs() {
+        return overCapacityMaxDelayMs;
+    }
+
+    public void setOverCapacityMaxDelayMs(long overCapacityMaxDelayMs) {
+        this.overCapacityMaxDelayMs = overCapacityMaxDelayMs;
+    }
+
+    public int getIpApiFloodLimitPerMinute() {
+        return ipApiFloodLimitPerMinute;
+    }
+
+    public void setIpApiFloodLimitPerMinute(int ipApiFloodLimitPerMinute) {
+        this.ipApiFloodLimitPerMinute = ipApiFloodLimitPerMinute;
+    }
+
+    public int getIpAuthLimitPerMinute() {
+        return ipAuthLimitPerMinute;
+    }
+
+    public void setIpAuthLimitPerMinute(int ipAuthLimitPerMinute) {
+        this.ipAuthLimitPerMinute = ipAuthLimitPerMinute;
+    }
+
+    public int getHourlyUpstreamApiBudget() {
+        return hourlyUpstreamApiBudget;
+    }
+
+    public void setHourlyUpstreamApiBudget(int hourlyUpstreamApiBudget) {
+        this.hourlyUpstreamApiBudget = hourlyUpstreamApiBudget;
+    }
+
+    public int getDailyUpstreamApiBudget() {
+        return dailyUpstreamApiBudget;
+    }
+
+    public void setDailyUpstreamApiBudget(int dailyUpstreamApiBudget) {
+        this.dailyUpstreamApiBudget = dailyUpstreamApiBudget;
+    }
+
+    public int getDailyTweetPublishLimitPerUser() {
+        return dailyTweetPublishLimitPerUser;
+    }
+
+    public void setDailyTweetPublishLimitPerUser(int dailyTweetPublishLimitPerUser) {
+        this.dailyTweetPublishLimitPerUser = dailyTweetPublishLimitPerUser;
+    }
+
+    public String getHourlyUpstreamUsdBudget() { return hourlyUpstreamUsdBudget; }
+    public void setHourlyUpstreamUsdBudget(String value) { hourlyUpstreamUsdBudget = value; }
+    public String getDailyUpstreamUsdBudget() { return dailyUpstreamUsdBudget; }
+    public void setDailyUpstreamUsdBudget(String value) { dailyUpstreamUsdBudget = value; }
+    public String getMonthlyUpstreamUsdBudget() { return monthlyUpstreamUsdBudget; }
+    public void setMonthlyUpstreamUsdBudget(String value) { monthlyUpstreamUsdBudget = value; }
+    public String getUnpricedUpstreamRequestReserveUsd() { return unpricedUpstreamRequestReserveUsd; }
+    public void setUnpricedUpstreamRequestReserveUsd(String value) { unpricedUpstreamRequestReserveUsd = value; }
 
     public boolean hasTwitterApiIoKey() {
         return twitterapiIoKey != null && !twitterapiIoKey.isBlank();

@@ -77,7 +77,11 @@ public class CommunityHubService {
     private static final int MAX_MEMORY_STORES = 200;
     /** 按独立认证账号限流：每人独立计数互不连坐（5 分钟已覆盖请求走内存缓存不扣额度） */
     private static final int ACCOUNT_LIVE_SYNC_LIMIT_PER_MINUTE = 30;
-    /** 单公网出口 IP 防洪兜底上限：允许同一公司/校园/活动 Wi-Fi 或 NAT 下百人同时正常登录加载零误伤 */
+    /** 逐人继续核验（单批最多 100 次关系查询）独立防刷上限，避免恶意脚本高频刷干额度 */
+    private static final int ACCOUNT_CONTINUE_RELATIONS_PER_MINUTE = 4;
+    private static final int ACCOUNT_CONTINUE_RELATIONS_PER_HOUR = 10;
+    private static final long AUTHOR_LIVE_LOOKUP_NEGATIVE_COOLDOWN_MS = 600_000L;
+    /** 共享出口 IP 防洪下限；实际阈值随配置的并发用户容量扩展。 */
     private static final int IP_FLOOD_GUARD_PER_MINUTE = 600;
     private static final java.util.regex.Pattern SAFE_HANDLE_KEY_PATTERN =
             java.util.regex.Pattern.compile("^[a-z0-9_]{1,15}$");
@@ -158,16 +162,21 @@ public class CommunityHubService {
     private final CommunityAnalyticsEngine analyticsEngine;
 
     private final ConcurrentHashMap<String, CachedSnapshot> snapshotCache = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<String, Object> fetchLocks = new ConcurrentHashMap<>();
+    private static final int ACCOUNT_LOCK_STRIPES = 256;
+    private final Object[] fetchLocks = newLocks();
     /** 仅在未配置磁盘目录时启用的有界内存存储兜底（配置磁盘目录时不在内存保留重复副本） */
     private final ConcurrentHashMap<String, AccountStore.StoredAccount> memoryStores = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, RateWindow> accountLiveRateMap = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, RateWindow> accountRelationMinuteMap = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, RateWindow> accountRelationHourMap = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, RateWindow> ipLiveRateMap = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, UserUsageEntry> usageMap = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<String, Object> usageLocks = new ConcurrentHashMap<>();
+    private final Object[] usageLocks = newLocks();
     private final Object legacyUsageLock = new Object();
+    private final Object authorLookupLock = new Object();
     private volatile boolean legacyUsageHydrated = false;
     private volatile CachedAuthorProfile cachedAuthorProfile = null;
+    private volatile long authorLiveLookupCooldownUntilMs = 0L;
     private volatile CachedAuthorRanks cachedAuthorRanks = null;
     private volatile Path cachedAuthorStoreFile = null;
     private final AtomicBoolean top50AutoSyncRunning = new AtomicBoolean(false);
@@ -222,7 +231,8 @@ public class CommunityHubService {
                 properties.hasOAuthClient(),
                 properties.isRequireLoginSelfOnly(),
                 Math.max(0L, properties.getCacheTtlSeconds()),
-                resolveZoneId().getId()
+                resolveZoneId().getId(),
+                properties.isFxtwitterEnabled()
         );
     }
 
@@ -349,7 +359,7 @@ public class CommunityHubService {
         String today = LocalDate.now(zone).toString();
 
         Instant requestedAt = Instant.now();
-        Object lock = fetchLocks.computeIfAbsent(cacheKey, k -> new Object());
+        Object lock = fetchLockFor(ownerKey);
         synchronized (lock) {
             Instant now = Instant.now();
             UserUsageEntry quotaEntry = readUsageSnapshot(ownerKey);
@@ -367,6 +377,7 @@ public class CommunityHubService {
                     throw new XDataProviderException(400, "当前数据源不支持逐人继续核验");
                 }
                 checkLiveSyncRateLimit(handleKey, clientIp);
+                checkContinueRelationsRateLimit(handleKey);
                 AccountStore.StoredAccount stored = loadStore(handleKey, expectedAccountId);
                 if (stored != null) verifyAccountOwner(stored.profile(), handleKey, expectedAccountId);
                 var continued = twitterApiIoProvider.continueRelationships(handle, stored, expectedAccountId);
@@ -746,7 +757,7 @@ public class CommunityHubService {
             }
         }
 
-        Object lock = fetchLocks.computeIfAbsent(cacheKey, k -> new Object());
+        Object lock = fetchLockFor(ownerKey);
         synchronized (lock) {
             Instant now = Instant.now();
             CachedSnapshot active = snapshotCache.get(cacheKey);
@@ -756,6 +767,7 @@ public class CommunityHubService {
                     throw new XDataProviderException(400, "当前数据源不支持逐人继续核验");
                 }
                 checkLiveSyncRateLimit(handleKey, clientIp);
+                checkContinueRelationsRateLimit(handleKey);
                 AccountStore.StoredAccount stored = loadStore(handleKey, expectedAccountId);
                 if (stored != null) verifyAccountOwner(stored.profile(), handleKey, expectedAccountId);
                 var continued = twitterApiIoProvider.continueRelationships(handle, stored, expectedAccountId);
@@ -1099,6 +1111,7 @@ public class CommunityHubService {
             }
         } catch (Exception ex) {
             log.warn("Failed to persist account store for @{}: {}", safeKey, ex.getMessage());
+            throw new XDataProviderException(503, "采集数据保存失败，已停止本次更新，请稍后重试");
         }
     }
 
@@ -1275,9 +1288,9 @@ public class CommunityHubService {
     }
 
     /**
-     * 限流按账号严格分离，互不连坐、不误伤同网络百人并发：
-     * 1. 主限流按归一化账号 handleKey 独立计数（每人 30 次/分钟实时增量批次；5 分钟缓存命中不计入）；
-     * 2. 单出口 IP 仅设 600 次/分钟防洪上限，同一公司/校园 Wi-Fi 或反代出口下百名正常登录用户同时访问零误伤。
+     * 主限流按归一化账号 handleKey 独立计数，每人每分钟最多 30 次实时增量批次，缓存命中不计入。
+     * 共享出口 IP 上限为 max(600, 配置并发用户数 × 30)，默认 50 人对应 1500 次/分钟，
+     * 避免共享 NAT 的正常用户在各自额度内先撞到旧 600 次总量限制；上游仍受统一付费预算约束。
      */
     private void checkLiveSyncRateLimit(String handleKey, String clientIp) {
         String safeAccount = validateIsolatedHandleKey(handleKey);
@@ -1309,8 +1322,39 @@ public class CommunityHubService {
             }
             return new RateWindow(nowMinute, prev.count() + 1);
         });
-        if (ipWin.count() > IP_FLOOD_GUARD_PER_MINUTE) {
+        long sharedIpLimit = Math.max((long) IP_FLOOD_GUARD_PER_MINUTE,
+                Math.max(1L, properties.getMaxConcurrentUsers()) * ACCOUNT_LIVE_SYNC_LIMIT_PER_MINUTE);
+        if (ipWin.count() > sharedIpLimit) {
             throw new XDataProviderException(429, "当前网络出口短时请求过高，请稍等片刻后再试");
+        }
+    }
+
+    private void checkContinueRelationsRateLimit(String handleKey) {
+        String safeAccount = validateIsolatedHandleKey(handleKey);
+        long nowSec = Instant.now().getEpochSecond();
+        long nowMinute = nowSec / 60L;
+        long nowHour = nowSec / 3600L;
+
+        if (accountRelationMinuteMap.size() > 1024) {
+            accountRelationMinuteMap.entrySet().removeIf(e -> e.getValue().minuteEpoch() < nowMinute);
+        }
+        RateWindow minWin = accountRelationMinuteMap.compute(safeAccount, (k, prev) ->
+                (prev == null || prev.minuteEpoch() != nowMinute)
+                        ? new RateWindow(nowMinute, 1)
+                        : new RateWindow(nowMinute, prev.count() + 1));
+        if (minWin.count() > ACCOUNT_CONTINUE_RELATIONS_PER_MINUTE) {
+            throw new XDataProviderException(429, "逐人关系核验点击过于频繁，请稍候十几秒再继续核验");
+        }
+
+        if (accountRelationHourMap.size() > 1024) {
+            accountRelationHourMap.entrySet().removeIf(e -> e.getValue().minuteEpoch() < nowHour);
+        }
+        RateWindow hourWin = accountRelationHourMap.compute(safeAccount, (k, prev) ->
+                (prev == null || prev.minuteEpoch() != nowHour)
+                        ? new RateWindow(nowHour, 1)
+                        : new RateWindow(nowHour, prev.count() + 1));
+        if (hourWin.count() > ACCOUNT_CONTINUE_RELATIONS_PER_HOUR) {
+            throw new XDataProviderException(429, "当前小时逐人关系核验批次已达安全上限，请稍后再继续核验");
         }
     }
 
@@ -1326,12 +1370,6 @@ public class CommunityHubService {
                 }
             }
         }
-        if (fetchLocks.size() > MAX_CACHE_ENTRIES * 2) {
-            fetchLocks.keySet().removeIf(k -> !snapshotCache.containsKey(k));
-        }
-        if (usageLocks.size() > MAX_CACHE_ENTRIES * 2) {
-            usageLocks.clear();
-        }
     }
 
     private ZoneId resolveZoneId() {
@@ -1342,11 +1380,19 @@ public class CommunityHubService {
         }
     }
 
-    private Object usageLockFor(String handleKey) {
-        if (usageLocks.size() > MAX_CACHE_ENTRIES * 2) {
-            usageLocks.clear();
-        }
-        return usageLocks.computeIfAbsent(handleKey, k -> new Object());
+    private static Object[] newLocks() {
+        Object[] locks = new Object[ACCOUNT_LOCK_STRIPES];
+        for (int i = 0; i < locks.length; i++) locks[i] = new Object();
+        return locks;
+    }
+
+    private Object fetchLockFor(String ownerKey) {
+        // All providers write the same account store; the lock must survive cache eviction.
+        return fetchLocks[(ownerKey.hashCode() & 0x7fffffff) % fetchLocks.length];
+    }
+
+    private Object usageLockFor(String ownerKey) {
+        return usageLocks[(ownerKey.hashCode() & 0x7fffffff) % usageLocks.length];
     }
 
     /**
@@ -1586,12 +1632,23 @@ public class CommunityHubService {
             this.cachedAuthorProfile = disk;
             return withCanonicalAuthorIdentity(disk.profile());
         }
-        if (allowLiveLookupIfMissing) {
-            XUserSummary live = twitterApiIoProvider.fetchPublicUserSummaryQuietly(AUTHOR_USERNAME);
-            if (live != null) {
-                XUserSummary merged = withCanonicalAuthorIdentity(live);
-                cacheAuthorProfile(merged);
-                return merged;
+        if (allowLiveLookupIfMissing && System.currentTimeMillis() >= authorLiveLookupCooldownUntilMs) {
+            synchronized (authorLookupLock) {
+                Instant recheckNow = Instant.now();
+                CachedAuthorProfile recheckMem = this.cachedAuthorProfile;
+                if (recheckMem != null && recheckMem.profile() != null && recheckNow.isBefore(recheckMem.expiresAt())) {
+                    return withCanonicalAuthorIdentity(recheckMem.profile());
+                }
+                if (System.currentTimeMillis() >= authorLiveLookupCooldownUntilMs) {
+                    XUserSummary live = twitterApiIoProvider.fetchPublicUserSummaryQuietly(AUTHOR_USERNAME);
+                    if (live != null) {
+                        authorLiveLookupCooldownUntilMs = 0L;
+                        XUserSummary merged = withCanonicalAuthorIdentity(live);
+                        cacheAuthorProfile(merged);
+                        return merged;
+                    }
+                    authorLiveLookupCooldownUntilMs = System.currentTimeMillis() + AUTHOR_LIVE_LOOKUP_NEGATIVE_COOLDOWN_MS;
+                }
             }
         }
         if (disk != null && disk.profile() != null) {
@@ -2086,7 +2143,7 @@ public class CommunityHubService {
             if (ranks == null) {
                 return 0;
             }
-            List<AccountStore.StoredAccount> registeredStores = listPersistedStores();
+            List<AccountStore.StoredAccount> registeredStores = listPersistedStores(ranks);
             ZoneId zone = resolveZoneId();
             String today = LocalDate.now(zone).toString();
             for (AccountStore.StoredAccount st : registeredStores) {
@@ -2108,7 +2165,7 @@ public class CommunityHubService {
                 }
                 String ownerKey = accountOwnerKey(handleKey, uid);
                 String lockKey = ProviderMode.TWITTERAPI_IO.name() + ":" + ownerKey;
-                Object lock = fetchLocks.computeIfAbsent(lockKey, k -> new Object());
+                Object lock = fetchLockFor(ownerKey);
                 try {
                     synchronized (lock) {
                         AccountStore.StoredAccount latest = loadStore(handleKey, uid);
@@ -2144,7 +2201,7 @@ public class CommunityHubService {
         }
     }
 
-    private List<AccountStore.StoredAccount> listPersistedStores() {
+    private List<AccountStore.StoredAccount> listPersistedStores(CachedAuthorRanks ranks) {
         List<AccountStore.StoredAccount> result = new ArrayList<>();
         Set<String> seenOwnerKeys = new LinkedHashSet<>();
         String dir = properties.getDiskCacheDir();
@@ -2153,13 +2210,13 @@ public class CommunityHubService {
             Path byIdRoot = usersRoot.resolve("by-id");
             if (Files.isDirectory(byIdRoot)) {
                 try (Stream<Path> dirs = Files.list(byIdRoot)) {
-                    for (Path p : dirs.toList()) {
+                    for (Path p : (Iterable<Path>) dirs::iterator) {
                         Path storeFile = p.resolve("store_v" + AccountStore.VERSION + ".json.gz");
                         if (!Files.isRegularFile(storeFile)) continue;
                         AccountStore.StoredAccount st = AccountStore.read(storeFile, objectMapper);
                         if (st != null && st.profile() != null && st.profile().id() != null) {
                             String key = "id:" + st.profile().id();
-                            if (seenOwnerKeys.add(key)) {
+                            if (isTopAutoSyncCandidate(st, ranks) && seenOwnerKeys.add(key)) {
                                 result.add(st);
                             }
                         }
@@ -2170,7 +2227,7 @@ public class CommunityHubService {
             }
             if (Files.isDirectory(usersRoot)) {
                 try (Stream<Path> dirs = Files.list(usersRoot)) {
-                    for (Path p : dirs.toList()) {
+                    for (Path p : (Iterable<Path>) dirs::iterator) {
                         if ("by-id".equals(p.getFileName().toString())) continue;
                         Path storeFile = p.resolve("store_v" + AccountStore.VERSION + ".json.gz");
                         if (!Files.isRegularFile(storeFile)) continue;
@@ -2180,7 +2237,7 @@ public class CommunityHubService {
                             String key = (uid != null && !uid.isBlank())
                                     ? "id:" + uid
                                     : st.profile().username().toLowerCase(Locale.ROOT);
-                            if (seenOwnerKeys.add(key)) {
+                            if (isTopAutoSyncCandidate(st, ranks) && seenOwnerKeys.add(key)) {
                                 result.add(st);
                             }
                         }
@@ -2196,12 +2253,21 @@ public class CommunityHubService {
                 String key = (uid != null && !uid.isBlank())
                         ? "id:" + uid
                         : mem.profile().username().toLowerCase(Locale.ROOT);
-                if (seenOwnerKeys.add(key)) {
+                if (isTopAutoSyncCandidate(mem, ranks) && seenOwnerKeys.add(key)) {
                     result.add(mem);
                 }
             }
         }
         return result;
+    }
+
+    private boolean isTopAutoSyncCandidate(AccountStore.StoredAccount store, CachedAuthorRanks ranks) {
+        if (store == null || store.profile() == null || store.profile().username() == null) return false;
+        String handle = store.profile().username().toLowerCase(Locale.ROOT);
+        if (AUTHOR_USERNAME.equals(handle)) return false;
+        Integer rank = store.profile().id() != null ? ranks.rankById().get(store.profile().id()) : null;
+        if (rank == null) rank = ranks.rankByUsername().get(handle);
+        return rank != null && rank <= TOP_AUTO_SYNC_RANK;
     }
 
     private Path userUsageFile(String handleKey) {
