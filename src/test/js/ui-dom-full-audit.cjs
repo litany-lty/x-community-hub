@@ -256,15 +256,15 @@ this.__exports = { state, PERIOD_META, normalizePeriod, isPeriodUnlocked, syncPe
 
 // 3. 关注列表在筛选后、分页前排序；切换排序不重读上游也不改原报表。
 (function testFollowSortingAndPagination() {
-    const item = (username, relationshipOrder, intimacyScore, followersCount) => Object.freeze({
-        user: Object.freeze({ username, displayName: username, bio: "", followersCount }),
+    const item = (username, relationshipOrder, intimacyScore, followersCount, verified) => Object.freeze({
+        user: Object.freeze({ username, displayName: username, bio: "", followersCount, verified }),
         relationshipOrder, intimacyScore, auditCategory: "ZERO_INTERACTION"
     });
     const rows = Object.freeze([
         item("older", 8, 12, 900),
-        item("unknown", null, 10, 800),
-        item("recent", 0, 3, 200),
-        item("close", 4, 60, 30)
+        item("unknown", null, 10, 800, true),
+        item("recent", 0, 3, 200, false),
+        item("close", 4, 60, 30, true)
     ]);
     const report = { followAudit: {
         notFollowingBackList: rows, fansNotFollowedBackList: rows, mutualList: rows
@@ -298,9 +298,9 @@ this.__exports = { state, PERIOD_META, normalizePeriod, isPeriodUnlocked, syncPe
     );
     const names = () => Array.from(context.filterFollow(report), row => row.user.username);
     const expected = {
-        recent: ["recent", "close", "older", "unknown"],
-        intimacy: ["close", "older", "unknown", "recent"],
-        followers: ["older", "unknown", "recent", "close"]
+        recent: ["close", "unknown", "recent", "older"],
+        intimacy: ["close", "unknown", "older", "recent"],
+        followers: ["unknown", "close", "older", "recent"]
     };
     for (const tab of ["NOT_FOLLOWING_BACK", "FAN_ONLY", "MUTUAL"]) {
         state.followStateTab = tab;
@@ -323,16 +323,17 @@ this.__exports = { state, PERIOD_META, normalizePeriod, isPeriodUnlocked, syncPe
     state.whitelistSet.add("recent");
     assert.deepEqual(names(), ["recent"]);
     state.unfollowCategory = "SUGGEST_CLEAN";
-    assert.deepEqual(names(), ["older", "unknown", "close"]);
+    assert.deepEqual(names(), ["unknown", "close", "older"]);
     state.unfollowCategory = "ALL";
 
-    // 最高粉丝数在原始数组第63位，必须排进首屏；不能只排序当前可见50条。
+    // 原数组第61位的蓝 V 应排在非蓝 V 的最高粉丝数前；两者都须进入首屏。
     report.followAudit.notFollowingBackList = Object.freeze(
-        Array.from({ length: 63 }, (_, i) => item("peer" + i, 62 - i, 0, i))
+        Array.from({ length: 63 }, (_, i) => item("peer" + i, 62 - i, 0, i, i === 60))
     );
     const firstPage = context.filterFollow(report).slice(0, state.followRenderLimit);
     assert.equal(firstPage.length, 50);
-    assert.equal(firstPage[0].user.username, "peer62");
+    assert.equal(firstPage[0].user.username, "peer60");
+    assert.equal(firstPage[1].user.username, "peer62");
     assert.equal(firstPage[49].user.username, "peer13");
 
     // 同值保持可靠关注顺序；均无来源的旧记录保持原次序。

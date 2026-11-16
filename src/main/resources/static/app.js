@@ -2610,6 +2610,8 @@
                 ? item.relationshipOrder
                 : Number.MAX_SAFE_INTEGER;
         items.sort((a, b) => {
+            const blueFirst = Number(b.user.verified === true) - Number(a.user.verified === true);
+            if (blueFirst !== 0) return blueFirst;
             const difference = state.followSortBy === "intimacy"
                 ? Number(b.intimacyScore || 0) - Number(a.intimacyScore || 0)
                 : state.followSortBy === "followers"
