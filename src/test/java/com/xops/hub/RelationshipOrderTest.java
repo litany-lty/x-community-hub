@@ -107,6 +107,36 @@ class RelationshipOrderTest {
     }
 
     @Test
+    void continueVerificationResolvesBothSidesOfIncompleteLists() throws Exception {
+        var owner = new XUserSummary("self", "self", "Self", "", "", false, 3, 3, 0, "");
+        var graph = new AccountStore.GraphUpdate(List.of(user("both", 0), user("outgoing", 0)),
+                List.of(user("both", 0), user("incoming", 0)), Set.of(), true, true, false, false);
+        var sample = AccountStore.merge(null, owner, now, List.of(), List.of(), List.of(), List.of(), graph);
+        var before = report(sample).followAudit();
+        assertThat(before.unknownFollowBackCount()).isOne();
+        assertThat(before.unknownFollowingCount()).isOne();
+        assertThat(com.xops.hub.provider.TwitterApiIoProvider.pendingRelationshipChecks(sample)).isEqualTo(2);
+        var checked = java.util.concurrent.ConcurrentHashMap.<String>newKeySet();
+        try (var fixture = new ExactFollowProviderTest().new Fixture(uri -> {
+            if (uri.getPath().endsWith("/info")) return ExactFollowProviderTest.Reply.ok(
+                    "{\"data\":{\"id\":\"self\",\"userName\":\"self\",\"following\":3,\"followers\":3}}");
+            if (!uri.getPath().endsWith("/check_follow_relationship")) throw new AssertionError(uri.getPath());
+            String peer = uri.getQuery().split("target_user_name=")[1];
+            checked.add(peer);
+            return ExactFollowProviderTest.Reply.ok("{\"status\":\"success\",\"data\":{\"following\":"
+                    + peer.equals("outgoing") + ",\"followed_by\":" + peer.equals("incoming") + "}}");
+        })) {
+            var verified = fixture.provider.continueRelationships("self", sample, "self").store();
+            assertThat(checked).containsExactlyInAnyOrder("outgoing", "incoming");
+            var after = report(verified).followAudit();
+            assertThat(after.notFollowingBackList()).extracting(x -> x.user().id()).containsExactly("outgoing");
+            assertThat(after.fansNotFollowedBackList()).extracting(x -> x.user().id()).containsExactly("incoming");
+            assertThat(after.mutualCount()).isOne();
+            assertThat(com.xops.hub.provider.TwitterApiIoProvider.pendingRelationshipChecks(verified)).isZero();
+        }
+    }
+
+    @Test
     void relationshipVerificationChangesCategoryWithoutInventingTheOtherDirectionsOrder() {
         var base = stored();
         var verified = AccountStore.withRelationshipEvidence(base, List.of(

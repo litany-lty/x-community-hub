@@ -363,6 +363,32 @@ test('intimacy is primary even when the lower-score account is verified and more
     assert.ok(f.markup.peer.includes('data-list-key="bob"'));
 });
 
+test('follow tabs distinguish verified counts from unfinished lists in both directions', () => {
+    const f = renderingFixture();
+    const buttons = [clickControl(), clickControl(), clickControl()];
+    f.elements.set('followStateTabs', { querySelectorAll: () => buttons });
+    f.ctx.emptyStateHtml = message => message;
+    Object.assign(f.report.followAudit, {
+        notFollowingBackList: [], notFollowingBackCount: 0, mutualCount: 4,
+        followersSampleTruncated: true, followingsSampleTruncated: true,
+        unknownFollowBackCount: 2, unknownFollowingCount: 3
+    });
+    f.ctx.renderFollowAuditPanel(f.report);
+    assert.deepEqual(buttons.map(b => b.textContent), ['TA未回关 待核验', '我未回关 待核验', '互关 ≥4']);
+    assert.match(f.elements.get('followAuditList').innerHTML, /2 人/);
+    f.state.followStateTab = 'FAN_ONLY';
+    f.ctx.renderFollowAuditPanel(f.report);
+    assert.match(f.elements.get('followAuditList').innerHTML, /3 人/);
+    Object.assign(f.report.followAudit, { followersSampleTruncated: true, followingsSampleTruncated: false,
+        unknownFollowBackCount: 0, unknownFollowingCount: 0 });
+    f.ctx.renderFollowAuditPanel(f.report);
+    assert.deepEqual(buttons.map(b => b.textContent), ['TA未回关 0', '我未回关 未确定', '互关 4']);
+    Object.assign(f.report.followAudit, { followersSampleTruncated: false, followingsSampleTruncated: false,
+        unknownFollowBackCount: 0, unknownFollowingCount: 0 });
+    f.ctx.renderFollowAuditPanel(f.report);
+    assert.deepEqual(buttons.map(b => b.textContent), ['TA未回关 0', '我未回关 0', '互关 4']);
+});
+
 test('real follow audit labels survive a stale opened-account state', () => {
     const f = renderingFixture();
     f.ctx.renderFollowAuditPanel(f.report);

@@ -2648,22 +2648,37 @@
         }
         $("suggestCleanPillBtn").textContent = `建议取关 ${effectiveSuggestCount}`;
 
-        const graphIncomplete = audit.followersSampleTruncated || audit.followingsSampleTruncated;
         const limitations = [];
         if (audit.followersSampleTruncated) limitations.push(`粉丝采样 ${fmtNum(audit.followersSampleCount)}`);
         if (audit.followingsSampleTruncated) limitations.push("关注未全量");
         const unknownFollowBackCount = Number(audit.unknownFollowBackCount || 0);
         const unknownFollowingCount = Number(audit.unknownFollowingCount || 0);
         const totalUnknown = unknownFollowBackCount + unknownFollowingCount;
-        const hasUnknownRelations = totalUnknown > 0;
-        if (hasUnknownRelations) limitations.push(`待核验 ${fmtNum(totalUnknown)} 人`);
+        if (totalUnknown > 0) {
+            limitations.push(`待核验 ${totalUnknown.toLocaleString("zh-CN")} 人`);
+            if (state.storedMode) limitations.push("切回实时后可检查更新");
+            else if (state.pendingRelationshipChecks === 0) limitations.push("请在名单更新后再核验");
+        }
         $("followScopeNote").textContent = limitations.join(" · ");
         $("followScopeNote").hidden = limitations.length === 0;
 
+        // An incomplete source list may omit members. An incomplete opposite list leaves sampled peers unresolved.
+        const pendingBack = unknownFollowBackCount > 0 || (audit.followersSampleTruncated && audit.unknownFollowBackCount == null);
+        const pendingFollowing = unknownFollowingCount > 0 || (audit.followingsSampleTruncated && audit.unknownFollowingCount == null);
+        const partialBack = audit.followingsSampleTruncated || pendingBack;
+        const partialFan = audit.followersSampleTruncated || pendingFollowing;
+        const partialMutual = (audit.followersSampleTruncated && audit.followingsSampleTruncated) || pendingBack || pendingFollowing;
+        const countLabel = (count, partial, pending) => {
+            if (!Number.isInteger(count)) return "未确定";
+            const exactCount = count.toLocaleString("zh-CN");
+            if (!partial) return exactCount;
+            if (count > 0) return `≥${exactCount}`;
+            return pending ? "待核验" : "未确定";
+        };
         const tabBtns = $("followStateTabs").querySelectorAll(".seg-tab");
-        tabBtns[0].textContent = `TA未回关 ${audit.notFollowingBackCount}`;
-        tabBtns[1].textContent = `我未回关 ${audit.fansNotFollowedBackCount}`;
-        tabBtns[2].textContent = `互关 ${audit.mutualCount}`;
+        tabBtns[0].textContent = `TA未回关 ${countLabel(audit.notFollowingBackCount, partialBack, unknownFollowBackCount)}`;
+        tabBtns[1].textContent = `我未回关 ${countLabel(audit.fansNotFollowedBackCount, partialFan, unknownFollowingCount)}`;
+        tabBtns[2].textContent = `互关 ${countLabel(audit.mutualCount, partialMutual, totalUnknown)}`;
 
         $("unfollowCategoryPills").hidden = state.followStateTab !== "NOT_FOLLOWING_BACK";
 
@@ -2671,13 +2686,16 @@
         const listEl = $("followAuditList");
 
         if (items.length === 0) {
-            const emptyMsg = state.followSearchQuery
-                ? `没有找到「${state.followSearchQuery}」`
-                : state.followStateTab === "NOT_FOLLOWING_BACK"
-                    ? "当前分类暂无账号"
-                    : state.followStateTab === "FAN_ONLY"
-                        ? (hasUnknownRelations ? "暂无已确认未回关账号" : graphIncomplete ? "已采样粉丝均已回关" : "关注你的人均已回关")
-                        : "暂无互关账号";
+            const isOutgoing = state.followStateTab === "NOT_FOLLOWING_BACK";
+            const isFan = state.followStateTab === "FAN_ONLY";
+            const pending = isOutgoing ? unknownFollowBackCount : isFan ? unknownFollowingCount : totalUnknown;
+            const partial = isOutgoing ? partialBack : isFan ? partialFan : partialMutual;
+            let emptyMsg;
+            if (state.followSearchQuery) emptyMsg = `没有找到「${state.followSearchQuery}」`;
+            else if (isOutgoing && state.unfollowCategory !== "ALL") emptyMsg = "当前筛选暂无已确认账号";
+            else if (pending > 0) emptyMsg = `此分类暂无已确认账号，另有 ${pending.toLocaleString("zh-CN")} 人的关系待核验`;
+            else if (partial) emptyMsg = "名单尚未收齐，此分类暂无已确认账号";
+            else emptyMsg = isOutgoing ? "当前分类暂无账号" : isFan ? "关注你的人均已回关" : "暂无互关账号";
             const emptyActs = state.followSearchQuery
                 ? [{ text: "清空搜索", action: "clearFollowSearch" }]
                 : state.followStateTab === "NOT_FOLLOWING_BACK" && state.unfollowCategory !== "ALL"

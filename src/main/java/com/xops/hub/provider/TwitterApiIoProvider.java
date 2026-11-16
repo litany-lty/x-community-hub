@@ -589,9 +589,12 @@ public class TwitterApiIoProvider {
 
         if (!lightweightDailyOnly && graph != null && graph.followersTruncated() && !graph.followingsFailed()) {
             Map<String, Long> attemptedAt = new ConcurrentHashMap<>(existing != null ? existing.relationshipAttemptedAt() : Map.of());
-            List<AccountStore.RelationshipEvidence> exact = verifyMissingFollowers(
-                    baseUrl, profile.username(), graph.followings(), graph.followers(),
-                    existing != null ? existing.relationshipEvidence() : List.of(), Long.MAX_VALUE,
+            Set<String> followerIds = new HashSet<>();
+            graph.followers().forEach(peer -> followerIds.add(peer.id()));
+            List<XUserSummary> missing = graph.followings().stream()
+                    .filter(peer -> !followerIds.contains(peer.id())).toList();
+            List<AccountStore.RelationshipEvidence> exact = verifyRelationshipCandidates(
+                    baseUrl, profile.username(), missing, existing != null ? existing.relationshipEvidence() : List.of(),
                     attemptedAt, apiKey, pacer, deadline, degraded);
             boolean followingChanged = exact.stream().anyMatch(e -> !e.following());
             graph = new AccountStore.GraphUpdate(graph.followings(), graph.followers(), graph.explicitFollowedBy(),
@@ -795,10 +798,17 @@ public class TwitterApiIoProvider {
     }
 
     public static int pendingRelationshipChecks(AccountStore.StoredAccount store) {
-        if (store == null || !store.followersTruncated() || store.graphRefreshFailed()) return 0;
-        return (int) AccountStore.toSnapshot(store, "", false, 0).relationships().stream()
-                .filter(r -> r.iFollowThem() && !r.theyFollowMe() && !r.relationshipVerified())
-                .count();
+        return pendingRelationshipPeers(store).size();
+    }
+
+    private static List<XUserSummary> pendingRelationshipPeers(AccountStore.StoredAccount store) {
+        if (store == null || store.graphRefreshFailed() || (!store.followersTruncated() && !store.followingsTruncated())) {
+            return List.of();
+        }
+        return AccountStore.toSnapshot(store, "", false, 0).relationships().stream()
+                .filter(r -> !r.relationshipVerified() && r.iFollowThem() != r.theyFollowMe())
+                .filter(r -> r.iFollowThem() ? store.followersTruncated() : store.followingsTruncated())
+                .map(RelationshipEntry::user).toList();
     }
 
     /** 仅应用户明确点击续查调用，不抓取历史或重新分页图谱。 */
@@ -808,8 +818,9 @@ public class TwitterApiIoProvider {
                 || now.getEpochSecond() - store.graphFetchedAt() >= 300) {
             throw new XDataProviderException(409, "关注图谱已过期或不可用，请在缓存间隔结束后刷新数据，再继续核验关系");
         }
-        if (pendingRelationshipChecks(store) == 0) return new SyncOutcome(store, false, false, true, 0);
-        if (AccountStore.followingUsers(store).stream().anyMatch(p -> p.id() == null || p.id().isBlank())) {
+        List<XUserSummary> pending = pendingRelationshipPeers(store);
+        if (pending.isEmpty()) return new SyncOutcome(store, false, false, true, 0);
+        if (pending.stream().anyMatch(p -> p.id() == null || p.id().isBlank())) {
             throw new XDataProviderException(409, "旧图谱缺少推友 ID，请在缓存间隔结束后刷新图谱，再继续核验关系");
         }
         String apiKey = properties.getTwitterapiIoKey();
@@ -827,10 +838,8 @@ public class TwitterApiIoProvider {
         }
         AtomicBoolean degraded = new AtomicBoolean(false);
         Map<String, Long> attemptedAt = new ConcurrentHashMap<>(store.relationshipAttemptedAt());
-        long validAfter = Math.max(store.graphFetchedAt(), now.minusSeconds(300).getEpochSecond() + 1);
-        List<AccountStore.RelationshipEvidence> checked = verifyMissingFollowers(baseUrl, profile.username(),
-                AccountStore.followingUsers(store), AccountStore.followerUsers(store), store.relationshipEvidence(),
-                validAfter, attemptedAt, apiKey, pacer, deadline, degraded);
+        List<AccountStore.RelationshipEvidence> checked = verifyRelationshipCandidates(
+                baseUrl, profile.username(), pending, store.relationshipEvidence(), attemptedAt, apiKey, pacer, deadline, degraded);
         Map<String, AccountStore.RelationshipEvidence> combined = new java.util.LinkedHashMap<>();
         store.relationshipEvidence().forEach(e -> combined.put(e.peerId(), e));
         checked.forEach(e -> combined.put(e.peerId(), e));
@@ -838,32 +847,19 @@ public class TwitterApiIoProvider {
         return new SyncOutcome(result, !checked.isEmpty(), degraded.get(), true, 0);
     }
 
-    private List<AccountStore.RelationshipEvidence> verifyMissingFollowers(
-            String baseUrl, String self, List<XUserSummary> followings, List<XUserSummary> followers,
-            List<AccountStore.RelationshipEvidence> previousChecks,
-            long validEvidenceAfter,
-            Map<String, Long> attemptedAt,
+    private List<AccountStore.RelationshipEvidence> verifyRelationshipCandidates(
+            String baseUrl, String self, List<XUserSummary> peers,
+            List<AccountStore.RelationshipEvidence> previousChecks, Map<String, Long> attemptedAt,
             String apiKey, KeyPacer pacer, Instant deadline, AtomicBoolean degraded) {
-        Set<String> returnedFollowers = new HashSet<>();
-        followers.stream().map(XUserSummary::id).filter(id -> id != null && !id.isBlank()).forEach(returnedFollowers::add);
-        Set<String> seenIds = new HashSet<>();
-        Map<String, Long> lastChecked = new HashMap<>();
-        Map<String, Long> checkedHandles = new HashMap<>();
+        Map<String, Long> lastChecked = new HashMap<>(attemptedAt);
         previousChecks.forEach(e -> lastChecked.merge(e.peerId(), e.checkedAt() * 1000, Math::max));
-        attemptedAt.forEach((id, at) -> lastChecked.merge(id, at, Math::max));
-        previousChecks.stream().filter(e -> e.handle() != null)
-                .forEach(e -> checkedHandles.merge(e.peerId() + ":" + e.handle().toLowerCase(Locale.ROOT), e.checkedAt(), Math::max));
-        Set<String> currentCandidates = new HashSet<>();
-        followings.stream().filter(p -> p.id() != null && !p.id().isBlank() && !returnedFollowers.contains(p.id()))
-                .forEach(p -> currentCandidates.add(p.id()));
-        attemptedAt.keySet().retainAll(currentCandidates);
-        List<XUserSummary> candidates = followings.stream()
+        Set<String> seenIds = new HashSet<>();
+        List<XUserSummary> candidates = peers.stream()
                 .filter(p -> p.id() != null && !p.id().isBlank() && p.username() != null && !p.username().isBlank())
-                .filter(p -> !returnedFollowers.contains(p.id()))
-                .filter(p -> checkedHandles.getOrDefault(p.id() + ":" + p.username().toLowerCase(Locale.ROOT), 0L) < validEvidenceAfter)
                 .filter(p -> seenIds.add(p.id()))
                 .sorted(java.util.Comparator.comparingLong(p -> lastChecked.getOrDefault(p.id(), 0L)))
                 .limit(100).toList();
+        attemptedAt.keySet().retainAll(seenIds);
         List<AccountStore.RelationshipEvidence> evidence = new ArrayList<>();
         // 每批最多 4 个单次请求，沿用共享有界池和 KeyPacer；不重试，也不为补核验扩展同步期限。
         for (int offset = 0; offset < candidates.size() && Instant.now().isBefore(deadline); offset += 4) {
