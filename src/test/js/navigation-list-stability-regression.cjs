@@ -385,12 +385,65 @@ function renderingFixture() {
     return { ctx, state, report, markup, updates, toasts, saved, elements, peerRow, peerLink, followMark, followLink };
 }
 
-test('intimacy is primary even when the lower-score account is verified and more active', () => {
+test('sort priority enforces blue-verified first, then inbound > outbound, then selected sort', () => {
     const f = renderingFixture();
     f.state.peerRenderLimit = 20;
+    f.report.interactions.peerStats = [
+        // non-blue, inbound <= outbound, highest intimacy & outbound
+        { peer: { username: 'nonblue_equal', displayName: 'N1', verified: false }, reciprocityCode: 'MUTUAL', intimacyScore: 99, myRepliesToPeer: 50, peerRepliesToMe: 50 },
+        // non-blue, inbound > outbound, lower intimacy & outbound
+        { peer: { username: 'nonblue_inlead_low', displayName: 'N2', verified: false }, reciprocityCode: 'MUTUAL', intimacyScore: 20, myRepliesToPeer: 2, peerRepliesToMe: 5 },
+        // non-blue, inbound > outbound, higher intimacy
+        { peer: { username: 'nonblue_inlead_high', displayName: 'N3', verified: false }, reciprocityCode: 'MUTUAL', intimacyScore: 60, myRepliesToPeer: 10, peerRepliesToMe: 12 },
+        // blue, inbound <= outbound, high intimacy & outbound
+        { peer: { username: 'blue_outlead', displayName: 'B1', verified: true }, reciprocityCode: 'MUTUAL', intimacyScore: 95, myRepliesToPeer: 40, peerRepliesToMe: 10 },
+        // blue, inbound > outbound, lower intimacy but higher outbound
+        { peer: { username: 'blue_inlead_out20', displayName: 'B2', verified: true }, reciprocityCode: 'MUTUAL', intimacyScore: 30, myRepliesToPeer: 20, peerRepliesToMe: 25 },
+        // blue, inbound > outbound, higher intimacy but lower outbound
+        { peer: { username: 'blue_inlead_int80', displayName: 'B3', verified: true }, reciprocityCode: 'MUTUAL', intimacyScore: 80, myRepliesToPeer: 3, peerRepliesToMe: 8 }
+    ];
+
+    const extractOrder = (html) => [...html.matchAll(/data-list-key="([^"]+)"/g)].map((m) => m[1]).filter((k) => k !== 'more');
+
+    f.state.peerSortBy = 'intimacy';
     f.ctx.renderPeerList(f.report);
-    assert.ok(f.markup.peer.indexOf('data-list-key="alice"') < f.markup.peer.indexOf('data-list-key="bob"'));
-    assert.ok(f.markup.peer.includes('data-list-key="bob"'));
+    assert.deepEqual(extractOrder(f.markup.peer), [
+        'blue_inlead_int80',
+        'blue_inlead_out20',
+        'blue_outlead',
+        'nonblue_inlead_high',
+        'nonblue_inlead_low',
+        'nonblue_equal'
+    ]);
+
+    // Switching selected sort reorders ONLY within the same (verified, inbound > outbound) tier
+    f.state.peerSortBy = 'outbound';
+    f.ctx.renderPeerList(f.report);
+    assert.deepEqual(extractOrder(f.markup.peer), [
+        'blue_inlead_out20',
+        'blue_inlead_int80',
+        'blue_outlead',
+        'nonblue_inlead_high',
+        'nonblue_inlead_low',
+        'nonblue_equal'
+    ]);
+
+    // Follow audit list also enforces blue-verified -> inbound > outbound -> selected sort
+    f.state.followRenderLimit = 20;
+    f.state.followSortBy = 'followers';
+    f.report.followAudit.notFollowingBackList = [
+        { user: { username: 'f_nonblue_big', displayName: 'F1', verified: false, followersCount: 99999 }, intimacyScore: 90, relationshipOrder: 0, relationState: 'NOT_FOLLOWING_BACK', auditCategory: 'BIG_ACCOUNT', auditLabel: '大V', myRepliesToThem: 5, theirRepliesToMe: 5 },
+        { user: { username: 'f_nonblue_inlead', displayName: 'F2', verified: false, followersCount: 10 }, intimacyScore: 10, relationshipOrder: 3, relationState: 'NOT_FOLLOWING_BACK', auditCategory: 'ONE_WAY_EFFORT', auditLabel: '互动', myRepliesToThem: 1, theirRepliesToMe: 2 },
+        { user: { username: 'f_blue_equal_big', displayName: 'F3', verified: true, followersCount: 50000 }, intimacyScore: 80, relationshipOrder: 1, relationState: 'NOT_FOLLOWING_BACK', auditCategory: 'BIG_ACCOUNT', auditLabel: '大V', myRepliesToThem: 4, theirRepliesToMe: 4 },
+        { user: { username: 'f_blue_inlead_small', displayName: 'F4', verified: true, followersCount: 50 }, intimacyScore: 15, relationshipOrder: 2, relationState: 'NOT_FOLLOWING_BACK', auditCategory: 'ONE_WAY_EFFORT', auditLabel: '互动', myRepliesToThem: 1, theirRepliesToMe: 3 }
+    ];
+    f.ctx.renderFollowAuditPanel(f.report);
+    assert.deepEqual(extractOrder(f.markup.follow), [
+        'f_blue_inlead_small',
+        'f_blue_equal_big',
+        'f_nonblue_inlead',
+        'f_nonblue_big'
+    ]);
 });
 
 test('follow tabs distinguish verified counts from unfinished lists in both directions', () => {

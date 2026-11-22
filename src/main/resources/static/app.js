@@ -2610,33 +2610,35 @@
 
         const effectiveSort = state.peerSortBy || "intimacy";
         list.sort((a, b) => {
+            const blueFirst = Number(b.peer?.verified === true) - Number(a.peer?.verified === true);
+            if (blueFirst !== 0) return blueFirst;
+            const inboundLeadDiff =
+                Number(Number(b.peerRepliesToMe || 0) > Number(b.myRepliesToPeer || 0)) -
+                Number(Number(a.peerRepliesToMe || 0) > Number(a.myRepliesToPeer || 0));
+            if (inboundLeadDiff !== 0) return inboundLeadDiff;
             const totalA = (a.myRepliesToPeer || 0) + (a.peerRepliesToMe || 0);
             const totalB = (b.myRepliesToPeer || 0) + (b.peerRepliesToMe || 0);
-            const blueDiff = (b.peer?.verified ? 1 : 0) - (a.peer?.verified ? 1 : 0);
             switch (effectiveSort) {
                 case "iOweFirst":
                     return (
                         (b.unrepliedInMyPostCount || 0) - (a.unrepliedInMyPostCount || 0) ||
                         (b.peerRepliesToMe - b.myRepliesToPeer) - (a.peerRepliesToMe - a.myRepliesToPeer) ||
-                        b.peerRepliesToMe - a.peerRepliesToMe ||
-                        blueDiff
+                        b.peerRepliesToMe - a.peerRepliesToMe
                     );
                 case "theyOweFirst":
                     return (
                         (b.myRepliesToPeer - b.peerRepliesToMe) - (a.myRepliesToPeer - a.peerRepliesToMe) ||
-                        b.myRepliesToPeer - a.myRepliesToPeer ||
-                        blueDiff
+                        b.myRepliesToPeer - a.myRepliesToPeer
                     );
                 case "outbound":
-                    return b.myRepliesToPeer - a.myRepliesToPeer || totalB - totalA || blueDiff;
+                    return b.myRepliesToPeer - a.myRepliesToPeer || totalB - totalA;
                 case "inbound":
-                    return b.peerRepliesToMe - a.peerRepliesToMe || totalB - totalA || blueDiff;
+                    return b.peerRepliesToMe - a.peerRepliesToMe || totalB - totalA;
                 default:
                     return (
                         (b.intimacyScore || 0) - (a.intimacyScore || 0) ||
                         totalB - totalA ||
-                        (b.peerRepliesToMe || 0) - (a.peerRepliesToMe || 0) ||
-                        blueDiff
+                        (b.peerRepliesToMe || 0) - (a.peerRepliesToMe || 0)
                     );
             }
         });
@@ -2795,6 +2797,10 @@
         items.sort((a, b) => {
             const blueFirst = Number(b.user.verified === true) - Number(a.user.verified === true);
             if (blueFirst !== 0) return blueFirst;
+            const inboundLeadDiff =
+                Number(Number(b.theirRepliesToMe || 0) > Number(b.myRepliesToThem || 0)) -
+                Number(Number(a.theirRepliesToMe || 0) > Number(a.myRepliesToThem || 0));
+            if (inboundLeadDiff !== 0) return inboundLeadDiff;
             const difference = state.followSortBy === "intimacy"
                 ? Number(b.intimacyScore || 0) - Number(a.intimacyScore || 0)
                 : state.followSortBy === "followers"
