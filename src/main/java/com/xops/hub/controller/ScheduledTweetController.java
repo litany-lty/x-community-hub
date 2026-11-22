@@ -7,8 +7,10 @@ import com.xops.hub.config.RequestSecuritySupport;
 import com.xops.hub.model.AnalyticsReportModels.AuthenticatedXUser;
 import com.xops.hub.model.ScheduledTweetModels.BatchConfirmRequest;
 import com.xops.hub.model.ScheduledTweetModels.BatchCreateItemMeta;
+import com.xops.hub.model.ScheduledTweetModels.BatchCreateJsonRequest;
 import com.xops.hub.model.ScheduledTweetModels.BatchCreateResponse;
 import com.xops.hub.model.ScheduledTweetModels.ConfirmResendRequest;
+import com.xops.hub.model.ScheduledTweetModels.CreateScheduledTweetJsonRequest;
 import com.xops.hub.model.ScheduledTweetModels.RescheduleRequest;
 import com.xops.hub.model.ScheduledTweetModels.ScheduledTweetJob;
 import com.xops.hub.model.ScheduledTweetModels.ScheduledTweetListResponse;
@@ -89,15 +91,56 @@ public class ScheduledTweetController {
                 }
             }
         }
-        String draftId=request.getParameter("assistantDraftId");
-        String rawVersion=request.getParameter("assistantDraftVersion");
-        if(draftId==null && rawVersion==null)
-            return scheduledTweetService.createScheduledTweet(user.id(),user.username(),text,scheduledAtEpochMs,clientRequestId,uploads);
+        String draftId = request.getParameter("assistantDraftId");
+        String rawVersion = request.getParameter("assistantDraftVersion");
         Integer version;
-        try { version=rawVersion==null?null:Integer.valueOf(rawVersion); }
-        catch(NumberFormatException ex) { throw new IllegalArgumentException("稿件版本格式无效"); }
-        var source=publishing.prepare(user.id(),draftId,version,clientRequestId,text,scheduledAtEpochMs,uploads);
-        var job=scheduledTweetService.createScheduledTweet(user.id(),user.username(),text,scheduledAtEpochMs,clientRequestId,uploads,source);
+        try {
+            version = rawVersion == null ? null : Integer.valueOf(rawVersion);
+        } catch (NumberFormatException ex) {
+            throw new IllegalArgumentException("稿件版本格式无效");
+        }
+        return createScheduledTweetInternal(user, text, scheduledAtEpochMs, clientRequestId, uploads, draftId, version);
+    }
+
+    @PostMapping(consumes = MediaType.APPLICATION_JSON_VALUE)
+    public ScheduledTweetJob createJson(
+            @RequestBody(required = false) CreateScheduledTweetJsonRequest body,
+            HttpServletRequest request,
+            HttpServletResponse response
+    ) {
+        CommunityApiController.applyPrivateNoStoreHeaders(response);
+        verifySameOriginIfPresent(request);
+        AuthenticatedXUser user = requireAuthenticatedUser(request);
+        if (body == null || body.scheduledAtEpochMs() == null) {
+            throw new IllegalArgumentException("发布时间格式不正确，请重新选择时间");
+        }
+        return createScheduledTweetInternal(
+                user,
+                body.text() != null ? body.text() : "",
+                body.scheduledAtEpochMs(),
+                body.clientRequestId() != null ? body.clientRequestId() : "",
+                List.of(),
+                body.assistantDraftId(),
+                body.assistantDraftVersion()
+        );
+    }
+
+    private ScheduledTweetJob createScheduledTweetInternal(
+            AuthenticatedXUser user,
+            String text,
+            long scheduledAtEpochMs,
+            String clientRequestId,
+            List<MediaUploadInput> uploads,
+            String draftId,
+            Integer version
+    ) {
+        if (draftId == null && version == null) {
+            return scheduledTweetService.createScheduledTweet(
+                    user.id(), user.username(), text, scheduledAtEpochMs, clientRequestId, uploads);
+        }
+        var source = publishing.prepare(user.id(), draftId, version, clientRequestId, text, scheduledAtEpochMs, uploads);
+        var job = scheduledTweetService.createScheduledTweet(
+                user.id(), user.username(), text, scheduledAtEpochMs, clientRequestId, uploads, source);
         publishing.record(job);
         return job;
     }
@@ -118,11 +161,31 @@ public class ScheduledTweetController {
         } catch (Exception ex) {
             throw new IllegalArgumentException("批量定时推文参数格式无效");
         }
+        MultipartHttpServletRequest multiReq = request instanceof MultipartHttpServletRequest m ? m : null;
+        return createBatchInternal(user, metas, multiReq);
+    }
+
+    @PostMapping(value = "/batch", consumes = MediaType.APPLICATION_JSON_VALUE)
+    public BatchCreateResponse createBatchJson(
+            @RequestBody(required = false) BatchCreateJsonRequest body,
+            HttpServletRequest request,
+            HttpServletResponse response
+    ) throws IOException {
+        CommunityApiController.applyPrivateNoStoreHeaders(response);
+        verifySameOriginIfPresent(request);
+        AuthenticatedXUser user = requireAuthenticatedUser(request);
+        return createBatchInternal(user, body != null ? body.items() : null, null);
+    }
+
+    private BatchCreateResponse createBatchInternal(
+            AuthenticatedXUser user,
+            List<BatchCreateItemMeta> metas,
+            MultipartHttpServletRequest multiReq
+    ) throws IOException {
         if (metas == null || metas.isEmpty()) {
             throw new IllegalArgumentException("请至少添加 1 条定时推文");
         }
 
-        MultipartHttpServletRequest multiReq = request instanceof MultipartHttpServletRequest m ? m : null;
         List<BatchTweetDraftInput> drafts = new ArrayList<>(metas.size());
         for (int i = 0; i < metas.size(); i++) {
             BatchCreateItemMeta meta = metas.get(i);
@@ -140,19 +203,19 @@ public class ScheduledTweetController {
                     }
                 }
             }
-            var source=meta.assistantDraftId()==null && meta.assistantDraftVersion()==null ? null
-                    : publishing.prepare(user.id(),meta.assistantDraftId(),meta.assistantDraftVersion(),
-                            meta.clientRequestId(),meta.text(),meta.scheduledAtEpochMs(),uploads);
+            var source = meta.assistantDraftId() == null && meta.assistantDraftVersion() == null ? null
+                    : publishing.prepare(user.id(), meta.assistantDraftId(), meta.assistantDraftVersion(),
+                            meta.clientRequestId(), meta.text(), meta.scheduledAtEpochMs(), uploads);
             drafts.add(new BatchTweetDraftInput(
                     meta.text(),
                     meta.scheduledAtEpochMs(),
                     meta.clientRequestId(),
-                    uploads,source
+                    uploads, source
             ));
         }
 
-        var result=scheduledTweetService.createBatchScheduledTweets(user.id(), user.username(), drafts);
-        if(result!=null && publishing!=null) result.created().forEach(publishing::record);
+        var result = scheduledTweetService.createBatchScheduledTweets(user.id(), user.username(), drafts);
+        if (result != null && publishing != null) result.created().forEach(publishing::record);
         return result;
     }
 

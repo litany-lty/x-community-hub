@@ -250,6 +250,20 @@ public final class ScheduledTweetModels {
         public BatchCreateItemMeta(String text,long time,String key) { this(text,time,key,null,null); }
     }
 
+    public record CreateScheduledTweetJsonRequest(
+            String text,
+            Long scheduledAtEpochMs,
+            String clientRequestId,
+            String assistantDraftId,
+            Integer assistantDraftVersion
+    ) {
+    }
+
+    public record BatchCreateJsonRequest(
+            List<BatchCreateItemMeta> items
+    ) {
+    }
+
     public record BatchCreateResponse(
             List<ScheduledTweetJob> created,
             int createdCount

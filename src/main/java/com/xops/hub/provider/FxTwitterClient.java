@@ -68,6 +68,9 @@ public final class FxTwitterClient {
             Route route = route(paidUrl);
             return switch (route.path()) {
                 case "/twitter/user/info" -> validProfileSelector(route.query().get("userName"));
+                case "/twitter/user/last_tweets" -> validProfileSelector(route.query().get("userName"))
+                        && (route.query().getOrDefault("cursor", "").isEmpty()
+                            || route.query().get("cursor").startsWith(CURSOR_PREFIX));
                 case "/twitter/tweet/advanced_search" -> !isSearchCircuitOpen()
                         && "Latest".equalsIgnoreCase(route.query().get("queryType"))
                         && route.query().getOrDefault("query", "").length() > 0
@@ -75,6 +78,7 @@ public final class FxTwitterClient {
                         && (route.query().getOrDefault("cursor", "").isEmpty()
                             || route.query().get("cursor").startsWith(CURSOR_PREFIX));
                 case "/twitter/tweets" -> !tweetIds(route.query().get("tweet_ids")).isEmpty();
+                case "/twitter/article" -> TWEET_ID.matcher(route.query().getOrDefault("tweet_id", "")).matches();
                 default -> false;
             };
         } catch (RuntimeException ex) {
@@ -95,13 +99,24 @@ public final class FxTwitterClient {
                 String selector = route.query().get("userName");
                 yield mapCancellable(request("/profile/" + encode(selector), deadline, requestStarted, null), fetched -> {
                     ObjectNode user = user(fetched.body().path("user"));
-                    boolean matches = selector.regionMatches(true, 0, "id:", 0, 3)
-                            ? user.path("id").asText().equals(selector.substring(3))
-                            : user.path("userName").asText().equalsIgnoreCase(selector);
+                    boolean matches = matchesProfileSelector(fetched.body().path("user"), selector);
                     if (!matches) throw invalid("公开账号身份与请求不一致");
                     ObjectNode out = envelope();
                     out.set("data", user);
                     return out;
+                });
+            }
+            case "/twitter/user/last_tweets" -> {
+                String selector = route.query().get("userName");
+                boolean includeReplies = "true".equalsIgnoreCase(route.query().get("includeReplies"));
+                String cursor = route.query().getOrDefault("cursor", "");
+                if (cursor.equals(CURSOR_PREFIX)) yield CompletableFuture.failedFuture(invalid("公开数据分页游标无效"));
+                String path = "/profile/" + encode(selector) + "/statuses?count=20&groupthreads=false"
+                        + (includeReplies ? "&with_replies=true" : "")
+                        + (cursor.isEmpty() ? "" : "&cursor=" + encode(cursor.substring(CURSOR_PREFIX.length())));
+                yield TwitterApiIoProvider.handleComposeCancellable(request(path, deadline, requestStarted, null), (fetched, error) -> {
+                    if (error != null) return CompletableFuture.failedFuture(error);
+                    return statuses(fetched, selector, includeReplies, cursor, searchRoots, deadline);
                 });
             }
             case "/twitter/tweet/advanced_search" -> {
@@ -116,6 +131,25 @@ public final class FxTwitterClient {
                 });
             }
             case "/twitter/tweets" -> metrics(tweetIds(route.query().get("tweet_ids")), deadline, requestStarted);
+            case "/twitter/article" -> {
+                String id = route.query().get("tweet_id");
+                yield mapCancellable(request("/status/" + id, deadline, requestStarted, null), fetched -> {
+                    JsonNode rawStatus = fetched.body().path("status");
+                    if (!rawStatus.isObject() || !id.equals(rawStatus.path("id").asText())) {
+                        throw invalid("公开长文推文 ID 与请求不一致");
+                    }
+                    JsonNode article = rawStatus.get("article");
+                    if (article == null || !article.isObject()) {
+                        throw invalid("公开数据未包含长文结构");
+                    }
+                    ObjectNode out = envelope();
+                    out.set("article", article.deepCopy());
+                    if (extractHasNoBody(article)) {
+                        throw invalid("公开长文仅包含摘要预览");
+                    }
+                    return out;
+                });
+            }
             default -> CompletableFuture.failedFuture(invalid("不支持此公开数据请求"));
         };
     }
@@ -204,6 +238,115 @@ public final class FxTwitterClient {
         } catch (RuntimeException ex) {
             return false;
         }
+    }
+
+    private CompletableFuture<JsonNode> statuses(Fetched fetched, String selector, boolean includeReplies,
+                                                 String requestedCursor, SearchReplyRoots roots, Instant deadline) {
+        JsonNode rows = fetched.body().get("results");
+        JsonNode cursors = fetched.body().get("cursor");
+        if (rows == null || !rows.isArray() || cursors == null || !cursors.isObject()
+                || !cursors.has("bottom") || (!cursors.path("bottom").isNull() && !cursors.path("bottom").isTextual())) {
+            throw invalid("公开时间线分页结构不完整");
+        }
+        String bottom = cursors.path("bottom").asText("");
+        if ((!bottom.isEmpty() && bottom.isBlank()) || (rows.isEmpty() && !bottom.isEmpty())
+                || (!bottom.isEmpty() && (CURSOR_PREFIX + bottom).equals(requestedCursor))) {
+            throw invalid("公开时间线分页没有取得进展");
+        }
+        ObjectNode out = envelope();
+        ArrayNode tweets = out.putArray("tweets");
+        SearchReplyRoots.Page page = roots.new Page();
+        List<Long> ownTimestamps = new ArrayList<>();
+        for (JsonNode raw : rows) {
+            if (raw == null || !raw.isObject() || !"status".equals(raw.path("type").asText())) continue;
+            if (raw.hasNonNull("reposted_by")) {
+                // Retweets carry the original tweet's creation timestamp; skip so timeline coverage bounds stay monotonic.
+                continue;
+            }
+            if (!matchesProfileSelector(raw.path("author"), selector)) {
+                if (includeReplies) {
+                    try {
+                        ObjectNode contextTweet = tweet(raw, null, fetched.observedAt());
+                        page.add(SearchReplyRoots.Post.fromNormalized(contextTweet, raw.path("created_timestamp").asLong()));
+                    } catch (XDataProviderException ignored) {
+                        // Conversation context items from other authors are optional root hints.
+                    }
+                }
+                continue;
+            }
+            ObjectNode normalized = tweet(raw, null, fetched.observedAt());
+            if (!includeReplies && normalized.path("isReply").asBoolean(false)) {
+                String replyTo = normalized.path("inReplyToUsername").asText("");
+                String selfHandle = normalized.path("author").path("userName").asText("");
+                if (!replyTo.equalsIgnoreCase(selfHandle)) continue;
+            }
+            if (raw.path("is_pinned").asBoolean(false) || raw.path("pinned").asBoolean(false)) {
+                normalized.put("isPinned", true);
+            }
+            long ts = raw.path("created_timestamp").asLong();
+            page.add(SearchReplyRoots.Post.fromNormalized(normalized, ts));
+            tweets.add(normalized);
+            ownTimestamps.add(ts);
+        }
+        if (requestedCursor.isEmpty() && tweets.size() >= 2 && ownTimestamps.size() >= 2
+                && ownTimestamps.get(0) < ownTimestamps.get(1)) {
+            ((ObjectNode) tweets.get(0)).put("isPinned", true);
+        }
+        out.put("has_next_page", !bottom.isEmpty());
+        out.put("next_cursor", bottom.isEmpty() ? "" : CURSOR_PREFIX + bottom);
+        Set<String> missing = page.fill(tweets);
+        if (missing.isEmpty()) return CompletableFuture.completedFuture(out);
+        Set<String> fetchParents = new LinkedHashSet<>();
+        for (String id : missing) {
+            List<SearchReplyRoots.Post> cached = roots.thread(id);
+            if (cached == null) {
+                if (fetchParents.size() < MAX_THREAD_LOOKUPS_PER_PAGE) fetchParents.add(id);
+            } else {
+                cached.forEach(page::add);
+            }
+        }
+        missing = page.fill(tweets);
+        if (missing.isEmpty() || fetchParents.isEmpty() || deadline == null) {
+            return CompletableFuture.completedFuture(out);
+        }
+        long availableMs = Duration.between(Instant.now(), deadline).toMillis();
+        if (availableMs <= 200) return CompletableFuture.completedFuture(out);
+        Instant threadDeadline = Instant.now().plusMillis(Math.min(THREAD_LOOKUP_BUDGET_MS, availableMs));
+        List<CompletableFuture<Void>> lookups = new ArrayList<>();
+        for (String id : fetchParents) {
+            var lookup = request("/thread/" + id, threadDeadline, null, null)
+                    .thenApply(fetchedThread -> threadAncestors(id, fetchedThread))
+                    .handle((chain, err) -> {
+                        List<SearchReplyRoots.Post> resolved = err == null && chain != null ? chain : List.of();
+                        roots.rememberThread(id, resolved);
+                        synchronized (page) {
+                            resolved.forEach(page::add);
+                        }
+                        return (Void) null;
+                    });
+            lookups.add(lookup);
+        }
+        return mapCancellable(CompletableFuture.allOf(lookups.toArray(CompletableFuture[]::new)), unused -> {
+            page.fill(tweets);
+            return out;
+        });
+    }
+
+    private static boolean matchesProfileSelector(JsonNode rawUser, String selector) {
+        if (rawUser == null || !rawUser.isObject() || selector == null) return false;
+        return selector.regionMatches(true, 0, "id:", 0, 3)
+                ? rawUser.path("id").asText("").equals(selector.substring(3))
+                : rawUser.path("screen_name").asText("").equalsIgnoreCase(selector);
+    }
+
+    private static boolean extractHasNoBody(JsonNode article) {
+        for (String field : List.of("contents", "content", "articleContent", "blocks")) {
+            JsonNode body = article.path(field);
+            if (body.isObject() || (body.isArray() && !body.isEmpty()) || (body.isTextual() && !body.asText().isBlank())) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private CompletableFuture<JsonNode> search(Fetched fetched, String query, String requestedCursor,

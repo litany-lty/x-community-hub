@@ -37,6 +37,7 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 @Component
 public class UpstreamBudgetGuard {
+    public static final String BUDGET_REACHED_MESSAGE = "外部调用预算已达保护上限，已停止本次同步；仍可查看已入库报表";
     private static final Logger log = LoggerFactory.getLogger(UpstreamBudgetGuard.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final Object[] FILE_LOCKS = new Object[64];
@@ -175,7 +176,7 @@ public class UpstreamBudgetGuard {
                             || cost > monthlyMicros - usage.monthMicros) {
                         rejectedCalls.incrementAndGet();
                         warn("Upstream budget reached; external request was not sent");
-                        throw new XDataProviderException(429, "外部调用预算已达保护上限，已停止本次同步；仍可查看已入库报表");
+                        throw new XDataProviderException(429, BUDGET_REACHED_MESSAGE);
                     }
                     Usage reserved = usage.reserve(cost);
                     persist(reserved);
@@ -195,6 +196,81 @@ public class UpstreamBudgetGuard {
             }
         }
         callsByCategory.computeIfAbsent(category, k -> new AtomicLong()).incrementAndGet();
+    }
+
+    public boolean canAfford(String rawUrl, String category) {
+        return canAffordWithinFraction(rawUrl, category, 1.0);
+    }
+
+    public boolean canAffordBackground(String rawUrl, String category) {
+        return canAffordWithinFraction(rawUrl, category, 0.80);
+    }
+
+    private boolean canAffordWithinFraction(String rawUrl, String category, double maxUsageFraction) {
+        final URI uri;
+        try {
+            uri = URI.create(rawUrl);
+        } catch (RuntimeException ex) {
+            return false;
+        }
+        if (uri == null || uri.getHost() == null || uri.getUserInfo() != null
+                || (!"https".equalsIgnoreCase(uri.getScheme())
+                    && !("http".equalsIgnoreCase(uri.getScheme()) && isLocalLoopbackUri(uri)))) {
+            return false;
+        }
+        if (!knownCategory(category)) return false;
+        if (!enforceOnLocalMock && isLocalLoopbackUri(uri)) {
+            return true;
+        }
+        if (ledger == null) return false;
+        final long cost;
+        try {
+            cost = estimateMicros(uri, category, unpricedRequestMicros);
+        } catch (RuntimeException ex) {
+            return false;
+        }
+        long effectiveHourCalls = Math.max(0L, (long) Math.floor(hourlyBudget * maxUsageFraction));
+        long effectiveDayCalls = Math.max(0L, (long) Math.floor(dailyBudget * maxUsageFraction));
+        long effectiveHourMicros = Math.max(0L, (long) Math.floor(hourlyMicros * maxUsageFraction));
+        long effectiveDayMicros = Math.max(0L, (long) Math.floor(dailyMicros * maxUsageFraction));
+        long effectiveMonthMicros = maxUsageFraction < 1.0
+                ? Math.max(0L, (long) Math.floor(monthlyMicros * 0.90))
+                : monthlyMicros;
+        synchronized (FILE_LOCKS[Math.floorMod(ledger.hashCode(), FILE_LOCKS.length)]) {
+            try {
+                if (Files.isSymbolicLink(lockFile) || Files.isSymbolicLink(ledger)) {
+                    return false;
+                }
+                boolean lockInitialized = Files.exists(lockFile, LinkOption.NOFOLLOW_LINKS)
+                        && Files.isRegularFile(lockFile, LinkOption.NOFOLLOW_LINKS)
+                        && Files.size(lockFile) > 0;
+                if (!Files.exists(ledger, LinkOption.NOFOLLOW_LINKS)) {
+                    if (lockInitialized) return false;
+                    return effectiveHourCalls > 0 && effectiveDayCalls > 0
+                            && cost <= effectiveHourMicros && cost <= effectiveDayMicros && cost <= effectiveMonthMicros;
+                }
+                Usage usage = readUsage(lockInitialized).roll(clock.instant(), zoneId);
+                current = usage;
+                ledgerLoaded = true;
+                ledgerHealthy = true;
+                return usage.hourCalls < effectiveHourCalls && usage.dayCalls < effectiveDayCalls
+                        && cost <= effectiveHourMicros - usage.hourMicros
+                        && cost <= effectiveDayMicros - usage.dayMicros
+                        && cost <= effectiveMonthMicros - usage.monthMicros;
+            } catch (IOException | RuntimeException ex) {
+                return false;
+            }
+        }
+    }
+
+    public static boolean isBudgetReached(Throwable error) {
+        while (error instanceof java.util.concurrent.CompletionException && error.getCause() != null) {
+            error = error.getCause();
+        }
+        if (!(error instanceof XDataProviderException xpe)) return false;
+        String msg = xpe.getMessage() == null ? "" : xpe.getMessage();
+        return (xpe.getStatusCode() == 429 && msg.contains("外部调用预算已达保护上限"))
+                || (xpe.getStatusCode() == 503 && (msg.contains("预算记录暂不可用") || msg.contains("未配置持久化预算目录")));
     }
 
     private Usage empty(Instant now) {

@@ -46,6 +46,11 @@ public final class AssistantWorker {
 
     @Scheduled(fixedDelayString="${xops.content-assistant-worker-ms:2500}")
     public synchronized void tick() {
+        try {
+            if (!store.hasCollectionSpace()) return;
+        } catch (IllegalStateException ex) {
+            return;
+        }
         var expired = store.tx(tx -> {
             long now = System.currentTimeMillis();
             var ids = new ArrayList<String>();

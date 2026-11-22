@@ -427,11 +427,65 @@ class FxTwitterClientTest {
 
         // Circuit breaker is now open for /search, avoiding repeated wasted calls/timeouts
         assertThat(client.supports("https://paid.example" + search)).isFalse();
-        // Profile and status endpoints remain active on FxTwitter
+        // Profile, user timeline, and status endpoints remain active on FxTwitter even when /search is 503
         assertThat(client.supports("https://paid.example/twitter/user/info?userName=Self")).isTrue();
+        assertThat(client.supports("https://paid.example/twitter/user/last_tweets?userName=Self")).isTrue();
         assertThat(client.supports("https://paid.example/twitter/tweets?tweet_ids=101")).isTrue();
         JsonNode profile = fetch("/twitter/user/info?userName=Self", new AtomicBoolean());
         assertThat(profile.path("data").path("id").asText()).isEqualTo("100");
+    }
+
+    @Test
+    void userStatusesSupportsTimelineAndRepliesFiltersForeignContextMarksPinnedAndUsesFxCursor() throws Exception {
+        ObjectNode oldPinned = status("99", 100).put("text", "Pinned post");
+        ObjectNode latest = status("105", 300).put("text", "Latest post");
+        ObjectNode retweet = status("88", 50);
+        retweet.set("author", user("200", "Peer"));
+        retweet.set("reposted_by", user("100", "Self"));
+        ObjectNode foreignReply = status("106", 310);
+        foreignReply.set("author", user("200", "Peer"));
+        foreignReply.set("replying_to", mapper.createObjectNode().put("status", "105").put("screen_name", "Self"));
+        ObjectNode ownReplyToPeer = status("104", 290);
+        ownReplyToPeer.set("replying_to", mapper.createObjectNode().put("status", "90").put("screen_name", "Peer"));
+
+        handler = exchange -> json(page("cur+1=", oldPinned, latest, retweet, foreignReply, ownReplyToPeer));
+        JsonNode contentOnly = fetch("/twitter/user/last_tweets?userName=Self", new AtomicBoolean());
+        assertThat(seen.get(0).uri()).contains("/profile/Self/statuses?count=20&groupthreads=false");
+        assertThat(seen.get(0).uri()).doesNotContain("with_replies=true");
+        assertThat(seen.get(0).apiKey()).isNull();
+        assertThat(contentOnly.path("tweets")).hasSize(2);
+        assertThat(contentOnly.path("tweets").get(0).path("id").asText()).isEqualTo("99");
+        assertThat(contentOnly.path("tweets").get(0).path("isPinned").asBoolean()).isTrue();
+        assertThat(contentOnly.path("tweets").get(1).path("id").asText()).isEqualTo("105");
+        assertThat(contentOnly.path("next_cursor").asText()).isEqualTo("fx:cur+1=");
+        assertThat(contentOnly.path("has_next_page").asBoolean()).isTrue();
+
+        ObjectNode peerRoot = status("90", 250);
+        peerRoot.set("author", user("200", "Peer"));
+        handler = exchange -> json(page("", peerRoot, ownReplyToPeer, foreignReply));
+        JsonNode withReplies = fetch("/twitter/user/last_tweets?userName=Self&includeReplies=true&cursor=fx%3Acur%2B1%3D", new AtomicBoolean());
+        assertThat(seen.get(1).uri()).contains("with_replies=true", "cursor=cur%2B1%3D");
+        assertThat(withReplies.path("tweets")).hasSize(1);
+        assertThat(withReplies.path("tweets").get(0).path("id").asText()).isEqualTo("104");
+        assertThat(withReplies.path("tweets").get(0).path("conversationId").asText()).isEqualTo("90");
+        assertThat(withReplies.path("has_next_page").asBoolean()).isFalse();
+        assertThat(client.supports("https://paid.example/twitter/user/last_tweets?userName=Self&cursor=paid-cursor")).isFalse();
+    }
+
+    @Test
+    void articleEndpointUsesFreeStatusAndRejectsPreviewOnlyPayloadsForPaidFallback() throws Exception {
+        ObjectNode fullArticleStatus = status("101", 300);
+        fullArticleStatus.putObject("article").put("title", "Deep Dive")
+                .putArray("contents").addObject().put("text", "Full free article body");
+        handler = exchange -> json(mapper.createObjectNode().put("code", 200).set("status", fullArticleStatus));
+        JsonNode ok = fetch("/twitter/article?tweet_id=101", new AtomicBoolean());
+        assertThat(ok.path("_source").asText()).isEqualTo("fxtwitter");
+        assertThat(ok.path("article").path("contents").get(0).path("text").asText()).isEqualTo("Full free article body");
+
+        ObjectNode previewOnly = status("101", 300);
+        previewOnly.putObject("article").put("title", "Preview only");
+        handler = exchange -> json(mapper.createObjectNode().put("code", 200).set("status", previewOnly));
+        assertFailed("/twitter/article?tweet_id=101");
     }
 
     private JsonNode fetch(String path, AtomicBoolean started) throws Exception {

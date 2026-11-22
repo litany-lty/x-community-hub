@@ -933,6 +933,7 @@ globalThis.XOpsMessages = [
     ["最佳互动搭子：{0}","Top conversation partners: {0}","交流ベストパートナー：{0}","최고의 교류 상대: {0}"],
     ["最新推文 ↗","Latest posts ↗","最新の投稿 ↗","최근 게시물 ↗"],
     ["最近 24 小时数据与指标已完成本轮同步；满 1 小时后再次检查更新。","The latest 24 hours of data and metrics are synced for this cycle. Check again after 1 hour.","直近24時間のデータと指標の同期が完了しました。1時間後に再確認できます。","이번 주기의 최근 24시간 데이터와 지표 동기화가 완료되었습니다. 1시간 후 다시 확인하세요."],
+    ["最近互动","Recent activity","最近の交流順","최근 교류"],
     ["最近关注","Recently followed","フォローした順","최근 팔로우"],
     ["最近发文记录","Latest post recorded","最近の投稿記録","최근 게시 기록"],
     ["最近发文记录 {0}","Latest post recorded {0}","最近の投稿記録 {0}","최근 게시 기록 {0}"],

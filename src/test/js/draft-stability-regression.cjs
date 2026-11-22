@@ -126,8 +126,10 @@ function fixture(shared = {}) {
     vm.runInContext(
         section('    const LIST_PAGE_SIZE =', '    function cancelReportRequest()')
         + section('    function stableUserId(', '    function getSelfStorageKey(')
+        + section('    function isOwnerAllPermissions()', '    function hasPeriodAccessDecision()')
         + section('    function validateAndMergeScheduleFiles(', '    function getTzDateParts(')
         + section('    function rotateComposerRequestId()', '    function getQueuedScheduledEpochsMs(')
+        + section('    function randomScheduleJitterMinutes()', '    function getRecommendedScheduleEpochMs(')
         + section('    function createScheduleDraftItem(', '    const STEPUP_SCHEDULE_DRAFT_KEY =')
         + section('    const STEPUP_SCHEDULE_DRAFT_KEY =', '    function syncScheduleAuthBanner()')
         + section('    function scheduleDraftMediaHtml(', '    function renderScheduleQuickSlots()')

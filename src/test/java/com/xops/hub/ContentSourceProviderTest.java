@@ -10,11 +10,13 @@ class ContentSourceProviderTest {
 
     @Test
     void textPageKeepsOriginalAndQuoteTextWhileExcludingRepliesRetweetsAndMediaOnlyPosts() throws Exception {
+        java.util.List<String> lastTweetsQueries = new java.util.concurrent.CopyOnWriteArrayList<>();
         try (var fixture = new ExactFollowProviderTest().new Fixture(uri -> {
             if (uri.getPath().endsWith("/info")) {
                 return ExactFollowProviderTest.Reply.ok("{\"data\":{\"id\":\"author-id\",\"userName\":\"author\"}}");
             }
             if (uri.getPath().endsWith("/last_tweets")) {
+                lastTweetsQueries.add(uri.getRawQuery());
                 return ExactFollowProviderTest.Reply.ok("""
                         {"tweets":[
                           {"id":"post","text":"author view","createdAt":"2026-11-21T01:00:00Z","quoted_tweet":{"text":"quoted fact","author":{"id":"quoted-id","userName":"quoted"}}},
@@ -69,6 +71,12 @@ class ContentSourceProviderTest {
             assertThat(page.posts().get(2).articleTextStatus()).isEqualTo("FULL");
             assertThat(page.posts().get(2).styleText()).isEqualTo("commentary");
             assertThat(page.posts().get(3).textStatus()).isEqualTo("MEDIA_ONLY");
+            assertThat(lastTweetsQueries).singleElement().satisfies(q -> assertThat(q).doesNotContain("includeReplies=true"));
+
+            fixture.provider.fetchHistoryPostsPage("author", "author-id", "", 100, Instant.now().plusSeconds(3));
+            assertThat(lastTweetsQueries).hasSize(2);
+            assertThat(lastTweetsQueries.get(1)).contains("includeReplies=true");
+
             var inbound = fixture.provider.fetchInboundTextPage("author", "author-id", "", 100,
                     Instant.now().plusSeconds(3));
             assertThat(inbound.exhausted()).isTrue();

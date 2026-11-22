@@ -97,8 +97,30 @@ public final class AnalyticsReportModels {
             String relationshipType,
             String relationshipPortrait,
             String recentSnippet,
-            boolean followStateKnown
+            boolean followStateKnown,
+            Instant latestInteractionAt
     ) {
+        public PeerInteractionStat(
+                RawSnapshotModels.XUserSummary peer, boolean iFollowThem, boolean theyFollowMe,
+                int myRepliesToPeer, int peerRepliesToMe, int myRawCommentCount, int peerRawCommentCount,
+                int peerInThreadRepliesOnTheirPost, int myRepliesInMyOwnPost, int unrepliedInMyPostCount,
+                String latestUnrepliedTweetUrl, int myQuotesOfPeer, int peerQuotesOfMe,
+                int myMentionsOfPeer, int peerMentionsOfMe, int outboundTotal, int inboundTotal,
+                int totalInteractions, String replyRatioLabel, String quoteRatioLabel, String mentionRatioLabel,
+                double outboundSharePct, double returnRatePct, String returnRateLabel,
+                double interactionSharePct, double intimacyScore, String reciprocityCode,
+                String relationshipType, String relationshipPortrait, String recentSnippet,
+                boolean followStateKnown
+        ) {
+            this(peer, iFollowThem, theyFollowMe, myRepliesToPeer, peerRepliesToMe, myRawCommentCount,
+                    peerRawCommentCount, peerInThreadRepliesOnTheirPost, myRepliesInMyOwnPost,
+                    unrepliedInMyPostCount, latestUnrepliedTweetUrl, myQuotesOfPeer, peerQuotesOfMe,
+                    myMentionsOfPeer, peerMentionsOfMe, outboundTotal, inboundTotal, totalInteractions,
+                    replyRatioLabel, quoteRatioLabel, mentionRatioLabel, outboundSharePct, returnRatePct,
+                    returnRateLabel, interactionSharePct, intimacyScore, reciprocityCode, relationshipType,
+                    relationshipPortrait, recentSnippet, followStateKnown, null);
+        }
+
         public PeerInteractionStat(
                 RawSnapshotModels.XUserSummary peer, boolean iFollowThem, boolean theyFollowMe,
                 int myRepliesToPeer, int peerRepliesToMe, int myRawCommentCount, int peerRawCommentCount,
@@ -116,7 +138,7 @@ public final class AnalyticsReportModels {
                     myMentionsOfPeer, peerMentionsOfMe, outboundTotal, inboundTotal, totalInteractions,
                     replyRatioLabel, quoteRatioLabel, mentionRatioLabel, outboundSharePct, returnRatePct,
                     returnRateLabel, interactionSharePct, intimacyScore, reciprocityCode, relationshipType,
-                    relationshipPortrait, recentSnippet, iFollowThem && theyFollowMe);
+                    relationshipPortrait, recentSnippet, iFollowThem && theyFollowMe, null);
         }
     }
 

@@ -103,6 +103,46 @@ class ScheduledRequestStabilityTest {
     }
 
     @Test
+    void textOnlySingleAndBatchJsonCreateScheduleWithoutMultipart() throws Exception {
+        MockMvc mvc = mvc(service);
+        long t1 = clock.millis() + 120_000L;
+        long t2 = t1 + 3_600_000L;
+        long t3 = t2 + 3_600_000L;
+
+        mvc.perform(post("/api/scheduled-tweets")
+                        .session(session())
+                        .contentType("application/json")
+                        .content(mapper.writeValueAsString(Map.of(
+                                "text", "json single schedule",
+                                "scheduledAtEpochMs", t1,
+                                "clientRequestId", "json-single-1"
+                        ))))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.text").value("json single schedule"))
+                .andExpect(jsonPath("$.clientRequestId").value("json-single-1"))
+                .andExpect(jsonPath("$.status").value("SCHEDULED"));
+
+        mvc.perform(post("/api/scheduled-tweets/batch")
+                        .session(session())
+                        .contentType("application/json")
+                        .content(mapper.writeValueAsString(Map.of("items", List.of(
+                                Map.of("text", "batch-a", "scheduledAtEpochMs", t2, "clientRequestId", "json-batch-0"),
+                                Map.of("text", "batch-b", "scheduledAtEpochMs", t3, "clientRequestId", "json-batch-1")
+                        )))))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.createdCount").value(2));
+
+        mvc.perform(post("/api/scheduled-tweets")
+                        .session(session())
+                        .contentType("application/json")
+                        .content("{\"text\":\"missing-time\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("INVALID_INPUT"));
+
+        assertEquals(3, service.listJobs("1001", "alice").items().size());
+    }
+
+    @Test
     void createRejectsTimeThatExpiredWhileWaitingForAccountLock() throws Exception {
         long candidate = clock.millis() + 20_000;
         Throwable error = rejectAfterLockDelay(() -> service.createScheduledTweet(

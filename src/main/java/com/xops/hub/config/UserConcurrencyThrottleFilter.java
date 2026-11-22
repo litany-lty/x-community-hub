@@ -7,6 +7,8 @@ import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import jakarta.servlet.http.HttpSession;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Component;
@@ -33,19 +35,39 @@ import java.util.concurrent.atomic.AtomicLong;
 @Order(Ordered.HIGHEST_PRECEDENCE + 20)
 public class UserConcurrencyThrottleFilter extends OncePerRequestFilter {
 
+    private static final Logger log = LoggerFactory.getLogger(UserConcurrencyThrottleFilter.class);
+
     private static final int MAX_TRACKED_USERS = 4096;
     private static final int MAX_PARALLEL_PER_RESIDENT_USER = 4;
+    private static final int MAX_PARALLEL_SCHEDULE_MUTATIONS_PER_USER = 2;
+    private static final int MAX_PARALLEL_MEDIA_PER_USER = 4;
     private static final long MIN_STAGGER_STEP_MS = 12L;
 
     private static final class UserSlot {
         final AtomicLong lastSeenMs;
         final AtomicInteger inFlight = new AtomicInteger(0);
         final Semaphore executionPermits = new Semaphore(MAX_PARALLEL_PER_RESIDENT_USER, true);
+        final Semaphore scheduleMutationPermits = new Semaphore(MAX_PARALLEL_SCHEDULE_MUTATIONS_PER_USER, true);
+        final Semaphore mediaPermits = new Semaphore(MAX_PARALLEL_MEDIA_PER_USER, true);
         volatile boolean resident;
 
         UserSlot(long nowMs, boolean resident) {
             this.lastSeenMs = new AtomicLong(nowMs);
             this.resident = resident;
+        }
+
+        Semaphore selectPermits(HttpServletRequest request) {
+            String method = request.getMethod();
+            String uri = RequestSecuritySupport.requestPath(request);
+            if (uri != null && ("/api/scheduled-tweets".equals(uri) || uri.startsWith("/api/scheduled-tweets/"))) {
+                if ("POST".equalsIgnoreCase(method) || "DELETE".equalsIgnoreCase(method)) {
+                    return scheduleMutationPermits;
+                }
+                if (("GET".equalsIgnoreCase(method) || "HEAD".equalsIgnoreCase(method)) && uri.contains("/media/")) {
+                    return mediaPermits;
+                }
+            }
+            return executionPermits;
         }
     }
 
@@ -101,13 +123,14 @@ public class UserConcurrencyThrottleFilter extends OncePerRequestFilter {
         long nowMs = System.currentTimeMillis();
         String userKey = resolveUserIdentityKey(request);
         UserSlot slot = resolveOrAllocateSlot(userKey, nowMs);
+        Semaphore lanePermits = slot != null ? slot.selectPermits(request) : null;
         boolean eligibleFastResident = slot != null && slot.resident;
         boolean userPermit = false;
         boolean residentPermit = false;
         try {
             // 有排队者时禁止新到请求抢占公平信号量。
-            if (eligibleFastResident) {
-                userPermit = slot.executionPermits.tryAcquire(0L, TimeUnit.NANOSECONDS);
+            if (eligibleFastResident && lanePermits != null) {
+                userPermit = lanePermits.tryAcquire(0L, TimeUnit.NANOSECONDS);
                 if (userPermit) {
                     residentPermit = residentSemaphore.tryAcquire(0L, TimeUnit.NANOSECONDS);
                     if (residentPermit) {
@@ -116,17 +139,17 @@ public class UserConcurrencyThrottleFilter extends OncePerRequestFilter {
                         filterChain.doFilter(request, response);
                         return;
                     }
-                    slot.executionPermits.release();
+                    lanePermits.release();
                     userPermit = false;
                 }
             }
-            executeSmoothThrottled(request, response, filterChain, slot, eligibleFastResident);
+            executeSmoothThrottled(request, response, filterChain, lanePermits, eligibleFastResident);
         } catch (InterruptedException ex) {
             Thread.currentThread().interrupt();
             rejectBusy(request, response, "REQUEST_INTERRUPTED", "请求排队已中止，请稍候重试");
         } finally {
             if (residentPermit) residentSemaphore.release();
-            if (userPermit) slot.executionPermits.release();
+            if (userPermit && lanePermits != null) lanePermits.release();
             if (slot != null) {
                 synchronized (slotMonitor) {
                     slot.lastSeenMs.set(System.currentTimeMillis());
@@ -140,7 +163,7 @@ public class UserConcurrencyThrottleFilter extends OncePerRequestFilter {
             HttpServletRequest request,
             HttpServletResponse response,
             FilterChain filterChain,
-            UserSlot slot,
+            Semaphore lanePermits,
             boolean residentBurst
     ) throws ServletException, IOException, InterruptedException {
         int currentWaiters = queuedWaiters.incrementAndGet();
@@ -165,11 +188,11 @@ public class UserConcurrencyThrottleFilter extends OncePerRequestFilter {
                 TimeUnit.NANOSECONDS.sleep(Math.min(targetPaceNanos, remaining));
             }
             remaining = deadlineNanos - System.nanoTime();
-            if (remaining > 0L && slot != null) {
-                userAcquired = slot.executionPermits.tryAcquire(remaining, TimeUnit.NANOSECONDS);
+            if (remaining > 0L && lanePermits != null) {
+                userAcquired = lanePermits.tryAcquire(remaining, TimeUnit.NANOSECONDS);
             }
             remaining = deadlineNanos - System.nanoTime();
-            if (remaining > 0L && (slot == null || userAcquired)) {
+            if (remaining > 0L && (lanePermits == null || userAcquired)) {
                 acquired = targetSemaphore.tryAcquire(remaining, TimeUnit.NANOSECONDS);
             }
             queuedWaiters.decrementAndGet();
@@ -187,13 +210,15 @@ public class UserConcurrencyThrottleFilter extends OncePerRequestFilter {
         } finally {
             if (!waiterReleased) queuedWaiters.decrementAndGet();
             if (acquired) targetSemaphore.release();
-            if (userAcquired) slot.executionPermits.release();
+            if (userAcquired && lanePermits != null) lanePermits.release();
         }
     }
 
     private void rejectBusy(HttpServletRequest request, HttpServletResponse response,
                             String code, String message) throws IOException {
         queueOverflowRejectedCount.incrementAndGet();
+        log.warn("Request rejected by concurrency gate ({}): {} {} user={}",
+                code, request.getMethod(), RequestSecuritySupport.requestPath(request), resolveUserIdentityKey(request));
         response.setHeader("Retry-After", "3");
         MaliciousRequestShieldFilter.rejectJsonOrEmpty(request, response,
                 HttpServletResponse.SC_SERVICE_UNAVAILABLE, code, message);

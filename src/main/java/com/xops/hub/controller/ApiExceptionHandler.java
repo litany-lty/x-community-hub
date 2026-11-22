@@ -104,8 +104,13 @@ public class ApiExceptionHandler {
             HttpServletResponse response
     ) {
         if (isClientDisconnect(ex) || (response != null && response.isCommitted())) {
-            log.debug("Client disconnected or response already committed on {}: {}",
-                    request != null ? request.getRequestURI() : "unknown", ex.toString());
+            String method = request != null ? request.getMethod() : "";
+            String uri = request != null ? request.getRequestURI() : "unknown";
+            if ("POST".equalsIgnoreCase(method) || "DELETE".equalsIgnoreCase(method)) {
+                log.warn("Client or proxy disconnected before completing {} {}: {}", method, uri, ex.toString());
+            } else {
+                log.debug("Client disconnected or response already committed on {}: {}", uri, ex.toString());
+            }
             return null;
         }
         if (ex instanceof org.springframework.web.ErrorResponse errResp) {

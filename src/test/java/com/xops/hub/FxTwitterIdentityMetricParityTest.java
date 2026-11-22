@@ -222,7 +222,7 @@ class FxTwitterIdentityMetricParityTest {
             });
             free = new MockServer(uri -> {
                 if (uri.getPath().equals("/2/profile/self")) return json(JSON.createObjectNode().put("code", 200).set("user", freeUser("100", "self")));
-                if (uri.getPath().equals("/2/search")) {
+                if (uri.getPath().equals("/2/profile/self/statuses") || uri.getPath().equals("/2/search")) {
                     ObjectNode root = JSON.createObjectNode().put("code", 200); root.putArray("results"); root.putObject("cursor").put("bottom", "");
                     return json(root);
                 }

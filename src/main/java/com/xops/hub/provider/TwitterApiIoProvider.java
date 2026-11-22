@@ -272,6 +272,24 @@ public class TwitterApiIoProvider {
      * Fetches exactly one upstream page. Callers own cursor persistence and only advance it after
      * the returned material has committed, so process restarts cannot silently skip a page.
      */
+    public boolean isPageReadBudgetExhausted() {
+        String baseUrl = trimTrailingSlash(properties.getTwitterapiIoBaseUrl());
+        return !budgetGuard.canAfford(baseUrl + "/twitter/user/last_tweets?userName=probe", "twitterapi_io_read");
+    }
+
+    public boolean isBackgroundPaidBudgetExhausted() {
+        String baseUrl = trimTrailingSlash(properties.getTwitterapiIoBaseUrl());
+        return !budgetGuard.canAffordBackground(baseUrl + "/twitter/user/last_tweets?userName=probe", "twitterapi_io_read");
+    }
+
+    public boolean canReadTimelineForFree(String cursor) {
+        String baseUrl = trimTrailingSlash(properties.getTwitterapiIoBaseUrl());
+        String safeCursor = cursor == null ? "" : cursor.trim();
+        String url = baseUrl + "/twitter/user/last_tweets?userName=probe"
+                + (safeCursor.isBlank() ? "" : "&cursor=" + URLEncoder.encode(safeCursor, StandardCharsets.UTF_8));
+        return useFreeSource(url);
+    }
+
     public TextPostPage fetchTextPostsPage(
             String username,
             String expectedAuthorId,
@@ -301,23 +319,60 @@ public class TwitterApiIoProvider {
             boolean contentOnly
     ) {
         Instant effectiveDeadline = deadline != null ? deadline : Instant.now().plusSeconds(SNAPSHOT_SOFT_DEADLINE_SECONDS);
-        XUserSummary author = resolvePublicAuthor(username, effectiveDeadline);
-        requireSameAccountId(author, expectedAuthorId);
-        String apiKey = properties.getTwitterapiIoKey().trim();
         String baseUrl = trimTrailingSlash(properties.getTwitterapiIoBaseUrl());
-        StringBuilder url = new StringBuilder(baseUrl)
-                .append("/twitter/user/last_tweets?userName=")
-                .append(URLEncoder.encode(author.username(), StandardCharsets.UTF_8))
-                .append("&includeReplies=true");
         String safeCursor = cursor == null ? "" : cursor.trim();
-        if (!safeCursor.isBlank()) {
-            url.append("&cursor=").append(URLEncoder.encode(safeCursor, StandardCharsets.UTF_8));
+        String probeUser = username == null || username.isBlank() ? "probe" : username.trim();
+        String probeUrl = baseUrl + "/twitter/user/last_tweets?userName="
+                + URLEncoder.encode(probeUser, StandardCharsets.UTF_8)
+                + (safeCursor.isBlank() ? "" : "&cursor=" + URLEncoder.encode(safeCursor, StandardCharsets.UTF_8));
+        if (!useFreeSource(probeUrl) && isPageReadBudgetExhausted()) {
+            budgetGuard.acquirePermit(baseUrl + "/twitter/user/last_tweets?userName=probe", "twitterapi_io_read");
         }
-        JsonNode root = getJsonBefore(url.toString(), apiKey, pacerFor(apiKey), effectiveDeadline);
+        String rawKey = properties.getTwitterapiIoKey();
+        String apiKey = rawKey == null ? "" : rawKey.trim();
+        XUserSummary author = null;
+        JsonNode root;
+        List<JsonNode> rows;
+        if (useFreeSource(probeUrl) && expectedAuthorId != null && !expectedAuthorId.isBlank()
+                && probeUser.matches("[A-Za-z0-9_]{1,15}")) {
+            StringBuilder fastUrl = new StringBuilder(baseUrl)
+                    .append("/twitter/user/last_tweets?userName=")
+                    .append(URLEncoder.encode(probeUser, StandardCharsets.UTF_8));
+            if (!contentOnly) fastUrl.append("&includeReplies=true");
+            if (!safeCursor.isBlank()) fastUrl.append("&cursor=").append(URLEncoder.encode(safeCursor, StandardCharsets.UTF_8));
+            root = getJsonBefore(fastUrl.toString(), apiKey, pacerFor(apiKey), effectiveDeadline);
+            rows = extractArray(root, "tweets", "data");
+            for (JsonNode row : rows) {
+                if (row.path("author").isObject()) {
+                    XUserSummary candidate = parseUserNode(row.path("author"), probeUser);
+                    if (!candidate.id().isBlank() && candidate.username().equalsIgnoreCase(probeUser)) {
+                        author = candidate;
+                        break;
+                    }
+                }
+            }
+            if (author == null) {
+                author = resolvePublicAuthor(username, effectiveDeadline);
+            }
+            requireSameAccountId(author, expectedAuthorId);
+        } else {
+            author = resolvePublicAuthor(username, effectiveDeadline);
+            requireSameAccountId(author, expectedAuthorId);
+            StringBuilder url = new StringBuilder(baseUrl)
+                    .append("/twitter/user/last_tweets?userName=")
+                    .append(URLEncoder.encode(author.username(), StandardCharsets.UTF_8));
+            if (!contentOnly) {
+                url.append("&includeReplies=true");
+            }
+            if (!safeCursor.isBlank()) {
+                url.append("&cursor=").append(URLEncoder.encode(safeCursor, StandardCharsets.UTF_8));
+            }
+            root = getJsonBefore(url.toString(), apiKey, pacerFor(apiKey), effectiveDeadline);
+            rows = extractArray(root, "tweets", "data");
+        }
 
         int pageLimit = Math.max(1, Math.min(100, limit));
         List<TextPost> posts = new ArrayList<>();
-        List<JsonNode> rows = extractArray(root, "tweets", "data");
         List<String> missingAuthorIds = rows.stream()
                 .filter(node -> !node.path("author").isObject())
                 .map(node -> node.path("id").asText(""))
@@ -453,6 +508,10 @@ public class TwitterApiIoProvider {
             Instant deadline
     ) {
         Instant effectiveDeadline = deadline != null ? deadline : Instant.now().plusSeconds(SNAPSHOT_SOFT_DEADLINE_SECONDS);
+        if (isPageReadBudgetExhausted()) {
+            budgetGuard.acquirePermit(trimTrailingSlash(properties.getTwitterapiIoBaseUrl())
+                    + "/twitter/user/mentions?userName=probe", "twitterapi_io_read");
+        }
         XUserSummary target = resolvePublicAuthor(username, effectiveDeadline);
         requireSameAccountId(target, expectedAuthorId);
         String apiKey = properties.getTwitterapiIoKey().trim();
@@ -548,15 +607,16 @@ public class TwitterApiIoProvider {
     /** Attempts to backfill full X article text during research; failure keeps preview status rather than claiming full text. */
     public ArticleBackfill fetchArticleText(String tweetId, Instant deadline) {
         if (tweetId == null || tweetId.isBlank()) return new ArticleBackfill("", false);
-        String apiKey = properties.getTwitterapiIoKey();
-        if (apiKey == null || apiKey.isBlank()) return new ArticleBackfill("", false);
+        String rawKey = properties.getTwitterapiIoKey();
+        String apiKey = rawKey == null ? "" : rawKey.trim();
+        String baseUrl = trimTrailingSlash(properties.getTwitterapiIoBaseUrl());
+        String articleUrl = baseUrl + "/twitter/article?tweet_id="
+                + URLEncoder.encode(tweetId.trim(), StandardCharsets.UTF_8);
+        if (apiKey.isBlank() && !useFreeSource(articleUrl)) return new ArticleBackfill("", false);
         Instant effectiveDeadline = deadline != null ? deadline : Instant.now().plusSeconds(20);
         if (!Instant.now().isBefore(effectiveDeadline)) return new ArticleBackfill("", false);
         try {
-            String baseUrl = trimTrailingSlash(properties.getTwitterapiIoBaseUrl());
-            JsonNode articleRoot = getJsonBefore(baseUrl + "/twitter/article?tweet_id="
-                            + URLEncoder.encode(tweetId.trim(), StandardCharsets.UTF_8),
-                    apiKey.trim(), pacerFor(apiKey.trim()), effectiveDeadline);
+            JsonNode articleRoot = getJsonBefore(articleUrl, apiKey, pacerFor(apiKey), effectiveDeadline);
             String full = extractArticleBody(articleRoot);
             if (!full.isBlank()) return new ArticleBackfill(full, true);
             return new ArticleBackfill(extractArticleText(articleRoot), false);
@@ -783,9 +843,10 @@ public class TwitterApiIoProvider {
         SearchReplyRoots searchRoots = properties.isFxtwitterEnabled()
                 ? SearchReplyRoots.from(existing, profile.id(), profile.username()) : SearchReplyRoots.empty();
         boolean allowNativeHead = staleHead;
+        boolean allowOwnNativeHead = staleHead || fxTwitterClient.isSearchCircuitOpen();
         CompletableFuture<StreamFill> tweetsF = startTweetsFillAsync(
                 baseUrl, searchRoots, encodedUser, profile, tweetCoverage, cutoff30, cutoff30, headTo,
-                allowNativeHead, false, apiKey, pacer, pageBudget, deadline, degraded);
+                allowOwnNativeHead, false, apiKey, pacer, pageBudget, deadline, degraded);
         CompletableFuture<StreamFill> inboundF = startInboundFillAsync(
                 baseUrl, searchRoots, encodedUser, profile.username(), profile.id(), inboundCoverage, cutoff30, cutoff30, headTo,
                 allowNativeHead, false, apiKey, pacer, pageBudget, deadline, degraded);
@@ -919,6 +980,7 @@ public class TwitterApiIoProvider {
                 String knownSelf = existing.profile().username();
                 int pageBudget = pacer.freeTierSlowMode ? 3 : (lightweightDailyOnly ? 16 : MAX_STREAM_PAGES_PER_BATCH);
                 boolean allowNativeHead = !lightweightDailyOnly;
+                boolean allowOwnNativeHead = allowNativeHead || fxTwitterClient.isSearchCircuitOpen();
                 Instant cutoff30 = cutoffForWindowDays(syncTo, 30);
                 Instant targetCutoff = cutoffForWindowHours(syncTo, effectiveHours);
                 long headTo = syncTo.getEpochSecond();
@@ -973,7 +1035,7 @@ public class TwitterApiIoProvider {
                 });
 
                 CompletableFuture<StreamFill> tweetsF = startTweetsFillAsync(
-                        baseUrl, searchRoots, encodedUser, existing.profile(), tweetCoverage, targetCutoff, cutoff30, headTo, allowNativeHead, false,
+                        baseUrl, searchRoots, encodedUser, existing.profile(), tweetCoverage, targetCutoff, cutoff30, headTo, allowOwnNativeHead, false,
                         apiKey, pacer, pageBudget, deadline, degraded);
                 CompletableFuture<StreamFill> inboundF = startInboundFillAsync(
                         baseUrl, searchRoots, encodedUser, knownSelf, existing.profile().id(), inboundCoverage, targetCutoff, cutoff30, headTo, allowNativeHead, false,
@@ -1003,12 +1065,13 @@ public class TwitterApiIoProvider {
                 String self = profile.username();
                 int pageBudget = pacer.freeTierSlowMode ? 3 : (lightweightDailyOnly ? 32 : MAX_STREAM_PAGES_PER_BATCH * 2);
                 boolean allowNativeHead = !lightweightDailyOnly;
+                boolean allowOwnNativeHead = allowNativeHead || fxTwitterClient.isSearchCircuitOpen();
                 Instant cutoff30 = cutoffForWindowDays(syncTo, 30);
                 Instant targetCutoff = cutoffForWindowHours(syncTo, effectiveHours);
                 long headTo = syncTo.getEpochSecond();
 
                 CompletableFuture<StreamFill> tweetsF = startTweetsFillAsync(
-                        baseUrl, searchRoots, encodedUser, profile, tweetCoverage, targetCutoff, cutoff30, headTo, allowNativeHead, true,
+                        baseUrl, searchRoots, encodedUser, profile, tweetCoverage, targetCutoff, cutoff30, headTo, allowOwnNativeHead, true,
                         apiKey, pacer, pageBudget, deadline, degraded);
                 CompletableFuture<StreamFill> inboundF = startInboundFillAsync(
                         baseUrl, searchRoots, encodedUser, self, profile.id(), inboundCoverage, targetCutoff, cutoff30, headTo, allowNativeHead, true,
@@ -1214,7 +1277,7 @@ public class TwitterApiIoProvider {
             }
         }
         List<String> missingBlueIds = refreshBadges
-                ? collectUncachedBadgeUserIds(merged, nowSec, blueLimit, lightweightDailyOnly ? nowSec - 86400L : Long.MIN_VALUE)
+                ? collectUncachedBadgeUserIds(merged, nowSec, blueLimit, lightweightDailyOnly ? nowSec - 86400L : Long.MIN_VALUE, !fetchGraph)
                 : List.of();
         if (!missingBlueIds.isEmpty() && !Instant.now().isAfter(deadline)) {
             int blueChunkSize = (initialFetch && !pacer.freeTierSlowMode && missingBlueIds.size() > 25) ? 25 : missingBlueIds.size();
@@ -1795,8 +1858,11 @@ public class TwitterApiIoProvider {
         long b = gaps.get(idx)[1];
         boolean nativeHead = allowNativeHead && b >= headTo;
 
+        int maxNativePages = useFreeSource(ctx.nativeUrl()) && fxTwitterClient.isSearchCircuitOpen()
+                ? Math.max(6, ctx.pagesLeft().get())
+                : (ctx.pacer().freeTierSlowMode ? 1 : 2);
         CompletableFuture<Void> gapFuture = nativeHead
-                ? runNativeHeadAsync(ctx, a, b, "", null, 0, ctx.pacer().freeTierSlowMode ? 1 : 2)
+                ? runNativeHeadAsync(ctx, a, b, "", null, 0, maxNativePages)
                 : fillSearchRangeWithAdaptiveShardsAsync(ctx, a, b);
 
         return gapFuture.thenCompose(v -> {
@@ -2192,6 +2258,14 @@ public class TwitterApiIoProvider {
     private CompletableFuture<JsonNode> getJsonOnceBeforeAsync(
             String url, String apiKey, KeyPacer pacer, Instant deadline, AtomicBoolean degraded,
             long requestTimeoutMs, boolean finishBeforeDeadline, AtomicBoolean requestStarted, AccountStore.StoredAccount metricStore) {
+        return getJsonOnceBeforeAsync(url, apiKey, pacer, deadline, degraded,
+                requestTimeoutMs, finishBeforeDeadline, requestStarted, metricStore, null);
+    }
+
+    private CompletableFuture<JsonNode> getJsonOnceBeforeAsync(
+            String url, String apiKey, KeyPacer pacer, Instant deadline, AtomicBoolean degraded,
+            long requestTimeoutMs, boolean finishBeforeDeadline, AtomicBoolean requestStarted,
+            AccountStore.StoredAccount metricStore, AtomicReference<XDataProviderException> capturedError) {
         var read = new ReadDiagnostic(url);
         if (useFreeSource(url)) {
             var started = requestStarted != null ? requestStarted : new AtomicBoolean();
@@ -2201,7 +2275,7 @@ public class TwitterApiIoProvider {
                         if (error != null) {
                             logFreeFallback(read, started, startNanos, deadline, error);
                             return getPaidJsonOnceBeforeAsync(withoutFreeCursor(url), apiKey, pacer, deadline,
-                                    degraded, requestTimeoutMs, finishBeforeDeadline, requestStarted, read);
+                                    degraded, requestTimeoutMs, finishBeforeDeadline, requestStarted, read, capturedError);
                         }
                         Set<String> disputed = rejectConflictingMetrics(free, metricStore);
                         List<String> missing = jsonIds(free, "__incomplete_ids");
@@ -2217,7 +2291,7 @@ public class TwitterApiIoProvider {
                         log.info("x_read_fallback refresh_id={} read_id={} source=fxtwitter target=twitterapi_io path=/twitter/tweets result=verify_missing count={}",
                                 read.refreshId(), read.readId(), missing.size());
                         return handleComposeCancellable(getPaidJsonOnceBeforeAsync(missingUrl, apiKey, pacer, deadline, degraded,
-                                requestTimeoutMs, finishBeforeDeadline, paidStarted, read), (paid, paidError) -> {
+                                requestTimeoutMs, finishBeforeDeadline, paidStarted, read, null), (paid, paidError) -> {
                                     if (paidError != null) degraded.set(true);
                                     if (paidStarted.get() && requestStarted != null) requestStarted.set(true);
                                     return CompletableFuture.completedFuture(
@@ -2226,12 +2300,20 @@ public class TwitterApiIoProvider {
                     });
         }
         return getPaidJsonOnceBeforeAsync(url, apiKey, pacer, deadline, degraded,
-                requestTimeoutMs, finishBeforeDeadline, requestStarted, read);
+                requestTimeoutMs, finishBeforeDeadline, requestStarted, read, capturedError);
     }
 
     private CompletableFuture<JsonNode> getPaidJsonOnceBeforeAsync(
             String url, String apiKey, KeyPacer pacer, Instant deadline, AtomicBoolean degraded,
             long requestTimeoutMs, boolean finishBeforeDeadline, AtomicBoolean requestStarted, ReadDiagnostic read) {
+        return getPaidJsonOnceBeforeAsync(url, apiKey, pacer, deadline, degraded,
+                requestTimeoutMs, finishBeforeDeadline, requestStarted, read, null);
+    }
+
+    private CompletableFuture<JsonNode> getPaidJsonOnceBeforeAsync(
+            String url, String apiKey, KeyPacer pacer, Instant deadline, AtomicBoolean degraded,
+            long requestTimeoutMs, boolean finishBeforeDeadline, AtomicBoolean requestStarted,
+            ReadDiagnostic read, AtomicReference<XDataProviderException> capturedError) {
         long startedNanos = System.nanoTime();
         var phase = new AtomicReference<>("queue");
         var httpStatus = new AtomicInteger();
@@ -2265,7 +2347,10 @@ public class TwitterApiIoProvider {
                     ex != null ? ex.getClass().getSimpleName() : root == null ? "no_result" : "parsed");
             if (ex == null) return CompletableFuture.completedFuture(root);
             Throwable cause = ex instanceof CompletionException && ex.getCause() != null ? ex.getCause() : ex;
-            if (cause instanceof XDataProviderException xe && (xe.getStatusCode() == 401 || xe.getStatusCode() == 402)) throw xe;
+            if (cause instanceof XDataProviderException xe) {
+                if (xe.getStatusCode() == 401 || xe.getStatusCode() == 402) throw xe;
+                if (capturedError != null) capturedError.set(xe);
+            }
             degraded.set(true);
             return CompletableFuture.completedFuture(null);
         });
@@ -2396,14 +2481,35 @@ public class TwitterApiIoProvider {
         if (deadline == null || !Instant.now().isBefore(deadline))
             throw new XDataProviderException(504, "读取期限已到，已保留当前进度");
         try {
+            boolean localMock = isLocalMockBaseUrl();
+            long firstTimeoutMs = localMock ? 10_000L : 20_000L;
+            var capturedError = new AtomicReference<XDataProviderException>();
             JsonNode result = getJsonOnceBeforeAsync(url, apiKey, pacer, deadline,
-                    new AtomicBoolean(false), 10_000, true).join();
-            if (result == null) throw new XDataProviderException(504, "读取超时，已保留当前进度");
+                    new AtomicBoolean(false), firstTimeoutMs, true, null, null, capturedError).join();
+            if (result == null && !localMock
+                    && Duration.between(Instant.now(), deadline).toMillis() >= 6_000L
+                    && isRetryableGetJsonBeforeFailure(capturedError.get())) {
+                capturedError.set(null);
+                result = getJsonOnceBeforeAsync(url, apiKey, pacer, deadline,
+                        new AtomicBoolean(false), 18_000L, true, null, null, capturedError).join();
+            }
+            if (result == null) {
+                XDataProviderException known = capturedError.get();
+                if (known != null) throw known;
+                throw new XDataProviderException(504, "读取超时，已保留当前进度");
+            }
             return result;
         } catch (CompletionException ex) {
             if (ex.getCause() instanceof RuntimeException runtime) throw runtime;
             throw ex;
         }
+    }
+
+    private static boolean isRetryableGetJsonBeforeFailure(XDataProviderException error) {
+        if (error == null) return true;
+        if (UpstreamBudgetGuard.isBudgetReached(error)) return false;
+        int code = error.getStatusCode();
+        return code >= 500 && code != 503;
     }
 
     private CompletableFuture<JsonNode> getJsonWithRetryAsync(String url, String apiKey, KeyPacer pacer) {
@@ -2875,7 +2981,8 @@ public class TwitterApiIoProvider {
                 && blueVerifiedCache.resolveValid(user.id(), handle, now) == null;
     }
 
-    private List<String> collectUncachedBadgeUserIds(AccountStore.StoredAccount merged, long nowSec, int limit, long activityCutoff) {
+    private List<String> collectUncachedBadgeUserIds(AccountStore.StoredAccount merged, long nowSec, int limit,
+                                                     long activityCutoff, boolean includeCachedGraph) {
         if (merged == null || merged.users() == null || merged.users().isEmpty()) {
             return List.of();
         }
@@ -2896,8 +3003,10 @@ public class TwitterApiIoProvider {
                 }
             }
         }
-        peerHandles.addAll(merged.followings());
-        peerHandles.addAll(merged.followers());
+        if (includeCachedGraph) {
+            peerHandles.addAll(merged.followings());
+            peerHandles.addAll(merged.followers());
+        }
         Set<String> ids = new LinkedHashSet<>();
         for (String h : peerHandles) {
             AccountStore.StoredUser u = merged.users().get(h);

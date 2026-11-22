@@ -72,10 +72,12 @@ function fixture() {
     vm.createContext(ctx);
     vm.runInContext(section('    const LIST_PAGE_SIZE =', '    function cancelReportRequest()')
         + section('    function stableUserId(', '    function getSelfStorageKey(')
+        + section('    function isOwnerAllPermissions()', '    function hasPeriodAccessDecision()')
         + section('    async function requestJsonWithin(', '    function syncAuthGateAndWorkspaceUI(')
         + section('    async function triggerXOAuthLogin(', '    function startCacheCooldownTicker(')
         + section('    function syncScheduleAuthBanner(', '    function formatGapDurationShort(')
         + section('    function setPublishAuthError(', '    async function submitConfirmResend(')
+        + section('    const MIN_SCHEDULE_INTERVAL_MS =', '    function computeNextAvailableScheduleMs(')
         + section('    function validateBatchScheduleEpochs(', '    function alignBatchScheduleEpochs(')
         + section('    function setRescheduleError(', '    function renderScheduledTweetsList(')
         + section('    async function submitScheduledJobAction(', '    /* ==================== 事件绑定与初始化')
@@ -194,6 +196,40 @@ async function testUnknownCreateChecksWithoutResubmitting() {
     assert.equal(ctx.toasts.at(-1), '已确认加入定时队列');
     assert.equal(ctx.state.scheduleMutations.size, 0);
 }
+async function testJsonFastPathAndPreExecutionBusyRejection() {
+    const ctx = fixture();
+    let captured = null, reads = 0;
+    ctx.fetch = async (url, options = {}) => {
+        if (options.method === 'POST') {
+            captured = { url, options };
+            return response({ error: 'SERVER_BUSY', message: '当前访问高峰排队等待超时，请稍候再试' }, 503);
+        }
+        reads++;
+        return response({ items: [] });
+    };
+    await ctx.submitCreateScheduledTweet();
+    assert.equal(captured.url, '/api/scheduled-tweets');
+    assert.equal(captured.options.headers?.['Content-Type'], 'application/json');
+    assert.equal(JSON.parse(captured.options.body).text, 'original draft');
+    assert.equal(reads, 0, 'pre-execution SERVER_BUSY must not trigger ambiguous queue reconciliation');
+    assert.equal(ctx.$('scheduleComposeError').textContent, '当前访问高峰排队等待超时，请稍候再试');
+
+    ctx.state.scheduleDraftItems = [{
+        text: 'with media',
+        scheduledAtValue: String(ctx.Date.now() + 3600000),
+        files: [{ file: { size: 12 }, name: 'pic.png' }],
+        timeTouched: true
+    }];
+    ctx.fetch = async (url, options = {}) => {
+        if (options.method === 'POST') {
+            captured = { url, options };
+            return response({ id: 'created-media' }, 200);
+        }
+        return response({ items: [] });
+    };
+    await ctx.submitCreateScheduledTweet();
+    assert.ok(captured.options.body instanceof ctx.FormData, 'media drafts keep using multipart FormData');
+}
 async function testRescheduleUnknownResultKeepsEditor() {
     const ctx = fixture(); let posts = 0;
     ctx.state.rescheduleEditingJobId = 'job-1'; ctx.state.rescheduleDraftValue = '2026-12-01T12:30';
@@ -241,6 +277,7 @@ async function testLogoutShowsProgressAndVerifiesAmbiguousResult() {
     await testQueueWaitingFailureAndCooldown();
     await testComposerFailureStaysLocal();
     await testUnknownCreateChecksWithoutResubmitting();
+    await testJsonFastPathAndPreExecutionBusyRejection();
     await testRescheduleUnknownResultKeepsEditor();
     testAuthorizationErrorHasIndependentLifetime();
     await testLogoutShowsProgressAndVerifiesAmbiguousResult();

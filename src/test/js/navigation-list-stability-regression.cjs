@@ -428,6 +428,31 @@ test('sort priority enforces blue-verified first, then inbound > outbound, then 
         'nonblue_equal'
     ]);
 
+    // Equal intimacy/counts break ties by latestInteractionAt desc, and 'recent' sorts by recency within tier
+    f.report.interactions.peerStats = [
+        { peer: { username: 'tie_older', displayName: 'T1', verified: true }, reciprocityCode: 'MUTUAL', intimacyScore: 50, myRepliesToPeer: 2, peerRepliesToMe: 3, latestInteractionAt: '2026-11-22T10:00:00Z' },
+        { peer: { username: 'tie_unknown', displayName: 'T0', verified: true }, reciprocityCode: 'MUTUAL', intimacyScore: 50, myRepliesToPeer: 2, peerRepliesToMe: 3, latestInteractionAt: null },
+        { peer: { username: 'tie_newer', displayName: 'T2', verified: true }, reciprocityCode: 'MUTUAL', intimacyScore: 50, myRepliesToPeer: 2, peerRepliesToMe: 3, latestInteractionAt: '2026-11-22T11:30:00Z' },
+        { peer: { username: 'high_int_earliest', displayName: 'T3', verified: true }, reciprocityCode: 'MUTUAL', intimacyScore: 85, myRepliesToPeer: 4, peerRepliesToMe: 6, latestInteractionAt: '2026-11-22T08:00:00Z' }
+    ];
+    f.state.peerSortBy = 'intimacy';
+    f.ctx.renderPeerList(f.report);
+    assert.deepEqual(extractOrder(f.markup.peer), [
+        'high_int_earliest',
+        'tie_newer',
+        'tie_older',
+        'tie_unknown'
+    ]);
+
+    f.state.peerSortBy = 'recent';
+    f.ctx.renderPeerList(f.report);
+    assert.deepEqual(extractOrder(f.markup.peer), [
+        'tie_newer',
+        'tie_older',
+        'high_int_earliest',
+        'tie_unknown'
+    ]);
+
     // Follow audit list also enforces blue-verified -> inbound > outbound -> selected sort
     f.state.followRenderLimit = 20;
     f.state.followSortBy = 'followers';

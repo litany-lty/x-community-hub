@@ -269,9 +269,13 @@
         state.assistantDraftSave = null;
         state.assistantDraftDirty = false;
         state.assistantRequestGeneration++;
-        delete $("assistantSettingsForm")?.dataset.version;
-        delete $("assistantSettingsForm")?.dataset.editRevision;
-        delete $("assistantAdvancedSettings")?.dataset.userToggled;
+        if ($("assistantSettingsForm")?.dataset) {
+            delete $("assistantSettingsForm").dataset.version;
+            delete $("assistantSettingsForm").dataset.editRevision;
+        }
+        if ($("assistantAdvancedSettings")?.dataset) {
+            delete $("assistantAdvancedSettings").dataset.userToggled;
+        }
         for (const id of ["assistantTopicList", "assistantTopicDetail", "assistantMaterialsList", "assistantReviewList",
             "assistantTopicTagChips", "assistantReviewTagChips", "assistantSuggestedPeers",
             "assistantSourcesList", "assistantCapabilityStatus", "assistantStyleMeta", "assistantStyleProfile",
@@ -629,7 +633,8 @@
     }
 
     function isOwnerAllPermissions() {
-        if (!isLoggedIn()) return false;
+        const loggedIn = typeof isLoggedIn === "function" ? isLoggedIn() : Boolean(state.authStatus?.loggedIn);
+        if (!loggedIn) return false;
         if (state.authStatus?.ownerAllPermissions === true) return true;
         if (state.assistantAccess?.allowed === true) return true;
         if (
@@ -1230,6 +1235,11 @@
         } finally {
             clearTimeout(timeoutId);
         }
+    }
+
+    function isPreExecutionGatewayRejection(err) {
+        return err?.httpStatus === 503
+            && (err.errorCode === "SERVER_BUSY" || err.errorCode === "REQUEST_INTERRUPTED");
     }
 
     async function startColdWorkspaceRefresh(period, targetDays, isCurrent) {
@@ -2609,6 +2619,11 @@
         }
 
         const effectiveSort = state.peerSortBy || "intimacy";
+        const peerLatestMs = (item) => {
+            if (!item?.latestInteractionAt) return -1;
+            const ms = Date.parse(item.latestInteractionAt);
+            return Number.isFinite(ms) ? ms : -1;
+        };
         list.sort((a, b) => {
             const blueFirst = Number(b.peer?.verified === true) - Number(a.peer?.verified === true);
             if (blueFirst !== 0) return blueFirst;
@@ -2618,27 +2633,38 @@
             if (inboundLeadDiff !== 0) return inboundLeadDiff;
             const totalA = (a.myRepliesToPeer || 0) + (a.peerRepliesToMe || 0);
             const totalB = (b.myRepliesToPeer || 0) + (b.peerRepliesToMe || 0);
+            const recencyDiff = peerLatestMs(b) - peerLatestMs(a);
             switch (effectiveSort) {
+                case "recent":
+                    return (
+                        recencyDiff ||
+                        (b.intimacyScore || 0) - (a.intimacyScore || 0) ||
+                        totalB - totalA ||
+                        (b.peerRepliesToMe || 0) - (a.peerRepliesToMe || 0)
+                    );
                 case "iOweFirst":
                     return (
                         (b.unrepliedInMyPostCount || 0) - (a.unrepliedInMyPostCount || 0) ||
                         (b.peerRepliesToMe - b.myRepliesToPeer) - (a.peerRepliesToMe - a.myRepliesToPeer) ||
-                        b.peerRepliesToMe - a.peerRepliesToMe
+                        b.peerRepliesToMe - a.peerRepliesToMe ||
+                        recencyDiff
                     );
                 case "theyOweFirst":
                     return (
                         (b.myRepliesToPeer - b.peerRepliesToMe) - (a.myRepliesToPeer - a.peerRepliesToMe) ||
-                        b.myRepliesToPeer - a.myRepliesToPeer
+                        b.myRepliesToPeer - a.myRepliesToPeer ||
+                        recencyDiff
                     );
                 case "outbound":
-                    return b.myRepliesToPeer - a.myRepliesToPeer || totalB - totalA;
+                    return b.myRepliesToPeer - a.myRepliesToPeer || totalB - totalA || recencyDiff;
                 case "inbound":
-                    return b.peerRepliesToMe - a.peerRepliesToMe || totalB - totalA;
+                    return b.peerRepliesToMe - a.peerRepliesToMe || totalB - totalA || recencyDiff;
                 default:
                     return (
                         (b.intimacyScore || 0) - (a.intimacyScore || 0) ||
                         totalB - totalA ||
-                        (b.peerRepliesToMe || 0) - (a.peerRepliesToMe || 0)
+                        (b.peerRepliesToMe || 0) - (a.peerRepliesToMe || 0) ||
+                        recencyDiff
                     );
             }
         });
@@ -3719,11 +3745,12 @@
                 if (!metaParts.length && !source.error) metaParts.push("等待首次检查");
                 if (lagging) metaParts.push("采集滞后");
                 if (gapCount > 0) metaParts.push(`历史缺口 ${gapCount} 处`);
-                const stateClass = paused ? "muted" : (source.error ? "error" : (lagging ? "running" : "ok"));
-                const stateText = paused ? "已暂停" : (source.error ? "采集异常" : (lagging ? "采集滞后" : "监听中"));
+                const isBudgetPaused = !paused && Boolean(source.error && String(source.error).includes("外部调用预算已达保护上限"));
+                const stateClass = paused ? "muted" : (isBudgetPaused ? "running" : (source.error ? "error" : (lagging ? "running" : "ok")));
+                const stateText = paused ? "已暂停" : (isBudgetPaused ? "预算保护" : (source.error ? "采集异常" : (lagging ? "采集滞后" : "监听中")));
                 return `<div class="assistant-source-row"><span><strong>@${esc(source.username || source.handle || source.id)}</strong>
                     <small class="assistant-source-meta-line">${esc(metaParts.join(" · "))}</small>
-                    ${source.error ? `<small class="assistant-source-error-line">异常：${esc(source.error)}</small>` : ""}</span>
+                    ${source.error ? `<small class="assistant-source-error-line">${isBudgetPaused ? "保护暂停：" : "异常："}${esc(source.error)}</small>` : ""}</span>
                     <span class="assistant-state ${stateClass}">${stateText}</span>
                     <button type="button" class="link-inline-btn" data-assistant-source-action="${paused ? "resume" : "pause"}" data-source-id="${esc(source.id)}">${paused ? "恢复" : "暂停"}</button>
                     <button type="button" class="link-inline-btn danger" data-assistant-source-action="remove" data-source-id="${esc(source.id)}">移除</button>
@@ -5950,7 +5977,8 @@
     const MIN_SCHEDULE_INTERVAL_MS = 3_600_000;
     const MAX_BATCH_SCHEDULE_ITEMS = 20;
     function getRequiredScheduleIntervalMs() {
-        return (isOwnerAllPermissions() || state.assistantAccess?.allowed === true) ? 0 : MIN_SCHEDULE_INTERVAL_MS;
+        return ((typeof isOwnerAllPermissions === "function" && isOwnerAllPermissions())
+                || state.assistantAccess?.allowed === true) ? 0 : MIN_SCHEDULE_INTERVAL_MS;
     }
 
     function computeNextAvailableScheduleMs(preferredMs, occupiedEpochsMs = [], minIntervalMs = MIN_SCHEDULE_INTERVAL_MS) {
@@ -7830,7 +7858,35 @@
         btn.textContent = "提交中…";
         try {
             let resp, body;
-            if (items.length === 1) {
+            if (!anyHasFiles && items.length === 1) {
+                const payload = {
+                    text: items[0].text || "",
+                    scheduledAtEpochMs: draftEpochs[0],
+                    clientRequestId: state.composerClientRequestId
+                };
+                if (items[0].sourceRef?.assistantDraftId) {
+                    payload.assistantDraftId = items[0].sourceRef.assistantDraftId;
+                    payload.assistantDraftVersion = Number(items[0].sourceRef.assistantDraftVersion || 0);
+                }
+                ({ resp, body } = await requestJsonWithin("/api/scheduled-tweets", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(payload)
+                }, 60000));
+            } else if (!anyHasFiles) {
+                const metas = items.map((it, idx) => ({
+                    text: it.text || "",
+                    scheduledAtEpochMs: draftEpochs[idx],
+                    clientRequestId: `${state.composerClientRequestId}_${idx}`,
+                    assistantDraftId: it.sourceRef?.assistantDraftId || null,
+                    assistantDraftVersion: it.sourceRef?.assistantDraftVersion || null
+                }));
+                ({ resp, body } = await requestJsonWithin("/api/scheduled-tweets/batch", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ items: metas })
+                }, 60000));
+            } else if (items.length === 1) {
                 const fd = new FormData();
                 fd.append("text", items[0].text || "");
                 fd.append("scheduledAtEpochMs", String(draftEpochs[0]));
@@ -7867,6 +7923,7 @@
             if (!resp.ok) {
                 const error = new Error(body.message || `提交未完成（HTTP ${resp.status}）`);
                 error.httpStatus = resp.status;
+                error.errorCode = body.error || "";
                 throw error;
             }
             if (!mutation.isCurrent()) return;
@@ -7877,7 +7934,7 @@
             showToast(submittedCount > 1 ? `已批量加入 ${submittedCount} 条定时推文` : "已加入定时发布队列");
         } catch (err) {
             if (!mutation.isCurrent()) return;
-            const uncertain = !err.httpStatus || err.httpStatus >= 500;
+            const uncertain = !isPreExecutionGatewayRejection(err) && (!err.httpStatus || err.httpStatus >= 500);
             if (uncertain) {
                 setScheduleComposerError("暂未收到提交结果，正在核对队列；草稿已保留。", true);
                 const checked = await loadScheduledTweets(true, true);
@@ -7945,6 +8002,7 @@
             if (!resp.ok) {
                 const error = new Error(body.message || `确认未完成（HTTP ${resp.status}）`);
                 error.httpStatus = resp.status;
+                error.errorCode = body.error || "";
                 throw error;
             }
             if (!mutation.isCurrent()) return;
@@ -7954,7 +8012,8 @@
             await loadScheduledTweets(true, true);
         } catch (err) {
             if (!mutation.isCurrent()) return;
-            const message = !err.httpStatus || err.httpStatus >= 500
+            const uncertain = !isPreExecutionGatewayRejection(err) && (!err.httpStatus || err.httpStatus >= 500);
+            const message = uncertain
                 ? "暂未确认补发结果，请先刷新队列核对。" : err.message || "确认未完成，请重试。";
             if (state.pendingConfirmJob?.id === job.id) {
                 $("confirmResendReason").textContent = message;
@@ -8010,6 +8069,7 @@
             if (!resp.ok) {
                 const error = new Error(body.message || `批量确认未完成（HTTP ${resp.status}）`);
                 error.httpStatus = resp.status;
+                error.errorCode = body.error || "";
                 throw error;
             }
             if (!mutation.isCurrent()) return;
@@ -8022,7 +8082,8 @@
             await loadScheduledTweets(true, true);
         } catch (err) {
             if (mutation.isCurrent()) {
-                const message = !err.httpStatus || err.httpStatus >= 500
+                const uncertain = !isPreExecutionGatewayRejection(err) && (!err.httpStatus || err.httpStatus >= 500);
+                const message = uncertain
                     ? "暂未确认批量补发结果，请刷新队列核对。" : err.message || "批量确认未完成，请重试。";
                 setScheduleActionError(message, true);
             }
@@ -8057,6 +8118,7 @@
             if (!resp.ok) {
                 const error = new Error(body.message || `${label}未完成（HTTP ${resp.status}）`);
                 error.httpStatus = resp.status;
+                error.errorCode = body.error || "";
                 throw error;
             }
             const editedWhileSaving = action === "reschedule" && state.rescheduleEditingJobId === jobId
@@ -8075,7 +8137,7 @@
             await loadScheduledTweets(true, true);
         } catch (err) {
             if (mutation.isCurrent()) {
-                const uncertain = !err.httpStatus || err.httpStatus >= 500;
+                const uncertain = !isPreExecutionGatewayRejection(err) && (!err.httpStatus || err.httpStatus >= 500);
                 const message = uncertain ? `尚未确认${label}结果，请刷新队列核对。`
                     : err.message || label + "未完成，请重试。";
                 if (action === "reschedule") {

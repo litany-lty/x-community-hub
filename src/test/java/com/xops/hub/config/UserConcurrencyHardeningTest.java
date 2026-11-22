@@ -170,6 +170,55 @@ class UserConcurrencyHardeningTest {
         assertThat(invoke(failureFilter, "overflow", (req, res) -> {}).getStatus()).isEqualTo(200);
     }
 
+    @Test
+    void slowReadsAndMediaLoadsDoNotStarveScheduledTweetMutations() throws Exception {
+        var filter = new UserConcurrencyThrottleFilter(properties());
+        var pool = Executors.newFixedThreadPool(8);
+        CountDownLatch readsAndMediaEntered = new CountDownLatch(8);
+        CountDownLatch release = new CountDownLatch(1);
+        List<Future<MockHttpServletResponse>> running = new ArrayList<>();
+        try {
+            for (int i = 0; i < 4; i++) {
+                running.add(pool.submit(() -> {
+                    var res = new MockHttpServletResponse();
+                    filter.doFilter(request("GET", "/api/analyze/bundle", "busy-author"), res, (rq, rs) -> {
+                        readsAndMediaEntered.countDown();
+                        await(release);
+                    });
+                    return res;
+                }));
+            }
+            for (int i = 0; i < 4; i++) {
+                final int idx = i;
+                running.add(pool.submit(() -> {
+                    var res = new MockHttpServletResponse();
+                    filter.doFilter(request("GET", "/api/scheduled-tweets/job-1/media/asset-" + idx, "busy-author"), res, (rq, rs) -> {
+                        readsAndMediaEntered.countDown();
+                        await(release);
+                    });
+                    return res;
+                }));
+            }
+            assertThat(readsAndMediaEntered.await(5, TimeUnit.SECONDS)).isTrue();
+
+            var saveResp = new MockHttpServletResponse();
+            filter.doFilter(request("POST", "/api/scheduled-tweets", "busy-author"), saveResp, (rq, rs) -> {});
+            assertThat(saveResp.getStatus()).isEqualTo(200);
+            assertThat(saveResp.getHeader("X-RateLimit-Mode")).isEqualTo("normal");
+
+            var deleteResp = new MockHttpServletResponse();
+            filter.doFilter(request("DELETE", "/api/scheduled-tweets/job-1", "busy-author"), deleteResp, (rq, rs) -> {});
+            assertThat(deleteResp.getStatus()).isEqualTo(200);
+            assertThat(deleteResp.getHeader("X-RateLimit-Mode")).isEqualTo("normal");
+        } finally {
+            release.countDown();
+            for (var f : running) {
+                try { f.get(2, TimeUnit.SECONDS); } catch (Exception ignored) {}
+            }
+            pool.shutdownNow();
+        }
+    }
+
     private static XOpsProperties properties() {
         XOpsProperties props = new XOpsProperties();
         props.setMaxConcurrentUsers(50);
@@ -185,7 +234,11 @@ class UserConcurrencyHardeningTest {
     }
 
     private static MockHttpServletRequest request(String user) {
-        var request = new MockHttpServletRequest("GET", "/api/scheduled-tweets");
+        return request("GET", "/api/scheduled-tweets", user);
+    }
+
+    private static MockHttpServletRequest request(String method, String path, String user) {
+        var request = new MockHttpServletRequest(method, path);
         var session = new MockHttpSession();
         session.setAttribute(XOAuthController.SESSION_AUTH_USER,
                 new AuthenticatedXUser(user, user, user, "", false, Instant.EPOCH));

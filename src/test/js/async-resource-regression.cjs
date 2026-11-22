@@ -23,7 +23,8 @@ function fixture() {
     const elements = new Map(), timers = new Map(), created = [], revoked = [];
     let timerId = 0;
     function element(id) {
-        if (!elements.has(id)) elements.set(id, { hidden: false, disabled: false, textContent: '', innerHTML: '',
+        if (!elements.has(id)) elements.set(id, { hidden: false, disabled: false, textContent: '', innerHTML: '', dataset: {},
+            replaceChildren() { this.innerHTML = ''; },
             classList: { add: noop, remove: noop, toggle: noop }, querySelectorAll: () => [], querySelector: () => null,
             setAttribute: noop, removeAttribute: noop, getAttribute: () => null, scrollIntoView: noop });
         return elements.get(id);
@@ -45,6 +46,7 @@ function fixture() {
         isScheduleEligible: () => true, getScheduleLockedReason: () => 'locked',
         parseDraftItemEpochMs: it => Number(it.scheduledAtValue), getQueuedScheduledEpochsMs: () => [],
         validateBatchScheduleEpochs: () => ({ ok: true }), MIN_SCHEDULE_INTERVAL_MS: 3600000, MAX_BATCH_SCHEDULE_ITEMS: 20,
+        getRequiredScheduleIntervalMs: () => 3600000,
         clearScheduleComposerDraft: () => { ctx.clears++; ctx.state.scheduleDraftItems = []; },
         closeConfirmResendModal: () => { ctx.state.pendingConfirmJob = null; },
         rotateComposerRequestId: () => { ctx.state.composerClientRequestId = 'generated'; },
@@ -191,7 +193,7 @@ function testMediaValidationAndBoundedCache() {
 function testAccountResetHidesPreviousReport() {
     const ctx = fixture();
     const panels = [{ id: 'panel-circle', hidden: false }, { id: 'panel-activity', hidden: false }, { id: 'panel-schedule', hidden: false }];
-    ctx.document.querySelectorAll = () => panels;
+    ctx.document.querySelectorAll = sel => sel === '.tab-panel' ? panels : [];
     const canvas = ctx.$('shareCardCanvas');
     let resets = 0;
     Object.defineProperty(canvas, 'width', { get: () => 1080, set: () => { resets++; } });

@@ -45,6 +45,7 @@ public class MaliciousRequestShieldFilter extends OncePerRequestFilter {
             "/api/scheduled-tweets/batch"
     );
     private static final long MAX_NON_UPLOAD_BODY_BYTES = 256L * 1024L;
+    private static final long MAX_JSON_SCHEDULE_BODY_BYTES = 2L * 1024L * 1024L;
     private static final long MAX_UPLOAD_BODY_BYTES = 26L * 1024L * 1024L;
     private static final int MAX_URI_LENGTH = 512;
     private static final int MAX_QUERY_LENGTH = 2048;
@@ -123,7 +124,8 @@ public class MaliciousRequestShieldFilter extends OncePerRequestFilter {
             return;
         }
 
-        if ("POST".equalsIgnoreCase(method) && (path == null || !path.startsWith("/api/"))) {
+        if ("POST".equalsIgnoreCase(method)
+                && (path == null || (!path.startsWith("/api/") && !path.startsWith("/__capacity_fixture/")))) {
             recordMaliceStrike(clientIp, nowSec, 1);
             response.setStatus(HttpServletResponse.SC_METHOD_NOT_ALLOWED);
             response.setHeader("Allow", "GET, HEAD, OPTIONS");
@@ -141,7 +143,9 @@ public class MaliciousRequestShieldFilter extends OncePerRequestFilter {
             rejectJsonOrEmpty(request, response, HttpServletResponse.SC_UNSUPPORTED_MEDIA_TYPE, "UNSUPPORTED_MEDIA_TYPE", "当前接口不接受 Multipart 上传");
             return;
         }
-        long maxAllowedBytes = isUploadEndpoint ? MAX_UPLOAD_BODY_BYTES : MAX_NON_UPLOAD_BODY_BYTES;
+        long maxAllowedBytes = isUploadEndpoint
+                ? (isMultipart ? MAX_UPLOAD_BODY_BYTES : MAX_JSON_SCHEDULE_BODY_BYTES)
+                : MAX_NON_UPLOAD_BODY_BYTES;
         if (contentLength > maxAllowedBytes) {
             rejectJsonOrEmpty(request, response, HttpServletResponse.SC_REQUEST_ENTITY_TOO_LARGE, "PAYLOAD_TOO_LARGE", "请求体超出安全大小上限");
             return;
@@ -179,7 +183,7 @@ public class MaliciousRequestShieldFilter extends OncePerRequestFilter {
             }
         }
 
-        if (isUploadEndpoint) {
+        if (isUploadEndpoint && isMultipart) {
             // Multipart 总大小另由容器的 25MB 解析上限约束，包括 chunked 上传。
             filterChain.doFilter(request, response);
         } else {

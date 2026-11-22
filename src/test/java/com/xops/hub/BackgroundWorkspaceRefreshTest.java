@@ -62,7 +62,7 @@ class BackgroundWorkspaceRefreshTest {
         var readers = Executors.newSingleThreadExecutor();
         try {
             var immediate = service.analyzeWorkspaceBundle(
-                    "owner", ReportPeriod.HOURS_24, "TWITTERAPI_IO", true, "127.0.0.1", "owner-id", false);
+                    "owner", ReportPeriod.HOURS_24, "TWITTERAPI_IO", true, "127.0.0.1", "owner-id", false, true);
             assertThat(immediate.backgroundRefreshStatus().state()).isEqualTo("RUNNING");
             assertThat(upstreamStarted.await(1, TimeUnit.SECONDS)).isTrue();
 

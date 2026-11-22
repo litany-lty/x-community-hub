@@ -197,6 +197,7 @@ public class CommunityHubService {
     private final AtomicBoolean silentHistoryRunning = new AtomicBoolean(false);
     private final ConcurrentHashMap<String, Long> silentHistoryLastAttemptMs = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Long> silentHistoryDegradedCooldownUntilMs = new ConcurrentHashMap<>();
+    private volatile long silentHistoryBudgetCooldownUntilMs = 0L;
     private final ConcurrentHashMap<String, AtomicBoolean> backgroundRefreshes = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, BackgroundRefreshStatus> backgroundRefreshStatuses = new ConcurrentHashMap<>();
     private final ExecutorService backgroundRefreshExecutor = Executors.newFixedThreadPool(2, runnable -> {
@@ -499,7 +500,8 @@ public class CommunityHubService {
             boolean freshDaily = completedDaily && now.getEpochSecond() >= stored.dailyRefreshedAt()
                     && now.getEpochSecond() < stored.dailyRefreshedAt() + DAILY_REFRESH_SECONDS;
             boolean exhaustedDailyAttempts = canContinueDailyRefresh(stored, now) && !dailyCanContinue(stored);
-            if (forceRefresh && !backgroundExecution && resolvedMode != ProviderMode.DEMO && stored != null) {
+            if (preferStored && forceRefresh && !backgroundExecution && resolvedMode != ProviderMode.DEMO
+                    && stored != null && !freshDaily && !exhaustedDailyAttempts) {
                 return serveStoredAndScheduleRefresh(
                         cacheKey, rawHandle, handleKey, resolvedPeriod, requestedProvider, clientIp, expectedAccountId,
                         stored, completedDaily, quotaEntry, zone, today, initialRank, configuredTtl, now, algoFp,
@@ -517,8 +519,8 @@ public class CommunityHubService {
                     && active.bundle() != null && active.bundle().dailyCacheStatus() != null
                     && active.bundle().dailyCacheStatus().lastAttemptDegraded()
                     && Duration.between(active.computedAt(), now).getSeconds() < 60;
-            if (!forceRefresh && resolvedMode != ProviderMode.DEMO && stored != null
-                    && (coalesced || recentBgResult || recentDegradedCooldown) && !freshDaily
+            if (resolvedMode != ProviderMode.DEMO && stored != null
+                    && (coalesced || (!forceRefresh && (recentBgResult || recentDegradedCooldown))) && !freshDaily
                     && cacheIdentityMatches(active, handleKey, expectedAccountId)
                     && Objects.equals(algoFp, active.algoFingerprint())
                     && active.bundle() != null && active.bundle().hours24() != null) {
@@ -527,7 +529,7 @@ public class CommunityHubService {
                         .withDailyCacheStatus(active.bundle().dailyCacheStatus() != null
                                 ? active.bundle().dailyCacheStatus() : dailyCacheStatus(stored));
             }
-            if (!forceRefresh && resolvedMode != ProviderMode.DEMO && stored != null && (freshDaily || exhaustedDailyAttempts)) {
+            if (resolvedMode != ProviderMode.DEMO && stored != null && (freshDaily || exhaustedDailyAttempts)) {
                 Instant warmExpires = dailyRefreshExpiresAt(stored, now);
                 if (active != null && active.bundle() != null && active.snapshot() != null
                         && Objects.equals(stored.syncedAtInstant(), active.snapshot().fetchedAt())
@@ -2327,6 +2329,7 @@ public class CommunityHubService {
                     .thenComparing(Comparator.comparingInt(PeerInteractionStat::peerRepliesToMe).reversed())
                     .thenComparing(Comparator.comparingDouble(PeerInteractionStat::intimacyScore).reversed())
                     .thenComparing((PeerInteractionStat p) -> p.peer() != null && p.peer().verified(), Comparator.reverseOrder())
+                    .thenComparing(PeerInteractionStat::latestInteractionAt, Comparator.nullsLast(Comparator.reverseOrder()))
                     .thenComparing(p -> p.peer() != null && p.peer().username() != null
                             ? p.peer().username().toLowerCase(Locale.ROOT) : "");
 
@@ -2411,6 +2414,14 @@ public class CommunityHubService {
         if (hasActiveForegroundWork()) {
             return false;
         }
+        long precheckNowMs = System.currentTimeMillis();
+        if (precheckNowMs < silentHistoryBudgetCooldownUntilMs) {
+            return false;
+        }
+        if (twitterApiIoProvider.isBackgroundPaidBudgetExhausted()) {
+            silentHistoryBudgetCooldownUntilMs = precheckNowMs + 300_000L;
+            return false;
+        }
         List<LongHistoryCandidate> candidates = longHistoryCandidates();
         if (candidates.isEmpty()) {
             return false;
@@ -2471,7 +2482,11 @@ public class CommunityHubService {
         silentHistoryLastAttemptMs.put(ownerKey, nowMs);
         TwitterApiIoProvider.SyncOutcome outcome = twitterApiIoProvider.syncStoreSilentHistoryStep(handle, before, 3, uid);
         if (outcome.degraded() && !outcome.progressed()) {
-            silentHistoryDegradedCooldownUntilMs.put(ownerKey, System.currentTimeMillis() + 300_000L);
+            long cooldownUntil = System.currentTimeMillis() + 300_000L;
+            silentHistoryDegradedCooldownUntilMs.put(ownerKey, cooldownUntil);
+            if (twitterApiIoProvider.isBackgroundPaidBudgetExhausted()) {
+                silentHistoryBudgetCooldownUntilMs = cooldownUntil;
+            }
         } else {
             silentHistoryDegradedCooldownUntilMs.remove(ownerKey);
         }

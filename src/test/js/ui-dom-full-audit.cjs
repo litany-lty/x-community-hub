@@ -24,7 +24,20 @@ function slice(startMarker, endMarker) {
         "loadMorePeersBtn",
         "loadMoreFollowBtn",
         "clearDraftSimBtn",
-        "sendDraftToScheduleBtn"
+        "sendDraftToScheduleBtn",
+        "assistantDraftEditor",
+        "assistantDraftVersions",
+        "assistantTopicTasks",
+        "assistantDraftSaveState",
+        "assistantDraftTitle",
+        "assistantDraftSelect",
+        "assistantDraftLength",
+        "assistantDraftNumberChanges",
+        "assistantMoveTarget",
+        "assistantDraftVersionPreview",
+        "assistantDraftVersionText",
+        "assistantDraftVersionTitle",
+        "assistantOptimizeInstruction"
     ]);
 
     const referencedIds = new Set([

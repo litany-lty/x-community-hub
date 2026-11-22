@@ -153,5 +153,105 @@ class UpstreamBudgetGuardTest {
             .isInstanceOf(XDataProviderException.class).hasMessageContaining("持久化预算目录");
     }
 
+    @Test void twitterApiIoPageReadPropagatesBudgetLimitWithoutFakeTimeoutOrProfileLeak() throws Exception {
+        var calls = new java.util.concurrent.atomic.AtomicInteger();
+        var server = com.sun.net.httpserver.HttpServer.create(new java.net.InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/", exchange -> {
+            calls.incrementAndGet();
+            byte[] body = "{\"status\":\"success\",\"data\":{\"id\":\"817386\",\"userName\":\"Techmeme\"}}"
+                    .getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            try (var output = exchange.getResponseBody()) { output.write(body); }
+        });
+        server.start();
+        XOpsProperties p = properties();
+        p.setTwitterapiIoKey("synthetic-key");
+        p.setTwitterapiIoBaseUrl("http://127.0.0.1:" + server.getAddress().getPort());
+        // $0.0020 (2,000 micros) can afford /twitter/user/info (180 micros), but NOT /twitter/user/last_tweets (15,000 micros).
+        p.setDailyUpstreamUsdBudget("0.0020");
+        SharedApiExecutor pool = new SharedApiExecutor(p);
+        try {
+            var guard = new UpstreamBudgetGuard(p, true);
+            assertThat(guard.canAfford(p.getTwitterapiIoBaseUrl() + "/twitter/user/info?userName=Techmeme", "twitterapi_io_read")).isTrue();
+            assertThat(guard.canAfford(p.getTwitterapiIoBaseUrl() + "/twitter/user/last_tweets?userName=Techmeme", "twitterapi_io_read")).isFalse();
+            var mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+            var provider = new TwitterApiIoProvider(p, mapper, pool, guard);
+            assertThat(provider.isPageReadBudgetExhausted()).isTrue();
+            assertThatThrownBy(() -> provider.fetchTextPostsPage("Techmeme", "817386", "", 100, Instant.now().plusSeconds(30)))
+                    .isInstanceOfSatisfying(XDataProviderException.class, ex -> {
+                        assertThat(ex.getStatusCode()).isEqualTo(429);
+                        assertThat(ex.getMessage()).isEqualTo(UpstreamBudgetGuard.BUDGET_REACHED_MESSAGE);
+                    });
+            assertThat(calls).hasValue(0);
+            assertThat(guard.snapshotMetrics().get("budgetRejectedCalls")).isEqualTo(1L);
+        } finally {
+            pool.shutdown();
+            server.stop(0);
+        }
+    }
+
+    @Test void freeFxTwitterTimelineRunsWithoutChargingOrBlockingEvenWhenPaidBudgetIsExhausted() throws Exception {
+        var paidCalls = new java.util.concurrent.atomic.AtomicInteger();
+        var freeCalls = new java.util.concurrent.atomic.AtomicInteger();
+        var paidServer = com.sun.net.httpserver.HttpServer.create(new java.net.InetSocketAddress("127.0.0.1", 0), 0);
+        paidServer.createContext("/", exchange -> {
+            paidCalls.incrementAndGet();
+            exchange.sendResponseHeaders(500, 0);
+            exchange.close();
+        });
+        var server = com.sun.net.httpserver.HttpServer.create(new java.net.InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/2/profile/Techmeme/statuses", exchange -> {
+            freeCalls.incrementAndGet();
+            String body = "{\"code\":200,\"results\":[{\"type\":\"status\",\"id\":\"2124458308216238209\","
+                    + "\"text\":\"AI security news\",\"raw_text\":{\"text\":\"AI security news\",\"facets\":[]},"
+                    + "\"created_timestamp\":1795345305,\"created_at\":\"Sun Nov 22 11:01:45 +0000 2026\","
+                    + "\"likes\":3,\"replies\":5,\"reposts\":1,\"quotes\":0,\"bookmarks\":1,\"views\":2044,"
+                    + "\"replying_to\":null,\"reposted_by\":null,\"media\":null,"
+                    + "\"author\":{\"id\":\"817386\",\"screen_name\":\"Techmeme\",\"name\":\"Techmeme\","
+                    + "\"followers\":428034,\"following\":1001,\"statuses\":213559,"
+                    + "\"verification\":{\"verified\":true,\"type\":\"individual\"}}}],"
+                    + "\"cursor\":{\"top\":null,\"bottom\":\"next-1\"}}";
+            byte[] bytes = body.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, bytes.length);
+            try (var out = exchange.getResponseBody()) { out.write(bytes); }
+        });
+        server.createContext("/2/profile/Techmeme", exchange -> {
+            freeCalls.incrementAndGet();
+            String body = "{\"code\":200,\"user\":{\"id\":\"817386\",\"screen_name\":\"Techmeme\",\"name\":\"Techmeme\","
+                    + "\"followers\":428034,\"following\":1001,\"statuses\":213559,"
+                    + "\"verification\":{\"verified\":true,\"type\":\"individual\"}}}";
+            byte[] bytes = body.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, bytes.length);
+            try (var out = exchange.getResponseBody()) { out.write(bytes); }
+        });
+        paidServer.start();
+        server.start();
+        XOpsProperties p = properties();
+        p.setTwitterapiIoKey("synthetic-key");
+        p.setTwitterapiIoBaseUrl("http://127.0.0.1:" + paidServer.getAddress().getPort());
+        p.setFxtwitterEnabled(true);
+        p.setFxtwitterBaseUrl("http://127.0.0.1:" + server.getAddress().getPort() + "/2");
+        p.setDailyUpstreamUsdBudget("0.0001"); // Exhausted for any paid read
+        SharedApiExecutor pool = new SharedApiExecutor(p);
+        try {
+            var guard = new UpstreamBudgetGuard(p, true);
+            var mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+            var provider = new TwitterApiIoProvider(p, mapper, pool, guard);
+            assertThat(provider.isPageReadBudgetExhausted()).isTrue();
+            assertThat(provider.canReadTimelineForFree("")).isTrue();
+            var page = provider.fetchTextPostsPage("Techmeme", "817386", "", 100, Instant.now().plusSeconds(30));
+            assertThat(page.posts()).hasSize(1);
+            assertThat(page.posts().get(0).id()).isEqualTo("2124458308216238209");
+            assertThat(page.nextCursor()).isEqualTo("fx:next-1");
+            assertThat(paidCalls).hasValue(0);
+            assertThat(freeCalls).hasValue(1);
+            assertThat(guard.snapshotMetrics().get("budgetRejectedCalls")).isEqualTo(0L);
+        } finally {
+            pool.shutdown();
+            paidServer.stop(0);
+            server.stop(0);
+        }
+    }
+
     private static Clock clock(String time) { return Clock.fixed(Instant.parse(time), ZoneOffset.UTC); }
 }

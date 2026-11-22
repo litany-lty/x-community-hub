@@ -9,6 +9,7 @@ import com.xops.hub.provider.TwitterApiIoProvider.TextPost;
 import com.xops.hub.provider.TwitterApiIoProvider.TextPostPage;
 import com.xops.hub.provider.TwitterApiIoProvider.TextInteraction;
 import com.xops.hub.provider.TwitterApiIoProvider.TextInteractionPage;
+import com.xops.hub.provider.UpstreamBudgetGuard;
 import com.xops.hub.provider.XDataProviderException;
 import com.xops.hub.service.CommunityHubService;
 import jakarta.annotation.PreDestroy;
@@ -42,6 +43,8 @@ public class SourceCollector {
     static final String INBOUND_ENDPOINT = "/twitter/user/mentions";
     static final long SCAN_OVERLAP_MS = 30 * 60 * 1000L;
     private static final long HISTORY_INCREMENTAL_INTERVAL_MS = 5 * 60 * 1000L;
+    static final long HISTORY_FAILURE_BACKOFF_MS = 90_000L;
+    static final long BUDGET_BACKOFF_MS = 10 * 60 * 1000L;
 
     private final AssistantStore store;
     private final TwitterApiIoProvider provider;
@@ -197,17 +200,24 @@ public class SourceCollector {
         boolean assistantCollectionActive = hasBoundOwner()
                 && settings.path("enabled").asBoolean(false)
                 && settings.path("collectionEnabled").asBoolean(false);
+        boolean paidBudgetExhausted = provider.isPageReadBudgetExhausted();
+        boolean freeTimelineAvailable = provider.canReadTimelineForFree("");
+        if (paidBudgetExhausted && !freeTimelineAvailable) {
+            reconcileMisclassifiedBudgetErrors(assistantCollectionActive);
+            return;
+        }
         if (assistantCollectionActive) {
             long interval = Math.max(1, settings.path("intervalMinutes").asLong(5)) * 60_000L;
             long now = System.currentTimeMillis();
             List<ObjectNode> dueSources = store.tx(tx -> tx.all("source").stream()
                     .filter(s -> "ACTIVE".equals(s.path("status").asText()))
-                    .filter(s -> sourceDue(s, now, interval))
+                    .filter(s -> sourceDue(s, now, interval, freeTimelineAvailable))
                     .sorted(Comparator.comparingLong(s -> s.path("lastAttemptAt").asLong(0)))
                     .limit(MAX_SOURCES_PER_TICK)
                     .map(ObjectNode::deepCopy).toList());
             for (ObjectNode due : dueSources) {
                 if (!store.hasCollectionSpace()) break;
+                if (!freeTimelineAvailable && provider.isPageReadBudgetExhausted()) break;
                 collectSourcePage(due);
             }
             boolean publicationChanged = store.tx(tx -> {
@@ -219,29 +229,76 @@ public class SourceCollector {
             });
             boolean styleHasNextBatch = store.tx(tx -> {
                 var status = tx.get("meta", "style_status");
-                return status != null && status.path("continueBatch").asBoolean()
-                        && status.path("error").asText("").isBlank();
+                if (status == null || !status.path("continueBatch").asBoolean()) return false;
+                String err = status.path("error").asText("");
+                return err.isBlank() || (freeTimelineAvailable && err.contains("外部调用预算已达保护上限"));
             });
-            if (publicationChanged || styleHasNextBatch) refreshStyleSamples();
+            if ((publicationChanged || styleHasNextBatch) && (freeTimelineAvailable || !provider.isPageReadBudgetExhausted())) {
+                refreshStyleSamples();
+            }
         }
         if ((assistantCollectionActive || communityHubService.isSilentHistoryEnabled())
-                && !communityHubService.hasActiveForegroundWork()) {
+                && !communityHubService.hasActiveForegroundWork()
+                && (freeTimelineAvailable || !provider.isBackgroundPaidBudgetExhausted())) {
             synchronizeHistoryCandidates();
-            if (!communityHubService.hasActiveForegroundWork()) {
+            if (!communityHubService.hasActiveForegroundWork()
+                    && (freeTimelineAvailable || !provider.isBackgroundPaidBudgetExhausted())) {
                 collectOneHistoryPage();
             }
         }
     }
 
+    private void reconcileMisclassifiedBudgetErrors(boolean assistantCollectionActive) {
+        store.tx(tx -> {
+            if (assistantCollectionActive) {
+                for (ObjectNode src : tx.all("source")) {
+                    if ("ACTIVE".equals(src.path("status").asText())
+                            && "读取超时，已保留当前进度".equals(src.path("error").asText(""))) {
+                        tx.put("source", src.path("id").asText(),
+                                src.deepCopy().put("error", UpstreamBudgetGuard.BUDGET_REACHED_MESSAGE));
+                    }
+                }
+                ObjectNode style = tx.get("meta", "style_status");
+                if (style != null && "读取超时，已保留当前进度".equals(style.path("error").asText(""))) {
+                    tx.put("meta", "style_status",
+                            style.deepCopy().put("error", UpstreamBudgetGuard.BUDGET_REACHED_MESSAGE));
+                }
+            }
+            for (ObjectNode hs : tx.all("history_source")) {
+                boolean tlMisclassified = "读取超时，已保留当前进度".equals(hs.path("timelineError").asText(""));
+                boolean inMisclassified = "读取超时，已保留当前进度".equals(hs.path("inboundError").asText(""));
+                if (tlMisclassified || inMisclassified) {
+                    ObjectNode next = hs.deepCopy();
+                    if (tlMisclassified) next.put("timelineError", UpstreamBudgetGuard.BUDGET_REACHED_MESSAGE);
+                    if (inMisclassified) next.put("inboundError", UpstreamBudgetGuard.BUDGET_REACHED_MESSAGE);
+                    tx.put("history_source", hs.path("id").asText(), next);
+                }
+            }
+            return null;
+        });
+    }
+
     static boolean sourceDue(ObjectNode source, long now, long intervalMs) {
+        return sourceDue(source, now, intervalMs, false);
+    }
+
+    static boolean sourceDue(ObjectNode source, long now, long intervalMs, boolean freeTimelineAvailable) {
         long lastAttempt = source.path("lastAttemptAt").asLong(0);
         if (lastAttempt <= 0) return true;
         String activeCursor = boundCursor(source, "cursor", TIMELINE_PROVIDER, TIMELINE_ENDPOINT);
-        if (!activeCursor.isBlank() && source.path("error").asText("").isBlank()) {
+        String error = source.path("error").asText("");
+        if (!activeCursor.isBlank() && error.isBlank()) {
             return now - lastAttempt >= 5_000L;
         }
         long configuredJitter = source.path("jitterMs").asLong(sourceJitterMs(source.path("id").asText("")));
         long jitter = Math.min(Math.max(0L, configuredJitter), Math.min(MAX_JITTER_MS, intervalMs / 5));
+        if (error.contains("外部调用预算已达保护上限") || error.contains("预算记录暂不可用")) {
+            if (freeTimelineAvailable) return true;
+            return now - lastAttempt >= Math.max(intervalMs, BUDGET_BACKOFF_MS) + jitter;
+        }
+        if (error.contains("超时")) {
+            return now - lastAttempt >= Math.min(intervalMs, 90_000L) + Math.min(15_000L, jitter);
+        }
         return now - lastAttempt >= intervalMs + jitter;
     }
 
@@ -259,6 +316,9 @@ public class SourceCollector {
     }
 
     static boolean shouldResetExpiredCursor(Exception error, int consecutiveFailures) {
+        if (UpstreamBudgetGuard.isBudgetReached(error)) {
+            return false;
+        }
         if (error instanceof XDataProviderException xpe) {
             int code = xpe.getStatusCode();
             String msg = xpe.getMessage() == null ? "" : xpe.getMessage();
@@ -283,6 +343,10 @@ public class SourceCollector {
         String id = source.path("id").asText();
         String storedRawCursor = source.path("cursor").asText("");
         String cursor = boundCursor(source, "cursor", TIMELINE_PROVIDER, TIMELINE_ENDPOINT);
+        if (!cursor.isBlank() && !cursor.startsWith("fx:")
+                && provider.isPageReadBudgetExhausted() && provider.canReadTimelineForFree("")) {
+            cursor = "";
+        }
         String instanceId = source.path("instanceId").asText("");
         long attemptAt = System.currentTimeMillis();
         long enabledAt = source.path("enabledAt").asLong(attemptAt);
@@ -296,7 +360,7 @@ public class SourceCollector {
         if (!markSourceAttempt(id, instanceId, storedRawCursor, cursor, attemptAt, scanStartedAt, scanSince)) return;
         try {
             TextPostPage page = provider.fetchTextPostsPage(source.path("username").asText(), id, cursor, 100,
-                    Instant.now().plusSeconds(30));
+                    Instant.now().plusSeconds(45));
             List<TextPost> accepted = page.posts().stream()
                     .filter(post -> post.publishedAt().toEpochMilli() >= scanSince).toList();
             boolean crossedBoundary = crossedListenerBoundary(page.posts(), scanSince);
@@ -369,16 +433,19 @@ public class SourceCollector {
 
     private void collectOneHistoryPage() {
         long now = System.currentTimeMillis();
+        boolean allowFreeTimeline = provider.canReadTimelineForFree("");
+        boolean allowPaidBackground = !provider.isBackgroundPaidBudgetExhausted();
         ObjectNode due = store.tx(tx -> tx.all("history_source").stream()
                 .filter(s -> s.path("eligible").asBoolean(false)
-                        && (historyDimensionDue(s, "timeline", now) || historyDimensionDue(s, "inbound", now)))
+                        && (((allowFreeTimeline || allowPaidBackground) && historyDimensionDue(s, "timeline", now, allowFreeTimeline))
+                            || (allowPaidBackground && historyDimensionDue(s, "inbound", now, false))))
                 .min(Comparator.comparingLong(s -> s.path("lastAttemptAt").asLong(0)))
                 .map(ObjectNode::deepCopy).orElse(null));
         if (due == null) return;
         String id = due.path("id").asText();
         long attemptAt = now;
-        boolean timelineDue = historyDimensionDue(due, "timeline", now);
-        boolean inboundDue = historyDimensionDue(due, "inbound", now);
+        boolean timelineDue = (allowFreeTimeline || allowPaidBackground) && historyDimensionDue(due, "timeline", now, allowFreeTimeline);
+        boolean inboundDue = allowPaidBackground && historyDimensionDue(due, "inbound", now, false);
         boolean timeline = timelineDue && (!inboundDue || "TIMELINE".equals(due.path("nextDimension").asText("TIMELINE")));
         HistoryScan scan = null;
         try {
@@ -411,7 +478,7 @@ public class SourceCollector {
                     ObjectNode next = source.deepCopy()
                             .put(dimension + "Error", safeError(ex))
                             .put("nextDimension", timeline ? "INBOUND" : "TIMELINE");
-                    if (failedScan != null && !failedScan.cursor().isBlank()) {
+                    if (failedScan != null && !failedScan.cursor().isBlank() && !UpstreamBudgetGuard.isBudgetReached(ex)) {
                         int failures = next.path(dimension + "CursorFailures").asInt(0) + 1;
                         if (shouldResetExpiredCursor(ex, failures)) {
                             appendCoverageGap(next, failedScan.since(), failedScan.startedAt(), dimension + ":" + safeError(ex));
@@ -429,7 +496,21 @@ public class SourceCollector {
 
     private record HistoryScan(String cursor, long startedAt, long since, boolean backfill) {}
 
-    private static boolean historyDimensionDue(ObjectNode source, String prefix, long now) {
+    static boolean historyDimensionDue(ObjectNode source, String prefix, long now) {
+        return historyDimensionDue(source, prefix, now, false);
+    }
+
+    static boolean historyDimensionDue(ObjectNode source, String prefix, long now, boolean freeAvailable) {
+        String dimError = source.path(prefix + "Error").asText("");
+        if (!dimError.isBlank()) {
+            boolean budgetError = dimError.contains("外部调用预算已达保护上限") || dimError.contains("预算记录暂不可用");
+            if (!(budgetError && freeAvailable)) {
+                long lastAttempt = source.path(prefix + "LastAttemptAt")
+                        .asLong(source.path("lastAttemptAt").asLong(0));
+                long backoff = budgetError ? BUDGET_BACKOFF_MS : HISTORY_FAILURE_BACKOFF_MS;
+                if (lastAttempt > 0 && now - lastAttempt < backoff) return false;
+            }
+        }
         if (!source.path(prefix + "BackfillComplete").asBoolean(false)) return true;
         if (!source.path(prefix + "Cursor").asText("").isBlank()) return true;
         return now - source.path("last" + Character.toUpperCase(prefix.charAt(0)) + prefix.substring(1)
@@ -437,7 +518,10 @@ public class SourceCollector {
     }
 
     private HistoryScan prepareHistoryScan(String sourceId, String prefix, String endpoint, ObjectNode source, long attemptAt) {
-        String cursor = boundCursor(source, prefix + "Cursor", TIMELINE_PROVIDER, endpoint);
+        String rawCursor = boundCursor(source, prefix + "Cursor", TIMELINE_PROVIDER, endpoint);
+        String cursor = ("timeline".equals(prefix) && !rawCursor.isBlank() && !rawCursor.startsWith("fx:")
+                && provider.isPageReadBudgetExhausted() && provider.canReadTimelineForFree(""))
+                ? "" : rawCursor;
         boolean backfill = !source.path(prefix + "BackfillComplete").asBoolean(false);
         long startedAt = cursor.isBlank() ? attemptAt : source.path(prefix + "ScanStartedAt").asLong(attemptAt);
         long since = backfill ? 0 : (cursor.isBlank()
@@ -447,6 +531,7 @@ public class SourceCollector {
             ObjectNode current = tx.get("history_source", sourceId);
             if (current != null) tx.put("history_source", sourceId, current.deepCopy()
                     .put("lastAttemptAt", attemptAt)
+                    .put(prefix + "LastAttemptAt", attemptAt)
                     .put(prefix + "Cursor", cursor)
                     .put(prefix + "CursorProvider", TIMELINE_PROVIDER)
                     .put(prefix + "CursorEndpoint", endpoint)
@@ -602,14 +687,21 @@ public class SourceCollector {
         ObjectNode status = store.tx(tx -> tx.get("meta", "style_status"));
         String cursor = status != null && status.path("authorTextOnly").asBoolean()
                 ? boundCursor(status, "cursor", TIMELINE_PROVIDER, TIMELINE_ENDPOINT) : "";
+        if (!cursor.isBlank() && !cursor.startsWith("fx:")
+                && provider.isPageReadBudgetExhausted() && provider.canReadTimelineForFree("")) {
+            cursor = "";
+        }
         if (countStyleSamples() >= STYLE_SAMPLE_LIMIT) cursor = "";
         String attemptedCursor = cursor;
         try {
             for (int pageNumber = 0; pageNumber < STYLE_PAGE_BATCH; pageNumber++) {
+                if (pageNumber > 0 && provider.canReadTimelineForFree("")) {
+                    Thread.sleep(200L);
+                }
                 attemptedCursor = cursor;
                 if (!store.hasCollectionSpace()) throw new IllegalStateException("本地空间达到采集保护下限");
                 TextPostPage page = provider.fetchTextPostsPage(owner.path("username").asText(),
-                        owner.path("accountId").asText(), cursor, 100, Instant.now().plusSeconds(30));
+                        owner.path("accountId").asText(), cursor, 100, Instant.now().plusSeconds(45));
                 if (!page.exhausted() && (page.nextCursor().isBlank() || cursor.equals(page.nextCursor()))) {
                     throw new IllegalStateException("上游分页游标无进展，已保留当前进度");
                 }
@@ -643,7 +735,7 @@ public class SourceCollector {
                 ObjectNode current = tx.get("meta", "style_status");
                 ObjectNode next = current != null ? current.deepCopy() : mapper.createObjectNode();
                 if (!next.path("authorTextOnly").asBoolean()) next.put("cursor", "").put("exhausted", false);
-                if (!failedCursor.isBlank()) {
+                if (!failedCursor.isBlank() && !UpstreamBudgetGuard.isBudgetReached(ex)) {
                     int failures = next.path("cursorFailures").asInt(0) + 1;
                     if (shouldResetExpiredCursor(ex, failures)) {
                         next.put("cursor", "").put("cursorFailures", 0);
@@ -698,7 +790,7 @@ public class SourceCollector {
                     && instanceId.equals(current.path("instanceId").asText())
                     && cursor.equals(current.path("cursor").asText(""))) {
                 ObjectNode next = current.deepCopy().put("error", safeError(error));
-                if (!cursor.isBlank()) {
+                if (!cursor.isBlank() && !UpstreamBudgetGuard.isBudgetReached(error)) {
                     int failures = next.path("cursorFailures").asInt(0) + 1;
                     if (shouldResetExpiredCursor(error, failures)) {
                         appendCoverageGap(next, scanSince, scanStartedAt, safeError(error));

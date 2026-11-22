@@ -683,6 +683,7 @@ public class CommunityAnalyticsEngine {
         int myMentionsOfPeer;
         int peerMentionsOfMe;
         String recentSnippet = "";
+        Instant latestInteractionAt;
 
         MutablePeerAcc(XUserSummary user) {
             this.user = user;
@@ -690,6 +691,12 @@ public class CommunityAnalyticsEngine {
 
         void mergeUser(XUserSummary candidate) {
             this.user = preferRicherUser(this.user, candidate);
+        }
+
+        void noteInteractionTime(Instant ts) {
+            if (ts != null && (this.latestInteractionAt == null || ts.isAfter(this.latestInteractionAt))) {
+                this.latestInteractionAt = ts;
+            }
         }
 
         void noteSnippet(String text) {
@@ -823,6 +830,7 @@ public class CommunityAnalyticsEngine {
                             // 我在自己帖子下回复对方评论：属于礼貌回评，绝不计入「我去他那边推文评论」次数
                             MutablePeerAcc acc = getOrCreatePeer(accMap, candidateKey, tweet.targetUser(), relByKey);
                             acc.myRepliedInMyOwnPostIds.add(!cid.isEmpty() ? cid : ("own_" + normId(tweet.id())));
+                            acc.noteInteractionTime(tweet.createdAt());
                         } else if (!cid.isEmpty()) {
                             String knownOwner = externalRootOwnerByConvId.get(cid);
                             // 根帖作者未知或属于第三方时，不把父评论作者认作根帖作者。
@@ -833,12 +841,14 @@ public class CommunityAnalyticsEngine {
                                     // 同一个对方帖子下我多次追评/盖楼：只算 1 次，其余合并过滤
                                     filteredSamePostReplies++;
                                 }
+                                acc.noteInteractionTime(tweet.createdAt());
                                 acc.noteSnippet("我去评 TA 帖：" + tweet.text());
                             }
                         }
                     } else if (tweet.kind() == TweetKind.QUOTE) {
                         MutablePeerAcc acc = getOrCreatePeer(accMap, candidateKey, tweet.targetUser(), relByKey);
                         acc.myQuotePostIds.add(normId(tweet.id()).isEmpty() ? ("q_" + acc.myQuotePostIds.size()) : normId(tweet.id()));
+                        acc.noteInteractionTime(tweet.createdAt());
                         acc.noteSnippet("我引用 TA：" + tweet.text());
                     }
                 }
@@ -880,6 +890,7 @@ public class CommunityAnalyticsEngine {
                                 // 对方在我同一个帖子下多次评论/追评：只算 1 次
                                 filteredSamePostReplies++;
                             }
+                            acc.noteInteractionTime(inbound.createdAt());
                             acc.noteSnippet("TA 来评我帖：" + inbound.snippet());
 
                             boolean iRepliedInPost = myRepliedPeersInMyPost.getOrDefault(cid, Set.of()).contains(pKey)
@@ -895,16 +906,19 @@ public class CommunityAnalyticsEngine {
                             // 对方在他自己的帖子（或外部帖子）下回复我的评论：不算「他来我推文评论」
                             MutablePeerAcc acc = getOrCreatePeer(accMap, pKey, inbound.peer(), relByKey);
                             acc.peerInThreadRepliesOnTheirPostIds.add(cid);
+                            acc.noteInteractionTime(inbound.createdAt());
                         }
                     } else if (replyToMyOutboundComment) {
                         MutablePeerAcc acc = getOrCreatePeer(accMap, pKey, inbound.peer(), relByKey);
                         acc.peerInThreadRepliesOnTheirPostIds.add(rid);
+                        acc.noteInteractionTime(inbound.createdAt());
                     }
                 }
                 case QUOTE_ME -> {
                     MutablePeerAcc acc = getOrCreatePeer(accMap, pKey, inbound.peer(), relByKey);
                     String qKey = normId(inbound.tweetId()).isEmpty() ? ("iq_" + acc.peerQuotePostIds.size()) : normId(inbound.tweetId());
                     acc.peerQuotePostIds.add(qKey);
+                    acc.noteInteractionTime(inbound.createdAt());
                     acc.noteSnippet("TA 引用我帖：" + inbound.snippet());
                 }
                 case MENTION_ME -> {
@@ -1074,15 +1088,17 @@ public class CommunityAnalyticsEngine {
                     relationType,
                     relationshipPortrait,
                     displaySnippet,
-                    followStateKnown
+                    followStateKnown,
+                    acc.latestInteractionAt
             ));
         }
 
-        // 排序规则：蓝V标识排在前面，其次按双方评论总数（我去评 + TA来评）倒序
+        // 排序规则：蓝V标识排在前面，其次按双方评论总数（我去评 + TA来评）倒序、TA来评数倒序、最近互动时间倒序
         peerStats.sort(Comparator
                 .comparing((PeerInteractionStat p) -> p.peer() != null && p.peer().verified()).reversed()
                 .thenComparing(Comparator.comparingInt((PeerInteractionStat p) -> p.myRepliesToPeer() + p.peerRepliesToMe()).reversed())
-                .thenComparing(Comparator.comparingInt(PeerInteractionStat::peerRepliesToMe).reversed()));
+                .thenComparing(Comparator.comparingInt(PeerInteractionStat::peerRepliesToMe).reversed())
+                .thenComparing(PeerInteractionStat::latestInteractionAt, Comparator.nullsLast(Comparator.reverseOrder())));
 
         double overallReturnRate = totalOutbound > 0
                 ? round1(totalInbound * 100.0 / totalOutbound)

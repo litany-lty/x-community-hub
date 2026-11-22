@@ -211,6 +211,41 @@ class AccumulationAndInteractionRulesTest {
 
         // Blue V peers (blue_i_owe total 9, blue_low total 2) both precede non-blue peers (total 8, total 6)
         assertThat(report.interactions().filteredSamePostReplies()).isGreaterThanOrEqualTo(3);
+        assertThat(blueLowStat.latestInteractionAt()).isEqualTo(twoHoursAgo.plusSeconds(40));
+    }
+
+    @Test
+    void peerStatsShouldBreakEqualCountTiesByLatestInteractionTimeDescending() {
+        Instant now = Instant.parse("2026-11-22T12:00:00Z");
+        XUserSummary me = new XUserSummary("10", "me_acc", "Me", "", "", true, 100, 100, 100, "");
+        XUserSummary olderPeer = new XUserSummary("21", "peer_older", "Older", "", "", true, 100, 100, 100, "");
+        XUserSummary newerPeer = new XUserSummary("22", "peer_newer", "Newer", "", "", true, 100, 100, 100, "");
+
+        List<RawTweet> timeline = List.of(
+                new RawTweet("my_root", "Root", now.minusSeconds(3600), TweetKind.POST, "", null, List.of(),
+                        false, false, 100, 5, 2, 0, 0, false, "my_root", ""),
+                new RawTweet("out_old", "Hi older", now.minusSeconds(1800), TweetKind.REPLY, "peer_older", olderPeer,
+                        List.of("peer_older"), false, false, 20, 1, 0, 0, 0, false, "ext_old", "ext_old"),
+                new RawTweet("out_new", "Hi newer", now.minusSeconds(1700), TweetKind.REPLY, "peer_newer", newerPeer,
+                        List.of("peer_newer"), false, false, 20, 1, 0, 0, 0, false, "ext_new", "ext_new")
+        );
+        List<InboundInteraction> inbound = List.of(
+                new InboundInteraction("in_old", olderPeer, now.minusSeconds(900), InboundKind.REPLY_TO_ME,
+                        "older reply", "my_root", "my_root", "me_acc"),
+                new InboundInteraction("in_new", newerPeer, now.minusSeconds(120), InboundKind.REPLY_TO_ME,
+                        "newer reply", "my_root", "my_root", "me_acc")
+        );
+
+        RawAccountSnapshot snapshot = new RawAccountSnapshot(
+                ProviderMode.TWITTERAPI_IO, true, "", now, me, timeline, inbound, List.of());
+        CommunityDashboardReport report = new CommunityAnalyticsEngine().analyze(
+                snapshot, ReportPeriod.HOURS_24, false, ZoneId.of("Asia/Shanghai"), false, 300L, now.plusSeconds(300));
+
+        assertThat(report.interactions().peerStats())
+                .extracting(p -> p.peer().username())
+                .containsExactly("peer_newer", "peer_older");
+        assertThat(report.interactions().peerStats().get(0).latestInteractionAt()).isEqualTo(now.minusSeconds(120));
+        assertThat(report.interactions().peerStats().get(1).latestInteractionAt()).isEqualTo(now.minusSeconds(900));
     }
 
     @Test
