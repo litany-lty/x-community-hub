@@ -34,7 +34,7 @@ const batchHelpersSlice = sliceBetween(
 const recommendationHelpersSlice = sliceBetween(
     appJs,
     "    function getQueuedScheduledEpochsMs(",
-    "    function createScheduleDraftItem("
+    "    function ensureScheduleDraftInitialized("
 );
 
 const harnessCode = `
@@ -59,7 +59,8 @@ this.__exports = {
     getRecommendedScheduleEpochMs,
     buildScheduleQuickPresets,
     formatScheduleLocalTime,
-    refreshAutomaticScheduleTimes
+    refreshAutomaticScheduleTimes,
+    createScheduleDraftItem
 };
 `;
 
@@ -95,6 +96,7 @@ const context = vm.createContext({
     isLoggedIn: () => Boolean(state.authStatus?.loggedIn),
     stableUserId: (user) => String(user?.id || ""),
     getActiveAlgoProfile: () => activeProfile,
+    newClientRequestId: () => "draft-id",
     rotateComposerRequestId: () => {
         state.composerRotationCount = (state.composerRotationCount || 0) + 1;
         state.composerClientRequestId = "rotated-" + state.composerRotationCount;
@@ -118,7 +120,8 @@ const {
     getRecommendedScheduleEpochMs,
     buildScheduleQuickPresets,
     formatScheduleLocalTime,
-    refreshAutomaticScheduleTimes
+    refreshAutomaticScheduleTimes,
+    createScheduleDraftItem
 } = context.__exports;
 
 function resetScheduleState(now = Date.UTC(2026, 10, 14, 12, 0, 0)) {
@@ -405,31 +408,37 @@ assert.equal(parseDraftItemEpochMs(state.scheduleDraftItems[0]), baseMs + 98 * M
 assert.equal(timeInputs.get(0).value, state.scheduleDraftItems[0].scheduledAtValue);
 assert.equal(state.composerRotationCount, submittingRotations + 1);
 
-// 8. Preset labels describe resolved local time (now + 1h + 1..10m), deduplicate, and remain correct across a year boundary.
+// 8. Preset labels follow max(lastPost + 1h + 1..10m, now + 1..10m) and stay 100% synced with input draft.
 const presetNowMs = new Date(2026, 10, 14, 19, 30).getTime();
 resetScheduleState(presetNowMs);
-state.report = liveReport(presetNowMs - 10 * MINUTE);
+state.report = liveReport(presetNowMs - 10 * MINUTE); // 19:20
 const presetDraft = draftAt(presetNowMs + 5 * MINUTE);
-presetDraft.recommendedJitterMin = 5; // 65m -> now(19:30) + 65m = 20:35
+presetDraft.recommendedJitterMin = 5; // 65m -> 19:20 + 65m = 20:25
 state.scheduleDraftItems = [presetDraft];
 const presets = Array.from(buildScheduleQuickPresets(presetNowMs));
 assert.ok(presets.length > 0);
 assert.equal(new Set(presets.map((preset) => preset.epochMs)).size, presets.length);
-const recommended = presets.find((preset) => preset.epochMs === presetNowMs + 65 * MINUTE);
-assert.ok(recommended, "Recommended preset starts at now + 1h + jitter (20:35)");
-assert.match(recommended.label, /20:35/);
+const recommended = presets.find((preset) => preset.epochMs === presetNowMs + 55 * MINUTE);
+assert.ok(recommended, "Recent post 10m ago (19:20) shifts recommended preset by 1h + 5m to 20:25");
+assert.match(recommended.label, /20:25/);
 
-// Screenshot regression: at 20:01 with last post at 17:51, recommended chip is 21:02..21:11 (never 20:31 +30m)
-const shotNowMs = new Date(2026, 10, 22, 20, 1).getTime();
+// Screenshot regression: at 20:14 with last post at 17:51 (18:51 already passed!),
+// both input draft and recommended chip resolve to the EXACT same minute in 20:15..20:24 (never N hours later!)
+const shotNowMs = new Date(2026, 10, 22, 20, 14).getTime();
 resetScheduleState(shotNowMs);
 state.report = liveReport(new Date(2026, 10, 22, 17, 51).getTime());
 state.scheduleDraftItems = [];
-const shotPresets = Array.from(buildScheduleQuickPresets(shotNowMs));
+// Even if buildScheduleQuickPresets runs BEFORE createScheduleDraftItem, both share the exact same jitter!
+const preInitPresets = Array.from(buildScheduleQuickPresets(shotNowMs));
+state.scheduleDraftItems = [createScheduleDraftItem("", null, [], false)];
+const postInitPresets = Array.from(buildScheduleQuickPresets(shotNowMs));
+const draftEpochMs = parseDraftItemEpochMs(state.scheduleDraftItems[0]);
 assert.ok(
-    shotPresets[0].epochMs >= shotNowMs + 61 * MINUTE && shotPresets[0].epochMs <= shotNowMs + 70 * MINUTE,
-    `Expected recommended chip at 20:01 to be 21:02..21:11, got ${shotPresets[0].label}`
+    draftEpochMs >= shotNowMs + 1 * MINUTE && draftEpochMs <= shotNowMs + 10 * MINUTE,
+    `Expected draft at 20:14 (with last post 17:51) to be 20:15..20:24, got ${state.scheduleDraftItems[0].scheduledAtValue}`
 );
-assert.doesNotMatch(shotPresets[0].label, /20:31/);
+assert.equal(preInitPresets[0].epochMs, draftEpochMs, "Pre-init recommended chip matches initialized draft minute");
+assert.equal(postInitPresets[0].epochMs, draftEpochMs, "Post-init recommended chip matches input draft minute");
 for (const preset of presets) {
     assert.ok(preset.label.includes(formatScheduleLocalTime(preset.epochMs, presetNowMs)));
 }

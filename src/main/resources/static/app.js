@@ -6109,21 +6109,25 @@
         return 1 + Math.floor(Math.random() * 10);
     }
 
-    function getRecommendedScheduleGapMs(draftItem = null) {
+    function getRecommendedScheduleJitterMin(draftItem = null) {
         if (draftItem && typeof draftItem === "object") {
             if (!Number.isInteger(draftItem.recommendedJitterMin)
                     || draftItem.recommendedJitterMin < 1
                     || draftItem.recommendedJitterMin > 10) {
                 draftItem.recommendedJitterMin = randomScheduleJitterMinutes();
             }
-            return MIN_SCHEDULE_INTERVAL_MS + draftItem.recommendedJitterMin * 60_000;
+            return draftItem.recommendedJitterMin;
         }
         if (!Number.isInteger(state.defaultScheduleJitterMin)
                 || state.defaultScheduleJitterMin < 1
                 || state.defaultScheduleJitterMin > 10) {
             state.defaultScheduleJitterMin = randomScheduleJitterMinutes();
         }
-        return MIN_SCHEDULE_INTERVAL_MS + state.defaultScheduleJitterMin * 60_000;
+        return state.defaultScheduleJitterMin;
+    }
+
+    function getRecommendedScheduleGapMs(draftItem = null) {
+        return MIN_SCHEDULE_INTERVAL_MS + getRecommendedScheduleJitterMin(draftItem) * 60_000;
     }
 
     function getRecommendedScheduleEpochMs(preferredMs, {
@@ -6138,6 +6142,7 @@
         const gap = Number.isFinite(gapMs) && gapMs >= MIN_SCHEDULE_INTERVAL_MS
             ? gapMs
             : getRecommendedScheduleGapMs(activeDraft);
+        const jitterMs = Math.max(60_000, gap - MIN_SCHEDULE_INTERVAL_MS);
         const latest = getLatestPublishedEpochMs(nowMs);
         const occupied = [];
         for (const job of getCurrentUserScheduleJobs()) {
@@ -6153,8 +6158,9 @@
             const time = parseDraftItemEpochMs(item);
             if (Number.isFinite(time) && time > nowMs) occupied.push(time);
         });
-        const preferred = Number.isFinite(preferredMs) ? preferredMs : nowMs + gap;
-        return computeNextAvailableScheduleMs(Math.max(nowMs + 5 * 60_000, latest + gap, preferred), occupied, gap);
+        const preferred = Number.isFinite(preferredMs) ? preferredMs : nowMs + jitterMs;
+        const earliestByLastPost = latest > 0 ? latest + gap : 0;
+        return computeNextAvailableScheduleMs(Math.max(nowMs + 60_000, earliestByLastPost, preferred), occupied, gap);
     }
 
     function formatScheduleLocalTime(epochMs, nowMs = Date.now()) {
@@ -6174,14 +6180,22 @@
     function buildScheduleQuickPresets(nowMs = Date.now()) {
         const tz = state.scheduleServerTz || state.report?.contentTiming?.timezone || "Asia/Shanghai";
         const now = getTzDateParts(nowMs, tz);
-        const activeDraft = Number.isInteger(state.activeScheduleDraftIdx) && state.activeScheduleDraftIdx >= 0
-            ? (state.scheduleDraftItems || [])[state.activeScheduleDraftIdx] || null
-            : null;
-        const defaultGapMs = getRecommendedScheduleGapMs(activeDraft);
+        const items = state.scheduleDraftItems || [];
+        const idx = items.length > 0
+            ? Math.max(0, Math.min(state.activeScheduleDraftIdx || 0, items.length - 1))
+            : -1;
+        const activeDraft = idx >= 0 ? items[idx] : null;
+        const jitterMin = getRecommendedScheduleJitterMin(activeDraft);
+        const gapMs = MIN_SCHEDULE_INTERVAL_MS + jitterMin * 60_000;
+        const jitterMs = jitterMin * 60_000;
         const untouchedDraftMs = activeDraft && !activeDraft.timeTouched ? parseDraftItemEpochMs(activeDraft) : NaN;
-        const recommendedBaseMs = Number.isFinite(untouchedDraftMs) && untouchedDraftMs >= nowMs + MIN_SCHEDULE_INTERVAL_MS
-            ? untouchedDraftMs
-            : nowMs + defaultGapMs;
+        const previousDraftMs = idx > 0 ? parseDraftItemEpochMs(items[idx - 1]) : NaN;
+        const recommendedBaseMs = Math.max(
+            Number.isFinite(untouchedDraftMs) && untouchedDraftMs >= nowMs + 60_000
+                ? untouchedDraftMs
+                : nowMs + jitterMs,
+            Number.isFinite(previousDraftMs) ? previousDraftMs + gapMs : 0
+        );
         const candidates = [{ epochMs: recommendedBaseMs, recommended: true }];
         const tonight = zonedWallClockToEpochMs(now.year, now.month, now.day, 20, 0, tz);
         if (tonight > nowMs + 60_000) candidates.push({ epochMs: tonight });
@@ -6189,7 +6203,14 @@
         const seen = new Set();
         const presets = [];
         for (const candidate of candidates) {
-            const epochMs = getRecommendedScheduleEpochMs(candidate.epochMs, { nowMs });
+            const epochMs = candidate.recommended
+                ? getRecommendedScheduleEpochMs(candidate.epochMs, {
+                    draftIndex: idx,
+                    nowMs,
+                    includeLaterAutoDrafts: false,
+                    gapMs
+                })
+                : getRecommendedScheduleEpochMs(candidate.epochMs, { nowMs });
             if (seen.has(epochMs)) continue;
             seen.add(epochMs);
             presets.push({
@@ -6209,10 +6230,11 @@
             const input = document.querySelector('#scheduleDraftItemsList [data-draft-time="' + index + '"]');
             if (item.timeTouched || (input && document.activeElement === input)) continue;
             const gap = getRecommendedScheduleGapMs(item);
+            const jitterMs = Math.max(60_000, gap - MIN_SCHEDULE_INTERVAL_MS);
             const current = parseDraftItemEpochMs(item);
             const previous = index > 0 ? parseDraftItemEpochMs(items[index - 1]) : NaN;
             const preferred = Math.max(
-                Number.isFinite(current) && current > nowMs + 5 * 60_000 ? current : nowMs + gap,
+                Number.isFinite(current) && current >= nowMs + 60_000 ? current : nowMs + jitterMs,
                 Number.isFinite(previous) ? previous + gap : 0
             );
             const next = getRecommendedScheduleEpochMs(preferred, {
@@ -6232,16 +6254,17 @@
     }
 
     function createScheduleDraftItem(text = "", epochMs = null, files = [], timeTouched = false, sourceRef = null, jitterMin = null) {
+        const existingItems = state.scheduleDraftItems || [];
         const resolvedJitter = Number.isInteger(jitterMin) && jitterMin >= 1 && jitterMin <= 10
             ? jitterMin
-            : randomScheduleJitterMinutes();
+            : (existingItems.length === 0 ? getRecommendedScheduleJitterMin(null) : randomScheduleJitterMinutes());
         const gapMs = MIN_SCHEDULE_INTERVAL_MS + resolvedJitter * 60_000;
-        const existingItems = state.scheduleDraftItems || [];
+        const jitterMs = resolvedJitter * 60_000;
         const lastDraftEpoch = !Number.isFinite(epochMs) && existingItems.length > 0
             ? parseDraftItemEpochMs(existingItems[existingItems.length - 1])
             : NaN;
         const defaultPreferred = Math.max(
-            Date.now() + gapMs,
+            Date.now() + jitterMs,
             Number.isFinite(lastDraftEpoch) ? lastDraftEpoch + gapMs : 0
         );
         const resolvedMs = Number.isFinite(epochMs)
@@ -6290,10 +6313,10 @@
             .filter((v) => Number.isFinite(v));
         const jitterMin = randomScheduleJitterMinutes();
         const gapMs = MIN_SCHEDULE_INTERVAL_MS + jitterMin * 60_000;
-        const lastEpoch = existingEpochs.length
-            ? existingEpochs[existingEpochs.length - 1]
-            : Date.now();
-        const basePreferred = Math.max(lastEpoch + gapMs, Date.now() + gapMs);
+        const jitterMs = jitterMin * 60_000;
+        const basePreferred = existingEpochs.length
+            ? Math.max(existingEpochs[existingEpochs.length - 1] + gapMs, Date.now() + jitterMs)
+            : Date.now() + jitterMs;
         const nextMs = getRecommendedScheduleEpochMs(basePreferred, { draftIndex: state.scheduleDraftItems.length, gapMs });
         state.scheduleDraftItems.push(createScheduleDraftItem("", nextMs, [], false, null, jitterMin));
         state.activeScheduleDraftIdx = state.scheduleDraftItems.length - 1;
@@ -7214,8 +7237,9 @@
             idx = items.length;
             const jitterMin = randomScheduleJitterMinutes();
             const gapMs = MIN_SCHEDULE_INTERVAL_MS + jitterMin * 60_000;
+            const jitterMs = jitterMin * 60_000;
             const last = parseDraftItemEpochMs(items[items.length - 1]);
-            const preferred = Math.max(Date.now() + gapMs, Number.isFinite(last) ? last + gapMs : 0);
+            const preferred = Math.max(Date.now() + jitterMs, Number.isFinite(last) ? last + gapMs : 0);
             item = createScheduleDraftItem("", getRecommendedScheduleEpochMs(preferred, { draftIndex: idx, gapMs }), [], false, null, jitterMin);
             items.push(item);
         } else {
@@ -7224,8 +7248,9 @@
         item.text = String(text || "");
         item.files = media.files;
         if (!item.timeTouched) {
-            const gapMs = getRecommendedScheduleGapMs(item);
-            const preferred = Math.max(parseDraftItemEpochMs(item) || 0, Date.now() + gapMs);
+            const jitterMin = getRecommendedScheduleJitterMin(item);
+            const gapMs = MIN_SCHEDULE_INTERVAL_MS + jitterMin * 60_000;
+            const preferred = Math.max(parseDraftItemEpochMs(item) || 0, Date.now() + jitterMin * 60_000);
             item.scheduledAtValue = formatEpochToDatetimeLocalValue(getRecommendedScheduleEpochMs(preferred, { draftIndex: idx, gapMs }));
         }
         state.activeScheduleDraftIdx = idx;
