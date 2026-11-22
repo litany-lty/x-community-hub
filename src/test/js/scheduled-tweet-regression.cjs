@@ -54,6 +54,7 @@ this.__exports = {
     formatEpochToDatetimeLocalValue,
     parseDraftItemEpochMs,
     getLatestPublishedEpochMs,
+    randomScheduleJitterMinutes,
     getRecommendedScheduleGapMs,
     getRecommendedScheduleEpochMs,
     buildScheduleQuickPresets,
@@ -112,6 +113,7 @@ const {
     formatEpochToDatetimeLocalValue,
     parseDraftItemEpochMs,
     getLatestPublishedEpochMs,
+    randomScheduleJitterMinutes,
     getRecommendedScheduleGapMs,
     getRecommendedScheduleEpochMs,
     buildScheduleQuickPresets,
@@ -130,6 +132,7 @@ function resetScheduleState(now = Date.UTC(2026, 10, 14, 12, 0, 0)) {
         composerRotationCount: 0,
         composerClientRequestId: "initial",
         activeScheduleDraftIdx: 0,
+        defaultScheduleJitterMin: null,
         scheduleServerTz: Intl.DateTimeFormat().resolvedOptions().timeZone
     });
     activeProfile = { cadenceAndReach: { minRecommendedGapMinutes: 180 } };
@@ -278,27 +281,39 @@ state.scheduleJobs = [{ accountId: "self", status: "PUBLISHED", publishedAtEpoch
 state.authStatus.loggedIn = false;
 assert.equal(getLatestPublishedEpochMs(baseMs), 0);
 
-// 6. Recommendations use the existing soft gap while preserving the 1-hour hard minimum.
+// 6. Recommendations use 1h + random(1..10)m default interval while preserving 1-hour hard minimum.
 resetScheduleState(baseMs);
-assert.equal(getRecommendedScheduleGapMs(), 180 * MINUTE);
-activeProfile = {};
-assert.equal(getRecommendedScheduleGapMs(), 180 * MINUTE);
-activeProfile = { cadenceAndReach: { minRecommendedGapMinutes: 30 } };
-assert.equal(getRecommendedScheduleGapMs(), MIN_SCHEDULE_INTERVAL_MS);
-activeProfile.cadenceAndReach.minRecommendedGapMinutes = 180;
-state.report = liveReport(baseMs - 30 * MINUTE);
-assert.equal(getRecommendedScheduleEpochMs(baseMs + 30 * MINUTE, { nowMs: baseMs }), baseMs + 150 * MINUTE);
+const sampledJitters = new Set();
+for (let i = 0; i < 200; i++) {
+    const j = randomScheduleJitterMinutes();
+    assert.equal(Number.isInteger(j), true);
+    assert.ok(j >= 1 && j <= 10, `Expected jitter in [1, 10], got ${j}`);
+    sampledJitters.add(j);
+}
+assert.ok(sampledJitters.size >= 5, "Expected multiple distinct random jitter values across 200 samples");
 
-activeProfile.cadenceAndReach.minRecommendedGapMinutes = 60;
+const defaultGapMs = getRecommendedScheduleGapMs();
+assert.ok(defaultGapMs >= 61 * MINUTE && defaultGapMs <= 70 * MINUTE);
+assert.equal(getRecommendedScheduleGapMs(), defaultGapMs, "Session default jitter stays stable once sampled");
+
+state.defaultScheduleJitterMin = 7;
+assert.equal(getRecommendedScheduleGapMs(), 67 * MINUTE);
+state.report = liveReport(baseMs - 10 * MINUTE);
+assert.equal(getRecommendedScheduleEpochMs(baseMs + 30 * MINUTE, { nowMs: baseMs }), baseMs + 57 * MINUTE);
+
+state.defaultScheduleJitterMin = 5;
 state.scheduleJobs = [
     { accountId: "self", status: "SCHEDULED", scheduledAtEpochMs: baseMs + 60 * MINUTE },
     { accountId: "other", status: "SCHEDULED", scheduledAtEpochMs: baseMs + 210 * MINUTE }
 ];
-state.scheduleDraftItems = [draftAt(baseMs + 210 * MINUTE), draftAt(baseMs + 150 * MINUTE, true)];
+const draft0 = draftAt(baseMs + 210 * MINUTE);
+draft0.recommendedJitterMin = 4; // 64m gap
+const draft1 = draftAt(baseMs + 130 * MINUTE, true);
+state.scheduleDraftItems = [draft0, draft1];
 assert.equal(
     getRecommendedScheduleEpochMs(baseMs + 5 * MINUTE, { draftIndex: 0, nowMs: baseMs }),
-    baseMs + 210 * MINUTE,
-    "Resolve last-post, queue and peer-draft conflicts without reserving the active draft or another account's queue"
+    baseMs + 194 * MINUTE,
+    "Resolve last-post, queue and peer-draft conflicts with 1h + jitter without reserving another account's queue"
 );
 state.report = null;
 state.scheduleDraftItems = [];
@@ -309,17 +324,33 @@ state.scheduleJobs = [
     { accountId: "self", status: "SENDING", scheduledAtEpochMs: baseMs - 48 * 60 * MINUTE },
     { accountId: "self", status: "RESEND_QUEUED", scheduledAtEpochMs: baseMs - 24 * 60 * MINUTE }
 ];
+state.defaultScheduleJitterMin = 6;
 assert.equal(getLatestPublishedEpochMs(baseMs), 0);
-assert.equal(getRecommendedScheduleEpochMs(baseMs + 5 * MINUTE, { nowMs: baseMs }), baseMs + 60 * MINUTE,
-    "In-flight work reserves the present without being reported as successfully published");
+assert.equal(getRecommendedScheduleEpochMs(baseMs + 5 * MINUTE, { nowMs: baseMs }), baseMs + 66 * MINUTE,
+    "In-flight work reserves the present and advances by 1h + jitter");
 
-// 7. Automatic ordering ignores later automatic drafts, but respects manual and focused inputs.
+// Per-item jitter alignment spaces batch drafts by 61..70m each and passes 1h validation
+const jitterAligned = alignBatchScheduleEpochs(
+    [baseMs + 10 * MINUTE, baseMs + 15 * MINUTE, baseMs + 20 * MINUTE],
+    [],
+    baseMs,
+    () => MIN_SCHEDULE_INTERVAL_MS + randomScheduleJitterMinutes() * MINUTE
+);
+assert.ok(jitterAligned[1] - jitterAligned[0] >= 61 * MINUTE && jitterAligned[1] - jitterAligned[0] <= 70 * MINUTE);
+assert.ok(jitterAligned[2] - jitterAligned[1] >= 61 * MINUTE && jitterAligned[2] - jitterAligned[1] <= 70 * MINUTE);
+assert.equal(validateBatchScheduleEpochs(jitterAligned, [], baseMs, MIN_SCHEDULE_INTERVAL_MS).ok, true);
+
+// 7. Automatic ordering ignores later automatic drafts, respects manual/focused inputs, and never drifts on repeat.
 state.scheduleJobs = [];
-state.scheduleDraftItems = [draftAt(baseMs + 5 * MINUTE), draftAt(baseMs + 120 * MINUTE), draftAt(baseMs + 60 * MINUTE, true)];
+const auto0 = draftAt(baseMs + 5 * MINUTE);
+auto0.recommendedJitterMin = 3; // 63m
+const auto1 = draftAt(baseMs + 125 * MINUTE);
+const manual2 = draftAt(baseMs + 60 * MINUTE, true);
+state.scheduleDraftItems = [auto0, auto1, manual2];
 assert.equal(getRecommendedScheduleEpochMs(baseMs + 5 * MINUTE,
-    { draftIndex: 0, nowMs: baseMs, includeLaterAutoDrafts: false }), baseMs + 120 * MINUTE);
+    { draftIndex: 0, nowMs: baseMs, includeLaterAutoDrafts: false }), baseMs + 123 * MINUTE);
 assert.equal(getRecommendedScheduleEpochMs(baseMs + 5 * MINUTE,
-    { draftIndex: 0, nowMs: baseMs }), baseMs + 180 * MINUTE);
+    { draftIndex: 0, nowMs: baseMs }), baseMs + 188 * MINUTE);
 state.scheduleDraftItems = [
     draftAt(baseMs + 5 * MINUTE, false, "Keep first body"),
     draftAt(baseMs + 120 * MINUTE, true, "Keep manual body"),
@@ -338,7 +369,12 @@ assert.equal(state.scheduleDraftItems[1].scheduledAtValue, manualValue);
 assert.equal(timeInputs.get(1).value, manualValue);
 assert.equal(state.scheduleDraftItems[3].scheduledAtValue, focusedValue);
 assert.equal(timeInputs.get(3).value, "");
-assert.ok(parseDraftItemEpochMs(state.scheduleDraftItems[2]) >= baseMs + 180 * MINUTE);
+const prevAnchorMs = Math.max(
+    parseDraftItemEpochMs(state.scheduleDraftItems[0]),
+    parseDraftItemEpochMs(state.scheduleDraftItems[1])
+);
+const followingGapMs = parseDraftItemEpochMs(state.scheduleDraftItems[2]) - prevAnchorMs;
+assert.ok(followingGapMs >= 61 * MINUTE && followingGapMs <= 70 * MINUTE, `Expected 61..70m gap, got ${followingGapMs / MINUTE}m`);
 assert.equal(timeInputs.get(2).value, state.scheduleDraftItems[2].scheduledAtValue);
 assert.equal(state.scheduleDraftItems[2].text, "Keep following body");
 assert.equal(state.scheduleDraftItems[2].files, preservedFiles);
@@ -349,8 +385,9 @@ assert.deepEqual(state.scheduleDraftItems.map((item) => item.scheduledAtValue), 
 
 // A successful create may appear in the refreshed queue before its draft is cleared.
 resetScheduleState(baseMs);
-activeProfile.cadenceAndReach.minRecommendedGapMinutes = 60;
-state.scheduleDraftItems = [draftAt(baseMs + 30 * MINUTE, false, "Submitted body")];
+const submittedDraft = draftAt(baseMs + 30 * MINUTE, false, "Submitted body");
+submittedDraft.recommendedJitterMin = 8; // 68m
+state.scheduleDraftItems = [submittedDraft];
 state.scheduleJobs = [{ accountId: "self", status: "SCHEDULED", scheduledAtEpochMs: baseMs + 30 * MINUTE }];
 const submittingValue = state.scheduleDraftItems[0].scheduledAtValue;
 timeInputs.set(0, { value: submittingValue });
@@ -364,21 +401,35 @@ assert.equal(state.composerClientRequestId, submittingId);
 assert.equal(state.composerRotationCount, submittingRotations);
 state.scheduleMutations.delete("create");
 assert.equal(refreshAutomaticScheduleTimes(0, baseMs), true);
-assert.equal(parseDraftItemEpochMs(state.scheduleDraftItems[0]), baseMs + 90 * MINUTE);
+assert.equal(parseDraftItemEpochMs(state.scheduleDraftItems[0]), baseMs + 98 * MINUTE);
 assert.equal(timeInputs.get(0).value, state.scheduleDraftItems[0].scheduledAtValue);
 assert.equal(state.composerRotationCount, submittingRotations + 1);
 
-// 8. Preset labels describe resolved local time, deduplicate, and remain correct across a year boundary.
+// 8. Preset labels describe resolved local time (now + 1h + 1..10m), deduplicate, and remain correct across a year boundary.
 const presetNowMs = new Date(2026, 10, 14, 19, 30).getTime();
 resetScheduleState(presetNowMs);
 state.report = liveReport(presetNowMs - 10 * MINUTE);
-state.scheduleDraftItems = [draftAt(presetNowMs + 5 * MINUTE)];
+const presetDraft = draftAt(presetNowMs + 5 * MINUTE);
+presetDraft.recommendedJitterMin = 5; // 65m -> now(19:30) + 65m = 20:35
+state.scheduleDraftItems = [presetDraft];
 const presets = Array.from(buildScheduleQuickPresets(presetNowMs));
 assert.ok(presets.length > 0);
 assert.equal(new Set(presets.map((preset) => preset.epochMs)).size, presets.length);
-const recommended = presets.find((preset) => preset.epochMs === presetNowMs + 170 * MINUTE);
-assert.ok(recommended, "The recent post shifts the earliest preset to 22:20");
-assert.match(recommended.label, /22:20/);
+const recommended = presets.find((preset) => preset.epochMs === presetNowMs + 65 * MINUTE);
+assert.ok(recommended, "Recommended preset starts at now + 1h + jitter (20:35)");
+assert.match(recommended.label, /20:35/);
+
+// Screenshot regression: at 20:01 with last post at 17:51, recommended chip is 21:02..21:11 (never 20:31 +30m)
+const shotNowMs = new Date(2026, 10, 22, 20, 1).getTime();
+resetScheduleState(shotNowMs);
+state.report = liveReport(new Date(2026, 10, 22, 17, 51).getTime());
+state.scheduleDraftItems = [];
+const shotPresets = Array.from(buildScheduleQuickPresets(shotNowMs));
+assert.ok(
+    shotPresets[0].epochMs >= shotNowMs + 61 * MINUTE && shotPresets[0].epochMs <= shotNowMs + 70 * MINUTE,
+    `Expected recommended chip at 20:01 to be 21:02..21:11, got ${shotPresets[0].label}`
+);
+assert.doesNotMatch(shotPresets[0].label, /20:31/);
 for (const preset of presets) {
     assert.ok(preset.label.includes(formatScheduleLocalTime(preset.epochMs, presetNowMs)));
 }
