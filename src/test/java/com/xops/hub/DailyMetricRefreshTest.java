@@ -338,6 +338,112 @@ class DailyMetricRefreshTest {
         }
     }
 
+    @Test
+    void higherParallelSliceConfigScalesIntermediateSpanConcurrencyProportionally() {
+        var props8 = new XOpsProperties();
+        props8.setApiMaxParallelSlices(8);
+        var pool8 = new com.xops.hub.provider.SharedApiExecutor(props8);
+        try {
+            var metrics = pool8.snapshotMetrics();
+            assertThat(metrics.get("maxParallelSlices")).isEqualTo(8);
+            assertThat(metrics.get("initialMaxParallelSlices")).isEqualTo(16);
+
+            assertThat(pool8.suggestSliceConcurrency(25 * 3600L, 20, 40, false, false)).isEqualTo(8);
+            assertThat(pool8.suggestSliceConcurrency(25 * 3600L, 20, 40, false, true)).isEqualTo(16);
+            assertThat(pool8.suggestSliceConcurrency(8 * 3600L, 20, 40, false, false)).isEqualTo(6);
+            assertThat(pool8.suggestSliceConcurrency(8 * 3600L, 20, 40, false, true)).isEqualTo(12);
+            assertThat(pool8.suggestSliceConcurrency(3 * 3600L, 20, 40, false, false)).isEqualTo(4);
+            assertThat(pool8.suggestSliceConcurrency(3 * 3600L, 20, 40, false, true)).isEqualTo(8);
+        } finally {
+            pool8.shutdown();
+        }
+    }
+
+    @Test
+    void splitInboundSearchQueriesDeduplicateItemsAndIntersectCoverage() throws Exception {
+        Instant now = Instant.now();
+        Instant recentAt = now.minusSeconds(2 * 3600L);
+        Instant midAt = now.minusSeconds(6 * 3600L);
+        List<String> observedQueries = Collections.synchronizedList(new ArrayList<>());
+
+        try (var f = new ExactFollowProviderTest().new Fixture(uri -> {
+            if (uri.getPath().endsWith("/info")) {
+                return ok("{\"data\":{\"id\":\"self-id\",\"userName\":\"self\",\"following\":0,\"followers\":0}}");
+            }
+            if (uri.getPath().endsWith("/advanced_search")) {
+                String rawQuery = URLDecoder.decode(uri.getRawQuery(), StandardCharsets.UTF_8);
+                observedQueries.add(rawQuery);
+                if (rawQuery.contains("(to:self OR @self) -from:self")) {
+                    String reply = "{\"id\":\"in-reply-1\",\"text\":\"@self hello\",\"isReply\":true,\"inReplyToUsername\":\"self\",\"createdAt\":\""
+                            + recentAt + "\",\"author\":{\"id\":\"peer-1\",\"userName\":\"peer1\"}}";
+                    String dupQuote = "{\"id\":\"in-quote-dup\",\"text\":\"@self quoting\",\"createdAt\":\""
+                            + midAt + "\",\"quoted_tweet\":{\"author\":{\"id\":\"self-id\",\"userName\":\"self\"}},\"author\":{\"id\":\"peer-2\",\"userName\":\"peer2\"}}";
+                    return ok("{\"tweets\":[" + reply + "," + dupQuote + "],\"has_next_page\":false}");
+                }
+                if (rawQuery.contains("quoted_user_id:self-id -from:self")) {
+                    String dupQuote = "{\"id\":\"in-quote-dup\",\"text\":\"@self quoting\",\"createdAt\":\""
+                            + midAt + "\",\"quoted_tweet\":{\"author\":{\"id\":\"self-id\",\"userName\":\"self\"}},\"author\":{\"id\":\"peer-2\",\"userName\":\"peer2\"}}";
+                    String pureQuote = "{\"id\":\"in-quote-only\",\"text\":\"pure quote\",\"createdAt\":\""
+                            + recentAt + "\",\"quoted_tweet\":{\"author\":{\"id\":\"self-id\",\"userName\":\"self\"}},\"author\":{\"id\":\"peer-3\",\"userName\":\"peer3\"}}";
+                    return ok("{\"tweets\":[" + dupQuote + "," + pureQuote + "],\"has_next_page\":false}");
+                }
+            }
+            return ok("{\"tweets\":[],\"has_next_page\":false}");
+        })) {
+            f.properties.setDiskCacheDir(temp.resolve("split-full").toString());
+            f.properties.setSplitInboundSearchQueries(true);
+            var provider = new TwitterApiIoProvider(f.properties, new ObjectMapper().findAndRegisterModules(), f.pool);
+            var result = provider.syncStoreByHours("self", null, 24, true, true, null, "self-id");
+            assertThat(result.degraded()).isFalse();
+            assertThat(observedQueries).anyMatch(q -> q.contains("(to:self OR @self) -from:self"));
+            assertThat(observedQueries).anyMatch(q -> q.contains("quoted_user_id:self-id -from:self"));
+            assertThat(observedQueries).noneMatch(q -> q.contains("(to:self OR @self OR quoted_user_id:self-id)"));
+            assertThat(result.store().inbound().stream().map(AccountStore.StoredInbound::id).toList())
+                    .containsExactlyInAnyOrder("in-reply-1", "in-quote-dup", "in-quote-only");
+            long to = result.store().syncedAt();
+            long from = to - 24 * 3600L;
+            assertThat(AccountStore.missingRanges(result.store().inboundCoverage(), from, to)).isEmpty();
+        }
+
+        // Partial coverage on quote stream must keep uncovered sub-range open while retaining fetched replies & quotes.
+        try (var f = new ExactFollowProviderTest().new Fixture(uri -> {
+            if (uri.getPath().endsWith("/info")) {
+                return ok("{\"data\":{\"id\":\"self-id\",\"userName\":\"self\",\"following\":0,\"followers\":0}}");
+            }
+            if (uri.getPath().endsWith("/advanced_search")) {
+                String rawQuery = URLDecoder.decode(uri.getRawQuery(), StandardCharsets.UTF_8);
+                if (rawQuery.contains("(to:self OR @self) -from:self")) {
+                    String reply = "{\"id\":\"in-reply-ok\",\"text\":\"@self ok\",\"isReply\":true,\"inReplyToUsername\":\"self\",\"createdAt\":\""
+                            + recentAt + "\",\"author\":{\"id\":\"peer-1\",\"userName\":\"peer1\"}}";
+                    return ok("{\"tweets\":[" + reply + "],\"has_next_page\":false}");
+                }
+                if (rawQuery.contains("quoted_user_id:self-id -from:self")) {
+                    long since = Long.parseLong(rawQuery.replaceAll(".*since_time:(\\d+).*", "$1"));
+                    long until = Long.parseLong(rawQuery.replaceAll(".*until_time:(\\d+).*", "$1"));
+                    if (until - since > 20 * 3600L && !rawQuery.contains("cursor=")) {
+                        String quote = "{\"id\":\"in-quote-head\",\"text\":\"head quote\",\"createdAt\":\""
+                                + midAt + "\",\"quoted_tweet\":{\"author\":{\"id\":\"self-id\",\"userName\":\"self\"}},\"author\":{\"id\":\"peer-3\",\"userName\":\"peer3\"}}";
+                        return ok("{\"tweets\":[" + quote + "],\"has_next_page\":true,\"next_cursor\":\"q2\"}");
+                    }
+                    return new ExactFollowProviderTest.Reply(500, "{\"error\":\"upstream timeout\"}");
+                }
+            }
+            return ok("{\"tweets\":[],\"has_next_page\":false}");
+        })) {
+            f.properties.setDiskCacheDir(temp.resolve("split-partial").toString());
+            f.properties.setSplitInboundSearchQueries(true);
+            var provider = new TwitterApiIoProvider(f.properties, new ObjectMapper().findAndRegisterModules(), f.pool);
+            var result = provider.syncStoreByHours("self", null, 24, true, true, null, "self-id");
+            assertThat(result.degraded()).isTrue();
+            assertThat(result.store().inbound().stream().map(AccountStore.StoredInbound::id).toList())
+                    .containsExactlyInAnyOrder("in-reply-ok", "in-quote-head");
+            long to = result.store().syncedAt();
+            long from = to - 24 * 3600L;
+            assertThat(AccountStore.missingRanges(result.store().inboundCoverage(), midAt.getEpochSecond(), to)).isEmpty();
+            assertThat(AccountStore.missingRanges(result.store().inboundCoverage(), from, midAt.getEpochSecond() - 1)).isNotEmpty();
+        }
+    }
+
     private ExactFollowProviderTest.Reply ok(String json) { return ExactFollowProviderTest.Reply.ok(json); }
     private String metric(String id, Instant at) {
         String classification = id.equals("old-0") ? ",\"isReply\":true,\"inReplyToUsername\":\"peer\""

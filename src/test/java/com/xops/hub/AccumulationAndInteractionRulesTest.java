@@ -508,6 +508,198 @@ class AccumulationAndInteractionRulesTest {
         }
     }
 
+    @Test
+    void authorAndTop5FullWithUnclosedInboundCoverageTailStillShowStoredActivityAndInteractionsAcrossAllPeriods(@TempDir Path dir) throws Exception {
+        Instant now = Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS);
+        XUserSummary author = new XUserSummary("88888", "elidlicom", "Author", "", "", true, 1200, 300, 500, "2020");
+        AccountStore.StoredUser peerUser = new AccountStore.StoredUser(
+                "Peer X", "", false, 200, 150, "builder", "99001", 80, "2022");
+
+        List<AccountStore.StoredTweet> tweets = List.of(
+                new AccountStore.StoredTweet("tw_2h", now.minus(Duration.ofHours(2)).getEpochSecond(), 'P',
+                        "post 2h", null, List.of(), 0, new long[]{120, 10, 2, 1, 0}, "tw_2h", null),
+                new AccountStore.StoredTweet("tw_36h", now.minus(Duration.ofHours(36)).getEpochSecond(), 'P',
+                        "post 36h", null, List.of(), 0, new long[]{240, 20, 3, 2, 1}, "tw_36h", null),
+                new AccountStore.StoredTweet("tw_5d", now.minus(Duration.ofDays(5)).getEpochSecond(), 'P',
+                        "post 5d", null, List.of(), 0, new long[]{360, 30, 4, 3, 2}, "tw_5d", null),
+                new AccountStore.StoredTweet("tw_20d", now.minus(Duration.ofDays(20)).getEpochSecond(), 'P',
+                        "post 20d", null, List.of(), 0, new long[]{480, 40, 5, 4, 3}, "tw_20d", null)
+        );
+        List<AccountStore.StoredInbound> inbound = List.of(
+                new AccountStore.StoredInbound("in_3h", now.minus(Duration.ofHours(3)).getEpochSecond(), 'R',
+                        "peer_x", "reply 3h", "tw_2h", "tw_2h", null),
+                new AccountStore.StoredInbound("in_30h", now.minus(Duration.ofHours(30)).getEpochSecond(), 'R',
+                        "peer_x", "reply 30h", "tw_36h", "tw_36h", null),
+                new AccountStore.StoredInbound("in_4d", now.minus(Duration.ofDays(4)).getEpochSecond(), 'R',
+                        "peer_x", "reply 4d", "tw_5d", "tw_5d", null),
+                new AccountStore.StoredInbound("in_18d", now.minus(Duration.ofDays(18)).getEpochSecond(), 'R',
+                        "peer_x", "reply 18d", "tw_20d", "tw_20d", null)
+        );
+        // tweetCoverage closed up to syncedAt, while inboundCoverage stops 2h before syncedAt (simulating an
+        // upstream search timeout leaving an unclosed tail gap so contiguousFrom(inboundCoverage, syncedAt) == syncedAt).
+        AccountStore.StoredAccount stored = new AccountStore.StoredAccount(
+                AccountStore.VERSION,
+                author,
+                now.getEpochSecond(),
+                Map.of("peer_x", peerUser),
+                tweets,
+                inbound,
+                List.of(new long[]{now.minus(Duration.ofHours(24)).getEpochSecond(), now.getEpochSecond()}),
+                List.of(new long[]{now.minus(Duration.ofHours(24)).getEpochSecond(), now.minus(Duration.ofHours(2)).getEpochSecond()}),
+                List.of("peer_x"),
+                List.of("peer_x"),
+                List.of("peer_x"),
+                now.getEpochSecond(),
+                false, false, false,
+                List.of(),
+                Map.of(),
+                now.minus(Duration.ofMinutes(10)).getEpochSecond(),
+                0L
+        );
+        AccountStore.write(dir.resolve("users/by-id/88888/store_v" + AccountStore.VERSION + ".json.gz"), stored, objectMapper);
+
+        XOpsProperties props = baseTwitterProps(dir, 1);
+        TwitterApiIoProvider degradedProvider = new TwitterApiIoProvider(props, objectMapper) {
+            @Override
+            public SyncOutcome syncStoreByHours(String username, AccountStore.StoredAccount existing,
+                    int hours, boolean head, boolean daily, String key, String expectedId) {
+                return new SyncOutcome(existing, true, false, false, 0);
+            }
+        };
+        CommunityHubService service = new CommunityHubService(
+                props, new DemoXDataProvider(), degradedProvider, new OfficialXApiV2Provider(props, objectMapper), objectMapper);
+
+        MultiPeriodDashboardBundle bundle = service.analyzeWorkspaceBundle(
+                "elidlicom", ReportPeriod.HOURS_24, "TWITTERAPI_IO", false, "127.0.0.1", "88888", false);
+
+        assertThat(bundle.accessPolicy().top5FullAccess()).isTrue();
+        assertThat(bundle.accessPolicy().accumulatedSummaryMode()).isFalse();
+        assertThat(bundle.dailyCacheStatus().inboundCovered()).isFalse();
+
+        assertThat(bundle.hours24().activity().originalPosts()).isEqualTo(1);
+        assertThat(bundle.hours24().interactions().peerStats())
+                .anySatisfy(p -> {
+                    assertThat(p.peer().username()).isEqualTo("peer_x");
+                    assertThat(p.peerRepliesToMe()).isEqualTo(1);
+                });
+
+        assertThat(bundle.day().activity().originalPosts()).isEqualTo(2);
+        assertThat(bundle.day().interactions().peerStats())
+                .anySatisfy(p -> {
+                    assertThat(p.peer().username()).isEqualTo("peer_x");
+                    assertThat(p.peerRepliesToMe()).isEqualTo(2);
+                });
+
+        assertThat(bundle.week().activity().originalPosts()).isEqualTo(3);
+        assertThat(bundle.week().interactions().peerStats())
+                .anySatisfy(p -> {
+                    assertThat(p.peer().username()).isEqualTo("peer_x");
+                    assertThat(p.peerRepliesToMe()).isEqualTo(3);
+                });
+
+        assertThat(bundle.month().activity().originalPosts()).isEqualTo(4);
+        assertThat(bundle.month().interactions().peerStats())
+                .anySatisfy(p -> {
+                    assertThat(p.peer().username()).isEqualTo("peer_x");
+                    assertThat(p.peerRepliesToMe()).isEqualTo(4);
+                });
+    }
+
+    @Test
+    void elidlicomGetsFullPermissionsAndSilentTop10HistoryBackfillsWithoutBlockingForeground(@TempDir Path dir) throws Exception {
+        Instant now = Instant.now();
+        com.xops.hub.assistant.AssistantStore assistantStore = new com.xops.hub.assistant.AssistantStore(
+                dir.resolve("content-assistant"), objectMapper);
+
+        XOpsProperties props = baseTwitterProps(dir, 1);
+        props.setTop10SilentHistoryEnabled(true);
+
+        java.util.concurrent.atomic.AtomicInteger silentCalls = new java.util.concurrent.atomic.AtomicInteger();
+        List<String> silentlySyncedHandles = new CopyOnWriteArrayList<>();
+
+        TwitterApiIoProvider mockProvider = new TwitterApiIoProvider(props, objectMapper) {
+            @Override
+            public SyncOutcome syncStoreSilentHistoryStep(String username, AccountStore.StoredAccount existing,
+                    int maxPagesPerStream, String expectedAccountId) {
+                silentCalls.incrementAndGet();
+                silentlySyncedHandles.add(username.toLowerCase(Locale.ROOT));
+                Instant syncTo = existing != null && existing.syncedAtInstant() != null ? existing.syncedAtInstant() : now;
+                XUserSummary prof = existing != null && existing.profile() != null
+                        ? existing.profile()
+                        : new XUserSummary(expectedAccountId, username, username, "", "", false, 20, 20, 10, "");
+                RawTweet history15d = new RawTweet("hist_" + username, "history 15d", syncTo.minus(Duration.ofDays(15)),
+                        TweetKind.POST, "", null, List.of(), false, false, 100, 10, 1, 0, 0, false, "hist_" + username, "");
+                List<long[]> full30d = List.of(new long[]{
+                        TwitterApiIoProvider.cutoffForWindowDays(syncTo, 30).getEpochSecond(),
+                        syncTo.getEpochSecond()
+                });
+                AccountStore.StoredAccount updated = AccountStore.merge(
+                        existing, prof, syncTo, List.of(history15d), List.of(), full30d, full30d, null);
+                return new SyncOutcome(updated, true, false, true, 1);
+            }
+        };
+
+        CommunityHubService service = new CommunityHubService(
+                props, new DemoXDataProvider(), mockProvider, new OfficialXApiV2Provider(props, objectMapper),
+                objectMapper, null, assistantStore);
+        try {
+            // 1. Cold-start @elidlicom immediately gets all permissions, while spoofed ID is rejected
+            assertThat(service.isAuthorAccount("9000", "elidlicom")).isTrue();
+            assertThat(service.isAuthorAccount("9999", "elidlicom")).isFalse();
+            assertThat(service.evaluateScheduledPublishAccess("9000", "elidlicom").allowed()).isTrue();
+            assertThat(service.evaluateScheduledPublishAccess("9999", "elidlicom").allowed()).isFalse();
+
+            // 2. Seed @elidlicom with 12 peers & an unclosed 24h-only coverage gap (missing 2..30d history)
+            XUserSummary author = new XUserSummary("9000", "elidlicom", "Litany", "", "", true, 500, 100, 50, "");
+            List<RawTweet> authorTweets = new ArrayList<>();
+            for (int rank = 1; rank <= 12; rank++) {
+                String peerUid = String.valueOf(7000 + rank);
+                String peerName = "top_peer_" + rank;
+                XUserSummary peer = new XUserSummary(peerUid, peerName, "Peer " + rank, "", "", false, 10, 10, 10, "");
+                int replies = 20 - rank;
+                for (int r = 1; r <= replies; r++) {
+                    String cid = "conv_" + rank + "_" + r;
+                    authorTweets.add(replyTweet("tw_" + rank + "_" + r, peerName, peer, cid, cid, now.minus(Duration.ofDays(3))));
+                }
+            }
+            //inboundCoverage stops 2h before syncedAt AND tweetCoverage only covers last 24h -> missing 30d history
+            AccountStore.StoredAccount authorSeed = AccountStore.merge(
+                    null, author, now, authorTweets, List.of(),
+                    List.of(new long[]{now.minus(Duration.ofHours(24)).getEpochSecond(), now.getEpochSecond()}),
+                    List.of(new long[]{now.minus(Duration.ofHours(24)).getEpochSecond(), now.minus(Duration.ofHours(2)).getEpochSecond()}),
+                    null);
+            Path authorStoreFile = dir.resolve("users/by-id/9000/store_v" + AccountStore.VERSION + ".json.gz");
+            AccountStore.write(authorStoreFile, authorSeed, objectMapper);
+
+            // Even with unclosed inboundCoverage tail, longHistoryCandidates keeps @elidlicom + Top 1..10 (11 total)
+            List<CommunityHubService.LongHistoryCandidate> candidates = service.longHistoryCandidates();
+            assertThat(candidates).hasSize(11);
+            assertThat(candidates.get(0).owner()).isTrue();
+            assertThat(candidates.get(0).user().username()).isEqualTo("elidlicom");
+            assertThat(candidates.stream().skip(1).map(c -> c.user().username()).toList())
+                    .containsExactly("top_peer_1", "top_peer_2", "top_peer_3", "top_peer_4", "top_peer_5",
+                            "top_peer_6", "top_peer_7", "top_peer_8", "top_peer_9", "top_peer_10")
+                    .doesNotContain("top_peer_11", "top_peer_12");
+
+            // 3. Step 1 prioritizes @elidlicom (owner) 30d silent backfill, then Top 1..10 peers, never touching rank 11/12
+            for (int step = 0; step < 11; step++) {
+                assertThat(service.runOneSilentTop10HistoryStepNow()).isTrue();
+            }
+            assertThat(service.runOneSilentTop10HistoryStepNow()).isFalse(); // All 11 now have complete 30d coverage!
+            assertThat(silentlySyncedHandles.get(0)).isEqualTo("elidlicom");
+            assertThat(silentlySyncedHandles).hasSize(11)
+                    .contains("elidlicom", "top_peer_1", "top_peer_10")
+                    .doesNotContain("top_peer_11", "top_peer_12");
+            assertThat(AccountStore.read(authorStoreFile, objectMapper).tweets())
+                    .extracting(AccountStore.StoredTweet::id).contains("hist_elidlicom");
+            assertThat(AccountStore.read(dir.resolve("users/by-id/7010/store_v" + AccountStore.VERSION + ".json.gz"), objectMapper).tweets())
+                    .extracting(AccountStore.StoredTweet::id).contains("hist_top_peer_10");
+            assertThat(dir.resolve("users/by-id/7011/store_v" + AccountStore.VERSION + ".json.gz")).doesNotExist();
+        } finally {
+            service.stopBackgroundRefreshes();
+        }
+    }
+
     private void writeSyncedDates(Path usageFile, int days) throws IOException {
         LocalDate today = LocalDate.now(ZoneId.of("Asia/Shanghai"));
         List<String> dates = new ArrayList<>();

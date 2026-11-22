@@ -282,6 +282,8 @@ public class UpstreamBudgetGuard {
         if ("twitterapi_io_relation".equals(category)) return 1_000;
         Map<String, String> query = query(uri);
         if ("twitterapi_io_read".equals(category)) {
+            // TwitterAPI.io Get Article: 100 credits per article, 100,000 credits per USD.
+            if (path.endsWith("/twitter/article")) return 1_000;
             if (path.endsWith("/twitter/user/info")) return 180;
             if (path.endsWith("/twitter/user/batch_info_by_ids")) {
                 return Math.max(150, countIds(query.get("userIds"), 100) * 180L);

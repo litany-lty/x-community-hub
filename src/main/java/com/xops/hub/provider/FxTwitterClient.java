@@ -39,6 +39,8 @@ public final class FxTwitterClient {
     // Spend at most one concurrent wave on missing parents, leaving time for the verified fallback.
     private static final int MAX_THREAD_LOOKUPS_PER_PAGE = 4;
     private static final long THREAD_LOOKUP_BUDGET_MS = 1500;
+    private static final long SEARCH_UNAVAILABLE_COOLDOWN_MS = Duration.ofMinutes(30).toMillis();
+    private static final long SEARCH_HTTP_TIMEOUT_MS = 4500L;
     private static final String CURSOR_PREFIX = "fx:";
     private static final Pattern TWEET_ID = Pattern.compile("[0-9]{2,20}");
     private static final Pattern USER_ID = Pattern.compile("[0-9]{1,20}");
@@ -48,6 +50,9 @@ public final class FxTwitterClient {
     private final ObjectMapper mapper;
     private final SharedApiExecutor executor;
     private final HttpClient httpClient;
+    private volatile long searchDisabledUntilEpochMs = 0L;
+    private final java.util.concurrent.atomic.AtomicInteger consecutiveSearchFailures =
+            new java.util.concurrent.atomic.AtomicInteger();
 
     public FxTwitterClient(XOpsProperties properties, ObjectMapper mapper, SharedApiExecutor executor) {
         this.properties = properties;
@@ -63,7 +68,8 @@ public final class FxTwitterClient {
             Route route = route(paidUrl);
             return switch (route.path()) {
                 case "/twitter/user/info" -> validProfileSelector(route.query().get("userName"));
-                case "/twitter/tweet/advanced_search" -> "Latest".equalsIgnoreCase(route.query().get("queryType"))
+                case "/twitter/tweet/advanced_search" -> !isSearchCircuitOpen()
+                        && "Latest".equalsIgnoreCase(route.query().get("queryType"))
                         && route.query().getOrDefault("query", "").length() > 0
                         && route.query().get("query").length() <= 512
                         && (route.query().getOrDefault("cursor", "").isEmpty()
@@ -121,18 +127,35 @@ public final class FxTwitterClient {
             long timeLeft = Duration.between(Instant.now(), deadline).toMillis();
             if (timeLeft <= 0 || Thread.currentThread().isInterrupted()) throw invalid("公开数据请求已超过本轮时限");
             String base = properties.getFxtwitterBaseUrl().replaceAll("/+$", "");
+            boolean searchPath = path.startsWith("/search?");
+            boolean loopbackBase = isLoopbackBaseUrl(base);
+            long requestCapMs = (searchPath && !loopbackBase) ? SEARCH_HTTP_TIMEOUT_MS : 10_000L;
             HttpRequest request = HttpRequest.newBuilder(URI.create(base + path))
-                    .timeout(Duration.ofMillis(Math.min(10_000, timeLeft)))
+                    .timeout(Duration.ofMillis(Math.min(requestCapMs, timeLeft)))
                     .header("Accept", "application/json").header("User-Agent", USER_AGENT).GET().build();
             if (requestStarted != null) requestStarted.set(true);
             if (onStarted != null) onStarted.run();
             try {
                 HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
                 long observedAt = Instant.now().getEpochSecond();
-                if (response.statusCode() != 200) throw invalid("公开数据服务暂不可用（HTTP " + response.statusCode() + "）");
+                if (response.statusCode() != 200) {
+                    if (searchPath && isSearchUpstreamUnavailable(response.statusCode(), response.body(), loopbackBase)) {
+                        tripSearchCircuit("HTTP " + response.statusCode());
+                    }
+                    throw invalid("公开数据服务暂不可用（HTTP " + response.statusCode() + "）");
+                }
                 JsonNode json = mapper.readTree(response.body());
                 if (json == null || !json.isObject() || !json.path("code").isIntegralNumber()
-                        || json.path("code").asInt() != 200) throw invalid("公开数据服务返回异常状态");
+                        || json.path("code").asInt() != 200) {
+                    if (searchPath && json != null && (json.path("code").asInt() == 503 || json.path("code").asInt() == 501)) {
+                        tripSearchCircuit("code " + json.path("code").asInt());
+                    }
+                    throw invalid("公开数据服务返回异常状态");
+                }
+                if (searchPath) {
+                    consecutiveSearchFailures.set(0);
+                    searchDisabledUntilEpochMs = 0L;
+                }
                 log.debug("FxTwitter {} read succeeded", path.startsWith("/profile/") ? "profile"
                         : path.startsWith("/status/") ? "status" : path.startsWith("/thread/") ? "thread" : "search");
                 return new Fetched(json, observedAt);
@@ -140,11 +163,47 @@ public final class FxTwitterClient {
                 Thread.currentThread().interrupt();
                 throw new XDataProviderException(503, "公开数据读取已中断");
             } catch (IOException ex) {
+                if (searchPath && !loopbackBase && consecutiveSearchFailures.incrementAndGet() >= 2) {
+                    tripSearchCircuit(ex.getClass().getSimpleName());
+                }
                 throw new XDataProviderException(502, "公开数据服务响应无法读取");
             }
         });
         // Completing the executor future also cancels/removes its queued or running task.
         return future.orTimeout(remaining, TimeUnit.MILLISECONDS);
+    }
+
+    boolean isSearchCircuitOpen() {
+        long until = searchDisabledUntilEpochMs;
+        return until > 0L && System.currentTimeMillis() < until;
+    }
+
+    private void tripSearchCircuit(String reason) {
+        long now = System.currentTimeMillis();
+        long prev = searchDisabledUntilEpochMs;
+        searchDisabledUntilEpochMs = now + SEARCH_UNAVAILABLE_COOLDOWN_MS;
+        if (prev <= now) {
+            log.warn("FxTwitter /search unavailable ({}); bypassing free search for 30m", reason);
+        }
+    }
+
+    private static boolean isSearchUpstreamUnavailable(int statusCode, String body, boolean loopbackBase) {
+        if (statusCode != 503 && statusCode != 501) {
+            return false;
+        }
+        if (!loopbackBase) {
+            return true;
+        }
+        return body != null && body.toLowerCase(Locale.ROOT).contains("unavailable");
+    }
+
+    private static boolean isLoopbackBaseUrl(String base) {
+        try {
+            String host = URI.create(base).getHost();
+            return "localhost".equalsIgnoreCase(host) || "127.0.0.1".equals(host) || "[::1]".equals(host);
+        } catch (RuntimeException ex) {
+            return false;
+        }
     }
 
     private CompletableFuture<JsonNode> search(Fetched fetched, String query, String requestedCursor,

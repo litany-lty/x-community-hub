@@ -15,6 +15,7 @@ function section(start, end) {
 }
 
 const switchCode = section('    function switchTab(', '    function applyTheme(');
+const reportVisibilityCode = section('    function syncReportVisibility()', '    function resetUserScopedMemoryState()');
 const initCode = section('    async function init()', '    function cleanAuthQueryParams()');
 const popstateCode = section(
     '        if ("scrollRestoration" in window.history)',
@@ -29,6 +30,9 @@ function navigationFixture(initialUrl = 'https://app.example.test/') {
     const writes = [];
     const listeners = new Map();
     const workspace = { dataset: {} };
+    const rightRail = {};
+    const timingPanel = { id: 'panel-timing', classList: {toggle: noop} };
+    const reportCard = {};
     let index = 0;
     const location = {
         get href() { return entries[index].url; },
@@ -60,8 +64,10 @@ function navigationFixture(initialUrl = 'https://app.example.test/') {
     };
     const ctx = {
         state, window, URL, URLSearchParams,
-        document: { querySelectorAll: () => [] },
-        $: () => workspace,
+        document: { querySelectorAll: selector => ({
+            '.tab-panel': [timingPanel], '[data-content-report]': [reportCard]
+        })[selector] || [] },
+        $: id => id === 'authenticatedRightRail' ? rightRail : workspace,
         isLoggedIn: () => Boolean(state.authStatus.loggedIn),
         stableUserId: (user) => user.id,
         showToast: noop, showError: (message) => assert.fail(message),
@@ -72,15 +78,16 @@ function navigationFixture(initialUrl = 'https://app.example.test/') {
         localStorage: { getItem: () => null, removeItem: noop },
         purgeLegacyClientBundles: noop, THEMES: [{ id: 'dark' }],
         applyTheme: noop, syncPeriodButtons: noop, syncAuthConnectionUI: noop,
-        fetchServerAndAuthStatus: async () => {},
+        fetchServerAndAuthStatus: async () => ctx.syncReportVisibility(),
+        loadContentAssistant: async () => {}, setPublishAuthError: noop, cleanAuthQueryParams: noop,
         fetchAlgoProfileStatus: async () => {},
         loadSelfReport: async () => {},
         checkinWorkspaceUsage: async () => {}
     };
     vm.createContext(ctx);
-    vm.runInContext(switchCode + '\nfunction bindEvents() {\n' + popstateCode + '\n}\n' + initCode, ctx);
+    vm.runInContext(reportVisibilityCode + switchCode + '\nfunction bindEvents() {\n' + popstateCode + '\n}\n' + initCode, ctx);
     return {
-        ctx, state, window, writes, entries, workspace,
+        ctx, state, window, writes, entries, workspace, timingPanel, reportCard,
         back() {
             assert.ok(index > 0);
             index -= 1;
@@ -144,7 +151,8 @@ test('init replaces the first history entry for default and deep linked tabs', a
         ['', 'activity'],
         ['?tab=activity', 'activity'],
         ['?tab=interactions', 'interactions'],
-        ['?tab=schedule', 'schedule']
+        ['?tab=schedule', 'schedule'],
+        ['?tab=timing&auth=publish_ok', 'schedule']
     ]) {
         const f = navigationFixture('https://app.example.test/' + query);
         await f.ctx.init();
@@ -154,6 +162,28 @@ test('init replaces the first history entry for default and deep linked tabs', a
         assert.equal(f.window.history.state?.xopsOwnerId, 'owner-1');
         assert.equal(f.writes.includes('push'), false);
         assert.equal(f.writes.filter((kind) => kind === 'replace').length, 1);
+    }
+});
+
+test('the content deep link can load its own data while the report is pending', async () => {
+    const f = navigationFixture('https://app.example.test/?tab=timing');
+    let markReportStarted, finishReport;
+    const reportStarted = new Promise(resolve => {markReportStarted = resolve;});
+    f.ctx.loadSelfReport = () => new Promise(resolve => {
+        finishReport = resolve;
+        markReportStarted();
+    });
+    const assistantTabs = [];
+    f.ctx.loadContentAssistant = async () => {assistantTabs.push(f.state.activeTab);};
+    const init = f.ctx.init();
+    await reportStarted;
+    try {
+        assert.deepEqual(assistantTabs, ['timing']);
+        assert.equal(f.timingPanel.hidden, false);
+        assert.equal(f.reportCard.hidden, true);
+    } finally {
+        finishReport();
+        await init;
     }
 });
 

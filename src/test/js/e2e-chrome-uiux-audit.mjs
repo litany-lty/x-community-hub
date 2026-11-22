@@ -650,23 +650,14 @@ async function main() {
         assert.ok(followCheck.sortRows.every(count => count > 0));
         assert.equal(followCheck.sortAfterTabs, "followers");
 
-        // ==================== JOURNEY 6: Tab 4 (Timing, Heatmap, Ops Buttons, Simulator, Algo Config) ====================
-        console.log("7. Auditing Tab 4 (Timing, Heatmap Readout, Ops Playbook Actions, Simulator, Algo Config)...");
+        // ==================== JOURNEY 6: Tab 4 (Content assistant, Ops Buttons, Simulator, Algo Config) ====================
+        console.log("7. Auditing Tab 4 (Content assistant, Ops Playbook Actions, Simulator, Algo Config)...");
         const timingAudit = await page.eval(`
             function $(id) { return document.getElementById(id); }
             document.querySelector('.nav-item[data-tab="timing"]').click();
             await new Promise(r => setTimeout(r, 200));
 
-            // 6a. Heatmap cell click readout visibility test!
-            const hmCell = document.querySelector("#heatmapGridRows .hm-cell[data-tip]");
-            hmCell.click();
-            const hmReadoutHiddenAfterClick = $("timingPeriodDesc").hidden;
-            const hmReadoutDisplay = getComputedStyle($("timingPeriodDesc")).display;
-            const hmReadoutText = $("timingPeriodDesc").textContent;
-            hmCell.click();
-            const hmReadoutHiddenAfterUntoggle = $("timingPeriodDesc").hidden;
-
-            // 6b. Check Ops Playbook action buttons!
+            // 6a. Check Ops Playbook action buttons!
             const opsBtns = Array.from(document.querySelectorAll("#algoOpsPlaybookList button.algo-ops-go")).map(b => ({
                 text: b.textContent.trim(),
                 go: b.dataset.go,
@@ -713,24 +704,7 @@ async function main() {
                 scrollIdFlashed = document.getElementById(targetId)?.classList.contains("is-target-flash") || false;
             }
 
-            // 6g. Test GOLDEN_SLOT_LAUNCH ("去排期 ›") deep-link -> switches to schedule & fills golden slot & marks 1 active chip
-            let goldenGoSwitched = false;
-            let goldenActiveChipCount = 0;
-            const goldenBtn = document.querySelector('#algoOpsPlaybookList button.algo-ops-go[data-go*="goldenSlot:"]');
-            if (goldenBtn) {
-                goldenBtn.click();
-                await new Promise(r => setTimeout(r, 150));
-                goldenGoSwitched = document.getElementById("panel-schedule").classList.contains("active");
-                goldenActiveChipCount = document.querySelectorAll("#scheduleQuickSlotChips .pill-chip.active").length;
-                document.querySelector('.nav-item[data-tab="timing"]').click();
-                await new Promise(r => setTimeout(r, 100));
-            }
-
             return {
-                hmReadoutHiddenAfterClick,
-                hmReadoutDisplay,
-                hmReadoutText,
-                hmReadoutHiddenAfterUntoggle,
                 opsBtns,
                 simVisible,
                 simScoreText,
@@ -741,21 +715,9 @@ async function main() {
                 drawerClosedByEscape,
                 overrideBadgeVisible,
                 resetBadgeHidden,
-                scrollIdFlashed,
-                goldenGoSwitched,
-                goldenActiveChipCount
+                scrollIdFlashed
             };
         `);
-        if (timingAudit.hmReadoutHiddenAfterClick || timingAudit.hmReadoutDisplay === "none") {
-            recordFinding(
-                "BUG",
-                "Heatmap Cell Tap Readout (#timingPeriodDesc)",
-                `Clicking heatmap cell sets text "${timingAudit.hmReadoutText}" but #timingPeriodDesc remains hidden (display=${timingAudit.hmReadoutDisplay})!`
-            );
-        }
-        assert.equal(timingAudit.hmReadoutHiddenAfterClick, false);
-        assert.notEqual(timingAudit.hmReadoutDisplay, "none");
-        assert.equal(timingAudit.hmReadoutHiddenAfterUntoggle, true);
         for (const ob of timingAudit.opsBtns) {
             if (ob.go === "tab:timing") {
                 recordFinding(
@@ -774,8 +736,6 @@ async function main() {
         assert.equal(timingAudit.overrideBadgeVisible, true);
         assert.equal(timingAudit.resetBadgeHidden, true);
         assert.equal(timingAudit.scrollIdFlashed, true);
-        assert.equal(timingAudit.goldenGoSwitched, true);
-        assert.equal(timingAudit.goldenActiveChipCount, 1);
 
         // ==================== JOURNEY 7: Tab 5 (Circle & Share Card Poster -> Schedule) ====================
         console.log("8. Auditing Tab 5 (Circle & 2x Canvas Poster + Send to Schedule)...");

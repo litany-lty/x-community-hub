@@ -522,6 +522,122 @@ public final class AccountStore {
     }
 
     /**
+     * 无锁后台静默历史分片回填后的并发安全合并：在毫秒级锁内把后台补齐的推文/互动/覆盖区间无损并入最新状态，
+     * 绝不回退前台刚更新的指标、关系图谱或小时刷新进度。
+     */
+    public static StoredAccount mergeStoredSlice(StoredAccount latest, StoredAccount sliceResult) {
+        if (latest == null || latest.profile() == null) return sliceResult;
+        if (sliceResult == null || sliceResult.profile() == null) return latest;
+        if (latest.profile().id() == null || latest.profile().id().isBlank()
+                || !latest.profile().id().equals(sliceResult.profile().id())
+                || latest.profile().username() == null
+                || !latest.profile().username().equalsIgnoreCase(sliceResult.profile().username())) {
+            throw new IllegalStateException("数据隔离保护：静默历史合并账号身份不一致");
+        }
+        boolean sliceNewer = sliceResult.syncedAt() >= latest.syncedAt();
+        XUserSummary profile = sliceNewer ? sliceResult.profile() : latest.profile();
+        long syncedAt = Math.max(latest.syncedAt(), sliceResult.syncedAt());
+        long minKeep = Instant.ofEpochSecond(syncedAt).minus(RETENTION).getEpochSecond();
+
+        Map<String, StoredUser> users = new LinkedHashMap<>(sliceNewer ? latest.users() : sliceResult.users());
+        users.putAll(sliceNewer ? sliceResult.users() : latest.users());
+
+        Map<String, StoredTweet> tweets = new LinkedHashMap<>();
+        for (StoredTweet t : sliceResult.tweets()) tweets.put(t.id(), t);
+        for (StoredTweet cur : latest.tweets()) {
+            StoredTweet bg = tweets.get(cur.id());
+            if (bg == null) {
+                tweets.put(cur.id(), cur);
+            } else {
+                StoredTweet primary = cur.metricsFetchedAt() >= bg.metricsFetchedAt() ? cur : bg;
+                StoredTweet secondary = primary == cur ? bg : cur;
+                String conv = (primary.conversationId() != null && !primary.conversationId().isBlank() && !"-".equals(primary.conversationId()))
+                        ? primary.conversationId() : secondary.conversationId();
+                long[] stats = primary.stats() != null ? primary.stats().clone() : new long[5];
+                long[] secStats = secondary.stats() != null ? secondary.stats() : new long[5];
+                Set<String> unavail = new HashSet<>(primary.unavailableMetrics());
+                String[] metricNames = {"views", "likes", "replies", "reposts", "bookmarks"};
+                for (int i = 0; i < metricNames.length; i++) {
+                    if (unavail.contains(metricNames[i]) && !secondary.unavailableMetrics().contains(metricNames[i])) {
+                        stats[i] = secStats[i];
+                        unavail.remove(metricNames[i]);
+                    }
+                }
+                tweets.put(cur.id(), new StoredTweet(primary.id(), primary.createdAt(), primary.kind(), primary.text(),
+                        primary.target(), primary.mentions(), primary.flags(), stats, conv, primary.inReplyToId(),
+                        Math.max(cur.metricsFetchedAt(), bg.metricsFetchedAt()),
+                        Math.max(cur.metricsAttemptedAt(), bg.metricsAttemptedAt()),
+                        unavail, primary.metricsTimeObserved() || secondary.metricsTimeObserved()));
+            }
+        }
+
+        Map<String, StoredInbound> inbound = new LinkedHashMap<>();
+        for (StoredInbound i : sliceResult.inbound()) inbound.put(i.id(), i);
+        for (StoredInbound cur : latest.inbound()) {
+            StoredInbound bg = inbound.get(cur.id());
+            if (bg == null) {
+                inbound.put(cur.id(), cur);
+            } else {
+                String conv = (cur.conversationId() != null && !cur.conversationId().isBlank())
+                        ? cur.conversationId() : bg.conversationId();
+                inbound.put(cur.id(), new StoredInbound(cur.id(), cur.createdAt(), cur.kind(), cur.peer(),
+                        cur.snippet(), conv, cur.inReplyToId(), cur.inReplyToUser()));
+            }
+        }
+
+        List<long[]> tc = new ArrayList<>(latest.tweetCoverage());
+        tc.addAll(sliceResult.tweetCoverage());
+        List<long[]> ic = new ArrayList<>(latest.inboundCoverage());
+        ic.addAll(sliceResult.inboundCoverage());
+
+        StoredAccount graphOwner = latest.graphFetchedAt() >= sliceResult.graphFetchedAt() ? latest : sliceResult;
+        Map<String, RelationshipEvidence> evidenceByPeer = new LinkedHashMap<>();
+        for (RelationshipEvidence e : sliceResult.relationshipEvidence()) {
+            if (e != null && e.peerId() != null && e.checkedAt() >= minKeep) evidenceByPeer.put(e.peerId(), e);
+        }
+        for (RelationshipEvidence e : latest.relationshipEvidence()) {
+            if (e != null && e.peerId() != null && e.checkedAt() >= minKeep) {
+                RelationshipEvidence prev = evidenceByPeer.get(e.peerId());
+                if (prev == null || e.checkedAt() >= prev.checkedAt()) evidenceByPeer.put(e.peerId(), e);
+            }
+        }
+        Map<String, Long> attempted = new LinkedHashMap<>();
+        sliceResult.relationshipAttemptedAt().forEach((k, ts) -> {
+            if (k != null && ts != null && ts >= minKeep) attempted.put(k, ts);
+        });
+        latest.relationshipAttemptedAt().forEach((k, ts) -> {
+            if (k != null && ts != null && ts >= minKeep) attempted.merge(k, ts, Math::max);
+        });
+
+        StoredAccount combined = new StoredAccount(
+                VERSION,
+                profile,
+                syncedAt,
+                users,
+                tweets.values().stream().filter(t -> t.createdAt() >= minKeep)
+                        .sorted(Comparator.comparingLong(StoredTweet::createdAt).reversed()).toList(),
+                inbound.values().stream().filter(i -> i.createdAt() >= minKeep)
+                        .sorted(Comparator.comparingLong(StoredInbound::createdAt).reversed()).toList(),
+                clipIntervals(tc, minKeep),
+                clipIntervals(ic, minKeep),
+                graphOwner.followings(),
+                graphOwner.followers(),
+                graphOwner.explicitFollowedBy(),
+                graphOwner.graphFetchedAt(),
+                graphOwner.followersTruncated(),
+                graphOwner.followingsTruncated(),
+                graphOwner.graphRefreshFailed(),
+                new ArrayList<>(evidenceByPeer.values()),
+                attempted,
+                Math.max(latest.dailyRefreshStartedAt(), sliceResult.dailyRefreshStartedAt()),
+                Math.max(latest.dailyRefreshedAt(), sliceResult.dailyRefreshedAt()),
+                graphOwner.followingOrderById(),
+                graphOwner.followerOrderById()
+        );
+        return pruneToRollingWindow(combined, Instant.ofEpochSecond(syncedAt));
+    }
+
+    /**
      * 按给定基准时间动态裁剪保留近 30 天（721 小时）滚动窗口数据，自动淘汰过期动态、互动、覆盖区间与不再被引用的推友字典。
      */
     public static StoredAccount pruneToRollingWindow(StoredAccount s, Instant referenceNow) {

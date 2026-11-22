@@ -69,6 +69,11 @@ public class XOAuthController {
         this.communityHubService = communityHubService;
     }
 
+    private com.xops.hub.assistant.AssistantStore assistantStore;
+
+    @Autowired
+    void bindAssistantStore(com.xops.hub.assistant.AssistantStore store) { this.assistantStore=store; }
+
     @GetMapping("/status")
     public AuthStatusResponse getStatus(HttpServletRequest request, HttpServletResponse response) {
         CommunityApiController.applyPrivateNoStoreHeaders(response);
@@ -76,6 +81,16 @@ public class XOAuthController {
         AuthenticatedXUser user = session != null
                 ? (AuthenticatedXUser) session.getAttribute(SESSION_AUTH_USER)
                 : null;
+        boolean ownerAllPermissions = false;
+        if (user != null) {
+            if (assistantStore != null && CommunityHubService.AUTHOR_USERNAME.equalsIgnoreCase(user.username())) {
+                ownerAllPermissions = assistantStore.authorize(user);
+            } else if (communityHubService != null) {
+                ownerAllPermissions = communityHubService.isAuthorAccount(user.id(), user.username());
+            } else if (assistantStore != null && user.id() != null && !user.id().isBlank()) {
+                ownerAllPermissions = assistantStore.isOwner(user.id());
+            }
+        }
         String baseOrigin = resolveBaseOrigin(request);
         boolean writeAuthorized = false;
         boolean mediaWriteAuthorized = false;
@@ -106,7 +121,8 @@ public class XOAuthController {
                 user,
                 writeAuthorized,
                 mediaWriteAuthorized,
-                offlineRefreshable
+                offlineRefreshable,
+                ownerAllPermissions
         );
     }
 
@@ -222,6 +238,9 @@ public class XOAuthController {
                 throw new IllegalStateException("登录会话已失效，请重新登录");
             }
             promoteAuthenticatedSession(request, response, session, user);
+            if (user != null && assistantStore != null && CommunityHubService.AUTHOR_USERNAME.equalsIgnoreCase(user.username())) {
+                assistantStore.authorize(user);
+            }
             if (cb.purpose() == XOAuthService.AuthPurpose.PUBLISH || publishFlow) {
                 log.info("X OAuth 2.0 publish step-up authorization succeeded for @{}", user.username());
                 response.sendRedirect("/?auth=publish_ok&tab=schedule");

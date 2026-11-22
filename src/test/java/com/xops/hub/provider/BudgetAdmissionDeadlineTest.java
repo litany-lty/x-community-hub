@@ -87,6 +87,23 @@ class BudgetAdmissionDeadlineTest {
         }
     }
 
+    @Test
+    void paidFallbackDeadlineReturnsDuringContendedBudgetAndNeverStartsHttp(@TempDir Path dir) throws Exception {
+        try (Fixture fixture = new Fixture(dir)) {
+            Instant deadline = Instant.now().plusSeconds(1);
+            CompletableFuture<JsonNode> pending = ReflectionTestUtils.invokeMethod(fixture.provider,
+                    "getJsonWithRetryAsync", fixture.baseUrl + "/twitter/tweet/advanced_search?queryType=Latest",
+                    "local-test-key", fixture.pacer, deadline, SearchReplyRoots.empty());
+            assertThat(fixture.guard.entered.await(2, TimeUnit.SECONDS)).isTrue();
+            Throwable failure = pending.handle((value, error) -> error).get(2, TimeUnit.SECONDS);
+            assertThat(failure).isInstanceOfSatisfying(XDataProviderException.class,
+                    providerError -> assertThat(providerError.getStatusCode()).isEqualTo(504));
+            fixture.guard.release.countDown();
+            fixture.awaitWorker();
+            assertThat(fixture.received.get()).isZero();
+        }
+    }
+
     private static void awaitDeadline(Instant deadline) throws InterruptedException {
         long remaining = Duration.between(Instant.now(), deadline).toMillis();
         if (remaining >= 0) Thread.sleep(remaining + 20L);

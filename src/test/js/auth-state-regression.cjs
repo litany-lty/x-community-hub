@@ -17,17 +17,15 @@ const profileCacheCode = section('    function getProfileHeaderCacheKey(', '    
 const loadCode = section('    async function loadSelfReport(', '    // 首次加载骨架屏');
 const logoutCode = section('        const doLogout = async () => {', '        $("railLogoutBtn").addEventListener')
     .replace('const doLogout =', 'globalThis.doLogout =');
-const timingCode = section('    function computeNextGoldenWindowHint(', '    function timingPeriodDescription(')
-    + section('    function timingPeriodDescription(', '    function renderTimingPanel(');
 const dailyStatusCode = section('    function renderDailyCacheStatus(', '    function renderProfileHeader(');
 const noop = () => {};
 function context() {
     const state = {authStatus: {loggedIn: true, user: {id: '1001', username: 'alice'}}, period: 'HOURS_48', days: 2,
         report: null, bundle: null, userScopeGeneration: 0, reportRequestGeneration: 0, authStatusGeneration: 0};
-    const element = {classList: {remove: noop}, hidden: false};
+    const element = {classList: {remove: noop}, dataset: {}, hidden: false};
     const removedStorageKeys = [];
     const ctx = {state, LIST_PAGE_SIZE: 50, PERIOD_META: {HOURS_48: {badgePrefix: '48h'}}, Date, Number,
-        Boolean, Set, AbortController, Intl,
+        Boolean, Set, AbortController, Intl, URLSearchParams,
         removedStorageKeys, localStorage: {removeItem: key => removedStorageKeys.push(key)},
         document: {querySelectorAll: () => [], getElementById: () => null},
         $: () => element, setTimeout: () => 1, clearTimeout: noop, setInterval: () => 1, clearInterval: noop,
@@ -40,7 +38,7 @@ function context() {
         applyLoadedPeriodReport: r => {state.report = r;}, fetchServerAndAuthStatus: async () => {},
         showToast: msg => {ctx.toast = msg;}};
     vm.createContext(ctx);
-    vm.runInContext(identityCode + profileCacheCode + resetCode + loadCode + requestCode + logoutCode + timingCode + dailyStatusCode, ctx);
+    vm.runInContext(identityCode + profileCacheCode + resetCode + loadCode + requestCode + logoutCode + dailyStatusCode, ctx);
     return ctx;
 }
 function response(username = 'alice', id = '1001') {
@@ -123,14 +121,6 @@ function response(username = 'alice', id = '1001') {
     assert.deepEqual(success.removedStorageKeys, ['xops_profile_meta_user_1001', 'xops_last_uid'],
         'logout must clear only the stable-ID profile cache and last-user marker');
 
-    const timing = context();
-    const RealDate = Date;
-    timing.Date = class extends RealDate {constructor(...args) {super(...(args.length ? args : ['2026-11-09T01:00:00Z']));}};
-    timing.state.report = {contentTiming: {timezone: 'America/New_York'}};
-    assert.match(timing.computeNextGoldenWindowHint([{label: '周日 18:00–21:00'}]), /当前正处于黄金档/);
-    assert.match(timing.timingPeriodDescription(), /America\/New_York/);
-    timing.state.report = {contentTiming: {}};
-    assert.match(timing.computeNextGoldenWindowHint([{label: '周一 09:00–12:00'}]), /当前正处于黄金档/);
     const daily = context();
     daily.state.dailyCacheStatus = {snapshotAt: '2026-11-14T18:53:05Z',
         latestMetricFetchedAt: '2026-11-14T19:03:05Z', recentPosts: 1, recentInbound: 0, pendingMetricPosts: 0};
@@ -140,5 +130,378 @@ function response(username = 'alice', id = '1001') {
     delete daily.state.dailyCacheStatus.latestMetricFetchedAt;
     daily.renderDailyCacheStatus({});
     assert.match(daily.$('dailyCacheStatusHint').textContent, /指标最近采集时间未确认/);
+    const assistant = context();
+    assistant.renderContentAssistant = noop;
+    assistant.setContentAssistantError = noop;
+    assistant.state.assistantRequestGeneration = 0;
+    assistant.state.assistantAccess = {allowed: true};
+    let deliverDashboard;
+    assistant.contentAssistantRequest = () => new Promise(resolve => {deliverDashboard = resolve;});
+    vm.runInContext(section('    async function loadContentAssistant(', '    async function runAssistantMutation('), assistant);
+    const priorAccount = assistant.loadContentAssistant(true);
+    assistant.resetUserScopedMemoryState();
+    assistant.state.authStatus = {loggedIn: true, user: {id: 'other'}};
+    deliverDashboard({drafts: [{id: 'private-draft', text: 'private text'}]});
+    await priorAccount;
+    assert.equal(assistant.state.assistantDashboard, null, 'late private dashboard response cannot populate another account');
+
+    const filtered = context();
+    filtered.renderContentAssistant = noop;
+    filtered.setContentAssistantError = noop;
+    Object.assign(filtered.state, {
+        assistantAccess: {allowed: true}, assistantRequestGeneration: 0,
+        assistantTopicSearch: '@OpenAI', assistantTopicSort: 'reach', assistantTopicOffset: 100,
+        assistantSelectedTopicId: 'selected'
+    });
+    const assistantPaths = [];
+    filtered.contentAssistantRequest = async path => {
+        assistantPaths.push(path);
+        return {topics: [{id: 'first'}, {id: 'selected'}], topicHasNext: false};
+    };
+    filtered.loadAssistantTopicDetail = async id => {assistantPaths.push(id);};
+    vm.runInContext(section('    async function loadContentAssistant(', '    async function runAssistantMutation('), filtered);
+    await filtered.loadContentAssistant(true);
+    assert.equal(assistantPaths[0], '/dashboard?limit=100&topicOffset=100&q=%40OpenAI&sort=reach');
+    assert.equal(filtered.state.assistantTopicOffset, 100, 'sync retains current page');
+    assert.equal(assistantPaths[1], 'selected', 'sync reloads the selected topic instead of selecting the first match');
+
+    const monitor = context();
+    const controls = new Map();
+    monitor.$ = id => {
+        if (!controls.has(id)) controls.set(id, {dataset: {}, contains: () => false, replaceChildren: noop});
+        return controls.get(id);
+    };
+    monitor.document.createTextNode = text => text;
+    monitor.assistantKeyValueRows = () => '';
+    monitor.renderAssistantHistory = () => '';
+    vm.runInContext(section('    function renderAssistantMonitor(', '    function renderContentAssistant('), monitor);
+    const priorSettings = {settings: {model: 'stored', version: 1}};
+    monitor.renderAssistantMonitor(priorSettings);
+    monitor.$('assistantModel').value = 'edited before blur';
+    monitor.$('assistantSettingsForm').dataset.editRevision = '1';
+    monitor.renderAssistantMonitor(priorSettings);
+    assert.equal(monitor.$('assistantModel').value, 'edited before blur', 'sync after blur preserves unsaved settings');
+
+    const progress = context();
+    const liveEditor = {value: 'text mid-edit', closest: () => ({dataset: {draftId: 'draft'}})};
+    const taskList = {};
+    progress.$ = id => ({assistantDraftEditor: liveEditor, assistantTopicTasks: taskList})[id];
+    progress.document.activeElement = liveEditor;
+    progress.state.assistantSelectedTopicId = 'topic';
+    progress.state.assistantSelectedDraftByTopic = {};
+    progress.renderAssistantTask = task => task.stage;
+    vm.runInContext(section('    function assistantDraftLengthText(', '    function assistantKeyValueRows('), progress);
+    progress.renderAssistantTopicDetail({
+        topics: [{id: 'topic'}], drafts: [{id: 'draft', topicId: 'topic'}],
+        tasks: [{id: 'job', topicId: 'topic', stage: 'DRAFT'}]
+    });
+    assert.match(taskList.innerHTML, /DRAFT/, 'topic task status remains live during editing');
+    assert.equal(liveEditor.value, 'text mid-edit');
+
+    const topicDetail = {};
+    progress.$ = id => id === 'assistantTopicDetail' ? topicDetail : null;
+    Object.assign(progress, {
+        assistantScoreText: String, escapeHtml: String,
+        materialText: material => material.text,
+        renderAssistantEvidenceChanges: () => '',
+        renderAssistantObservationReview: () => ''
+    });
+    const material = {id: 'source', topicId: 'topic', text: 'A post'};
+    progress.renderAssistantTopicDetail({topics: [{id: 'topic'}], materials: [material]});
+    assert.doesNotMatch(topicDetail.innerHTML, /data-regenerate="true"/, 'first research uses the ordinary entry');
+    progress.renderAssistantTopicDetail({
+        topics: [{id: 'topic'}], materials: [material],
+        drafts: [{id: 'draft', topicId: 'topic', materialId: 'source', version: 1}]
+    });
+    assert.match(topicDetail.innerHTML, /data-assistant-research="source">研究并生成/);
+    assert.match(topicDetail.innerHTML, /data-assistant-research="source" data-regenerate="true">重新研究/);
+    assert.match(topicDetail.innerHTML, /id="assistantDraftLength" class="inline-feedback" hidden/);
+    assert.match(topicDetail.innerHTML, /id="assistantDraftNumberChanges"[^>]+ hidden/);
+    progress.renderAssistantTopicDetail({
+        topics: [{id: 'topic'}], materials: [material], drafts: [{
+            id: 'draft', topicId: 'topic', materialId: 'source', version: 6,
+            numberChanges: {added: ['0.5', '2.0'], met: false}
+        }]
+    });
+    assert.match(topicDetail.innerHTML, /较基线新增数字 0\.5、2\.0，请审核。/);
+
+    const constraintRepair = {
+        attempted: true,
+        initial: {hanLength: {actual: 147, min: 180, max: 240, met: false}, numberChanges: {added: ['2.0', '0.5'], met: false}},
+        final: {hanLength: {actual: 205, min: 180, max: 240, met: true}, numberChanges: {added: [], met: true}}
+    };
+    progress.renderAssistantTopicDetail({
+        topics: [{id: 'topic'}], materials: [material], drafts: [{
+            id: 'draft', topicId: 'topic', materialId: 'source', version: 8, constraintRepair
+        }]
+    });
+    assert.match(topicDetail.innerHTML, /已自动修订一次/);
+    assert.match(topicDetail.innerHTML, /首次校验：147 个汉字.*未达标.*新增数字 2\.0、0\.5/);
+    assert.match(topicDetail.innerHTML, /最终校验：205 个汉字.*已达标.*无新增数字/);
+
+    const repairTask = context();
+    repairTask.escapeHtml = text => String(text).replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+    repairTask.renderAssistantResearch = () => '';
+    vm.runInContext(section('    function assistantStatusLabel(', '    function assistantScoreText(')
+        + section('    function renderAssistantTask(', '    function renderAssistantTopicDetail('), repairTask);
+    const review = repairTask.renderAssistantTask({
+        kind: 'OPTIMIZE', stage: 'OPTIMIZE_REVISION', status: 'CONSTRAINTS_UNMET',
+        constraintRepair: {...constraintRepair, final: {numberChanges: {added: ['2.0'], met: false}}},
+        result: {text: '<b>候选</b>'}
+    });
+    assert.match(review, /约束未达标/);
+    assert.match(review, /最终校验：新增数字 2\.0/);
+    assert.match(review, /查看未采用的候选稿/);
+    assert.match(review, /&lt;b&gt;候选&lt;\/b&gt;/);
+    const interrupted = repairTask.renderAssistantTask({
+        kind: 'OPTIMIZE', stage: 'OPTIMIZE_REVISION', status: 'INTERRUPTED',
+        constraintRepair: {attempted: true, initial: constraintRepair.initial}
+    });
+    assert.doesNotMatch(interrupted, /data-assistant-task-action="retry"/);
+
+    const editorCase = context();
+    const draftBox = {dataset: {draftId: 'd1', draftVersion: '1'}};
+    const editor = {value: 'first edit', closest: () => draftBox};
+    const saveState = {};
+    const draftTitle = {textContent: '初稿 v1'};
+    const draftLength = {hidden: true};
+    const numberChanges = {hidden: false, textContent: '较基线新增数字 0.5、2.0，请审核。'};
+    const draftSelect = {options: [
+        {value: 'd1', textContent: '稿件 1 · v1'},
+        {value: 'd2', textContent: '稿件 2 · v4'}
+    ]};
+    editorCase.$ = id => ({
+        assistantDraftEditor: editor, assistantDraftSaveState: saveState,
+        assistantDraftTitle: draftTitle, assistantDraftSelect: draftSelect,
+        assistantDraftLength: draftLength, assistantDraftNumberChanges: numberChanges
+    })[id];
+    editorCase.syncScheduleDraftUnloadProtection = noop;
+    editorCase.state.assistantDashboard = {drafts: [{id: 'd1', version: 1}]};
+    editorCase.state.assistantDraftDirty = true;
+    const writes = [];
+    let resolveSave;
+    editorCase.contentAssistantRequest = (_, input) => {
+        writes.push([input.version, input.text]);
+        if (input.version === 1) return new Promise(resolve => {resolveSave = resolve;});
+        return Promise.resolve({
+            id: 'd1', version: 3, text: input.text,
+            hanLength: {min: 180, max: 240, actual: 123, met: false}, numberChanges: {added: [], met: true}
+        });
+    };
+    vm.runInContext(section('    function assistantDraftLengthText(', '    function renderAssistantTopicDetail(')
+        + section('    async function saveAssistantDraftEditor(', '    function queueAssistantDraftSave('), editorCase);
+    const saved = editorCase.saveAssistantDraftEditor();
+    editor.value = 'final edit';
+    resolveSave({id: 'd1', version: 2, text: 'first edit'});
+    assert.equal((await saved).version, 3);
+    assert.deepEqual(writes, [[1, 'first edit'], [2, 'final edit']]);
+    assert.equal(editorCase.state.assistantDraftDirty, false);
+    assert.equal(draftBox.dataset.draftVersion, '3');
+    assert.equal(draftTitle.textContent, '初稿 v3');
+    assert.deepEqual(draftSelect.options.map(option => option.textContent), ['稿件 1 · v3', '稿件 2 · v4']);
+    assert.equal(editor.value, 'final edit');
+    assert.equal(draftLength.hidden, false);
+    assert.equal(draftLength.textContent, '当前 123 个汉字 · 目标 180–240 · 未达标');
+    assert.equal(numberChanges.hidden, true, 'saving a compliant edit clears the number warning');
+
+    const historyCase = context();
+    const draftRef = {dataset: {draftId: 'd1', draftVersion: '3'}};
+    const activeDraftEditor = {value: 'current unsaved edit', closest: () => draftRef};
+    const preview = {hidden: true, dataset: {}};
+    const previewText = {};
+    const previewTitle = {};
+    const versionList = {hidden: false};
+    historyCase.$ = id => ({
+        assistantDraftEditor: activeDraftEditor, assistantDraftVersionPreview: preview,
+        assistantDraftVersionText: previewText, assistantDraftVersionTitle: previewTitle,
+        assistantDraftVersions: versionList
+    })[id];
+    const savedTexts = [];
+    let queued = 0;
+    historyCase.queueAssistantDraftSave = () => {queued++;};
+    const historyClick = section('            const history = event.target.closest(', '            const optimize = event.target.closest(');
+    vm.runInContext(`async function historyClick(event) { ${historyClick} }`, historyCase);
+    const selectVersion = {dataset: {assistantVersion: '1', assistantVersionText: '<b>older text</b>'}};
+    const click = (selector, target) => historyCase.historyClick({target: {closest: query => query === selector ? target : null}});
+    await click('[data-assistant-version-text]', selectVersion);
+    assert.equal(activeDraftEditor.value, 'current unsaved edit', 'viewing history leaves the editor alone');
+    assert.equal(preview.hidden, false);
+    assert.equal(previewTitle.textContent, '预览 v1');
+    assert.equal(previewText.value, '<b>older text</b>');
+    assert.deepEqual(savedTexts, []);
+    assert.equal(queued, 0);
+    historyCase.saveAssistantDraftEditor = async () => {savedTexts.push(activeDraftEditor.value); return true;};
+    await click('#assistantAdoptDraftVersion', {isConnected: true});
+    assert.deepEqual(savedTexts, ['current unsaved edit', '<b>older text</b>'], 'adopting saves current edits before the old text');
+    assert.equal(queued, 1);
+    assert.equal(preview.hidden, true);
+    activeDraftEditor.value = 'current owner text';
+    await click('[data-assistant-version-text]', selectVersion);
+    let completePriorSave;
+    historyCase.saveAssistantDraftEditor = () => new Promise(resolve => {completePriorSave = resolve;});
+    const lateAdopt = click('#assistantAdoptDraftVersion', {isConnected: true});
+    historyCase.state.authStatus = {loggedIn: true, user: {id: 'other'}};
+    completePriorSave(true);
+    await lateAdopt;
+    assert.equal(activeDraftEditor.value, 'current owner text', 'a pending adoption cannot apply after account changes');
+    assert.equal(queued, 1);
+
+    const nonOwnerUi = context();
+    const shellEl = {hidden: false};
+    const noticeEl = {hidden: false};
+    nonOwnerUi.$ = id => ({contentAssistantShell: shellEl, contentAssistantAccessNotice: noticeEl})[id] || null;
+    nonOwnerUi.state.assistantAccess = {allowed: false};
+    vm.runInContext(section('    function renderContentAssistant(', '    async function loadContentAssistant('), nonOwnerUi);
+    nonOwnerUi.renderContentAssistant();
+    assert.equal(shellEl.hidden, true, 'non-owner never sees assistant shell');
+    assert.equal(noticeEl.hidden, true, 'non-owner never sees private assistant notice on public tab');
+
+    monitor.renderAssistantMonitor({
+        sources: [{
+            id: 'src-1', username: 'OpenAI', status: 'ACTIVE',
+            lastSuccessAt: 1700000000000, lastAttemptAt: 1700000300000,
+            lagging: true, error: 'Invalid cursor token',
+            gaps: [{fromAt: 1, toAt: 2, reason: 'expired'}]
+        }],
+        upstreamBudget: {ledgerState: 'SHARED_FILE_ACTIVE', hourlyUsed: 12, hourlyBudget: 120, dailyUsed: 40, dailyBudget: 800, dailyUsdReserved: 0.25, dailyUsdBudget: 5, budgetRejectedCalls: 0}
+    });
+    assert.match(monitor.$('assistantSourcesList').innerHTML, /采集滞后/);
+    assert.match(monitor.$('assistantSourcesList').innerHTML, /异常：Invalid cursor token/);
+    assert.match(monitor.$('assistantSourcesList').innerHTML, /历史缺口 1 处/);
+
+    const waitingStyleHtml = repairTask.renderAssistantTask({
+        id: 't-style', kind: 'RESEARCH', stage: 'DRAFT', status: 'WAITING_STYLE'
+    });
+    assert.match(waitingStyleHtml, /data-assistant-task-action="cancel"/);
+    assert.match(waitingStyleHtml, /data-assistant-task-action="retry"/);
+    const partialResearchHtml = repairTask.renderAssistantTask({
+        id: 't-partial', kind: 'RESEARCH', stage: 'DRAFT', status: 'RESEARCH_PARTIAL'
+    });
+    assert.match(partialResearchHtml, /继续深挖/);
+    assert.match(partialResearchHtml, /深度研究与成稿/);
+    assert.match(partialResearchHtml, /撰写初稿/);
+    assert.doesNotMatch(partialResearchHtml, />RESEARCH<|>DRAFT</);
+
+    const synthesisTaskHtml = repairTask.renderAssistantTask({
+        id: 't-syn', kind: 'RESEARCH', stage: 'RESEARCH_SYNTHESIS', status: 'RUNNING'
+    });
+    assert.match(synthesisTaskHtml, /证据核实与归纳/);
+    assert.doesNotMatch(synthesisTaskHtml, /RESEARCH_SYNTHESIS/);
+    assert.equal(repairTask.assistantStatusLabel('SUPPORTS'), '证据支持');
+    assert.equal(repairTask.assistantStatusLabel('SCORED'), '已评分');
+    assert.equal(repairTask.assistantSourceRefLabel('source-2#p3'), '网页来源 #2（第 3 段）');
+    assert.equal(repairTask.assistantSourceRefLabel('material-99-quoted-article'), '被引用文章全文');
+
+    // Period switch in normal mode reuses in-memory bundle for same user with 0 network requests
+    const periodReuse = context();
+    const periodUrls = [];
+    const cooldownTicks = [];
+    periodReuse.startCacheCooldownTicker = sec => {cooldownTicks.push(sec);};
+    periodReuse.state.period = 'HOURS_24';
+    periodReuse.state.days = 1;
+    periodReuse.fetch = async url => {
+        periodUrls.push(url);
+        return {
+            status: 200,
+            ok: true,
+            body: {
+                hours24: {profile: {id: '1001', username: 'alice'}, periodCode: 'HOURS_24', cacheRemainingSeconds: 120},
+                day: {profile: {id: '1001', username: 'alice'}, periodCode: 'HOURS_48', cacheRemainingSeconds: 115},
+                week: {profile: {id: '1001', username: 'alice'}, periodCode: 'WEEK', cacheRemainingSeconds: 110},
+                month: {profile: {id: '1001', username: 'alice'}, periodCode: 'MONTH', cacheRemainingSeconds: 105},
+                coveredWindowDays: 30,
+                hasMoreHistoryForTarget: false
+            }
+        };
+    };
+    await periodReuse.loadSelfReport(false);
+    assert.equal(periodUrls.length, 1, 'initial load fetches bundle once');
+    assert.match(periodUrls[0], /preferStored=true/, 'initial load requests preferStored=true for SWR fast open');
+    assert.equal(periodReuse.state.report.periodCode, 'HOURS_24');
+    periodReuse.state.period = 'WEEK';
+    periodReuse.state.days = 7;
+    await periodReuse.loadSelfReport(false);
+    assert.equal(periodUrls.length, 1, 'switching period in normal mode reuses in-memory bundle without fetch');
+    assert.equal(periodReuse.state.report.periodCode, 'WEEK');
+    assert.equal(cooldownTicks[cooldownTicks.length - 1], 110, 'reusing memory bundle refreshes cooldown ticker');
+    await periodReuse.loadSelfReport({reloadFromServer: true});
+    assert.equal(periodUrls.length, 2, 'reloadFromServer bypasses in-memory bundle');
+    assert.doesNotMatch(periodUrls[1], /refresh=true/, 'reloadFromServer must not re-trigger force refresh');
+    assert.doesNotMatch(periodUrls[1], /preferStored=true/, 'reloadFromServer must not send preferStored=true');
+
+    // Background refresh RUNNING -> poll SUCCEEDED -> reloads latest server bundle without ReferenceError
+    const bgPoll = context();
+    const bgFetchUrls = [];
+    const scheduledPolls = [];
+    bgPoll.setTimeout = (fn, ms) => {
+        if (ms === 2000) scheduledPolls.push(fn);
+        return scheduledPolls.length;
+    };
+    bgPoll.state.period = 'HOURS_24';
+    bgPoll.state.days = 1;
+    let bundleLoads = 0;
+    bgPoll.fetch = async url => {
+        bgFetchUrls.push(url);
+        if (url === '/api/analyze/bundle/refresh/status') {
+            return {status: 200, ok: true, body: {state: 'SUCCEEDED', refreshId: 'ref-1'}};
+        }
+        bundleLoads++;
+        const rev = bundleLoads === 1 ? 'stale' : 'fresh';
+        const report = {profile: {id: '1001', username: 'alice'}, periodCode: 'HOURS_24', cacheRemainingSeconds: 90, rev};
+        return {
+            status: 200,
+            ok: true,
+            body: {
+                hours24: report,
+                day: report,
+                week: report,
+                month: report,
+                backgroundRefreshStatus: bundleLoads === 1
+                    ? {state: 'RUNNING', refreshId: 'ref-1'}
+                    : {state: 'SUCCEEDED', refreshId: 'ref-1'},
+                dailyCacheStatus: {
+                    canContinue: true,
+                    lastAttemptDegraded: false,
+                    cycleStartedAt: '2026-11-22T10:00:00Z',
+                    unattemptedMetricPosts: 10
+                },
+                coveredWindowDays: 30,
+                hasMoreHistoryForTarget: false
+            }
+        };
+    };
+    await bgPoll.loadSelfReport(true);
+    assert.equal(bgPoll.error, undefined, 'RUNNING background refresh must not throw ReferenceError');
+    assert.equal(bgPoll.state.report.rev, 'stale');
+    assert.equal(scheduledPolls.length, 1, 'RUNNING status schedules workspace refresh poll');
+    await scheduledPolls[0]();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(bgPoll.error, undefined, 'SUCCEEDED poll must reload without ReferenceError');
+    assert.equal(bgPoll.state.report.rev, 'fresh', 'SUCCEEDED poll reloads latest server bundle');
+    assert.equal(bgFetchUrls.filter(u => u.startsWith('/api/analyze/bundle?')).length, 2);
+    assert.doesNotMatch(bgFetchUrls[0], /preferStored=true/, 'forceRefresh must not send preferStored=true');
+    assert.doesNotMatch(bgFetchUrls[bgFetchUrls.length - 1], /refresh=true/, 'post-SUCCEEDED reload must not send refresh=true');
+    assert.doesNotMatch(bgFetchUrls[bgFetchUrls.length - 1], /preferStored=true/, 'post-SUCCEEDED reload must not send preferStored=true');
+
+    // Verified @elidlicom ownerAllPermissions unlocks all periods, schedule access, and 0ms interval immediately
+    const ownerPerms = context();
+    vm.runInContext(
+        section('    function isOwnerAllPermissions(', '    function syncPeriodButtons(')
+        + section('    const MIN_SCHEDULE_INTERVAL_MS =', '    function computeNextAvailableScheduleMs(')
+        + section('    function hasScheduleAccessDecision(', '    function getScheduleLockedReason('),
+        ownerPerms
+    );
+    ownerPerms.state.authStatus = {loggedIn: true, ownerAllPermissions: true, user: {id: '9000', username: 'elidlicom'}};
+    ownerPerms.state.accessPolicy = null;
+    ownerPerms.state.assistantAccess = null;
+    ownerPerms.state.scheduleAccess = null;
+    assert.equal(ownerPerms.isPeriodUnlocked('MONTH'), true, '@elidlicom unlocks 30d immediately before bundle finishes');
+    assert.equal(ownerPerms.isScheduleEligible(), true, '@elidlicom unlocks scheduled tweets immediately');
+    assert.equal(ownerPerms.getRequiredScheduleIntervalMs(), 0, '@elidlicom has 0ms schedule interval without opening Content tab');
+
+    ownerPerms.state.authStatus = {loggedIn: true, ownerAllPermissions: false, user: {id: '9999', username: 'elidlicom'}};
+    assert.equal(ownerPerms.isPeriodUnlocked('MONTH'), false, 'unverified handle spoof does not unlock periods');
+    assert.equal(ownerPerms.getRequiredScheduleIntervalMs(), 3_600_000, 'unverified handle spoof keeps 1h schedule interval');
+
     console.log('auth-state-regression: passed');
 })().catch(err => {console.error(err); process.exitCode = 1;});

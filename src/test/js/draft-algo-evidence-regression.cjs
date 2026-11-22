@@ -51,7 +51,6 @@ const mockState = {
             }
         },
         contentTiming: {
-            goldenSlots: [{ dayOfWeek: 5, hour: 21, label: "周五 21:00" }],
             formatStats: [
                 { formatCode: "MEDIA", formatLabel: "图文/视频", viewSampleCount: 4, avgViews: 620 },
                 { formatCode: "TEXT", formatLabel: "纯文本", viewSampleCount: 5, avgViews: 310 }
@@ -79,7 +78,6 @@ const state = __state;
 const fmtNum = (n) => String(n ?? 0);
 const getQueuedScheduledEpochsMs = () => (state.scheduleJobs || []).map((j) => Number(j.scheduledAtEpochMs));
 const parseDraftItemEpochMs = (it) => Number(it.epochMs || NaN);
-const computeNextGoldenWindowHint = () => "🟢 当前处于本账号历史高活跃窗口";
 ${escapeHtmlSlice}
 ${draftAnalyzerSlice}
 this.__exports = { analyzeDraftByXAlgo, computeUpstreamDiversityMult, buildCalibrationShingleArray, DEFAULT_ALGO_PROFILE };
@@ -121,37 +119,37 @@ mockState.report.algorithmHealth.calibration.corpusSamples = [
     {
         id: "s1", createdLabel: "11-10 21:00", formatCode: "MEDIA", cleanCharLen: 48,
         structuredList: true, hasQuestion: true, hasExternalLink: false, externalDomain: "",
-        activeSlotHit: true, viewCount: 1200, rankPercentile: 92, realizedVmUtilityPer1k: 58.4,
+        viewCount: 1200, rankPercentile: 92, realizedVmUtilityPer1k: 58.4,
         shingles: buildCalibrationShingleArray("系统架构缓存分层与压测性能对比清单"), textPreview: "系统架构缓存分层与压测性能对比清单", tweetUrl: "https://x.com/self_ops/status/s1"
     },
     {
         id: "s2", createdLabel: "11-11 21:00", formatCode: "MEDIA", cleanCharLen: 52,
         structuredList: true, hasQuestion: true, hasExternalLink: false, externalDomain: "",
-        activeSlotHit: true, viewCount: 980, rankPercentile: 80, realizedVmUtilityPer1k: 49.1,
+        viewCount: 980, rankPercentile: 80, realizedVmUtilityPer1k: 49.1,
         shingles: buildCalibrationShingleArray("数据库索引优化与缓存穿透排查步骤"), textPreview: "数据库索引优化与缓存穿透排查步骤", tweetUrl: "https://x.com/self_ops/status/s2"
     },
     {
         id: "s3", createdLabel: "11-12 20:00", formatCode: "MEDIA", cleanCharLen: 44,
         structuredList: false, hasQuestion: true, hasExternalLink: true, externalDomain: "github.com",
-        activeSlotHit: true, viewCount: 760, rankPercentile: 65, realizedVmUtilityPer1k: 41.0,
+        viewCount: 760, rankPercentile: 65, realizedVmUtilityPer1k: 41.0,
         shingles: buildCalibrationShingleArray("开源算法仓库阅读笔记与架构图"), textPreview: "开源算法仓库阅读笔记与架构图", tweetUrl: "https://x.com/self_ops/status/s3"
     },
     {
         id: "s4", createdLabel: "11-12 10:00", formatCode: "TEXT", cleanCharLen: 14,
         structuredList: false, hasQuestion: false, hasExternalLink: false, externalDomain: "",
-        activeSlotHit: false, viewCount: 240, rankPercentile: 38, realizedVmUtilityPer1k: 14.2,
+        viewCount: 240, rankPercentile: 38, realizedVmUtilityPer1k: 14.2,
         shingles: buildCalibrationShingleArray("早上好喝杯咖啡开工"), textPreview: "早上好喝杯咖啡开工", tweetUrl: "https://x.com/self_ops/status/s4"
     },
     {
         id: "s5", createdLabel: "11-13 09:00", formatCode: "TEXT", cleanCharLen: 12,
         structuredList: false, hasQuestion: false, hasExternalLink: false, externalDomain: "",
-        activeSlotHit: false, viewCount: 190, rankPercentile: 22, realizedVmUtilityPer1k: 10.5,
+        viewCount: 190, rankPercentile: 22, realizedVmUtilityPer1k: 10.5,
         shingles: buildCalibrationShingleArray("今天天气不错出去散步"), textPreview: "今天天气不错出去散步", tweetUrl: "https://x.com/self_ops/status/s5"
     },
     {
         id: "s6", createdLabel: "11-14 08:00", formatCode: "TEXT", cleanCharLen: 16,
         structuredList: false, hasQuestion: false, hasExternalLink: true, externalDomain: "bit.ly",
-        activeSlotHit: false, viewCount: 140, rankPercentile: 10, realizedVmUtilityPer1k: 8.1,
+        viewCount: 140, rankPercentile: 10, realizedVmUtilityPer1k: 8.1,
         shingles: buildCalibrationShingleArray("随手转发一个链接"), textPreview: "随手转发一个链接", tweetUrl: "https://x.com/self_ops/status/s6"
     }
 ];

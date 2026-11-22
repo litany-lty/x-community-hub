@@ -240,10 +240,14 @@ public class SharedApiExecutor {
         int spanCap;
         if (initialFetch) {
             spanCap = remainingSpanSeconds >= 12 * 3600L ? sliceCap
-                    : (remainingSpanSeconds >= 6 * 3600L ? Math.min(sliceCap, 6) : Math.min(sliceCap, 4));
+                    : (remainingSpanSeconds >= 6 * 3600L
+                            ? Math.min(sliceCap, Math.max(6, (sliceCap * 3) / 4))
+                            : Math.min(sliceCap, Math.max(4, sliceCap / 2)));
         } else {
             spanCap = remainingSpanSeconds >= 24 * 3600L ? sliceCap
-                    : (remainingSpanSeconds >= 6 * 3600L ? Math.min(sliceCap, 3) : 2);
+                    : (remainingSpanSeconds >= 6 * 3600L
+                            ? Math.min(sliceCap, Math.max(3, (sliceCap * 3) / 4))
+                            : Math.min(sliceCap, Math.max(2, sliceCap / 2)));
         }
         int desired = Math.min(spanCap, Math.min(estimatedPages, Math.max(1, remainingBudget / 2)));
         if (queued > 0 || active > maxSize / 3) {

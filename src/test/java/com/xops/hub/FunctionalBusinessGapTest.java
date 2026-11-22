@@ -57,12 +57,11 @@ class FunctionalBusinessGapTest {
     }
 
     @Test
-    void postsWithoutAnyViewEvidenceDoNotBecomeGoldenPostingRecommendations() {
-        var result = report(List.of(tweet("unobserved", NOW.minusSeconds(100), TweetKind.POST, "", 0)),
+    void postsWithoutAnyViewEvidenceRemainVisibleWithoutInventedMetrics() {
+        var result = report(List.of(metricPost("unobserved", 0, 0, Set.of("views"))),
                 List.of(), List.of(), false);
         assertThat(result.contentTiming().topPosts()).hasSize(1);
-        assertThat(result.contentTiming().heatmapCells().stream().mapToInt(c -> c.postCount()).sum()).isEqualTo(1);
-        assertThat(result.contentTiming().goldenSlots()).isEmpty();
+        assertThat(result.contentTiming().formatStats().get(0).viewSampleCount()).isZero();
     }
 
     @Test
@@ -109,7 +108,6 @@ class FunctionalBusinessGapTest {
         assertThat(format.postCount()).isEqualTo(2);
         assertThat(format.avgViews()).isEqualTo(100);
         assertThat(format.viewSampleCount()).isEqualTo(1);
-        assertThat(result.contentTiming().goldenSlots().get(0).postCount()).isEqualTo(1);
     }
 
     @Test
@@ -130,7 +128,7 @@ class FunctionalBusinessGapTest {
                 List.of(), List.of(), false);
         assertThat(unknownOnly.activity().engagementRateSampleCount()).isZero();
         assertThat(unknownOnly.innerCircle().shareCard().shareTweetText()).contains("平均互动率 --");
-        assertThat(unknownOnly.contentTiming().goldenSlots()).isEmpty();
+        assertThat(unknownOnly.contentTiming().formatStats().get(0).engagementRateSampleCount()).isZero();
     }
 
     @Test

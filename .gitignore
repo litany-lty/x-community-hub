@@ -13,6 +13,7 @@ target/
 .sessions/
 /.local/
 /.serena/
+/.commandcode/
 .env
 .env.*
 !.env.example

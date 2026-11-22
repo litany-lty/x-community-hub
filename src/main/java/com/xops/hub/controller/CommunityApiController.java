@@ -4,6 +4,7 @@ import com.xops.hub.config.RequestSecuritySupport;
 import com.xops.hub.config.UserConcurrencyThrottleFilter;
 import com.xops.hub.config.XOpsProperties;
 import com.xops.hub.model.AnalyticsReportModels.AuthenticatedXUser;
+import com.xops.hub.model.AnalyticsReportModels.BackgroundRefreshStatus;
 import com.xops.hub.model.AnalyticsReportModels.CommunityDashboardReport;
 import com.xops.hub.model.AnalyticsReportModels.MultiPeriodDashboardBundle;
 import com.xops.hub.model.AnalyticsReportModels.ServerCapabilities;
@@ -94,6 +95,7 @@ public class CommunityApiController {
             @RequestParam(value = "refresh", defaultValue = "false") boolean refresh,
             @RequestParam(value = "continueRelations", defaultValue = "false") boolean continueRelations,
             @RequestParam(value = "stored", defaultValue = "false") boolean stored,
+            @RequestParam(value = "preferStored", defaultValue = "false") boolean preferStored,
             HttpServletRequest request,
             jakarta.servlet.http.HttpServletResponse response
     ) {
@@ -106,12 +108,43 @@ public class CommunityApiController {
         MultiPeriodDashboardBundle bundle = stored
                 ? hubService.analyzeStoredAccountBundle(authorizedUsername, accountId)
                 : hubService.analyzeWorkspaceBundle(authorizedUsername, resolvedPeriod, provider, refresh,
-                        clientIp, accountId, continueRelations);
+                        clientIp, accountId, continueRelations, preferStored);
         if (bundle.hours24() != null) verifyReportAccountIsolation(authorizedUsername, bundle.hours24());
         if (bundle.day() != null) verifyReportAccountIsolation(authorizedUsername, bundle.day());
         if (bundle.week() != null) verifyReportAccountIsolation(authorizedUsername, bundle.week());
         if (bundle.month() != null) verifyReportAccountIsolation(authorizedUsername, bundle.month());
         return bundle;
+    }
+
+    @PostMapping("/analyze/bundle/refresh")
+    public BackgroundRefreshStatus requestBundleRefresh(
+            @RequestParam(value = "username", required = false) String username,
+            @RequestParam(value = "period", required = false) String period,
+            @RequestParam(value = "targetDays", required = false) Integer targetDays,
+            @RequestParam(value = "provider", required = false) String provider,
+            HttpServletRequest request,
+            jakarta.servlet.http.HttpServletResponse response
+    ) {
+        applyPrivateNoStoreHeaders(response);
+        RequestSecuritySupport.verifySameOriginForMutation(request);
+        String authorizedUsername = resolveAuthorizedTargetUsername(username, request);
+        CommunityAnalyticsEngine.ReportPeriod resolvedPeriod = parseReportPeriod(
+                period, targetDays, CommunityAnalyticsEngine.ReportPeriod.HOURS_24);
+        return hubService.requestWorkspaceRefresh(authorizedUsername, resolvedPeriod, provider,
+                extractClientIp(request), resolveAuthorizedAccountId(authorizedUsername, request));
+    }
+
+    @GetMapping("/analyze/bundle/refresh/status")
+    public BackgroundRefreshStatus getBundleRefreshStatus(
+            @RequestParam(value = "username", required = false) String username,
+            @RequestParam(value = "provider", required = false) String provider,
+            HttpServletRequest request,
+            jakarta.servlet.http.HttpServletResponse response
+    ) {
+        applyPrivateNoStoreHeaders(response);
+        String authorizedUsername = resolveAuthorizedTargetUsername(username, request);
+        return hubService.workspaceRefreshStatus(authorizedUsername, provider,
+                resolveAuthorizedAccountId(authorizedUsername, request));
     }
 
     @PostMapping("/usage/checkin")

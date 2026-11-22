@@ -1,6 +1,8 @@
 package com.xops.hub.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.xops.hub.assistant.AssistantStore;
+import com.xops.hub.model.ScheduledTweetModels.AssistantSource;
 import com.xops.hub.config.XOpsProperties;
 import com.xops.hub.model.ScheduledTweetModels.BatchConfirmItem;
 import com.xops.hub.model.ScheduledTweetModels.BatchCreateResponse;
@@ -87,8 +89,11 @@ public class ScheduledTweetService {
             String text,
             long scheduledAtEpochMs,
             String clientRequestId,
-            List<MediaUploadInput> uploads
+            List<MediaUploadInput> uploads, AssistantSource assistantSource
     ) {
+        public BatchTweetDraftInput(String text,long time,String key,List<MediaUploadInput> uploads) {
+            this(text,time,key,uploads,null);
+        }
     }
 
     public record MediaFileContent(byte[] bytes, String mimeType, String fileName) {
@@ -105,18 +110,27 @@ public class ScheduledTweetService {
             String accountId,
             String username,
             List<ScheduledTweetJob> jobs,
-            Map<String, String> clientRequestMap
+            Map<String, String> clientRequestMap, Map<String,ScheduledTweetJob> assistantReceipts
     ) {
         static QueueStorage empty(String accountId, String username) {
-            return new QueueStorage(QUEUE_VERSION, accountId, username, new ArrayList<>(), new LinkedHashMap<>());
+            return new QueueStorage(QUEUE_VERSION, accountId, username, new ArrayList<>(), new LinkedHashMap<>(), new LinkedHashMap<>());
         }
 
         QueueStorage mutableCopy(String fallbackUsername) {
             List<ScheduledTweetJob> copyJobs = jobs != null ? new ArrayList<>(jobs) : new ArrayList<>();
             Map<String, String> copyMap = clientRequestMap != null ? new LinkedHashMap<>(clientRequestMap) : new LinkedHashMap<>();
             String resolvedUser = (username != null && !username.isBlank()) ? username : fallbackUsername;
-            return new QueueStorage(QUEUE_VERSION, accountId, resolvedUser, copyJobs, copyMap);
+            return new QueueStorage(QUEUE_VERSION, accountId, resolvedUser, copyJobs, copyMap, assistantReceipts == null ? new LinkedHashMap<>() : new LinkedHashMap<>(assistantReceipts));
         }
+    }
+
+    private AssistantStore assistantStore;
+    @Autowired
+    public void setAssistantStore(AssistantStore assistantStore) { this.assistantStore = assistantStore; }
+
+    private boolean owner(String accountId) {
+        return (assistantStore != null && assistantStore.isOwner(accountId))
+                || (communityHubService != null && communityHubService.isAuthorAccount(accountId, null));
     }
 
     private final XOpsProperties properties;
@@ -313,6 +327,17 @@ public class ScheduledTweetService {
             String clientRequestId,
             List<MediaUploadInput> uploads
     ) {
+        return createScheduledTweet(accountId,username,text,scheduledAtEpochMs,clientRequestId,uploads,null);
+    }
+
+    public ScheduledTweetJob createScheduledTweet(
+            String accountId,
+            String username,
+            String text,
+            long scheduledAtEpochMs,
+            String clientRequestId,
+            List<MediaUploadInput> uploads, AssistantSource source
+    ) {
         validateSafeId(accountId, "accountId");
         if (username == null || username.isBlank()) {
             throw new XDataProviderException(401, "缺少当前登录用户名，请重新登录");
@@ -350,7 +375,11 @@ public class ScheduledTweetService {
             long nowMs = clock.millis();
             boolean overduePromoted = promoteOverdueLocked(queue, nowMs);
             if (!normalizedReqId.isEmpty()) {
+                checkAssistantReplay(queue,normalizedReqId,source);
                 String existingJobId = queue.clientRequestMap().get(normalizedReqId);
+                if(source!=null && existingJobId==null) {
+                    for(var job:queue.jobs()) if(normalizedReqId.equals(job.clientRequestId())) return job;
+                }
                 if (existingJobId != null) {
                     ScheduledTweetJob existing = findJob(queue, existingJobId);
                     if (existing != null) {
@@ -426,7 +455,7 @@ public class ScheduledTweetService {
                         0L,
                         null,
                         null,
-                        null
+                        null, source
                 );
                 queue.jobs().add(job);
                 if (!normalizedReqId.isEmpty()) {
@@ -522,7 +551,7 @@ public class ScheduledTweetService {
         for (int i = 0; i < prepared.size(); i++) {
             for (int j = i + 1; j < prepared.size(); j++) {
                 long diff = Math.abs(prepared.get(i).scheduledAtEpochMs() - prepared.get(j).scheduledAtEpochMs());
-                if (diff < MIN_TWEET_INTERVAL_MS) {
+                if (diff < MIN_TWEET_INTERVAL_MS && !owner(accountId)) {
                     throw new XDataProviderException(
                             409,
                             String.format("第 %d 条与第 %d 条定时推文间隔不足 1 小时，每条定时推文之间必须至少间隔 1 小时", i + 1, j + 1)
@@ -547,9 +576,15 @@ public class ScheduledTweetService {
             // 整批幂等重放：若全部 clientRequestId 均已存在，直接返回原已创建的记录列表
             List<ScheduledTweetJob> idempotentHits = new ArrayList<>(prepared.size());
             int hitCount = 0;
-            for (PreparedDraftItem item : prepared) {
+            for (int index=0; index<prepared.size(); index++) {
+                var item=prepared.get(index);
+                var source=drafts.get(index).assistantSource();
                 if (!item.clientRequestId().isEmpty()) {
+                    checkAssistantReplay(queue,item.clientRequestId(),source);
                     String existingId = queue.clientRequestMap().get(item.clientRequestId());
+                    if(existingId==null && source!=null) {
+                        for(var job:queue.jobs()) if(item.clientRequestId().equals(job.clientRequestId())) existingId=job.id();
+                    }
                     if (existingId != null) {
                         ScheduledTweetJob existingJob = findJob(queue, existingId);
                         if (existingJob != null) {
@@ -651,7 +686,7 @@ public class ScheduledTweetService {
                             0L,
                             null,
                             null,
-                            null
+                            null, drafts.get(idx).assistantSource()
                     );
                     createdJobs.add(job);
                 }
@@ -821,6 +856,16 @@ public class ScheduledTweetService {
             long scheduledAtEpochMs,
             String text
     ) {
+        return rescheduleJob(accountId,username,jobId,scheduledAtEpochMs,text,null);
+    }
+
+    private ScheduledTweetJob rescheduleJob(
+            String accountId,
+            String username,
+            String jobId,
+            long scheduledAtEpochMs,
+            String text, AssistantSource source
+    ) {
         validateSafeId(accountId, "accountId");
         validateSafeId(jobId, "jobId");
         requireScheduledPublishEligible(accountId, username);
@@ -873,6 +918,7 @@ public class ScheduledTweetService {
             }
             if (!isActiveStatus(current.status())) assertActiveQueueCapacityLocked(queue, 1);
             ScheduledTweetJob updated = current.reschedule(scheduledAtEpochMs, nextText, nextFingerprint, nowMs);
+            if(source!=null) updated=updated.withAssistantSource(source);
             queue.jobs().set(idx, updated);
             saveQueueLocked(queue);
             return updated;
@@ -896,9 +942,53 @@ public class ScheduledTweetService {
             writeDurableJson(accountDir.resolve("scheduled_publish_budget_v1.json"),
                     new DailyPublishCounter(accountId, localDateStringFor(clock.millis()),
                             dailyPublishUsedLocked(queue, clock.millis())));
+            if(current.assistantSource()!=null) queue.assistantReceipts().put(current.clientRequestId(),current);
             queue.jobs().remove(idx);
             saveQueueLocked(queue);
             deleteDirectoryQuietly(resolveJobMediaDir(accountId, jobId));
+        }
+    }
+
+    private static void checkAssistantReplay(QueueStorage queue,String key,AssistantSource source) {
+        if(queue.assistantReceipts().containsKey(key)) throw new XDataProviderException(409,"该发布意图已有删除回执");
+        for(var job:queue.jobs()) {
+            if(!key.equals(job.clientRequestId())) continue;
+            var stored=job.assistantSource();
+            if(source==null && stored==null) return;
+            if(source==null || stored==null || !Objects.equals(source.requestDigest(),stored.requestDigest()))
+                throw new XDataProviderException(409,"该发布意图与原请求不符");
+            return;
+        }
+    }
+
+    /** Read queue and durable deletion receipts together, without dispatching. */
+    public record AssistantQueueEntry(ScheduledTweetJob job,boolean deleted) {}
+
+    public List<AssistantQueueEntry> assistantJobs(String accountId) {
+        validateSafeId(accountId,"accountId");
+        synchronized(accountLock(accountId)) {
+            var queue=loadQueueLocked(accountId,"");
+            var records=new ArrayList<AssistantQueueEntry>();
+            queue.assistantReceipts().values().forEach(j->records.add(new AssistantQueueEntry(j,true)));
+            queue.jobs().stream().filter(j->j.assistantSource()!=null).forEach(j->records.add(new AssistantQueueEntry(j,false)));
+            return records;
+        }
+    }
+
+    public ScheduledTweetJob updateAssistantJob(String accountId,String username,String jobId,long expectedTime,
+                                                String text,AssistantSource source) {
+        synchronized(accountLock(accountId)) {
+            var queue=loadQueueLocked(accountId,username);
+            var old=findJob(queue,jobId);
+            if(old==null || old.assistantSource()==null || !source.intentId().equals(old.assistantSource().intentId()))
+                throw new XDataProviderException(409,"排期来源已变更");
+            if(Objects.equals(old.assistantSource().updateOperationId(),source.updateOperationId())) {
+                if(old.assistantSource().equals(source) && old.text().equals(text)) return old;
+                throw new XDataProviderException(409,"更新请求标识已用于其他版本");
+            }
+            if(old.status()!=ScheduledTweetStatus.SCHEDULED || old.updatedAtEpochMs()!=expectedTime)
+                throw new XDataProviderException(409,"排期状态或版本已变化");
+            return rescheduleJob(accountId,username,jobId,old.scheduledAtEpochMs(),text,source);
         }
     }
 
@@ -1398,6 +1488,7 @@ public class ScheduledTweetService {
             String excludeJobId,
             String itemPrefix
     ) {
+        if (owner(queue.accountId())) return;
         for (ScheduledTweetJob existing : queue.jobs()) {
             if (existing.status() != ScheduledTweetStatus.SCHEDULED) {
                 continue;
@@ -1436,6 +1527,7 @@ public class ScheduledTweetService {
     }
 
     private void assertActiveQueueCapacityLocked(QueueStorage queue, int addingCount) {
+        if (owner(queue.accountId())) return;
         int activeCount = 0;
         for (ScheduledTweetJob job : queue.jobs()) {
             if (isActiveStatus(job.status())) {
@@ -1453,7 +1545,7 @@ public class ScheduledTweetService {
     private void assertStoredQueueCapacityLocked(QueueStorage queue, int adding, long mediaBytes) {
         long storedBytes = queue.jobs().stream().flatMap(job -> job.media().stream())
                 .mapToLong(asset -> Math.max(0L, asset.sizeBytes())).sum();
-        if ((long) queue.jobs().size() + adding > MAX_STORED_JOBS_PER_ACCOUNT
+        if ((!owner(queue.accountId()) && (long) queue.jobs().size() + adding > MAX_STORED_JOBS_PER_ACCOUNT)
                 || storedBytes + mediaBytes > MAX_STORED_MEDIA_BYTES_PER_ACCOUNT) {
             throw new XDataProviderException(429, "定时推文保存空间已满，请删除不再需要的历史记录后重试");
         }
@@ -1506,6 +1598,7 @@ public class ScheduledTweetService {
     }
 
     private void assertDailyPublishQuotaAvailableLocked(QueueStorage queue, long nowMs, int addingToday) {
+        if (owner(queue.accountId())) return;
         int limit = properties.getDailyTweetPublishLimitPerUser();
         if (limit <= 0) throw new XDataProviderException(429, "定时发布额度已关闭");
         int used = dailyPublishUsedLocked(queue, nowMs);

@@ -1,11 +1,20 @@
 package com.xops.hub.config;
 
+import com.xops.hub.controller.ApiExceptionHandler;
 import com.xops.hub.provider.XDataProviderException;
 import org.junit.jupiter.api.Test;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.MediaType;
 import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.mock.web.MockHttpServletResponse;
 import org.springframework.test.util.ReflectionTestUtils;
+import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.setup.MockMvcBuilders;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.servlet.resource.NoResourceFoundException;
 
+import java.io.IOException;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
@@ -15,6 +24,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 class RequestBoundaryHardeningTest {
     private static final Clock FIXED_CLOCK = Clock.fixed(Instant.parse("2026-11-15T01:00:00Z"), ZoneOffset.UTC);
@@ -194,6 +207,68 @@ class RequestBoundaryHardeningTest {
         assertThat(blocked.getStatus()).isEqualTo(429);
         assertThat((Map<?, ?>) ReflectionTestUtils.getField(shield, "ipApiCounters")).hasSizeLessThanOrEqualTo(4096);
         assertThat((Map<?, ?>) ReflectionTestUtils.getField(shield, "ipMaliceBox")).hasSizeLessThanOrEqualTo(4096);
+    }
+
+    @Test
+    void metaInfWebInfAndNonApiPostsAreStoppedAtShieldBoundary() throws Exception {
+        var shield = shield(new XOpsProperties());
+        for (String probe : new String[] {
+                "/s/6373e28/_/;/META-INF/maven/com.atlassian.jira/pom.xml",
+                "/WEB-INF/web.xml",
+                "/%2fmeta-inf/MANIFEST.MF"
+        }) {
+            var res = new MockHttpServletResponse();
+            shield.doFilter(request("GET", probe, "203.0.113.40"), res,
+                    (req, r) -> { throw new AssertionError("META-INF/WEB-INF probe bypassed shield: " + probe); });
+            assertThat(res.getStatus()).isEqualTo(404);
+        }
+
+        var postRoot = new MockHttpServletResponse();
+        var postReq = request("POST", "/", "203.0.113.41");
+        postReq.setServletPath("/");
+        shield.doFilter(postReq, postRoot,
+                (req, r) -> { throw new AssertionError("POST / reached static resource handler"); });
+        assertThat(postRoot.getStatus()).isEqualTo(405);
+        assertThat(postRoot.getHeader("Allow")).isEqualTo("GET, HEAD, OPTIONS");
+    }
+
+    @Test
+    void apiExceptionHandlerHandlesRestrictiveAcceptAndClientDisconnectCleanly() throws Exception {
+        MockMvc mvc = MockMvcBuilders.standaloneSetup(new ExceptionProbeController())
+                .setControllerAdvice(new ApiExceptionHandler())
+                .build();
+
+        mvc.perform(get("/probe/not-found").accept(MediaType.valueOf("image/webp")))
+                .andExpect(status().isNotFound())
+                .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_JSON))
+                .andExpect(jsonPath("$.error").exists());
+
+        mvc.perform(get("/probe/boom").accept(MediaType.valueOf("text/css")))
+                .andExpect(status().isInternalServerError())
+                .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_JSON))
+                .andExpect(jsonPath("$.error").value("INTERNAL_ERROR"));
+
+        mvc.perform(get("/probe/broken-pipe").accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(content().string(""));
+    }
+
+    @RestController
+    static class ExceptionProbeController {
+        @GetMapping("/probe/not-found")
+        String notFound() throws NoResourceFoundException {
+            throw new NoResourceFoundException(HttpMethod.GET, "missing.webp");
+        }
+
+        @GetMapping("/probe/boom")
+        String boom() {
+            throw new IllegalStateException("unexpected failure");
+        }
+
+        @GetMapping("/probe/broken-pipe")
+        String brokenPipe() throws IOException {
+            throw new IOException("ServletOutputStream failed to write: java.io.IOException: Broken pipe");
+        }
     }
 
     private static MaliciousRequestShieldFilter shield(XOpsProperties props) {

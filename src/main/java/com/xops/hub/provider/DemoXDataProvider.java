@@ -63,7 +63,7 @@ public class DemoXDataProvider {
 
     private static final String[] POST_TEMPLATES = {
             "复盘了过去两周在 X 做社区冷启动的数据：与其每天硬憋 5 条自嗨推文，不如发 1 条有信息密度的实战复盘 + 认真去 15 位同频推友评论区写有观点的回复，主页回访率直接翻了 2.6 倍。",
-            "整理了一份「独立开发者 X 账号从 0 到 5000 铁粉」的每日 45 分钟运营清单：\n1. 早间黄金档发 1 条踩坑/数据对比贴\n2. 围绕 10 个核心互暖推友做深度补充评论\n3. 每周定期清理零互动无效关注，保持健康关注比\n长推拆解如下 🧵👇",
+            "整理了一份「独立开发者 X 账号从 0 到 5000 铁粉」的每日 45 分钟运营清单：\n1. 发 1 条踩坑/数据对比贴\n2. 围绕 10 个核心互暖推友做深度补充评论\n3. 每周定期清理零互动无效关注，保持健康关注比\n长推拆解如下 🧵👇",
             "刚把新产品的暗黑模式交互细节打磨完，顺手贴一张前后对比图。大家觉得纯黑 #000000 还是暗夜蓝 #15202B 更耐看？欢迎评论区聊聊你的日常偏好 👇",
             "很多人忽略了 X 算法里的一个高权重信号：「双向对话深度」。当推友来你评论区留言，你在 30 分钟内接住话题形成二次来回回复，这条推文的推荐池明显会被推高一档。",
             "本周 #BuildInPublic 进度汇报：\n✅ 完成核心分析引擎重构，接口延迟压到 15ms 内\n✅ 新增关注关系智能分类（自动区分行业大V与零互动沉睡号，防误删）\n✅ 支持一键生成战报长图\n感谢这几天帮忙内测提建议的推友们！",
@@ -147,7 +147,7 @@ public class DemoXDataProvider {
         int quoteCount = 4 + rng.nextInt(5);
 
         List<String> myPostIds = new ArrayList<>();
-        // 生成原创推文（偏好周二/周四晚 21:00 与上午 09:30 的黄金窗口，让热力图与诊断有真实规律）
+        // 生成原创推文，覆盖多种发布时间与内容体裁。
         int[] preferredHours = {21, 21, 20, 9, 10, 22, 14, 19, 12, 23};
         for (int i = 0; i < postCount; i++) {
             int daysAgo = rng.nextInt(29);
@@ -167,8 +167,8 @@ public class DemoXDataProvider {
             boolean isThread = tpl.contains("🧵") || (i % 5 == 0);
             boolean hasMedia = !isThread && (tpl.contains("对比图") || i % 2 == 0);
 
-            boolean isGoldenHour = (hour >= 20 && hour <= 22) || (hour == 9);
-            double mult = (isGoldenHour ? 1.45 : 0.9) * (isThread ? 1.35 : (hasMedia ? 1.2 : 0.95));
+            boolean isHighTrafficHour = (hour >= 20 && hour <= 22) || (hour == 9);
+            double mult = (isHighTrafficHour ? 1.45 : 0.9) * (isThread ? 1.35 : (hasMedia ? 1.2 : 0.95));
             long views = Math.round((1800 + rng.nextInt(5200)) * mult);
             int likes = (int) Math.round(views * (0.022 + rng.nextDouble() * 0.026));
             int replies = (int) Math.round(views * (0.005 + rng.nextDouble() * 0.010));

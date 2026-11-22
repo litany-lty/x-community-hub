@@ -5,7 +5,9 @@ import hashlib
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -29,6 +31,45 @@ def isolated_environment():
         }:
             env.pop(key, None)
     return env
+
+
+def load_local_minimax(env, path):
+    keys = {"MINIMAX_API_KEY", "MINIMAX_BASE_URL"}
+    with path.expanduser().open(encoding="utf-8") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            fail("MiniMax environment file must be a regular file owned by this user and private (0600).")
+        values = {}
+        for line in stream:
+            match = re.match(r"\s*(?:export\s+)?(MINIMAX_API_KEY|MINIMAX_BASE_URL)\s*=(.*)", line)
+            if not match:
+                continue
+            name, raw = match.groups()
+            try:
+                parts = shlex.split(raw, comments=True)
+            except ValueError:
+                fail("Invalid value in MiniMax environment file.")
+            if name in values or len(parts) != 1 or not parts[0]:
+                fail("Invalid or duplicate value in MiniMax environment file.")
+            values[name] = parts[0]
+    if "MINIMAX_API_KEY" not in values:
+        fail("MiniMax environment file does not configure MINIMAX_API_KEY.")
+    for key in keys:
+        env.pop(key, None)
+    env.update(values)
+    env["X_CONTENT_ASSISTANT_MODEL_PROVIDER"] = "minimax"
+
+
+def local_minimax_file(explicit):
+    if explicit is not None:
+        return explicit
+    pointer = PROJECT / ".local" / "content-assistant-minimax-env"
+    if pointer.is_file():
+        path = pointer.read_text(encoding="utf-8").strip()
+        if not path or not Path(path).expanduser().is_absolute():
+            fail("Local MiniMax environment pointer must contain one absolute dotenv path.")
+        return Path(path)
+    return None
 
 
 def java17(env):
@@ -81,7 +122,11 @@ def main():
     parser.add_argument("--runtime-dir", type=Path, help="required existing production runtime directory")
     parser.add_argument("--public-url", default="https://x.life-benchmark.com",
                         help="production HTTPS public origin")
+    parser.add_argument("--minimax-env-file", type=Path,
+                        help="local only: load MiniMax configuration from an existing private dotenv file")
     args = parser.parse_args()
+    if args.minimax_env_file is not None and args.mode != "local":
+        parser.error("--minimax-env-file is only supported in local mode.")
     port = args.port if args.port is not None else (0 if args.mode == "preview" else 8080)
     if not 0 <= port <= 65535 or (args.mode != "preview" and port == 0):
         parser.error("--port must be 1..65535 (preview also accepts 0).")
@@ -126,6 +171,24 @@ def main():
     if args.mode != "preview" and not has_private_config and not os.environ.get("X_OAUTH_CLIENT_ID", "").strip():
         fail("The selected environment requires its own application-local.yml or X_OAUTH_CLIENT_ID environment configuration.")
     env = isolated_environment()
+    if args.mode == "local":
+        minimax_file = local_minimax_file(args.minimax_env_file)
+        if minimax_file is not None:
+            try:
+                load_local_minimax(env, minimax_file)
+            except (OSError, UnicodeError):
+                fail("Could not read the local MiniMax environment file.")
+        doh = PROJECT / ".local" / "content-assistant-doh-url"
+        if doh.is_file() and not env.get("X_CONTENT_ASSISTANT_DOH_URL"):
+            try:
+                env["X_CONTENT_ASSISTANT_DOH_URL"] = doh.read_text(encoding="utf-8").strip()
+            except (OSError, UnicodeError):
+                fail("Could not read the local content assistant DNS configuration.")
+    if args.mode == "preview":
+        for key in ("X_CONTENT_ASSISTANT_MODEL_PROVIDER", "X_CONTENT_ASSISTANT_COMMANDCODE_API_KEY",
+                    "X_CONTENT_ASSISTANT_COMMANDCODE_BASE_URL", "X_CONTENT_ASSISTANT_DOH_URL",
+                    "MINIMAX_API_KEY", "MINIMAX_BASE_URL"):
+            env.pop(key, None)
     java = java17(env)
     runtime.mkdir(parents=True, exist_ok=True)
     immutable_jar, digest = stage_jar(source, runtime)
@@ -155,6 +218,7 @@ def main():
         options.update({
             "xops.default-provider": "DEMO",
             "xops.fxtwitter-enabled": "false",
+            "xops.top10-silent-history-enabled": "false",
             "xops.twitterapi-io-key": "",
             "xops.official-bearer-token": "",
             "xops.oauth-client-id": "",

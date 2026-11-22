@@ -408,6 +408,32 @@ class FxTwitterClientTest {
         assertThat(client.supports("https://paid.example/twitter/user/followers?userName=Self")).isFalse();
     }
 
+    @Test
+    void search503UnavailableOpensSearchCircuitBreakerWhileKeepingProfileAndStatusEnabled() throws Exception {
+        String search = searchUrl("from:Self since_time:190 until_time:220", "");
+        handler = exchange -> {
+            if (exchange.getRequestURI().getPath().equals("/2/search")) {
+                return new Reply(503, "{\"code\":503,\"message\":\"X/Twitter search is unavailable due to current API limitations.\"}");
+            }
+            if (exchange.getRequestURI().getPath().equals("/2/profile/Self")) {
+                return json(mapper.createObjectNode().put("code", 200).set("user", user("100", "Self")));
+            }
+            return json(mapper.createObjectNode().put("code", 200).set("status", status("101", 200)));
+        };
+
+        assertThat(client.supports("https://paid.example" + search)).isTrue();
+        assertFailed(search);
+        assertThat(seen).hasSize(1);
+
+        // Circuit breaker is now open for /search, avoiding repeated wasted calls/timeouts
+        assertThat(client.supports("https://paid.example" + search)).isFalse();
+        // Profile and status endpoints remain active on FxTwitter
+        assertThat(client.supports("https://paid.example/twitter/user/info?userName=Self")).isTrue();
+        assertThat(client.supports("https://paid.example/twitter/tweets?tweet_ids=101")).isTrue();
+        JsonNode profile = fetch("/twitter/user/info?userName=Self", new AtomicBoolean());
+        assertThat(profile.path("data").path("id").asText()).isEqualTo("100");
+    }
+
     private JsonNode fetch(String path, AtomicBoolean started) throws Exception {
         return client.fetchAsync("https://paid.example" + path, Instant.now().plusSeconds(5), started).get(6, TimeUnit.SECONDS);
     }

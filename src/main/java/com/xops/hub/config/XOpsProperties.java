@@ -8,6 +8,7 @@ public class XOpsProperties {
     private String defaultProvider = "TWITTERAPI_IO";
     private String twitterapiIoKey = "";
     private String twitterapiIoBaseUrl = "https://api.twitterapi.io";
+    private Boolean splitInboundSearchQueries;
     private boolean fxtwitterEnabled = false;
     private String fxtwitterBaseUrl = "https://api.fxtwitter.com/2";
     private String oauthClientId = "";
@@ -34,6 +35,8 @@ public class XOpsProperties {
     private long scheduleGraceWindowSeconds = 300L;
     private boolean top50AutoSyncEnabled = true;
     private String top50AutoSyncCron = "0 20 23 * * *";
+    private boolean top10SilentHistoryEnabled = false;
+    private long top10SilentHistoryPollMs = 45000L;
     private String algoProfilePath = "./.cache/x-algorithm-profile.json";
     private int maxConcurrentUsers = 50;
     private int maxThrottleQueueSize = 150;
@@ -73,6 +76,14 @@ public class XOpsProperties {
 
     public void setTwitterapiIoBaseUrl(String twitterapiIoBaseUrl) {
         this.twitterapiIoBaseUrl = twitterapiIoBaseUrl;
+    }
+
+    public Boolean getSplitInboundSearchQueries() {
+        return splitInboundSearchQueries;
+    }
+
+    public void setSplitInboundSearchQueries(Boolean splitInboundSearchQueries) {
+        this.splitInboundSearchQueries = splitInboundSearchQueries;
     }
 
     public boolean isFxtwitterEnabled() {
@@ -387,6 +398,22 @@ public class XOpsProperties {
     public void setMonthlyUpstreamUsdBudget(String value) { monthlyUpstreamUsdBudget = value; }
     public String getUnpricedUpstreamRequestReserveUsd() { return unpricedUpstreamRequestReserveUsd; }
     public void setUnpricedUpstreamRequestReserveUsd(String value) { unpricedUpstreamRequestReserveUsd = value; }
+
+    public boolean isTop10SilentHistoryEnabled() {
+        return top10SilentHistoryEnabled;
+    }
+
+    public void setTop10SilentHistoryEnabled(boolean top10SilentHistoryEnabled) {
+        this.top10SilentHistoryEnabled = top10SilentHistoryEnabled;
+    }
+
+    public long getTop10SilentHistoryPollMs() {
+        return top10SilentHistoryPollMs;
+    }
+
+    public void setTop10SilentHistoryPollMs(long top10SilentHistoryPollMs) {
+        this.top10SilentHistoryPollMs = top10SilentHistoryPollMs;
+    }
 
     public boolean hasTwitterApiIoKey() {
         return twitterapiIoKey != null && !twitterapiIoKey.isBlank();

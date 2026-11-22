@@ -96,6 +96,8 @@ class UpstreamBudgetGuardTest {
             .isInstanceOf(XDataProviderException.class);
     }
     @Test void estimatesUseResourceCountsAndUnknownEndpointsCannotBypassAccounting() {
+        assertThat(UpstreamBudgetGuard.estimateMicros(URI.create("https://api.twitterapi.io/twitter/article?tweet_id=1"),
+                "twitterapi_io_read",200_000)).isEqualTo(1_000);
         assertThat(UpstreamBudgetGuard.estimateMicros(URI.create("https://api.twitterapi.io/twitter/tweets?tweet_ids=1%2C2%2C3"),
             "twitterapi_io_read", 200000)).isEqualTo(450);
         assertThat(UpstreamBudgetGuard.estimateMicros(URI.create("https://api.x.com/2/users/1/followers?max_results=200"),

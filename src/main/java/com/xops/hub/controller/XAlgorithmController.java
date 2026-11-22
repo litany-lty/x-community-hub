@@ -5,9 +5,8 @@ import com.xops.hub.config.XOpsProperties;
 import com.xops.hub.model.AnalyticsReportModels.AuthenticatedXUser;
 import com.xops.hub.model.XAlgorithmProfile;
 import com.xops.hub.provider.XDataProviderException;
-import com.xops.hub.service.CommunityHubService;
 import com.xops.hub.service.XAlgorithmProfileRegistry;
-import com.xops.hub.util.HandleNormalizer;
+import com.xops.hub.assistant.AssistantStore;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import jakarta.servlet.http.HttpSession;
@@ -36,7 +35,10 @@ public class XAlgorithmController {
     private final XOpsProperties properties;
     private final XAlgorithmProfileRegistry registry;
 
-    public XAlgorithmController(XOpsProperties properties, XAlgorithmProfileRegistry registry) {
+    private final AssistantStore assistantStore;
+
+    public XAlgorithmController(XOpsProperties properties, XAlgorithmProfileRegistry registry, AssistantStore assistantStore) {
+        this.assistantStore=assistantStore;
         this.properties = properties;
         this.registry = registry;
     }
@@ -89,8 +91,7 @@ public class XAlgorithmController {
         if (authUser != null
                 && authUser.id() != null && !authUser.id().isBlank()
                 && authUser.username() != null && !authUser.username().isBlank()) {
-            String normalized = HandleNormalizer.normalize(authUser.username());
-            if (CommunityHubService.AUTHOR_USERNAME.equalsIgnoreCase(normalized)) {
+            if (assistantStore.authorize(authUser)) {
                 return true;
             }
         }

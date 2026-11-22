@@ -44,6 +44,9 @@ public final class ScheduledTweetModels {
         }
     }
 
+    public record AssistantSource(String intentId, String draftId, int draftVersion, String topicId,
+                                  int topicVersion, String researchId, String requestDigest, String updateOperationId) {}
+
     @JsonInclude(JsonInclude.Include.NON_NULL)
     public record ScheduledTweetJob(
             String id,
@@ -67,7 +70,8 @@ public final class ScheduledTweetModels {
             long publishedAtEpochMs,
             String publishedTweetId,
             String publishedTweetUrl,
-            String lastError
+            String lastError,
+            AssistantSource assistantSource
     ) {
         public ScheduledTweetJob {
             text = text == null ? "" : text;
@@ -76,13 +80,20 @@ public final class ScheduledTweetModels {
             overdueReason = overdueReason == null ? OverdueReason.NONE : overdueReason;
         }
 
+        public ScheduledTweetJob withAssistantSource(AssistantSource source) {
+            return new ScheduledTweetJob(id,accountId,username,text,media,scheduledAtEpochMs,status,overdueReason,
+                    uncertainDelivery,postRequestDispatched,confirmToken,clientRequestId,contentFingerprint,
+                    attemptCount,createdAtEpochMs,updatedAtEpochMs,confirmedAtEpochMs,sendingStartedAtEpochMs,
+                    publishedAtEpochMs,publishedTweetId,publishedTweetUrl,lastError,source);
+        }
+
         public ScheduledTweetJob withMedia(List<ScheduledMediaAsset> nextMedia, long nowMs) {
             return new ScheduledTweetJob(
                     id, accountId, username, text, nextMedia, scheduledAtEpochMs,
                     status, overdueReason, uncertainDelivery, postRequestDispatched,
                     confirmToken, clientRequestId, contentFingerprint, attemptCount,
                     createdAtEpochMs, nowMs, confirmedAtEpochMs, sendingStartedAtEpochMs,
-                    publishedAtEpochMs, publishedTweetId, publishedTweetUrl, lastError
+                    publishedAtEpochMs, publishedTweetId, publishedTweetUrl, lastError, assistantSource
             );
         }
 
@@ -92,7 +103,7 @@ public final class ScheduledTweetModels {
                     status, overdueReason, uncertainDelivery, true,
                     confirmToken, clientRequestId, contentFingerprint, attemptCount,
                     createdAtEpochMs, nowMs, confirmedAtEpochMs, sendingStartedAtEpochMs,
-                    publishedAtEpochMs, publishedTweetId, publishedTweetUrl, lastError
+                    publishedAtEpochMs, publishedTweetId, publishedTweetUrl, lastError, assistantSource
             );
         }
 
@@ -102,7 +113,7 @@ public final class ScheduledTweetModels {
                     ScheduledTweetStatus.SENDING, overdueReason, uncertainDelivery, false,
                     null, clientRequestId, contentFingerprint, attemptCount + 1,
                     createdAtEpochMs, nowMs, confirmedAtEpochMs, nowMs,
-                    publishedAtEpochMs, publishedTweetId, publishedTweetUrl, null
+                    publishedAtEpochMs, publishedTweetId, publishedTweetUrl, null, assistantSource
             );
         }
 
@@ -118,7 +129,7 @@ public final class ScheduledTweetModels {
                     ScheduledTweetStatus.OVERDUE_CONFIRM_REQUIRED, reason, uncertain, postRequestDispatched,
                     newConfirmToken, clientRequestId, contentFingerprint, attemptCount,
                     createdAtEpochMs, nowMs, confirmedAtEpochMs, sendingStartedAtEpochMs,
-                    publishedAtEpochMs, publishedTweetId, publishedTweetUrl, errorMessage
+                    publishedAtEpochMs, publishedTweetId, publishedTweetUrl, errorMessage, assistantSource
             );
         }
 
@@ -128,7 +139,7 @@ public final class ScheduledTweetModels {
                     ScheduledTweetStatus.RESEND_QUEUED, overdueReason, uncertainDelivery, postRequestDispatched,
                     null, clientRequestId, contentFingerprint, attemptCount,
                     createdAtEpochMs, nowMs, nowMs, sendingStartedAtEpochMs,
-                    publishedAtEpochMs, publishedTweetId, publishedTweetUrl, null
+                    publishedAtEpochMs, publishedTweetId, publishedTweetUrl, null, assistantSource
             );
         }
 
@@ -138,7 +149,7 @@ public final class ScheduledTweetModels {
                     ScheduledTweetStatus.PUBLISHED, OverdueReason.NONE, false, true,
                     null, clientRequestId, contentFingerprint, attemptCount,
                     createdAtEpochMs, nowMs, confirmedAtEpochMs, sendingStartedAtEpochMs,
-                    nowMs, tweetId, tweetUrl, null
+                    nowMs, tweetId, tweetUrl, null, assistantSource
             );
         }
 
@@ -148,7 +159,7 @@ public final class ScheduledTweetModels {
                     ScheduledTweetStatus.FAILED, OverdueReason.NONE, false, false,
                     newConfirmToken, clientRequestId, contentFingerprint, attemptCount,
                     createdAtEpochMs, nowMs, confirmedAtEpochMs, sendingStartedAtEpochMs,
-                    publishedAtEpochMs, publishedTweetId, publishedTweetUrl, errorMessage
+                    publishedAtEpochMs, publishedTweetId, publishedTweetUrl, errorMessage, assistantSource
             );
         }
 
@@ -158,7 +169,7 @@ public final class ScheduledTweetModels {
                     ScheduledTweetStatus.CANCELLED, OverdueReason.NONE, false, false,
                     null, clientRequestId, contentFingerprint, attemptCount,
                     createdAtEpochMs, nowMs, confirmedAtEpochMs, sendingStartedAtEpochMs,
-                    publishedAtEpochMs, publishedTweetId, publishedTweetUrl, null
+                    publishedAtEpochMs, publishedTweetId, publishedTweetUrl, null, assistantSource
             );
         }
 
@@ -168,7 +179,7 @@ public final class ScheduledTweetModels {
                     ScheduledTweetStatus.SCHEDULED, OverdueReason.NONE, false, false,
                     null, clientRequestId, nextFingerprint, attemptCount,
                     createdAtEpochMs, nowMs, 0L, 0L,
-                    publishedAtEpochMs, publishedTweetId, publishedTweetUrl, null
+                    publishedAtEpochMs, publishedTweetId, publishedTweetUrl, null, assistantSource
             );
         }
     }
@@ -234,8 +245,9 @@ public final class ScheduledTweetModels {
     public record BatchCreateItemMeta(
             String text,
             long scheduledAtEpochMs,
-            String clientRequestId
+            String clientRequestId, String assistantDraftId, Integer assistantDraftVersion
     ) {
+        public BatchCreateItemMeta(String text,long time,String key) { this(text,time,key,null,null); }
     }
 
     public record BatchCreateResponse(

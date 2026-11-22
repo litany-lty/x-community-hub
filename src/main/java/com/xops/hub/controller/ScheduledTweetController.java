@@ -1,5 +1,6 @@
 package com.xops.hub.controller;
 
+import com.xops.hub.assistant.AssistantPublishing;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.xops.hub.config.RequestSecuritySupport;
@@ -46,6 +47,9 @@ public class ScheduledTweetController {
 
     private final ScheduledTweetService scheduledTweetService;
     private final ObjectMapper objectMapper;
+    @Autowired
+    void setAssistantPublishing(AssistantPublishing publishing) { this.publishing=publishing; }
+    private AssistantPublishing publishing;
 
     public ScheduledTweetController(ScheduledTweetService scheduledTweetService) {
         this(scheduledTweetService, new ObjectMapper());
@@ -85,14 +89,17 @@ public class ScheduledTweetController {
                 }
             }
         }
-        return scheduledTweetService.createScheduledTweet(
-                user.id(),
-                user.username(),
-                text,
-                scheduledAtEpochMs,
-                clientRequestId,
-                uploads
-        );
+        String draftId=request.getParameter("assistantDraftId");
+        String rawVersion=request.getParameter("assistantDraftVersion");
+        if(draftId==null && rawVersion==null)
+            return scheduledTweetService.createScheduledTweet(user.id(),user.username(),text,scheduledAtEpochMs,clientRequestId,uploads);
+        Integer version;
+        try { version=rawVersion==null?null:Integer.valueOf(rawVersion); }
+        catch(NumberFormatException ex) { throw new IllegalArgumentException("稿件版本格式无效"); }
+        var source=publishing.prepare(user.id(),draftId,version,clientRequestId,text,scheduledAtEpochMs,uploads);
+        var job=scheduledTweetService.createScheduledTweet(user.id(),user.username(),text,scheduledAtEpochMs,clientRequestId,uploads,source);
+        publishing.record(job);
+        return job;
     }
 
     @PostMapping(value = "/batch", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
@@ -133,15 +140,20 @@ public class ScheduledTweetController {
                     }
                 }
             }
+            var source=meta.assistantDraftId()==null && meta.assistantDraftVersion()==null ? null
+                    : publishing.prepare(user.id(),meta.assistantDraftId(),meta.assistantDraftVersion(),
+                            meta.clientRequestId(),meta.text(),meta.scheduledAtEpochMs(),uploads);
             drafts.add(new BatchTweetDraftInput(
                     meta.text(),
                     meta.scheduledAtEpochMs(),
                     meta.clientRequestId(),
-                    uploads
+                    uploads,source
             ));
         }
 
-        return scheduledTweetService.createBatchScheduledTweets(user.id(), user.username(), drafts);
+        var result=scheduledTweetService.createBatchScheduledTweets(user.id(), user.username(), drafts);
+        if(result!=null && publishing!=null) result.created().forEach(publishing::record);
+        return result;
     }
 
     @PostMapping("/{id}/confirm-resend")

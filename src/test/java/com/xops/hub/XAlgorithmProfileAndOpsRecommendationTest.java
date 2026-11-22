@@ -215,7 +215,10 @@ class XAlgorithmProfileAndOpsRecommendationTest {
 
         ObjectMapper objectMapper = new ObjectMapper().findAndRegisterModules();
         XAlgorithmProfileRegistry registry = new XAlgorithmProfileRegistry(props, objectMapper);
-        XAlgorithmController controller = new XAlgorithmController(props, registry);
+        XAlgorithmController controller = new XAlgorithmController(
+                props,
+                registry,
+                new com.xops.hub.assistant.AssistantStore(tempDir, objectMapper));
 
         // 1. 普通登录用户仅可只读查询（canManage = false），写入必须拒绝 403
         MockHttpServletRequest regularReq = new MockHttpServletRequest();
@@ -494,10 +497,9 @@ class XAlgorithmProfileAndOpsRecommendationTest {
         assertThat(report.algorithmHealth().opsRecommendations())
                 .noneMatch(item -> item.externalUrl() != null && item.externalUrl().endsWith("/c7"));
 
-        report.algorithmHealth().opsRecommendations().stream()
-                .filter(i -> "GOLDEN_SLOT_LAUNCH".equals(i.code()))
-                .findFirst()
-                .ifPresent(g -> assertThat(g.actionTarget()).isEqualTo("tab:schedule|goldenSlot:0"));
+        assertThat(report.algorithmHealth().opsRecommendations())
+                .extracting(OpsRecommendationItem::code)
+                .doesNotContain("GOLDEN_SLOT_LAUNCH");
 
         // 短口头禅/笑声（如「哈哈哈哈」「谢谢支持」）即使多次出现也不应误报为刷屏模板
         List<RawTweet> casualReplies = List.of(

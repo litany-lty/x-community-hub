@@ -73,7 +73,7 @@ xops:
   api-pool-max-size: ${X_API_POOL_MAX_SIZE:36}
   api-pool-queue-capacity: ${X_API_POOL_QUEUE_CAPACITY:320}
   api-queue-timeout-ms: ${X_API_QUEUE_TIMEOUT_MS:12000}
-  api-max-parallel-slices: ${X_API_MAX_PARALLEL_SLICES:4}
+  api-max-parallel-slices: ${X_API_MAX_PARALLEL_SLICES:8}
 
   # 50 活跃用户席位 + 超员平滑排队；队列满/等待超时返回可重试 503，恶意请求直接拦截
   max-concurrent-users: ${X_MAX_CONCURRENT_USERS:50}
@@ -108,6 +108,9 @@ xops:
   # 与 @elidlicom 互动前 50 名活跃已登录用户每日自动同步配置
   top50-auto-sync-enabled: ${X_TOP50_AUTO_SYNC_ENABLED:true}
   top50-auto-sync-cron: "${X_TOP50_AUTO_SYNC_CRON:0 20 23 * * *}"
+  # @elidlicom 本人及互动排名前 10 账号后台低优静默历史缓存（前台有请求时自动让路）
+  top10-silent-history-enabled: ${X_TOP10_SILENT_HISTORY_ENABLED:true}
+  top10-silent-history-poll-ms: ${X_TOP10_SILENT_HISTORY_POLL_MS:45000}
 
   # 可热更新的 X 推荐算法规则覆盖文件路径（不存在时使用内置默认基线）
   algo-profile-path: "${X_ALGO_PROFILE_PATH:./.cache/x-algorithm-profile.json}"

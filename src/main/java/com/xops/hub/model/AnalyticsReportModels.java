@@ -197,28 +197,7 @@ public final class AnalyticsReportModels {
         }
     }
 
-    // 4. 黄金发帖时段与爆款推文诊断
-    public record HeatmapCell(
-            int dayOfWeek,
-            String dayLabel,
-            int hour,
-            int postCount,
-            long avgViews,
-            double avgEngagementRatePct,
-            double intensity,
-            int viewSampleCount,
-            int engagementRateSampleCount
-    ) {
-    }
-
-    public record GoldenSlot(
-            String label,
-            int postCount,
-            long avgViews,
-            double avgEngagementRatePct
-    ) {
-    }
-
+    // 4. 内容表现诊断
     public record ContentFormatStat(
             String formatCode,
             String formatLabel,
@@ -314,7 +293,6 @@ public final class AnalyticsReportModels {
             boolean hasExternalLink,
             String externalDomain,
             boolean authorEngaged,
-            boolean activeSlotHit,
             long viewCount,
             double followerReachMultiple,
             double realizedVmUtilityPer1k,
@@ -511,9 +489,7 @@ public final class AnalyticsReportModels {
 
     public record ContentTimingOverview(
             String timezone,
-            List<GoldenSlot> goldenSlots,
             List<ContentFormatStat> formatStats,
-            List<HeatmapCell> heatmapCells,
             List<TopPostCard> topPosts
     ) {
     }
@@ -614,6 +590,18 @@ public final class AnalyticsReportModels {
             Instant timelineCoveredFrom, Instant inboundCoveredFrom, Instant latestMetricFetchedAt
     ) {}
 
+    public record BackgroundRefreshStatus(
+            String state,
+            Instant startedAt,
+            Instant completedAt,
+            String error,
+            String refreshId
+    ) {
+        public BackgroundRefreshStatus(String state, Instant startedAt, Instant completedAt, String error) {
+            this(state, startedAt, completedAt, error, "");
+        }
+    }
+
     public record MultiPeriodDashboardBundle(
             CommunityDashboardReport month,
             CommunityDashboardReport week,
@@ -624,18 +612,32 @@ public final class AnalyticsReportModels {
             int pendingRelationshipChecks,
             CommunityDashboardReport hours24,
             AccessPolicy accessPolicy,
-            DailyCacheStatus dailyCacheStatus
+            DailyCacheStatus dailyCacheStatus,
+            BackgroundRefreshStatus backgroundRefreshStatus
     ) {
+        public MultiPeriodDashboardBundle(CommunityDashboardReport month, CommunityDashboardReport week,
+                CommunityDashboardReport day, int coveredWindowDays, boolean hasMoreHistoryForTarget,
+                Instant coveredUntil, int pendingRelationshipChecks, CommunityDashboardReport hours24,
+                AccessPolicy accessPolicy, DailyCacheStatus dailyCacheStatus) {
+            this(month, week, day, coveredWindowDays, hasMoreHistoryForTarget, coveredUntil,
+                    pendingRelationshipChecks, hours24, accessPolicy, dailyCacheStatus, null);
+        }
+
         public MultiPeriodDashboardBundle(CommunityDashboardReport month, CommunityDashboardReport week,
                 CommunityDashboardReport day, int coveredWindowDays, boolean hasMoreHistoryForTarget,
                 Instant coveredUntil, int pendingRelationshipChecks, CommunityDashboardReport hours24, AccessPolicy accessPolicy) {
             this(month, week, day, coveredWindowDays, hasMoreHistoryForTarget, coveredUntil, pendingRelationshipChecks,
-                    hours24, accessPolicy, null);
+                    hours24, accessPolicy, null, null);
         }
 
         public MultiPeriodDashboardBundle withDailyCacheStatus(DailyCacheStatus status) {
             return new MultiPeriodDashboardBundle(month, week, day, coveredWindowDays, hasMoreHistoryForTarget,
-                    coveredUntil, pendingRelationshipChecks, hours24, accessPolicy, status);
+                    coveredUntil, pendingRelationshipChecks, hours24, accessPolicy, status, backgroundRefreshStatus);
+        }
+
+        public MultiPeriodDashboardBundle withBackgroundRefreshStatus(BackgroundRefreshStatus status) {
+            return new MultiPeriodDashboardBundle(month, week, day, coveredWindowDays, hasMoreHistoryForTarget,
+                    coveredUntil, pendingRelationshipChecks, hours24, accessPolicy, dailyCacheStatus, status);
         }
 
         @com.fasterxml.jackson.annotation.JsonCreator
@@ -649,14 +651,16 @@ public final class AnalyticsReportModels {
                 int coveredWindowDays, boolean hasMoreHistoryForTarget, Instant coveredUntil,
                 int pendingRelationshipChecks
         ) {
-            this(month, week, day, coveredWindowDays, hasMoreHistoryForTarget, coveredUntil, pendingRelationshipChecks, null, null);
+            this(month, week, day, coveredWindowDays, hasMoreHistoryForTarget, coveredUntil,
+                    pendingRelationshipChecks, null, null, null, null);
         }
 
         public MultiPeriodDashboardBundle(
                 CommunityDashboardReport month, CommunityDashboardReport week, CommunityDashboardReport day,
                 int coveredWindowDays, boolean hasMoreHistoryForTarget, Instant coveredUntil
         ) {
-            this(month, week, day, coveredWindowDays, hasMoreHistoryForTarget, coveredUntil, 0, null, null);
+            this(month, week, day, coveredWindowDays, hasMoreHistoryForTarget, coveredUntil,
+                    0, null, null, null, null);
         }
 
         public MultiPeriodDashboardBundle(
@@ -664,7 +668,7 @@ public final class AnalyticsReportModels {
                 CommunityDashboardReport week,
                 CommunityDashboardReport day
         ) {
-            this(month, week, day, 0, false, null, 0, null, null);
+            this(month, week, day, 0, false, null, 0, null, null, null, null);
         }
     }
 
@@ -706,8 +710,21 @@ public final class AnalyticsReportModels {
             AuthenticatedXUser user,
             boolean writeAuthorized,
             boolean mediaWriteAuthorized,
-            boolean offlineRefreshable
+            boolean offlineRefreshable,
+            boolean ownerAllPermissions
     ) {
+        public AuthStatusResponse(
+                boolean oauthConfigured,
+                String suggestedCallbackUrl,
+                boolean loggedIn,
+                AuthenticatedXUser user,
+                boolean writeAuthorized,
+                boolean mediaWriteAuthorized,
+                boolean offlineRefreshable
+        ) {
+            this(oauthConfigured, suggestedCallbackUrl, loggedIn, user, writeAuthorized, mediaWriteAuthorized, offlineRefreshable, false);
+        }
+
         public AuthStatusResponse(
                 boolean oauthConfigured,
                 String suggestedCallbackUrl,
@@ -716,7 +733,7 @@ public final class AnalyticsReportModels {
                 boolean writeAuthorized,
                 boolean mediaWriteAuthorized
         ) {
-            this(oauthConfigured, suggestedCallbackUrl, loggedIn, user, writeAuthorized, mediaWriteAuthorized, false);
+            this(oauthConfigured, suggestedCallbackUrl, loggedIn, user, writeAuthorized, mediaWriteAuthorized, false, false);
         }
 
         public AuthStatusResponse(
@@ -725,7 +742,7 @@ public final class AnalyticsReportModels {
                 boolean loggedIn,
                 AuthenticatedXUser user
         ) {
-            this(oauthConfigured, suggestedCallbackUrl, loggedIn, user, false, false, false);
+            this(oauthConfigured, suggestedCallbackUrl, loggedIn, user, false, false, false, false);
         }
     }
 

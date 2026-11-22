@@ -985,7 +985,11 @@ class CommunityAnalyticsAndApiTest {
             // 3. 若 1 小时缓存到期后拉取的新快照发现用户未关注 @elidlicom（例如取关了，following_count 2 -> 1），逢 20 次会再次精准弹出关注提示
             followsElidliInGraph.set(false);
             java.nio.file.Files.deleteIfExists(tempDir.resolve("users").resolve("fan_builder").resolve("store_v1.json.gz"));
-            CommunityHubService serviceAfterExpiry = new CommunityHubService(props, demoProvider, twitterProvider, officialProvider, objectMapper);
+            var identity = new com.xops.hub.assistant.AssistantStore(tempDir.resolve("assistant"), objectMapper);
+            identity.authorize(new com.xops.hub.model.AnalyticsReportModels.AuthenticatedXUser(
+                    "999", "elidlicom", "Author", "", false, Instant.now()));
+            CommunityHubService serviceAfterExpiry = new CommunityHubService(
+                    props, demoProvider, twitterProvider, officialProvider, objectMapper, null, identity);
             serviceAfterExpiry.analyzeAccountBundle("fan_builder", "TWITTERAPI_IO", false, "127.0.0.1");
 
             for (int i = 11; i <= 20; i++) {
@@ -1002,7 +1006,7 @@ class CommunityAnalyticsAndApiTest {
 
             // 4. 作者本人账号 @elidlicom 登录使用：逢 10 次永不向自己弹求关注提示
             for (int i = 1; i <= 10; i++) {
-                UsageCheckinResponse selfRes = serviceAfterExpiry.recordUsageCheckin("elidlicom");
+                UsageCheckinResponse selfRes = serviceAfterExpiry.recordUsageCheckin("elidlicom", "999");
                 if (i == 10) {
                     assertThat(selfRes.selfIsAuthor()).isTrue();
                     assertThat(selfRes.shouldShowAuthorModal()).isFalse();

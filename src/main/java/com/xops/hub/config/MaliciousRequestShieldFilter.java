@@ -123,6 +123,14 @@ public class MaliciousRequestShieldFilter extends OncePerRequestFilter {
             return;
         }
 
+        if ("POST".equalsIgnoreCase(method) && (path == null || !path.startsWith("/api/"))) {
+            recordMaliceStrike(clientIp, nowSec, 1);
+            response.setStatus(HttpServletResponse.SC_METHOD_NOT_ALLOWED);
+            response.setHeader("Allow", "GET, HEAD, OPTIONS");
+            response.setContentLength(0);
+            return;
+        }
+
         // 在进入 Multipart 解析器前拦截异常体积载荷，防止磁盘与内存被恶意请求打爆
         long contentLength = request.getContentLengthLong();
         String contentType = request.getContentType();
@@ -346,7 +354,10 @@ public class MaliciousRequestShieldFilter extends OncePerRequestFilter {
     }
 
     static boolean isScannerProbePath(String uri) {
-        String lower = decodePathForInspection(uri);
+        String lower = decodePathForInspection(uri).replace('\\', '/');
+        if (lower.contains("/web-inf") || lower.contains("/meta-inf")) {
+            return true;
+        }
         if (lower.startsWith("/.env")
                 || lower.startsWith("/.git")
                 || lower.startsWith("/.svn")

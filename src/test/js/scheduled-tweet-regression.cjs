@@ -47,7 +47,6 @@ this.__exports = {
     validateAndMergeScheduleFiles,
     getTzDateParts,
     zonedWallClockToEpochMs,
-    computeNextGoldenSlotTimestampMs,
     MIN_SCHEDULE_INTERVAL_MS,
     computeNextAvailableScheduleMs,
     validateBatchScheduleEpochs,
@@ -106,7 +105,6 @@ const {
     computeWeightedTweetLength,
     validateAndMergeScheduleFiles,
     getTzDateParts,
-    computeNextGoldenSlotTimestampMs,
     MIN_SCHEDULE_INTERVAL_MS,
     computeNextAvailableScheduleMs,
     validateBatchScheduleEpochs,
@@ -143,7 +141,7 @@ function liveReport(lastMs, userId = "self") {
         liveData: true,
         profile: { id: userId },
         algorithmHealth: { latestMainPostAt: new Date(lastMs).toISOString() },
-        contentTiming: { goldenSlots: [] }
+        contentTiming: {}
     };
 }
 function draftAt(epochMs, timeTouched = false, text = "") {
@@ -199,39 +197,7 @@ assert.equal(mixGifAfterPng.ok, false);
 const badExt = validateAndMergeScheduleFiles([], [makeFile("doc.svg", "image/svg+xml", 1024)]);
 assert.equal(badExt.ok, false);
 
-// 3. computeNextGoldenSlotTimestampMs timezone calculations
-// 2026-11-14T08:00:00Z = Saturday 16:00:00 in Asia/Shanghai
-const nowMs = Date.UTC(2026, 10, 14, 8, 0, 0);
-const sameDayEvening = computeNextGoldenSlotTimestampMs("周六 20:00–22:00", "Asia/Shanghai", nowMs);
-const eveningParts = getTzDateParts(sameDayEvening, "Asia/Shanghai");
-assert.equal(eveningParts.year, 2026);
-assert.equal(eveningParts.month, 11);
-assert.equal(eveningParts.day, 14);
-assert.equal(eveningParts.weekday, 6);
-assert.equal(eveningParts.hour, 20);
-assert.equal(eveningParts.minute, 0);
-
-// Earlier Saturday slot rolls +7 days to 2026-11-21
-const nextWeekAfternoon = computeNextGoldenSlotTimestampMs("周六 15:00–17:00", "Asia/Shanghai", nowMs);
-const nextWeekParts = getTzDateParts(nextWeekAfternoon, "Asia/Shanghai");
-assert.equal(nextWeekParts.year, 2026);
-assert.equal(nextWeekParts.month, 11);
-assert.equal(nextWeekParts.day, 21);
-assert.equal(nextWeekParts.weekday, 6);
-assert.equal(nextWeekParts.hour, 15);
-assert.equal(nextWeekParts.minute, 0);
-
-// America/New_York resolution (at 2026-11-14T08:00:00Z it is Saturday 03:00 EST)
-const nySlot = computeNextGoldenSlotTimestampMs("周一 09:00–11:00", "America/New_York", nowMs);
-const nyParts = getTzDateParts(nySlot, "America/New_York");
-assert.equal(nyParts.year, 2026);
-assert.equal(nyParts.month, 11);
-assert.equal(nyParts.day, 16);
-assert.equal(nyParts.weekday, 1);
-assert.equal(nyParts.hour, 9);
-assert.equal(nyParts.minute, 0);
-
-// 4. Multi-tweet batch scheduling & mandatory 1-hour minimum interval
+// 3. Multi-tweet batch scheduling & mandatory 1-hour minimum interval
 assert.equal(MIN_SCHEDULE_INTERVAL_MS, 3_600_000);
 
 const baseMs = Date.UTC(2026, 10, 14, 12, 0, 0);
@@ -406,7 +372,6 @@ assert.equal(state.composerRotationCount, submittingRotations + 1);
 const presetNowMs = new Date(2026, 10, 14, 19, 30).getTime();
 resetScheduleState(presetNowMs);
 state.report = liveReport(presetNowMs - 10 * MINUTE);
-state.report.contentTiming.goldenSlots = [{ label: "周六 20:00–22:00" }, { label: "周六 20:00–22:00" }];
 state.scheduleDraftItems = [draftAt(presetNowMs + 5 * MINUTE)];
 const presets = Array.from(buildScheduleQuickPresets(presetNowMs));
 assert.ok(presets.length > 0);
@@ -414,8 +379,6 @@ assert.equal(new Set(presets.map((preset) => preset.epochMs)).size, presets.leng
 const recommended = presets.find((preset) => preset.epochMs === presetNowMs + 170 * MINUTE);
 assert.ok(recommended, "The recent post shifts the earliest preset to 22:20");
 assert.match(recommended.label, /22:20/);
-assert.equal(presets.some((preset) => preset.isGolden), false,
-    "A recommendation shifted past the golden window must not retain its golden label");
 for (const preset of presets) {
     assert.ok(preset.label.includes(formatScheduleLocalTime(preset.epochMs, presetNowMs)));
 }
@@ -431,4 +394,31 @@ const denseOccupied = Array.from({ length: 240 }, (_, i) => baseMs + i * 30 * MI
 assert.equal(computeNextAvailableScheduleMs(baseMs, denseOccupied),
     baseMs + 239 * 30 * MINUTE + MIN_SCHEDULE_INTERVAL_MS);
 
-console.log("scheduled-tweet-regression: passed");
+const scheduleRestore = sliceBetween(appJs,
+    "    async function restoreScheduleDraftAfterStepUpAuth(", "    async function triggerXPublishAuth(");
+const fullLongText = "字".repeat(25050);
+const ownerState = {authStatus: {user: {id: "bound-owner"}}, userScopeGeneration: 1, scheduleDraftItems: []};
+const restoreContext = vm.createContext({
+    state: ownerState, stableUserId: (user) => user.id, isLoggedIn: () => true,
+    sessionStorage: {getItem: () => JSON.stringify({
+        userId: "bound-owner", savedAt: Date.now(), items: [{text: fullLongText,
+            sourceRef: {assistantDraftId: "saved-draft", assistantDraftVersion: 2}}]
+    })},
+    createScheduleDraftItem: (text, epoch, files, touched, sourceRef) => ({text, sourceRef}),
+    cancelScheduleDraftPersistence() {}, rotateComposerRequestId() {}, renderScheduleDraftItems() {},
+    syncScheduleComposerStats() {}, syncScheduleAuthBanner() {}, syncScheduleDraftUnloadProtection() {},
+    hasScheduleDraftContent: (item) => Boolean(item.text), STEPUP_SCHEDULE_DRAFT_KEY: "draft",
+    SCHEDULE_DRAFT_TTL_MS: 30000, MAX_BATCH_SCHEDULE_ITEMS: 20
+});
+vm.runInContext(scheduleRestore, restoreContext);
+(async () => {
+    await restoreContext.restoreScheduleDraftAfterStepUpAuth();
+    assert.equal(ownerState.scheduleDraftItems[0].text, fullLongText);
+    assert.equal(ownerState.scheduleDraftItems[0].sourceRef.assistantDraftId, "saved-draft");
+    assert.equal(ownerState.scheduleDraftItems[0].sourceRef.assistantDraftVersion, 2);
+    ownerState.authStatus.user.id = "other-account";
+    ownerState.scheduleDraftItems = [];
+    await restoreContext.restoreScheduleDraftAfterStepUpAuth();
+    assert.equal(ownerState.scheduleDraftItems.length, 0, "different account cannot restore an owner draft");
+    console.log("scheduled-tweet-regression: passed");
+})().catch(error => { console.error(error); process.exitCode = 1; });

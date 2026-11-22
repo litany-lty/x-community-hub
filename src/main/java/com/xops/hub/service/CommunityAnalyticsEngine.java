@@ -1427,10 +1427,6 @@ public class CommunityAnalyticsEngine {
                 .filter(CommunityAnalyticsEngine::isIndependentMainPost)
                 .toList();
 
-        int[] slotHours = {0, 3, 6, 9, 12, 15, 18, 21};
-        // count, known views sum, ER engagements, known-view count, ER views sum, ER sample count
-        long[][][] bucket = new long[7][8][6];
-        double[][] bucketWeighted = new double[7][8];
         // count, views, likes, replies, ER engagements, view count, like count, reply count, ER views, ER count
         long[][] fmtAgg = new long[3][10];
         long[] fmtBookmarkSum = new long[3];
@@ -1439,17 +1435,10 @@ public class CommunityAnalyticsEngine {
         int[] fmtAlgoScoreCount = new int[3];
 
         for (RawTweet t : authored) {
-            ZonedDateTime zdt = t.createdAt().atZone(zoneId);
-            int dowIdx = zdt.getDayOfWeek().getValue() - 1;
-            int slotIdx = Math.min(7, zdt.getHour() / 3);
             long views = Math.max(0L, t.viewCount());
-            boolean isAuthorEngaged = t.id() != null && authorEngagedMainPostIds.contains(t.id());
-            bucket[dowIdx][slotIdx][0]++;
             int fmtIdx = t.isThread() ? 2 : (t.hasMedia() ? 1 : 0);
             fmtAgg[fmtIdx][0]++;
             if (metricKnown(t, "views")) {
-                bucket[dowIdx][slotIdx][1] += views;
-                bucket[dowIdx][slotIdx][3]++;
                 fmtAgg[fmtIdx][1] += views;
                 fmtAgg[fmtIdx][5]++;
             }
@@ -1467,79 +1456,11 @@ public class CommunityAnalyticsEngine {
             }
             if (rateKnown(t)) {
                 long eng = Math.min(engagements(t), views);
-                bucket[dowIdx][slotIdx][2] += eng;
-                bucket[dowIdx][slotIdx][4] += views;
-                bucket[dowIdx][slotIdx][5]++;
-                double multiAction = Math.max(0, t.replyCount()) * scoring.compositeReplyWeight()
-                        + Math.max(0, t.retweetCount()) * scoring.compositeRepostWeight()
-                        + Math.max(0, t.bookmarkCount()) * scoring.compositeBookmarkWeight()
-                        + Math.max(0, t.likeCount()) * scoring.compositeLikeWeight()
-                        + (isAuthorEngaged ? scoring.compositeAuthorEngagedBonus() : 0.0);
-                bucketWeighted[dowIdx][slotIdx] += multiAction;
                 fmtAgg[fmtIdx][4] += eng;
                 fmtAgg[fmtIdx][8] += views;
                 fmtAgg[fmtIdx][9]++;
             }
         }
-
-        record GoldenSlotCandidate(GoldenSlot slot, double rankScore) {
-        }
-
-        double maxCellScore = 0.01;
-        double[][] rawCellEr = new double[7][8];
-        double[][] cellWeightedScore = new double[7][8];
-        for (int d = 0; d < 7; d++) {
-            for (int s = 0; s < 8; s++) {
-                long cnt = bucket[d][s][5];
-                long views = bucket[d][s][4];
-                long eng = bucket[d][s][2];
-                double er = safeErPct(eng, views);
-                rawCellEr[d][s] = er;
-                // 严格要求有有效浏览与互动样本（rateCount > 0 && eng > 0），再结合多动作权重与总曝光排序
-                double weightedSignalPct = (cnt > 0 && eng > 0)
-                        ? Math.min(100.0, bucketWeighted[d][s] * 100.0 / Math.max(50L, views))
-                        : 0.0;
-                double weighted = (cnt > 0 && eng > 0)
-                        ? (er + weightedSignalPct * 0.25) * Math.log10(Math.max(20, views))
-                        : 0.0;
-                cellWeightedScore[d][s] = weighted;
-                if (weighted > maxCellScore) {
-                    maxCellScore = weighted;
-                }
-            }
-        }
-
-        List<HeatmapCell> cells = new ArrayList<>(56);
-        List<GoldenSlotCandidate> slotCandidates = new ArrayList<>();
-        for (int d = 0; d < 7; d++) {
-            for (int s = 0; s < 8; s++) {
-                int hour = slotHours[s];
-                int cnt = (int) bucket[d][s][0];
-                int viewCount = (int) bucket[d][s][3];
-                int rateCount = (int) bucket[d][s][5];
-                long avgViews = viewCount > 0 ? Math.round((double) bucket[d][s][1] / viewCount) : 0L;
-                double er = round2(rawCellEr[d][s]);
-                double weighted = cellWeightedScore[d][s];
-                double intensity = cnt > 0 ? round2(Math.min(1.0, weighted / maxCellScore)) : 0.0;
-                cells.add(new HeatmapCell(d + 1, DAY_LABELS[d], hour, cnt, avgViews, er, intensity, viewCount, rateCount));
-                if (cnt > 0 && weighted > 0.0) {
-                    String slotLabel = String.format("%s %02d:00–%02d:00", DAY_LABELS[d], hour, (hour + 3) == 24 ? 24 : hour + 3);
-                    long slotAvgViews = Math.round((double) bucket[d][s][4] / rateCount);
-                    double rankScore = (er + Math.min(100.0, (bucketWeighted[d][s] / rateCount) * 100.0 / Math.max(50L, slotAvgViews)) * 0.25)
-                            * Math.log10(Math.max(25, bucket[d][s][4]));
-                    slotCandidates.add(new GoldenSlotCandidate(
-                            new GoldenSlot(slotLabel, rateCount, slotAvgViews, er),
-                            rankScore
-                    ));
-                }
-            }
-        }
-
-        slotCandidates.sort(Comparator.comparingDouble(GoldenSlotCandidate::rankScore).reversed());
-        List<GoldenSlot> goldenSlots = slotCandidates.stream()
-                .limit(3)
-                .map(GoldenSlotCandidate::slot)
-                .toList();
 
         // 先计算所有主推评分，用于各体裁平均规则分汇总及排序
         List<TopPostCard> allScoredCards = authored.stream()
@@ -1625,9 +1546,7 @@ public class CommunityAnalyticsEngine {
 
         return new ContentTimingOverview(
                 zoneId.getId(),
-                goldenSlots,
                 formatStats,
-                cells,
                 topPosts
         );
     }
@@ -2571,20 +2490,6 @@ public class CommunityAnalyticsEngine {
             ));
         }
 
-        if (contentTiming != null && contentTiming.goldenSlots() != null && !contentTiming.goldenSlots().isEmpty()) {
-            GoldenSlot topSlot = contentTiming.goldenSlots().get(0);
-            items.add(new OpsRecommendationItem(
-                    "GOLDEN_SLOT_LAUNCH",
-                    "NORMAL",
-                    "时段",
-                    String.format("优先排期在黄金时段 · %s", topSlot.label()),
-                    String.format("该时段历史平均浏览 %d、互动率 %.2f%%，在粉丝集中在线时发布更容易拿到首波互动。",
-                            topSlot.avgViews(), topSlot.avgEngagementRatePct()),
-                    "tab:schedule|goldenSlot:0",
-                    null
-            ));
-        }
-
         if (activity != null) {
             int authored = activity.originalPosts() + activity.quotes();
             if (authored == 0) {
@@ -2754,17 +2659,7 @@ public class CommunityAnalyticsEngine {
                 .sorted(Comparator.comparing(RawTweet::createdAt))
                 .toList();
 
-        // 统计历史高活跃时段集合（取热力图中 intensity >= 0.55 的时段用于判断单帖是否命中活跃窗口）
-        Set<String> activeSlotKeys = new HashSet<>();
-        if (contentTiming != null && contentTiming.heatmapCells() != null) {
-            for (HeatmapCell hc : contentTiming.heatmapCells()) {
-                if (hc.postCount() > 0 && hc.intensity() >= 0.55) {
-                    activeSlotKeys.add(hc.dayOfWeek() + ":" + hc.hour());
-                }
-            }
-        }
-
-        // 4. 外链域名实测表现账本（DomainReachStat）
+        // 3. 外链域名实测表现账本（DomainReachStat）
         List<DomainReachStat> domainStats = buildDomainReachStats(validMain);
 
         boolean coldStartEligible = ev.coldStartEnabled() && followers <= ev.coldStartFollowerCap();
@@ -2851,7 +2746,6 @@ public class CommunityAnalyticsEngine {
             boolean hasQuestion = rawText.indexOf('?') >= 0 || rawText.indexOf('？') >= 0;
             boolean engaged = t.id() != null && authorEngagedMainPostIds.contains(t.id());
             ZonedDateTime zdt = t.createdAt().atZone(zoneId);
-            boolean slotHit = activeSlotKeys.contains(zdt.getDayOfWeek().getValue() + ":" + zdt.getHour());
             String fmtCode = t.isThread() ? "THREAD"
                     : (t.hasMedia() ? "MEDIA" : (t.kind() == TweetKind.QUOTE ? "QUOTE" : "TEXT"));
             double mult = followers > 0 ? round2((double) viewsArr[i] / followers) : 0.0;
@@ -2867,7 +2761,6 @@ public class CommunityAnalyticsEngine {
                     hasExt,
                     domain,
                     engaged,
-                    slotHit,
                     viewsArr[i],
                     mult,
                     utilities[i],
@@ -2963,7 +2856,6 @@ public class CommunityAnalyticsEngine {
                     && q.externalDomain().equals(s.externalDomain())) ? 1.0 : 0.0;
             double listMatch = (q.structuredList() == s.structuredList()) ? 1.0 : 0.0;
             double qMatch = (q.hasQuestion() == s.hasQuestion()) ? 1.0 : 0.0;
-            double slotMatch = (q.activeSlotHit() == s.activeSlotHit()) ? 1.0 : 0.0;
             double lenDiff = Math.abs(Math.log1p(q.cleanCharLen()) - Math.log1p(s.cleanCharLen()));
 
             double z = 2.6 * jaccard
@@ -2972,7 +2864,6 @@ public class CommunityAnalyticsEngine {
                     + 0.55 * domainMatch
                     + 0.30 * listMatch
                     + 0.25 * qMatch
-                    + 0.20 * slotMatch
                     - 0.30 * Math.min(2.5, lenDiff);
             double w = Math.max(0.05, Math.exp(z) - 0.85);
             weights[j] = w;
