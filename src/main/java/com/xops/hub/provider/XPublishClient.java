@@ -75,9 +75,7 @@ public class XPublishClient {
         this.objectMapper = objectMapper;
         this.sharedExecutor = sharedExecutor;
         this.budgetGuard = budgetGuard != null ? budgetGuard : new UpstreamBudgetGuard(properties);
-        this.httpClient = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(10))
-                .build();
+        this.httpClient = OfficialProxySupport.buildHttpClient(this.properties, Duration.ofSeconds(10));
     }
 
     public String uploadMedia(String userAccessToken, byte[] bytes, String mimeType, String fileName) {

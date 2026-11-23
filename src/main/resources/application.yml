@@ -61,6 +61,8 @@ xops:
   # 备选：X 官方 API v2 Bearer Token（同时作为 OAuth /2/users/me 基础网关地址）
   official-bearer-token: ${X_OFFICIAL_BEARER_TOKEN:}
   official-base-url: ${X_OFFICIAL_BASE_URL:https://api.x.com/2}
+  # 可选：发推、传图与 X OAuth 令牌请求专用 HTTP 代理出口（如 http://127.0.0.1:18118；留空直连）
+  official-proxy-url: "${X_OFFICIAL_PROXY_URL:}"
 
   # 分页采样深度（四路并发采集 + 超过 30 天或达到精确总数立即停页省流 + 关注/粉丝未变跨小时免拉取）
   max-timeline-pages: ${X_MAX_TIMELINE_PAGES:600}

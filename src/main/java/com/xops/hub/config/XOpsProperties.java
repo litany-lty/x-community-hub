@@ -16,6 +16,7 @@ public class XOpsProperties {
     private String oauthRedirectUri = "";
     private String officialBearerToken = "";
     private String officialBaseUrl = "https://api.x.com/2";
+    private String officialProxyUrl = "";
     private int maxTimelinePages = 600;
     private int maxMentionPages = 600;
     private int maxFollowingPages = 4;
@@ -140,6 +141,14 @@ public class XOpsProperties {
 
     public void setOfficialBaseUrl(String officialBaseUrl) {
         this.officialBaseUrl = officialBaseUrl;
+    }
+
+    public String getOfficialProxyUrl() {
+        return officialProxyUrl;
+    }
+
+    public void setOfficialProxyUrl(String officialProxyUrl) {
+        this.officialProxyUrl = officialProxyUrl;
     }
 
     public int getMaxTimelinePages() {

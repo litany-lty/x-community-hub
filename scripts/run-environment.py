@@ -226,6 +226,7 @@ def main():
             "xops.token-encryption-secret": "isolated-preview-only",
             "xops.twitterapi-io-base-url": "http://127.0.0.1:9",
             "xops.official-base-url": "http://127.0.0.1:9/2",
+            "xops.official-proxy-url": "",
             "xops.hourly-upstream-api-budget": "0",
             "xops.daily-upstream-api-budget": "0",
             "xops.hourly-upstream-usd-budget": "0",
@@ -233,7 +234,7 @@ def main():
             "xops.monthly-upstream-usd-budget": "0",
             "server.servlet.session.persistent": "false",
         })
-        for key in ("X_TWITTERAPI_IO_KEY", "X_OFFICIAL_BEARER_TOKEN",
+        for key in ("X_TWITTERAPI_IO_KEY", "X_OFFICIAL_BEARER_TOKEN", "X_OFFICIAL_PROXY_URL",
                     "X_OAUTH_CLIENT_ID", "X_OAUTH_CLIENT_SECRET", "X_TOKEN_ENCRYPTION_SECRET"):
             env.pop(key, None)
     command = [java]

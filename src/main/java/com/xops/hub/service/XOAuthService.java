@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.xops.hub.config.XOpsProperties;
 import com.xops.hub.model.AnalyticsReportModels.AuthenticatedXUser;
+import com.xops.hub.provider.OfficialProxySupport;
 import com.xops.hub.provider.SharedApiExecutor;
 import com.xops.hub.provider.UpstreamBudgetGuard;
 import com.xops.hub.provider.XDataProviderException;
@@ -110,9 +111,7 @@ public class XOAuthService {
         this.sharedExecutor = sharedExecutor;
         this.budgetGuard = budgetGuard != null ? budgetGuard : new UpstreamBudgetGuard(properties);
         this.tokenStore = new XOAuthTokenStore(properties, objectMapper);
-        this.httpClient = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(10))
-                .build();
+        this.httpClient = OfficialProxySupport.buildHttpClient(this.properties, Duration.ofSeconds(10));
         this.accountLocks = new Object[LOCK_STRIPES];
         for (int i = 0; i < LOCK_STRIPES; i++) {
             this.accountLocks[i] = new Object();
