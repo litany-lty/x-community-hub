@@ -291,6 +291,7 @@ public class ScheduledTweetService {
             }
             items = new ArrayList<>(queue.jobs());
             items.sort(Comparator.comparingLong(ScheduledTweetJob::createdAtEpochMs).reversed());
+            long latestAuthFailureMs = 0L;
             for (ScheduledTweetJob job : items) {
                 if (job.status() == ScheduledTweetStatus.SCHEDULED
                         || job.status() == ScheduledTweetStatus.RESEND_QUEUED
@@ -299,6 +300,14 @@ public class ScheduledTweetService {
                 } else if (job.status() == ScheduledTweetStatus.OVERDUE_CONFIRM_REQUIRED) {
                     overdueConfirmCount++;
                 }
+                if ((job.status() == ScheduledTweetStatus.FAILED
+                        || job.status() == ScheduledTweetStatus.OVERDUE_CONFIRM_REQUIRED)
+                        && isPublishAuthExpiredMessage(job.lastError())) {
+                    latestAuthFailureMs = Math.max(latestAuthFailureMs, job.updatedAtEpochMs());
+                }
+            }
+            if (latestAuthFailureMs > 0L) {
+                oauthService.evictStaleTokenBefore(accountId, latestAuthFailureMs);
             }
         }
         XOAuthService.TokenCapability cap = oauthService.getTokenCapability(accountId);
@@ -1098,6 +1107,7 @@ public class ScheduledTweetService {
 
     private void dispatchClaimedJob(String accountId, ScheduledTweetJob claimed) {
         boolean dispatchedToTweetEndpoint = false;
+        String usedAccessToken = null;
         try {
             CommunityHubService.ScheduledPublishAccess access = evaluateAccess(accountId, claimed.username());
             if (!access.allowed()) {
@@ -1121,6 +1131,7 @@ public class ScheduledTweetService {
             }
             boolean hasMedia = !claimed.media().isEmpty();
             String accessToken = oauthService.getValidWriteAccessToken(accountId, hasMedia);
+            usedAccessToken = accessToken;
 
             List<ScheduledMediaAsset> workingAssets = new ArrayList<>(claimed.media());
             List<String> remoteMediaIds = new ArrayList<>(workingAssets.size());
@@ -1174,6 +1185,10 @@ public class ScheduledTweetService {
                 saveQueueLocked(queue);
             }
         } catch (Exception ex) {
+            String invalidatedAuthMsg = null;
+            if (ex instanceof XPublishException pex && pex.getStatusCode() == 401) {
+                invalidatedAuthMsg = oauthService.invalidateRejectedWriteToken(accountId, usedAccessToken);
+            }
             long failMs = clock.millis();
             boolean uncertain = dispatchedToTweetEndpoint
                     && (!(ex instanceof XPublishException pex) || pex.isDeliveryUncertain());
@@ -1188,7 +1203,9 @@ public class ScheduledTweetService {
                     return;
                 }
                 String newToken = UUID.randomUUID().toString();
-                String msg = (ex.getMessage() != null && !ex.getMessage().isBlank()) ? ex.getMessage() : "定时推文发送失败";
+                String msg = (invalidatedAuthMsg != null && !invalidatedAuthMsg.isBlank())
+                        ? invalidatedAuthMsg
+                        : (ex.getMessage() != null && !ex.getMessage().isBlank()) ? ex.getMessage() : "定时推文发送失败";
                 if (uncertain) {
                     queue.jobs().set(idx, latest.markOverdueConfirmRequired(
                             OverdueReason.UNCERTAIN_DELIVERY,
@@ -1203,6 +1220,16 @@ public class ScheduledTweetService {
                 saveQueueLocked(queue);
             }
         }
+    }
+
+    private static boolean isPublishAuthExpiredMessage(String message) {
+        if (message == null || message.isBlank()) {
+            return false;
+        }
+        return message.contains("二次授权")
+                || message.contains("发推授权已过期")
+                || message.contains("访问令牌已过期")
+                || message.contains("授权范围已变更");
     }
 
     private String resolveUsernameForAccount(String accountId, String username) {

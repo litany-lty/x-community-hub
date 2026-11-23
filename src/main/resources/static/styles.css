@@ -71,6 +71,10 @@
     box-sizing: border-box;
 }
 
+html {
+    font-size: 93.75%;
+}
+
 html,
 body {
     margin: 0;
@@ -81,10 +85,13 @@ body {
     background: var(--bg-main);
     color: var(--text-primary);
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
-    font-size: 15px;
     line-height: 1.45;
     -webkit-font-smoothing: antialiased;
     font-variant-numeric: tabular-nums;
+}
+
+body {
+    font-size: 1rem;
 }
 
 button,
@@ -3690,6 +3697,7 @@ body.is-guest .x-shell {
     max-width: 580px;
 }
 
+body.is-guest main.center-feed,
 body.is-guest .center-feed {
     border-left: none;
     border-right: none;
@@ -3698,7 +3706,7 @@ body.is-guest .center-feed {
     display: flex;
     flex-direction: column;
     justify-content: flex-start;
-    padding-bottom: 24px;
+    padding-bottom: 0;
 }
 
 body.is-guest .auth-gate-wrap {
@@ -6188,11 +6196,469 @@ body.modal-open {
     #followStateTabs .seg-tab { min-height: 44px; }
     .x-select { border-radius: 12px; }
     .settings-menu .language-select { border-radius: 8px; }
-    .mobile-bottom-nav { background: var(--bg-main); }
+    .mobile-bottom-nav { background: var(--bg-main); padding-bottom: calc(6px + env(safe-area-inset-bottom, 0px)); }
     .bottom-tab { min-height: 54px; }
     .bottom-badge { top: 2px; border: 2px solid var(--bg-main); line-height: 15px; min-width: 19px; }
     .overdue-banner { margin: 0; padding: 6px 14px; }
     .algo-ops-go,
     .tweet-draft-check-btn { min-height: 44px; display: inline-flex; align-items: center; }
     #toggleAlgoConfigBtn { min-height: 44px; }
+}
+
+/* ==================== WP-1 ~ WP-5 移动端 UX 与无障碍专项优化 ==================== */
+.auth-gate-features {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin: 0 0 18px;
+}
+
+.gate-feature-chip {
+    display: inline-flex;
+    align-items: center;
+    padding: 4px 10px;
+    border-radius: 999px;
+    border: 1px solid var(--border-color);
+    background: var(--bg-card-subtle, rgba(113, 118, 123, 0.08));
+    color: var(--text-secondary);
+    font-size: 12.5px;
+    line-height: 1.3;
+}
+
+.settings-account-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 10px 10px;
+    margin-bottom: 4px;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.settings-account-meta {
+    min-width: 0;
+    flex: 1 1 auto;
+}
+
+.settings-account-name {
+    font-size: 13.5px;
+    font-weight: 700;
+    color: var(--text-primary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.settings-account-handle {
+    font-size: 12px;
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.settings-menu .settings-logout {
+    margin-top: 8px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border-color);
+    color: var(--x-danger, #f4212e);
+}
+
+.workspace-retry-card {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--border-color);
+    background: var(--bg-card-subtle, rgba(113, 118, 123, 0.08));
+}
+
+.workspace-retry-body {
+    min-width: 0;
+    flex: 1 1 auto;
+}
+
+.workspace-retry-title {
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--text-primary);
+    margin-bottom: 2px;
+}
+
+.workspace-retry-card .section-desc {
+    margin: 0;
+    font-size: 12.5px;
+}
+
+#workspaceRetryBtn {
+    min-height: 44px;
+    padding: 0 16px;
+    flex-shrink: 0;
+}
+
+.search-input-wrap {
+    position: relative;
+    display: flex;
+    align-items: center;
+    flex: 1 1 180px;
+    min-width: 0;
+}
+
+.search-input-wrap input {
+    width: 100%;
+    padding-right: 36px;
+}
+
+.search-clear-btn {
+    position: absolute;
+    right: 4px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 30px;
+    height: 30px;
+    border: 0;
+    border-radius: 999px;
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 18px;
+    line-height: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+}
+
+.search-clear-btn:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+}
+
+.peer-row.clickable .peer-chevron {
+    flex-shrink: 0;
+    color: var(--text-secondary);
+    fill: currentColor;
+    opacity: 0.78;
+    transition: transform 0.16s ease, opacity 0.16s ease;
+}
+
+.peer-item.is-open .peer-row.clickable .peer-chevron {
+    transform: rotate(180deg);
+    opacity: 1;
+}
+
+.timing-quick-nav {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border-color);
+    background: var(--bg-main);
+}
+
+.timing-quick-nav .pill-chip {
+    flex: 0 0 auto;
+    white-space: nowrap;
+}
+
+.algo-advanced-json {
+    margin-top: 10px;
+    border-top: 1px dashed var(--border-color);
+    padding-top: 8px;
+}
+
+.algo-advanced-json > summary {
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    padding: 8px 2px;
+    user-select: none;
+}
+
+.algo-advanced-json > summary:hover {
+    color: var(--text-primary);
+}
+
+.algo-advanced-json-body {
+    margin-top: 8px;
+}
+
+.draft-head-title-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.draft-live-score-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 9px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 700;
+    background: var(--bg-card-subtle, rgba(113, 118, 123, 0.12));
+    border: 1px solid var(--border-color);
+    color: var(--text-primary);
+}
+
+.draft-live-score-pill.tone-green {
+    color: var(--x-green);
+    border-color: var(--x-green);
+    background: var(--x-green-soft);
+}
+
+.draft-live-score-pill.tone-amber {
+    color: var(--x-amber);
+    border-color: var(--x-amber);
+    background: var(--x-amber-soft);
+}
+
+.draft-live-score-pill.tone-blue {
+    color: var(--x-blue);
+    border-color: var(--x-blue);
+}
+
+.draft-undo-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 8px 12px;
+    margin-bottom: 10px;
+    border-radius: 10px;
+    border: 1px solid var(--border-color);
+    background: var(--bg-card-subtle, rgba(113, 118, 123, 0.08));
+    font-size: 12.5px;
+    color: var(--text-secondary);
+}
+
+.share-intent-note,
+.schedule-batch-hint {
+    margin: 0 0 10px;
+    font-size: 12.5px;
+    color: var(--text-secondary);
+}
+
+.schedule-tz-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 7px;
+    border-radius: 999px;
+    border: 1px solid var(--border-color);
+    font-size: 11.5px;
+    color: var(--text-secondary);
+    white-space: nowrap;
+}
+
+#scheduleShareCardBtn.is-locked-action {
+    opacity: 0.72;
+    border-style: dashed;
+}
+
+.schedule-job-card.is-rescheduling .schedule-job-actions {
+    display: none;
+}
+
+.tap-info-popover {
+    position: fixed;
+    z-index: 120;
+    max-width: min(320px, calc(100vw - 24px));
+    padding: 9px 12px;
+    border-radius: 12px;
+    border: 1px solid var(--border-color);
+    background: var(--bg-main);
+    color: var(--text-primary);
+    box-shadow: var(--shadow-modal);
+    font-size: 12.5px;
+    line-height: 1.45;
+    overflow-wrap: anywhere;
+}
+
+@media (max-width: 767px) {
+    body.is-guest main.center-feed,
+    body.is-guest .center-feed {
+        padding-bottom: 0;
+    }
+
+    #gateLanguageSelect,
+    #gateThemeBtn,
+    #gateAuthorBtn,
+    #openAuthorStoryBtn,
+    #topbarThemeBtn,
+    #topbarLogoutBtn,
+    .settings-language-row,
+    #languageSelect,
+    .peer-row .peer-ext-link,
+    #followAuditList .follow-go-link,
+    #followAuditList .mini-mark-btn,
+    .tweet-orig-link,
+    .tweet-draft-check-btn,
+    #topPostSortSelect,
+    #scheduleEligibilityActionLink,
+    #postToXIntentLink,
+    #toggleSharePrivacyBtn,
+    #downloadCardPngBtn,
+    #copyShareTextBtn,
+    #scheduleShareCardBtn,
+    #restoreDraftUndoBtn,
+    .algo-advanced-json > summary,
+    .timing-quick-nav .pill-chip {
+        min-height: 44px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+    }
+
+    .settings-language-row,
+    #openAuthorStoryBtn,
+    #topbarThemeBtn,
+    #topbarLogoutBtn {
+        justify-content: space-between;
+    }
+
+    .algo-advanced-json > summary {
+        display: flex;
+        justify-content: flex-start;
+    }
+
+    .author-modal-close {
+        width: 44px;
+        height: 44px;
+        min-width: 44px;
+        min-height: 44px;
+        font-size: 22px;
+    }
+
+    .search-clear-btn {
+        width: 40px;
+        height: 40px;
+        right: 2px;
+    }
+
+    .search-input-wrap input {
+        padding-right: 42px;
+    }
+
+    #followAuditList .peer-row-actions {
+        gap: 12px;
+    }
+
+    .tweet-metrics-bar {
+        gap: 10px 12px;
+    }
+
+    .tweet-draft-check-btn + .tweet-orig-link {
+        margin-left: 2px;
+    }
+
+    .schedule-job-actions,
+    .confirm-resend-actions,
+    .author-modal-sub-actions {
+        gap: 10px;
+    }
+
+    #contentAssistantShell button,
+    #contentAssistantShell summary,
+    #contentAssistantShell select,
+    #contentAssistantShell .assistant-suggested-peers button,
+    #contentAssistantShell .assistant-source-actions button,
+    #contentAssistantShell .assistant-material-actions button,
+    #contentAssistantShell .assistant-topic-actions button,
+    #contentAssistantShell .assistant-pager button,
+    #contentAssistantShell .assistant-view-tabs .pill-chip {
+        min-height: 44px;
+    }
+
+    #contentAssistantShell summary {
+        display: flex;
+        align-items: center;
+        padding: 8px 4px;
+    }
+
+    #contentAssistantShell .assistant-source-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        margin-top: 6px;
+    }
+
+    #contentAssistantShell .assistant-setting-toggle,
+    .draft-media-toggle {
+        min-height: 44px;
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+    }
+
+    #contentAssistantShell input[type="checkbox"],
+    .draft-media-toggle input[type="checkbox"] {
+        width: 20px;
+        height: 20px;
+        min-width: 20px;
+        min-height: 20px;
+        flex-shrink: 0;
+    }
+
+    #contentAssistantShell input:not([type="checkbox"]):not([type="radio"]),
+    #contentAssistantShell select,
+    #contentAssistantShell textarea,
+    .algo-json-editor,
+    .draft-textarea,
+    .schedule-textarea,
+    .schedule-time-input,
+    .schedule-reschedule-box input {
+        font-size: 16px;
+    }
+
+    .daily-chart-box.is-scrollable {
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+        justify-content: flex-start;
+        gap: 6px;
+        padding: 14px 10px 30px;
+        scroll-snap-type: x proximity;
+    }
+
+    .daily-chart-box.is-scrollable .day-col {
+        flex: 0 0 24px;
+        min-width: 24px;
+        scroll-snap-align: start;
+    }
+
+    .daily-chart-box.is-scrollable .day-label {
+        font-size: 11.5px;
+        white-space: nowrap;
+    }
+
+    .workspace-retry-card {
+        flex-direction: column;
+        align-items: stretch;
+    }
+}
+
+@media (max-height: 480px) {
+    .author-modal-card {
+        max-height: 94dvh;
+    }
+
+    .author-modal-cover,
+    .unlock-guide-card .author-modal-cover,
+    .confirm-resend-card .author-modal-cover {
+        height: 52px;
+        min-height: 52px;
+    }
+
+    .author-modal-body,
+    .unlock-guide-body,
+    .confirm-resend-body {
+        padding: 10px 16px 14px;
+    }
+
+    .author-profile-row {
+        margin-top: -24px;
+    }
 }

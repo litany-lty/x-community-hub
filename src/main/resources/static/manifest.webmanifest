@@ -1,0 +1,24 @@
+{
+  "name": "X 社区运营工作台 · Community Ops Hub",
+  "short_name": "X 运营工作台",
+  "description": "面向 X 创作者的互动回访、关注体检、草稿评估、运营战报与定时发推工作台",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#000000",
+  "theme_color": "#000000",
+  "icons": [
+    {
+      "src": "/author-avatar.webp",
+      "sizes": "192x192",
+      "type": "image/webp",
+      "purpose": "any"
+    },
+    {
+      "src": "/author-avatar.webp",
+      "sizes": "512x512",
+      "type": "image/webp",
+      "purpose": "any"
+    }
+  ]
+}

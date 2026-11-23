@@ -88,15 +88,24 @@ public final class AssistantController {
              .put("recommendedTopicCount",counts.recommended())
              .put("needsConfirmationCount",counts.needsConfirmation())
              .put("draftedTopicCount",counts.drafted());
-            String provider = environment != null
-                    ? AssistantConnection.provider(environment)
-                    : config.path("provider").asText("commandcode");
+            String provider = AssistantConnection.selectedProvider(config, environment);
+            if (environment != null) {
+                config = config.deepCopy()
+                        .put("provider", provider)
+                        .put("credentialConfigured", AssistantConnection.isProviderConfigured(environment, provider));
+                d.set("settings", config);
+                d.set("capabilities", capabilities(tx, config));
+            }
+            var configuredProviders = object()
+                    .put("minimax", environment != null && AssistantConnection.isProviderConfigured(environment, "minimax"))
+                    .put("commandcode", environment != null && AssistantConnection.isProviderConfigured(environment, "commandcode"));
             d.set("providerDefaults", object()
                     .put("provider", provider)
                     .put("defaultProtocol", AssistantConnection.defaultProtocol(provider))
                     .put("recommendedModel", "minimax".equals(provider) ? "MiniMax-M2.7" : "gpt-5.4")
                     .put("recommendedProtocol", "minimax".equals(provider) ? "MESSAGES" : "RESPONSES")
-                    .put("recommendedContextTokens", "minimax".equals(provider) ? 200_000 : 128_000));
+                    .put("recommendedContextTokens", "minimax".equals(provider) ? 200_000 : 128_000)
+                    .set("configuredProviders", configuredProviders));
             d.put("materialCount",tx.count("material"));
             d.put("topicHasNext",topics.size()>size);
             d.set("topics",mapper.valueToTree(topics.subList(0,Math.min(size,topics.size()))));
@@ -131,6 +140,9 @@ public final class AssistantController {
         return store.tx(tx->{
             var config=settings(tx);
             if(body.has("version")) expect(config,body);
+            if(body.has("provider")) {
+                AssistantConnection.switchProvider(tx,config,body.path("provider").asText(""),environment);
+            }
             for(String key:List.of("enabled","collectionEnabled","modelEnabled")) if(body.has(key)) {
                 if(!body.path(key).isBoolean()) throw new IllegalArgumentException(key+" 必须是布尔值");
                 config.put(key,body.get(key).asBoolean());

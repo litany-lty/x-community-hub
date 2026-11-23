@@ -4,7 +4,11 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="theme-color" id="metaThemeColor" content="#000000" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="X 运营工作台" />
     <title>X 社区运营工作台 · Community Ops Hub</title>
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="/author-avatar.webp" />
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%23000'/%3E%3Cpath fill='%23fff' d='M17.53 3h2.93l-6.4 7.32L21.6 21h-5.9l-4.62-6.04L5.8 21H2.86l6.85-7.83L2.48 3h6.05l4.18 5.52L17.53 3zm-1.03 16.24h1.62L7.65 4.67H5.9l10.6 14.57z'/%3E%3C/svg%3E" />
     <link rel="preconnect" href="https://pbs.twimg.com" crossorigin />
     <link rel="dns-prefetch" href="https://pbs.twimg.com" />
@@ -18,7 +22,7 @@
             }
         } catch (_) {}
     </script>
-    <link rel="stylesheet" href="/styles.css?v=20261122c" />
+    <link rel="stylesheet" href="/styles.css?v=20261123c" />
 </head>
 <body>
 <div class="x-shell">
@@ -35,7 +39,7 @@
             </div>
 
             <nav class="nav-menu" id="leftNavMenu" aria-label="核心运营模块">
-                <button class="nav-item active" data-tab="activity" type="button">
+                <button class="nav-item active" data-tab="activity" type="button" aria-current="page">
                     <svg viewBox="0 0 24 24" class="nav-icon"><path d="M8.75 21V3h2v18h-2zM18 21V8.5h2V21h-2zM4 21l.004-10h2L6 21H4zm9.248 0v-7h2v7h-2z"/></svg>
                     <span class="nav-label">活跃</span>
                 </button>
@@ -112,6 +116,13 @@
                     </div>
                 </div>
                 <h1 class="auth-gate-title">X 运营工作台</h1>
+                <div class="auth-gate-features" aria-label="核心功能">
+                    <span class="gate-feature-chip">互动回访</span>
+                    <span class="gate-feature-chip">关注清理</span>
+                    <span class="gate-feature-chip">草稿体检</span>
+                    <span class="gate-feature-chip">运营战报</span>
+                    <span class="gate-feature-chip">定时发推</span>
+                </div>
 
                 <div class="auth-policy-grid">
                     <div class="auth-policy-item">
@@ -169,6 +180,13 @@
                                 <svg viewBox="0 0 24 24" class="sm-icon" aria-hidden="true" fill="none"><path d="m9.5 3-.6 2.1-1.8 1L5 5.6 2.5 9.9 4 11.4v2L2.5 15 5 19.3l2.1-.5 1.8 1 .6 2.2h5l.6-2.2 1.8-1 2.1.5 2.5-4.3-1.5-1.6v-2l1.5-1.5L19 5.6l-2.1.5-1.8-1-.6-2.1h-5Z"/><circle cx="12" cy="12.5" r="3"/></svg>
                             </summary>
                             <div class="settings-menu" role="group" aria-label="工作台设置">
+                                <div class="settings-account-head" id="settingsAccountHead" hidden>
+                                    <div class="avatar-circle sm" id="settingsAccountAvatar" data-i18n-ignore>X</div>
+                                    <div class="settings-account-meta">
+                                        <div class="settings-account-name" id="settingsAccountName" data-i18n-ignore></div>
+                                        <div class="settings-account-handle" id="settingsAccountHandle" data-i18n-ignore></div>
+                                    </div>
+                                </div>
                                 <label class="settings-language-row" for="languageSelect">
                                     <span>语言</span>
                                     <select id="languageSelect" class="x-select language-select" aria-label="选择语言">
@@ -179,7 +197,7 @@
                                     </select>
                                 </label>
                                 <button type="button" class="settings-menu-item" id="topbarThemeBtn" title="切换主题" aria-label="切换主题">
-                                    <span>主题</span><span class="theme-btn-text">纯黑</span>
+                                    <span>主题</span> <span class="theme-btn-text">纯黑</span>
                                 </button>
                                 <button type="button" class="settings-menu-item" id="openAuthorStoryBtn">关于此应用</button>
                                 <button type="button" class="settings-menu-item settings-logout" id="topbarLogoutBtn">退出</button>
@@ -202,6 +220,13 @@
             <div id="overdueGlobalBanner" class="notice-strip overdue-banner" hidden>
                 <span id="overdueGlobalText">逾期待确认</span>
                 <button type="button" class="x-blue-pill sm" id="goOverdueScheduleBtn">查看补发</button>
+            </div>
+            <div id="workspaceRetryCard" class="x-section-card workspace-retry-card" role="alert" hidden>
+                <div class="workspace-retry-body">
+                    <div class="workspace-retry-title" id="workspaceRetryTitle">数据加载未完成</div>
+                    <p class="section-desc" id="workspaceRetryMessage">网络或数据服务暂时不可用，请重试加载。</p>
+                </div>
+                <button type="button" class="x-blue-pill sm" id="workspaceRetryBtn">立即重试</button>
             </div>
 
             <!-- X 原生风格个人主页头部 -->
@@ -232,10 +257,10 @@
                     <p class="profile-bio" id="profileBio" data-i18n-ignore hidden></p>
 
                     <div class="profile-stats-row">
-                        <div class="stat-inline"><strong id="profileFollowingNum">0</strong> <span>关注</span></div>
-                        <div class="stat-inline"><strong id="profileFollowersNum">0</strong> <span>关注者</span></div>
-                        <div class="stat-inline" title="我关注的人当中回关我的比例"><strong id="profileMutualRateNum">0%</strong> <span>回关率</span></div>
-                        <div class="stat-inline"><strong id="profileTotalTweetsNum">0</strong> <span>推文</span></div>
+                        <div class="stat-inline"><strong id="profileFollowingNum">--</strong> <span>关注</span></div>
+                        <div class="stat-inline"><strong id="profileFollowersNum">--</strong> <span>关注者</span></div>
+                        <div class="stat-inline" title="我关注的人当中回关我的比例"><strong id="profileMutualRateNum">--</strong> <span>回关率</span></div>
+                        <div class="stat-inline"><strong id="profileTotalTweetsNum">--</strong> <span>推文</span></div>
                     </div>
 
                 </div>
@@ -255,23 +280,23 @@
                 <div class="kpi-grid-4">
                     <div class="kpi-card" title="原创主推文数量（不含在他人推文下的回复）">
                         <div class="kpi-label" id="kpiPostsTitle">原创发帖</div>
-                        <div class="kpi-value" id="kpiOriginalPosts">0</div>
-                        <div class="kpi-sub" id="kpiDailyPosts">日均 0</div>
+                        <div class="kpi-value" id="kpiOriginalPosts">--</div>
+                        <div class="kpi-sub" id="kpiDailyPosts">--</div>
                     </div>
                     <div class="kpi-card" title="主动去其他推友评论区互动回复的条数">
                         <div class="kpi-label" id="kpiRepliesTitle">回复</div>
-                        <div class="kpi-value accent-blue" id="kpiReplies">0</div>
-                        <div class="kpi-sub" id="kpiDailyReplies">日均 0</div>
+                        <div class="kpi-value accent-blue" id="kpiReplies">--</div>
+                        <div class="kpi-sub" id="kpiDailyReplies">--</div>
                     </div>
                     <div class="kpi-card" title="回复数 ÷ 原创推文数，参考区间 2–6x">
                         <div class="kpi-label">回复 / 发帖</div>
-                        <div class="kpi-value accent-green" id="kpiReplyRatio">0x</div>
-                        <div class="kpi-sub" id="kpiReplyShare">回复占 0%</div>
+                        <div class="kpi-value accent-green" id="kpiReplyRatio">--</div>
+                        <div class="kpi-sub" id="kpiReplyShare">--</div>
                     </div>
                     <div class="kpi-card" title="互动率：(点赞+评论+转推/引用+收藏) ÷ 浏览量">
                         <div class="kpi-label">互动率</div>
-                        <div class="kpi-value accent-pink" id="kpiAvgEr">0%</div>
-                        <div class="kpi-sub" id="kpiAvgViews">帖均浏览 0</div>
+                        <div class="kpi-value accent-pink" id="kpiAvgEr">--</div>
+                        <div class="kpi-sub" id="kpiAvgViews">--</div>
                     </div>
                 </div>
 
@@ -327,7 +352,10 @@
                             <p class="section-desc" id="interactionSummaryDesc">--</p>
                         </div>
                         <div class="toolbar-right">
-                            <input type="search" id="peerSearchInput" class="x-mini-input" placeholder="搜索昵称 / @用户名" aria-label="搜索推友" />
+                            <div class="search-input-wrap">
+                                <input type="search" id="peerSearchInput" class="x-mini-input" placeholder="搜索昵称 / @用户名" aria-label="搜索推友" />
+                                <button type="button" class="search-clear-btn" id="clearPeerSearchBtn" aria-label="清空搜索" title="清空搜索" hidden>×</button>
+                            </div>
                             <select id="peerSortSelect" class="x-select" aria-label="排序方式">
                                 <option value="intimacy">亲密度</option>
                                 <option value="recent">最近互动</option>
@@ -340,6 +368,7 @@
                     </div>
 
                     <div class="filter-pills-row" id="interactionTypePills">
+                        <button class="pill-chip" data-rel-filter="ALL" id="pillAllPeersBtn" type="button" title="查看全部互动推友">全部</button>
                         <button class="pill-chip" data-rel-filter="I_OWE" id="pillIOweBtn" type="button" title="TA 来评过我但我没去评 TA，或双方主帖评论差额 > 5 帖且 TA 评我更多">待回访</button>
                         <button class="pill-chip" data-rel-filter="UNREPLIED_POST" id="pillUnrepliedBtn" type="button" title="别人评论了我，但我还没有回复 TA">待回复</button>
                         <button class="pill-chip" data-rel-filter="THEY_OWE" id="pillTheyOweBtn" type="button" title="我去评过 TA 但 TA 没来评我，或双方主帖评论差额 > 5 帖且我去评更多">未回访我</button>
@@ -364,7 +393,10 @@
                         </div>
 
                         <div class="toolbar-right">
-                            <input type="search" id="followFilterInput" class="x-mini-input" placeholder="搜索昵称 / @用户名" aria-label="搜索关注账号" />
+                            <div class="search-input-wrap">
+                                <input type="search" id="followFilterInput" class="x-mini-input" placeholder="搜索昵称 / @用户名" aria-label="搜索关注账号" />
+                                <button type="button" class="search-clear-btn" id="clearFollowSearchBtn" aria-label="清空搜索" title="清空搜索" hidden>×</button>
+                            </div>
                             <select id="followSortSelect" class="x-select" aria-label="关注列表排序">
                                 <option value="recent">最近关注</option>
                                 <option value="intimacy">亲密度</option>
@@ -391,6 +423,12 @@
 
             <!-- ==================== 模块 4：私人内容助手与内容诊断 ==================== -->
             <section class="tab-panel" id="panel-timing">
+                <div class="timing-quick-nav" id="timingQuickNav" hidden aria-label="内容页快捷跳转">
+                    <button type="button" class="pill-chip" data-go="tab:timing|scrollId:contentAssistantShell">内容助手</button>
+                    <button type="button" class="pill-chip" data-go="tab:timing|scrollId:formatCardsGrid">体裁表现</button>
+                    <button type="button" class="pill-chip" data-go="tab:timing|scrollId:algoPoolSection">曝光分布</button>
+                    <button type="button" class="pill-chip" data-go="tab:timing|focusDraft:1">草稿体检</button>
+                </div>
                 <div class="x-section-card content-assistant-shell" id="contentAssistantShell" hidden>
                     <div class="section-head wrap-gap content-assistant-head">
                         <h2 class="section-title">内容助手</h2>
@@ -525,6 +563,7 @@
                                     <label class="assistant-setting-toggle"><input id="assistantEnabled" type="checkbox" /><span>启用内容助手</span></label>
                                     <label class="assistant-setting-toggle"><input id="assistantCollectionEnabled" type="checkbox" /><span>自动采集</span></label>
                                     <label class="assistant-setting-toggle"><input id="assistantModelEnabled" type="checkbox" /><span>模型处理</span></label>
+                                    <label><span>模型服务</span><select id="assistantProvider" class="x-select"><option value="minimax" data-i18n-ignore>MiniMax</option><option value="commandcode" data-i18n-ignore>CommandCode</option></select></label>
                                     <label><span>综合推荐线</span><input id="assistantThreshold" type="number" min="0" max="100" inputmode="numeric" /></label>
                                     <details id="assistantAdvancedSettings" class="assistant-advanced-settings">
                                         <summary>模型与采集参数</summary>
@@ -606,12 +645,17 @@
                         <div class="algo-config-meta" id="algoConfigMetaLine">当前规则来源：内置基线</div>
                         <div class="algo-changelog-list" id="algoChangelogList"></div>
                         <div class="algo-perm-hint" id="algoConfigPermHint">仅授权运维账号或本地开发模式可保存覆盖规则，支持零停机热更新与一键还原。</div>
-                        <textarea id="algoProfileJsonInput" class="algo-json-editor" rows="10" spellcheck="false" aria-label="X 算法规则 JSON 配置"></textarea>
-                        <div class="algo-config-actions" id="algoConfigActionRow">
-                            <button type="button" class="algo-action-btn" id="reloadAlgoProfileBtn">从磁盘重载</button>
-                            <button type="button" class="algo-action-btn" id="resetAlgoProfileBtn">还原内置基线</button>
-                            <button type="button" class="algo-action-btn primary" id="saveAlgoProfileBtn">保存并热生效</button>
-                        </div>
+                        <details class="algo-advanced-json" id="algoAdvancedJsonDetails">
+                            <summary>高级开发者 JSON 配置</summary>
+                            <div class="algo-advanced-json-body">
+                                <textarea id="algoProfileJsonInput" class="algo-json-editor" rows="10" spellcheck="false" aria-label="X 算法规则 JSON 配置"></textarea>
+                                <div class="algo-config-actions" id="algoConfigActionRow">
+                                    <button type="button" class="algo-action-btn" id="reloadAlgoProfileBtn">从磁盘重载</button>
+                                    <button type="button" class="algo-action-btn" id="resetAlgoProfileBtn">还原内置基线</button>
+                                    <button type="button" class="algo-action-btn primary" id="saveAlgoProfileBtn">保存并热生效</button>
+                                </div>
+                            </div>
+                        </details>
                     </div>
                     <div class="format-cards-grid" id="algoReachPoolsGrid"></div>
                     <div class="algo-calibration-panel" id="algoCalibrationPanel" hidden></div>
@@ -622,7 +666,10 @@
                 <div class="x-section-card" id="prePostSimulatorCard" data-content-report hidden>
                     <div class="section-head wrap-gap">
                         <div>
-                            <h2 class="section-title">草稿体检</h2>
+                            <div class="draft-head-title-row">
+                                <h2 class="section-title">草稿体检</h2>
+                                <span class="draft-live-score-pill" id="draftLiveScorePill" hidden></span>
+                            </div>
                             <p class="section-desc" id="draftLiveTimingHint" hidden></p>
                         </div>
                         <div class="draft-toggles-group">
@@ -635,6 +682,10 @@
                                 <span>长文/串推</span>
                             </label>
                         </div>
+                    </div>
+                    <div class="draft-undo-bar" id="draftUndoBar" hidden>
+                        <span id="draftUndoText">已载入代表推文</span>
+                        <button type="button" class="x-outline-pill sm" id="restoreDraftUndoBtn">恢复刚才草稿</button>
                     </div>
                     <textarea
                         id="draftSimulatorInput"
@@ -686,6 +737,7 @@
                         </div>
                     </div>
 
+                    <p class="section-desc share-intent-note" id="shareIntentNote">X 网页发布暂不支持自动附图，建议先点「下载图片」再前往发布。</p>
                     <div class="share-canvas-preview-wrap">
                         <canvas id="shareCardCanvas" width="1080" height="600" class="share-canvas"></canvas>
                     </div>
@@ -739,11 +791,13 @@
                     <div class="section-head wrap-gap">
                         <h2 class="section-title">新建定时推文</h2>
                         <div class="toolbar-right">
+                            <button type="button" class="x-outline-pill sm" id="reauthorizePublishBtn" hidden>重新授权</button>
                             <button type="button" class="x-outline-pill sm" id="alignScheduleGapBtn" hidden>间隔 1 小时</button>
                             <button type="button" class="x-outline-pill sm" id="addScheduleDraftItemBtn">添加推文</button>
                         </div>
                     </div>
 
+                    <p class="section-desc schedule-batch-hint" id="scheduleBatchHint" hidden>多条草稿将按各自设定时间分批独立发布（非串推 Thread）。</p>
                     <div id="scheduleDraftItemsList" class="schedule-draft-stack"></div>
                     <input type="file" id="scheduleMediaFileInput" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden />
 
@@ -824,7 +878,7 @@
     </aside>
 <!-- 窄屏底部导航（左栏隐藏时出现，与 X 手机版一致） -->
     <nav class="mobile-bottom-nav" aria-label="页面切换">
-        <button class="bottom-tab active" data-tab="activity" type="button"><svg viewBox="0 0 24 24"><path d="M8.75 21V3h2v18h-2zM18 21V8.5h2V21h-2zM4 21l.004-10h2L6 21H4zm9.248 0v-7h2v7h-2z"/></svg><span>活跃</span></button>
+        <button class="bottom-tab active" data-tab="activity" type="button" aria-current="page"><svg viewBox="0 0 24 24"><path d="M8.75 21V3h2v18h-2zM18 21V8.5h2V21h-2zM4 21l.004-10h2L6 21H4zm9.248 0v-7h2v7h-2z"/></svg><span>活跃</span></button>
         <button class="bottom-tab" data-tab="interactions" type="button"><svg viewBox="0 0 24 24"><path d="M4.5 3.88l4.43 4.14-1.36 1.46L5.5 7.55V16c0 1.1.9 2 2 2H13v2H7.5c-2.21 0-4-1.79-4-4V7.55L1.43 9.48.07 8.02 4.5 3.88zM16.5 6H11V4h5.5c2.21 0 4 1.79 4 4v8.45l2.07-1.93 1.36 1.46-4.43 4.14-4.43-4.14 1.36-1.46 2.07 1.93V8c0-1.1-.9-2-2-2z"/></svg><span>互动</span><i class="bottom-badge" id="mobileInteractBadge" hidden>0</i></button>
         <button class="bottom-tab" data-tab="follow-audit" type="button"><svg viewBox="0 0 24 24"><path d="M10 4c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zM6 6c0-2.21 1.79-4 4-4s4 1.79 4 4-1.79 4-4 4-4-1.79-4-4zm13 4v3h2v-3h3V8h-3V5h-2v3h-3v2h3zM3.65 19h12.7c-.34-1.8-1.02-3.21-1.95-4.19C13.32 13.65 11.84 13 10 13s-3.32.65-4.4 1.81c-.93.98-1.61 2.39-1.95 4.19zm.49-5.56C5.63 11.85 7.65 11 10 11s4.37.85 5.86 2.44c1.48 1.58 2.37 3.8 2.63 6.46l.11 1.1H1.4l.11-1.1c.26-2.66 1.15-4.88 2.63-6.46z"/></svg><span>关注</span></button>
         <button class="bottom-tab" data-tab="timing" type="button"><svg viewBox="0 0 24 24"><path d="M12 1.75C6.34 1.75 1.75 6.34 1.75 12S6.34 22.25 12 22.25 22.25 17.66 22.25 12 17.66 1.75 12 1.75zm0 18.5c-4.56 0-8.25-3.69-8.25-8.25S7.44 3.75 12 3.75s8.25 3.69 8.25 8.25-3.69 8.25-8.25 8.25zm.75-13h-1.5v5.69l4.28 2.57.77-1.29-3.55-2.13V7.25z"/></svg><span>内容</span></button>
@@ -940,9 +994,10 @@
     </div>
 </div>
 
+<div id="tapInfoPopover" class="tap-info-popover" role="tooltip" hidden></div>
 <div id="copyToast" class="bottom-toast" role="status" aria-live="polite" hidden>已复制到剪贴板</div>
-<script src="/i18n-messages.js?v=20261122b"></script>
+<script src="/i18n-messages.js?v=20261123c"></script>
 <script src="/i18n.js?v=20261116e"></script>
-<script src="/app.js?v=20261122z"></script>
+<script src="/app.js?v=20261123c"></script>
 </body>
 </html>

@@ -804,10 +804,15 @@ public class CommunityHubService {
                 || backgroundRefreshes.values().stream().anyMatch(AtomicBoolean::get);
     }
 
+    private boolean canUsePublicOrPaidProvider() {
+        return properties.hasTwitterApiIoKey()
+                || (twitterApiIoProvider != null && twitterApiIoProvider.canReadTimelineForFree(""));
+    }
+
     public boolean isSilentHistoryEnabled() {
         return properties.isTop10SilentHistoryEnabled()
                 && resolvePreferredModeQuietly() == ProviderMode.TWITTERAPI_IO
-                && properties.hasTwitterApiIoKey();
+                && canUsePublicOrPaidProvider();
     }
 
     private static List<long[]> officialCoverage(Instant oldest, boolean exhausted, Instant cutoff, Instant anchor) {
@@ -1509,13 +1514,13 @@ public class CommunityHubService {
             return ProviderMode.DEMO;
         }
         if (cfg != ProviderMode.AUTO) {
-            if (cfg == ProviderMode.TWITTERAPI_IO && !properties.hasTwitterApiIoKey())
+            if (cfg == ProviderMode.TWITTERAPI_IO && !canUsePublicOrPaidProvider())
                 throw new XDataProviderException(400, "指定 TwitterAPI.io 数据源但未配置 API Key");
             if (cfg == ProviderMode.X_OFFICIAL_V2 && !properties.hasOfficialBearerToken())
                 throw new XDataProviderException(400, "指定 X 官方数据源但未配置 Bearer Token");
             return cfg;
         }
-        if (properties.hasTwitterApiIoKey()) {
+        if (canUsePublicOrPaidProvider()) {
             return ProviderMode.TWITTERAPI_IO;
         }
         if (properties.hasOfficialBearerToken()) {
@@ -2408,7 +2413,7 @@ public class CommunityHubService {
      * - 网络拉取在账号锁之外进行，仅在毫秒级磁盘合并时持锁，不阻塞用户当前使用。
      */
     public boolean runOneSilentTop10HistoryStepNow() {
-        if (resolvePreferredModeQuietly() != ProviderMode.TWITTERAPI_IO || !properties.hasTwitterApiIoKey()) {
+        if (resolvePreferredModeQuietly() != ProviderMode.TWITTERAPI_IO || !canUsePublicOrPaidProvider()) {
             return false;
         }
         if (hasActiveForegroundWork()) {
@@ -2418,7 +2423,8 @@ public class CommunityHubService {
         if (precheckNowMs < silentHistoryBudgetCooldownUntilMs) {
             return false;
         }
-        if (twitterApiIoProvider.isBackgroundPaidBudgetExhausted()) {
+        if (twitterApiIoProvider.isBackgroundPaidBudgetExhausted()
+                && !twitterApiIoProvider.canReadTimelineForFree("")) {
             silentHistoryBudgetCooldownUntilMs = precheckNowMs + 300_000L;
             return false;
         }
@@ -2653,7 +2659,7 @@ public class CommunityHubService {
     }
 
     public int runTop50AutoSyncNow() {
-        if (resolveProviderMode(null) != ProviderMode.TWITTERAPI_IO || !properties.hasTwitterApiIoKey()) {
+        if (resolveProviderMode(null) != ProviderMode.TWITTERAPI_IO || !canUsePublicOrPaidProvider()) {
             return 0;
         }
         if (!top50AutoSyncRunning.compareAndSet(false, true)) {

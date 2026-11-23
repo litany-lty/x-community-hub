@@ -68,7 +68,7 @@ public class TwitterApiIoProvider {
     private static final int MAX_429_RETRIES = 3;
     private static final long SNAPSHOT_SOFT_DEADLINE_SECONDS = 20L;
     private static final long PAID_HTTP_TIMEOUT_MS = 10_000L;
-    private static final long PAID_SEARCH_HTTP_TIMEOUT_MS = 8_500L;
+    private static final long PAID_SEARCH_HTTP_TIMEOUT_MS = 15_000L;
     // Stop the free phase before the existing sync deadline so the paid request can be admitted.
     private static final long PAID_FALLBACK_RESERVE_MS = 1500;
     private static final int MAX_STREAM_PAGES_PER_BATCH = 32;
@@ -254,14 +254,15 @@ public class TwitterApiIoProvider {
         if (requested.isBlank()) {
             throw new XDataProviderException(400, "作者用户名不能为空");
         }
-        String apiKey = properties.getTwitterapiIoKey();
-        if (apiKey == null || apiKey.isBlank()) {
-            throw new XDataProviderException(503, "TwitterAPI.io 尚未配置");
-        }
         String baseUrl = trimTrailingSlash(properties.getTwitterapiIoBaseUrl());
         String encoded = URLEncoder.encode(requested, StandardCharsets.UTF_8);
-        JsonNode root = getJsonBefore(baseUrl + "/twitter/user/info?userName=" + encoded,
-                apiKey.trim(), pacerFor(apiKey.trim()), deadline);
+        String infoUrl = baseUrl + "/twitter/user/info?userName=" + encoded;
+        String rawKey = properties.getTwitterapiIoKey();
+        String apiKey = rawKey == null ? "" : rawKey.trim();
+        if (apiKey.isBlank() && !useFreeSource(infoUrl)) {
+            throw new XDataProviderException(503, "TwitterAPI.io 尚未配置");
+        }
+        JsonNode root = getJsonBefore(infoUrl, apiKey, pacerFor(apiKey), deadline);
         XUserSummary author = parseValidatedUserProfile(root, requested);
         if (author.id() == null || author.id().isBlank())
             throw new XDataProviderException(502, "上游未返回作者稳定账号 ID，已停止绑定");
@@ -549,12 +550,12 @@ public class TwitterApiIoProvider {
     public com.fasterxml.jackson.databind.node.ObjectNode observePost(String ownerId, String postId) {
         if (ownerId == null || ownerId.isBlank()) throw new XDataProviderException(400, "作者账号 ID 不能为空");
         if (postId == null || postId.isBlank()) throw new XDataProviderException(400, "推文 ID 不能为空");
-        String apiKey = properties.getTwitterapiIoKey();
-        if (apiKey == null || apiKey.isBlank()) throw new XDataProviderException(503, "TwitterAPI.io 尚未配置");
         String baseUrl = trimTrailingSlash(properties.getTwitterapiIoBaseUrl());
-        JsonNode root = getJsonBefore(baseUrl + "/twitter/tweets?tweet_ids="
-                        + URLEncoder.encode(postId.trim(), StandardCharsets.UTF_8),
-                apiKey.trim(), pacerFor(apiKey.trim()), Instant.now().plusSeconds(SNAPSHOT_SOFT_DEADLINE_SECONDS));
+        String postUrl = baseUrl + "/twitter/tweets?tweet_ids=" + URLEncoder.encode(postId.trim(), StandardCharsets.UTF_8);
+        String rawKey = properties.getTwitterapiIoKey();
+        String apiKey = rawKey == null ? "" : rawKey.trim();
+        if (apiKey.isBlank() && !useFreeSource(postUrl)) throw new XDataProviderException(503, "TwitterAPI.io 尚未配置");
+        JsonNode root = getJsonBefore(postUrl, apiKey, pacerFor(apiKey), Instant.now().plusSeconds(SNAPSHOT_SOFT_DEADLINE_SECONDS));
         JsonNode row = extractArray(root, "tweets", "data").stream()
                 .filter(node -> postId.trim().equals(node.path("id").asText()))
                 .findFirst().orElseThrow(() -> new XDataProviderException(404, "推文不存在或暂不可读取"));
@@ -577,12 +578,12 @@ public class TwitterApiIoProvider {
     public com.fasterxml.jackson.databind.node.ObjectNode observeOwner(String ownerId, String username) {
         if (ownerId == null || ownerId.isBlank() || username == null || username.isBlank())
             throw new XDataProviderException(400, "作者账号 ID 与用户名不能为空");
-        String apiKey = properties.getTwitterapiIoKey();
-        if (apiKey == null || apiKey.isBlank()) throw new XDataProviderException(503, "TwitterAPI.io 尚未配置");
         String baseUrl = trimTrailingSlash(properties.getTwitterapiIoBaseUrl());
-        JsonNode root = getJsonBefore(baseUrl + "/twitter/user/info?userName="
-                        + URLEncoder.encode(username, StandardCharsets.UTF_8),
-                apiKey.trim(), pacerFor(apiKey.trim()), Instant.now().plusSeconds(SNAPSHOT_SOFT_DEADLINE_SECONDS));
+        String infoUrl = baseUrl + "/twitter/user/info?userName=" + URLEncoder.encode(username, StandardCharsets.UTF_8);
+        String rawKey = properties.getTwitterapiIoKey();
+        String apiKey = rawKey == null ? "" : rawKey.trim();
+        if (apiKey.isBlank() && !useFreeSource(infoUrl)) throw new XDataProviderException(503, "TwitterAPI.io 尚未配置");
+        JsonNode root = getJsonBefore(infoUrl, apiKey, pacerFor(apiKey), Instant.now().plusSeconds(SNAPSHOT_SOFT_DEADLINE_SECONDS));
         JsonNode raw = root.hasNonNull("data") ? root.get("data") : root;
         XUserSummary owner = parseValidatedUserProfile(root, username);
         requireSameAccountId(owner, ownerId);
@@ -652,14 +653,20 @@ public class TwitterApiIoProvider {
 
     public XUserSummary fetchPublicUserSummaryQuietly(String username) {
         try {
-            if (!properties.hasTwitterApiIoKey() || isLocalMockBaseUrl() || username == null || username.isBlank()) {
+            if (username == null || username.isBlank()) {
                 return null;
             }
-            String apiKey = properties.getTwitterapiIoKey().trim();
             String baseUrl = trimTrailingSlash(properties.getTwitterapiIoBaseUrl());
             String encodedUser = URLEncoder.encode(username.trim(), StandardCharsets.UTF_8);
+            String infoUrl = baseUrl + "/twitter/user/info?userName=" + encodedUser;
+            boolean freeAvailable = useFreeSource(infoUrl);
+            if ((!properties.hasTwitterApiIoKey() && !freeAvailable) || (isLocalMockBaseUrl() && !freeAvailable)) {
+                return null;
+            }
+            String rawKey = properties.getTwitterapiIoKey();
+            String apiKey = rawKey == null ? "" : rawKey.trim();
             KeyPacer pacer = pacerFor(apiKey);
-            JsonNode userRoot = getJsonWithRetry(baseUrl + "/twitter/user/info?userName=" + encodedUser, apiKey, pacer);
+            JsonNode userRoot = getJsonWithRetry(infoUrl, apiKey, pacer);
             JsonNode userNode = userRoot.hasNonNull("data") ? userRoot.get("data") : userRoot;
             if (userNode == null || userNode.isMissingNode()
                     || firstNonBlank(userNode.path("userName").asText(""), userNode.path("username").asText("")).isBlank()) {
@@ -801,12 +808,13 @@ public class TwitterApiIoProvider {
             int maxPagesPerStream,
             String expectedAccountId
     ) {
-        String apiKey = properties.getTwitterapiIoKey();
-        if (apiKey == null || apiKey.isBlank()) {
-            return new SyncOutcome(existing, false, false, true, 0);
-        }
+        String rawKey = properties.getTwitterapiIoKey();
+        String apiKey = rawKey == null ? "" : rawKey.trim();
         String baseUrl = trimTrailingSlash(properties.getTwitterapiIoBaseUrl());
         String encodedUser = URLEncoder.encode(username, StandardCharsets.UTF_8);
+        if (apiKey.isBlank() && !useFreeSource(baseUrl + "/twitter/user/info?userName=" + encodedUser)) {
+            return new SyncOutcome(existing, false, false, true, 0);
+        }
         KeyPacer pacer = pacerFor(apiKey);
         boolean warmExisting = existing != null && existing.syncedAtInstant() != null && existing.profile() != null;
         Instant now = Instant.now();
@@ -878,15 +886,16 @@ public class TwitterApiIoProvider {
             String overrideApiKey,
             String expectedAccountId
     ) {
-        String apiKey = (overrideApiKey != null && !overrideApiKey.isBlank())
+        String rawKey = (overrideApiKey != null && !overrideApiKey.isBlank())
                 ? overrideApiKey.trim()
                 : properties.getTwitterapiIoKey();
-        if (apiKey == null || apiKey.isBlank()) {
-            throw new XDataProviderException(400, "服务端尚未配置 TwitterAPI.io API Key，请在 application.yml 中配置 xops.twitterapi-io-key");
-        }
+        String apiKey = rawKey == null ? "" : rawKey.trim();
         long startMs = System.currentTimeMillis();
         String baseUrl = trimTrailingSlash(properties.getTwitterapiIoBaseUrl());
         String encodedUser = URLEncoder.encode(username, StandardCharsets.UTF_8);
+        if (apiKey.isBlank() && !useFreeSource(baseUrl + "/twitter/user/info?userName=" + encodedUser)) {
+            throw new XDataProviderException(400, "服务端尚未配置 TwitterAPI.io API Key，请在 application.yml 中配置 xops.twitterapi-io-key");
+        }
         KeyPacer pacer = pacerFor(apiKey);
         boolean warmExisting = existing != null && existing.syncedAtInstant() != null && existing.profile() != null;
         boolean initialFetch = !warmExisting;
@@ -979,8 +988,10 @@ public class TwitterApiIoProvider {
                 dailyCycleStart = lightweightDailyOnly ? syncTo.getEpochSecond() : 0L;
                 String knownSelf = existing.profile().username();
                 int pageBudget = pacer.freeTierSlowMode ? 3 : (lightweightDailyOnly ? 16 : MAX_STREAM_PAGES_PER_BATCH);
+                String ownTimelineUrl = baseUrl + "/twitter/user/last_tweets?userName=" + encodedUser;
                 boolean allowNativeHead = !lightweightDailyOnly;
-                boolean allowOwnNativeHead = allowNativeHead || fxTwitterClient.isSearchCircuitOpen();
+                boolean allowOwnNativeHead = allowNativeHead || fxTwitterClient.isSearchCircuitOpen()
+                        || isPureFreeEndpoint(ownTimelineUrl) || (apiKey.isBlank() && useFreeSource(ownTimelineUrl));
                 Instant cutoff30 = cutoffForWindowDays(syncTo, 30);
                 Instant targetCutoff = cutoffForWindowHours(syncTo, effectiveHours);
                 long headTo = syncTo.getEpochSecond();
@@ -991,6 +1002,9 @@ public class TwitterApiIoProvider {
                                 .thenApply(root -> parseValidatedUserProfile(root, username));
                 CompletableFuture<HeadGraphStage> headStageF = profileF.thenCompose(freshProfile -> {
                     requireSameAccountId(freshProfile, boundId);
+                    if (apiKey.isBlank()) {
+                        return CompletableFuture.completedFuture(new HeadGraphStage(freshProfile, existing.hasGraph(), false, null, null));
+                    }
                     long graphAgeHours = existing.hasGraph()
                             ? Duration.between(Instant.ofEpochSecond(existing.graphFetchedAt()), syncTo).toHours()
                             : Long.MAX_VALUE;
@@ -1045,6 +1059,9 @@ public class TwitterApiIoProvider {
                         : CompletableFuture.completedFuture(DailyMetricRefreshResult.empty());
 
                 CompletableFuture.allOf(headStageF, tweetsF, inboundF, metricsF).join();
+                if (apiKey.isBlank()) {
+                    degraded.set(true);
+                }
                 HeadGraphStage stage = headStageF.join();
                 profile = stage.profile();
                 graphReusable = stage.graphReusable();
@@ -1064,8 +1081,10 @@ public class TwitterApiIoProvider {
                 fetchGraph = true;
                 String self = profile.username();
                 int pageBudget = pacer.freeTierSlowMode ? 3 : (lightweightDailyOnly ? 32 : MAX_STREAM_PAGES_PER_BATCH * 2);
+                String ownTimelineUrl = baseUrl + "/twitter/user/last_tweets?userName=" + encodedUser;
                 boolean allowNativeHead = !lightweightDailyOnly;
-                boolean allowOwnNativeHead = allowNativeHead || fxTwitterClient.isSearchCircuitOpen();
+                boolean allowOwnNativeHead = allowNativeHead || fxTwitterClient.isSearchCircuitOpen()
+                        || isPureFreeEndpoint(ownTimelineUrl) || (apiKey.isBlank() && useFreeSource(ownTimelineUrl));
                 Instant cutoff30 = cutoffForWindowDays(syncTo, 30);
                 Instant targetCutoff = cutoffForWindowHours(syncTo, effectiveHours);
                 long headTo = syncTo.getEpochSecond();
@@ -1076,20 +1095,25 @@ public class TwitterApiIoProvider {
                 CompletableFuture<StreamFill> inboundF = startInboundFillAsync(
                         baseUrl, searchRoots, encodedUser, self, profile.id(), inboundCoverage, targetCutoff, cutoff30, headTo, allowNativeHead, true,
                         apiKey, pacer, pageBudget, deadline, degraded);
-                CompletableFuture<PagedUserResult> followingsF = profile.followingCount() > 0
+                CompletableFuture<PagedUserResult> followingsF = (!apiKey.isBlank() && profile.followingCount() > 0)
                         ? fetchPagedUsersAsync(
                                 baseUrl + "/twitter/user/followings?userName=" + encodedUser + "&pageSize=200",
                                 apiKey, pacer, pacer.freeTierSlowMode ? 1 : Math.max(1, properties.getMaxFollowingPages()),
                                 profile.followingCount(), "followings", deadline, degraded)
-                        : CompletableFuture.completedFuture(null);
-                CompletableFuture<PagedUserResult> followersF = profile.followersCount() > 0
+                        : CompletableFuture.completedFuture(apiKey.isBlank() && profile.followingCount() > 0
+                                ? new PagedUserResult(List.of(), Set.of(), true, true) : null);
+                CompletableFuture<PagedUserResult> followersF = (!apiKey.isBlank() && profile.followersCount() > 0)
                         ? fetchFollowersAsync(
                                 baseUrl, encodedUser, profile.id(),
                                 apiKey, pacer, pacer.freeTierSlowMode ? 1 : Math.max(1, properties.getMaxFollowerPages()),
                                 profile.followersCount(), deadline, degraded)
-                        : CompletableFuture.completedFuture(null);
+                        : CompletableFuture.completedFuture(apiKey.isBlank() && profile.followersCount() > 0
+                                ? new PagedUserResult(List.of(), Set.of(), true, true) : null);
 
                 CompletableFuture.allOf(tweetsF, inboundF, followingsF, followersF).join();
+                if (apiKey.isBlank() && (profile.followingCount() > 0 || profile.followersCount() > 0)) {
+                    degraded.set(true);
+                }
                 tweets = tweetsF.join();
                 inbound = inboundF.join();
                 followings = followingsF.join();
@@ -2138,7 +2162,8 @@ public class TwitterApiIoProvider {
         if (pacersByKey.size() > 64) {
             pacersByKey.clear();
         }
-        return pacersByKey.computeIfAbsent(apiKey, k -> new KeyPacer());
+        String safeKey = apiKey == null ? "" : apiKey.trim();
+        return pacersByKey.computeIfAbsent(safeKey, k -> new KeyPacer());
     }
 
     private boolean isLocalMockBaseUrl() {
@@ -2268,11 +2293,23 @@ public class TwitterApiIoProvider {
             AccountStore.StoredAccount metricStore, AtomicReference<XDataProviderException> capturedError) {
         var read = new ReadDiagnostic(url);
         if (useFreeSource(url)) {
+            boolean pureFree = isPureFreeEndpoint(url) || apiKey == null || apiKey.isBlank();
             var started = requestStarted != null ? requestStarted : new AtomicBoolean();
             long startNanos = System.nanoTime();
-            return handleComposeCancellable(fxTwitterClient.fetchAsync(url, deadline.minusMillis(PAID_FALLBACK_RESERVE_MS), started),
+            Instant freeDeadline = pureFree ? deadline : deadline.minusMillis(PAID_FALLBACK_RESERVE_MS);
+            return handleComposeCancellable(fxTwitterClient.fetchAsync(url, freeDeadline, started),
                     (free, error) -> {
                         if (error != null) {
+                            if (pureFree) {
+                                Throwable cause = error instanceof CompletionException && error.getCause() != null
+                                        ? error.getCause() : error;
+                                if (capturedError != null) {
+                                    capturedError.set(cause instanceof XDataProviderException xe
+                                            ? xe : new XDataProviderException(502, "免费公开数据读取失败：" + cause.getMessage(), cause));
+                                }
+                                degraded.set(true);
+                                return CompletableFuture.completedFuture(null);
+                            }
                             logFreeFallback(read, started, startNanos, deadline, error);
                             return getPaidJsonOnceBeforeAsync(withoutFreeCursor(url), apiKey, pacer, deadline,
                                     degraded, requestTimeoutMs, finishBeforeDeadline, requestStarted, read, capturedError);
@@ -2280,7 +2317,7 @@ public class TwitterApiIoProvider {
                         Set<String> disputed = rejectConflictingMetrics(free, metricStore);
                         List<String> missing = jsonIds(free, "__incomplete_ids");
                         if (missing.isEmpty()) return CompletableFuture.completedFuture(free);
-                        if (!Instant.now().isBefore(deadline)) {
+                        if (pureFree || !Instant.now().isBefore(deadline)) {
                             degraded.set(true);
                             return CompletableFuture.completedFuture(free);
                         }
@@ -2314,6 +2351,11 @@ public class TwitterApiIoProvider {
             String url, String apiKey, KeyPacer pacer, Instant deadline, AtomicBoolean degraded,
             long requestTimeoutMs, boolean finishBeforeDeadline, AtomicBoolean requestStarted,
             ReadDiagnostic read, AtomicReference<XDataProviderException> capturedError) {
+        if (apiKey == null || apiKey.isBlank()) {
+            if (capturedError != null) capturedError.set(new XDataProviderException(503, "TwitterAPI.io 尚未配置"));
+            degraded.set(true);
+            return CompletableFuture.completedFuture(null);
+        }
         long startedNanos = System.nanoTime();
         var phase = new AtomicReference<>("queue");
         var httpStatus = new AtomicInteger();
@@ -2519,11 +2561,19 @@ public class TwitterApiIoProvider {
     private CompletableFuture<JsonNode> getJsonWithRetryAsync(String url, String apiKey, KeyPacer pacer, Instant deadline, SearchReplyRoots searchRoots) {
         var diagnostic = new ReadDiagnostic(url);
         if (useFreeSource(url)) {
+            boolean pureFree = isPureFreeEndpoint(url) || apiKey == null || apiKey.isBlank();
             var freeStarted = new AtomicBoolean();
             long freeStartNanos = System.nanoTime();
+            Instant freeDeadline = pureFree ? deadline : deadline.minusMillis(PAID_FALLBACK_RESERVE_MS);
             return handleComposeCancellable(fxTwitterClient.fetchAsync(
-                    url, deadline.minusMillis(PAID_FALLBACK_RESERVE_MS), freeStarted, searchRoots), (root, error) -> {
+                    url, freeDeadline, freeStarted, searchRoots), (root, error) -> {
                 if (error == null) return CompletableFuture.completedFuture(root);
+                if (pureFree) {
+                    Throwable cause = error instanceof CompletionException && error.getCause() != null
+                            ? error.getCause() : error;
+                    return CompletableFuture.failedFuture(cause instanceof XDataProviderException xe
+                            ? xe : new XDataProviderException(502, "免费公开数据读取失败：" + cause.getMessage(), cause));
+                }
                 logFreeFallback(diagnostic, freeStarted, freeStartNanos, deadline, error);
                 if (!Instant.now().isBefore(deadline)) {
                     return CompletableFuture.<JsonNode>failedFuture(new XDataProviderException(504,
@@ -2604,6 +2654,26 @@ public class TwitterApiIoProvider {
         // 旧的本地模拟端点不能因启用默认配置而发出真实网络请求；免费模拟端点须显式配置。
         return fxTwitterClient.supports(url)
                 && (!isLocalMockBaseUrl() || isLoopbackUrl(properties.getFxtwitterBaseUrl()));
+    }
+
+    /**
+     * Public endpoints fully covered by free FxTwitter reads where skipping TwitterAPI.io
+     * does not sacrifice capabilities (profile info, timeline statuses, tweet metrics, articles).
+     * Follow graphs, relationship checks, mentions, and search fallbacks keep TwitterAPI.io support.
+     */
+    private boolean isPureFreeEndpoint(String url) {
+        if (!useFreeSource(url) || isLocalMockBaseUrl()) {
+            return false;
+        }
+        try {
+            String path = URI.create(url).getPath();
+            return path.endsWith("/twitter/user/info")
+                    || path.endsWith("/twitter/user/last_tweets")
+                    || path.endsWith("/twitter/tweets")
+                    || path.endsWith("/twitter/article");
+        } catch (RuntimeException ex) {
+            return false;
+        }
     }
 
     private static boolean isLoopbackUrl(String value) {
@@ -2724,6 +2794,9 @@ public class TwitterApiIoProvider {
             Instant deadline,
             ReadDiagnostic diagnostic
     ) {
+        if (apiKey == null || apiKey.isBlank()) {
+            return CompletableFuture.failedFuture(new XDataProviderException(503, "TwitterAPI.io 尚未配置"));
+        }
         long startedNanos = System.nanoTime();
         long remaining = Duration.between(Instant.now(), deadline).toMillis();
         if (remaining <= 0) {

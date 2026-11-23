@@ -1232,6 +1232,17 @@
                 })(),
                 deadline
             ]);
+        } catch (err) {
+            const raw = String(err?.message || "").trim();
+            if (
+                /^(?:Failed to fetch|Load failed|NetworkError when attempting to fetch resource\.?|fetch failed)$/i.test(raw) ||
+                (err?.name === "TypeError" && /fetch|network/i.test(raw))
+            ) {
+                const netErr = new Error("当前网络连接异常或处于离线状态，请检查网络后重试。");
+                netErr.name = "NetworkOfflineError";
+                throw netErr;
+            }
+            throw err;
         } finally {
             clearTimeout(timeoutId);
         }
@@ -1349,6 +1360,27 @@
         return request.promise;
     }
 
+    function syncSettingsAccountMenu(user) {
+        const head = document.getElementById("settingsAccountHead");
+        if (!head) return;
+        if (!user || !user.username) {
+            head.hidden = true;
+            return;
+        }
+        const nameEl = document.getElementById("settingsAccountName");
+        const handleEl = document.getElementById("settingsAccountHandle");
+        const avatarEl = document.getElementById("settingsAccountAvatar");
+        if (nameEl) nameEl.textContent = user.displayName || user.username;
+        if (handleEl) handleEl.textContent = "@" + String(user.username).replace(/^@+/, "");
+        if (avatarEl) {
+            avatarEl.outerHTML = avatarHtml(user, "sm").replace(
+                'class="avatar-circle sm"',
+                'class="avatar-circle sm" id="settingsAccountAvatar"'
+            );
+        }
+        head.hidden = false;
+    }
+
     function syncAuthGateAndWorkspaceUI() {
         const loggedIn = isLoggedIn();
 
@@ -1386,6 +1418,7 @@
                 'class="avatar-circle sm"',
                 'class="avatar-circle sm" id="railAvatar"'
             );
+            syncSettingsAccountMenu(effectiveUser);
             if (effectiveUser.avatarUrl) {
                 void warmMediaAsset(effectiveUser.avatarUrl);
             }
@@ -1443,6 +1476,7 @@
             $("railDisplayName").textContent = "未授权登录";
             $("railHandle").textContent = "仅限登录查本人账号";
             $("railAvatar").outerHTML = `<div class="avatar-circle sm" id="railAvatar">X</div>`;
+            syncSettingsAccountMenu(null);
 
             $("oauthAdminSetupHint").hidden = true;
         }
@@ -1478,6 +1512,14 @@
             state.authConnectionError = "登录暂不可用，请稍后再试。";
             syncAuthConnectionUI();
             return;
+        }
+        state.authConnectionState = "loading";
+        const btn = typeof document !== "undefined" ? document.getElementById("gateLoginBtn") : null;
+        if (btn) {
+            btn.disabled = true;
+            btn.setAttribute("aria-busy", "true");
+            const label = btn.querySelector("span");
+            if (label) label.textContent = "正在跳转 X 授权…";
         }
         window.location.href = "/api/auth/x/login";
     }
@@ -1641,6 +1683,8 @@
         updateRefreshButtonState();
 
         hideError();
+        const retryCardStart = document.getElementById("workspaceRetryCard");
+        if (retryCardStart) retryCardStart.hidden = true;
         $("loadingBar").hidden = false;
         if (!state.report) showLoadingSkeleton(true);
         const slowHintEl = $("loadingSlowHint");
@@ -1755,11 +1799,17 @@
             }
         } catch (err) {
             if (!requestIsCurrent()) return;
+            const rawErrMsg = String(err?.message || "");
+            const isBrowserFetchFailure =
+                /^(?:Failed to fetch|Load failed|NetworkError when attempting to fetch resource\.?|fetch failed)$/i.test(rawErrMsg.trim()) ||
+                (err?.name === "TypeError" && /fetch|network/i.test(rawErrMsg));
             const msg = state.storedMode && err && err.name === "AbortError"
                 ? "已入库报表读取超时，请重试当前模式"
                 : err && err.name === "AbortError"
                 ? "上游数据响应超时，请再点一次对应时间段继续从断点补齐"
-                : (err.message || "网络或数据服务异常，请稍后重试");
+                : isBrowserFetchFailure
+                ? "当前网络连接异常或处于离线状态，请检查网络后重试。"
+                : (rawErrMsg || "网络或数据服务异常，请稍后重试");
             showError(msg);
             if (!state.report) {
                 showLoadingSkeleton(false);
@@ -1767,6 +1817,10 @@
                 $("profileBio").textContent = "";
                 $("profileBio").hidden = true;
                 $("topbarWindowHint").textContent = state.storedMode ? "已入库模式 · 请稍后重试" : "请稍后重试";
+                const retryCard = document.getElementById("workspaceRetryCard");
+                const retryMsgEl = document.getElementById("workspaceRetryMessage");
+                if (retryMsgEl) retryMsgEl.textContent = msg;
+                if (retryCard) retryCard.hidden = false;
             }
         } finally {
             clearTimeout(slowTimer);
@@ -1866,6 +1920,75 @@
             authorProfileUrl: "https://x.com/elidlicom",
             authorFollowIntentUrl: "https://x.com/intent/follow?screen_name=elidlicom"
         };
+    }
+
+    const modalFocusHistoryStack = [];
+    let ignoreNextModalBackPopstate = false;
+
+    function formatLocalizedFetchError(err, fallback = "网络或数据服务异常，请稍后重试") {
+        const raw = String(err?.message || "").trim();
+        if (
+            /^(?:Failed to fetch|Load failed|NetworkError when attempting to fetch resource\.?|fetch failed)$/i.test(raw) ||
+            (err?.name === "TypeError" && /fetch|network/i.test(raw))
+        ) {
+            return "当前网络连接异常或处于离线状态，请检查网络后重试。";
+        }
+        return raw || fallback;
+    }
+
+    function onModalOpened(modalId, modalEl) {
+        const alreadyIdx = modalFocusHistoryStack.findIndex((item) => item.id === modalId);
+        if (alreadyIdx === -1) {
+            const opener = document.activeElement && document.activeElement !== document.body
+                ? document.activeElement
+                : null;
+            let pushedHistory = false;
+            try {
+                if (typeof window !== "undefined" && window.history && typeof window.history.pushState === "function") {
+                    const nextState = { ...(window.history.state || {}), xopsModal: modalId };
+                    window.history.pushState(nextState, "", window.location.href);
+                    pushedHistory = true;
+                }
+            } catch (_) {}
+            modalFocusHistoryStack.push({ id: modalId, opener, pushedHistory });
+        }
+        const focusTarget = modalEl?.querySelector?.(".author-modal-close, button:not([disabled]), a[href]");
+        if (focusTarget && typeof focusTarget.focus === "function") {
+            try { focusTarget.focus({ preventScroll: true }); } catch (_) {}
+        }
+    }
+
+    function onModalClosed(modalId, fromPopstate = false) {
+        const idx = modalFocusHistoryStack.findIndex((item) => item.id === modalId);
+        if (idx === -1) return;
+        const [entry] = modalFocusHistoryStack.splice(idx, 1);
+        if (entry?.opener && entry.opener.isConnected && typeof entry.opener.focus === "function") {
+            try { entry.opener.focus({ preventScroll: true }); } catch (_) {}
+        }
+        if (!fromPopstate && entry?.pushedHistory) {
+            try {
+                if (typeof window !== "undefined" && window.history?.state?.xopsModal === modalId && typeof window.history.back === "function") {
+                    ignoreNextModalBackPopstate = true;
+                    window.history.back();
+                }
+            } catch (_) {
+                ignoreNextModalBackPopstate = false;
+            }
+        }
+    }
+
+    function handleModalPopstate(event) {
+        if (ignoreNextModalBackPopstate) {
+            ignoreNextModalBackPopstate = false;
+            return true;
+        }
+        const top = modalFocusHistoryStack[modalFocusHistoryStack.length - 1];
+        if (!top) return false;
+        if (event?.state?.xopsModal === top.id) return false;
+        if (top.id === "authorPromptModal") closeAuthorPromptModal(true);
+        else if (top.id === "unlockGuideModal") closeUnlockGuideModal(true);
+        else if (top.id === "confirmResendModal") closeConfirmResendModal(true);
+        return true;
     }
 
     function openAuthorPromptModal(data) {
@@ -1968,12 +2091,14 @@
         $("authorModalLaterBtn").textContent = isFollowing || isSelf ? "我知道了" : "稍后再说";
         modal.hidden = false;
         syncBodyModalLock();
+        onModalOpened("authorPromptModal", modal);
     }
 
-    function closeAuthorPromptModal() {
+    function closeAuthorPromptModal(fromPopstate = false) {
         const modal = document.getElementById("authorPromptModal");
         if (modal) modal.hidden = true;
         syncBodyModalLock();
+        onModalClosed("authorPromptModal", fromPopstate);
     }
 
     function openUnlockGuideModal(focusPeriodCode = null) {
@@ -1983,10 +2108,15 @@
         const statusBox = document.getElementById("unlockGuideStatusBox");
         if (statusBox) {
             if (p) {
-                const rankBadge = p.top5FullAccess
-                    ? `互动第 ${Number(p.authorInteractionRank || 1)} 名（前 5 免等待全开）`
-                    : p.top50AutoSync
-                      ? `互动第 ${Number(p.authorInteractionRank || 1)} 名（前 50 每日自动同步）`
+                const rawRank = p.authorInteractionRank;
+                const validRank = rawRank !== null && rawRank !== undefined && Number.isInteger(Number(rawRank)) && Number(rawRank) > 0
+                    ? Number(rawRank)
+                    : null;
+                const allPeriodsUnlocked = Array.isArray(p.unlockedPeriods) && p.unlockedPeriods.length >= 4;
+                const rankBadge = p.top5FullAccess && (validRank !== null || allPeriodsUnlocked)
+                    ? (validRank !== null ? `互动第 ${validRank} 名（前 5 免等待全开）` : "全时间维度已解锁")
+                    : p.top50AutoSync && validRank !== null
+                      ? `互动第 ${validRank} 名（前 50 每日自动同步）`
                       : `24h 物理落盘 · 30 天滚动窗口`;
                 const followText = p.followsAuthor ? "已关注作者" : "未关注作者";
                 const quotaText = Number(p.dailyRefreshLimit || 1) > 10
@@ -2001,16 +2131,23 @@
         }
         const focusEl = document.getElementById("unlockGuideFocusMsg");
         if (focusEl) {
-            const reason = focusPeriodCode && p?.lockedReasons?.[focusPeriodCode];
-            if (reason) {
-                focusEl.textContent = `未解锁原因：${reason}`;
+            if (focusPeriodCode === "SCHEDULE") {
+                focusEl.textContent = getScheduleLockedReason();
                 focusEl.hidden = false;
-            } else if (focusPeriodCode && focusPeriodCode !== "HOURS_24") {
-                const label = PERIOD_META[focusPeriodCode]?.badgePrefix || focusPeriodCode;
-                focusEl.textContent = `${label}暂未解锁：每日物理存储 24 小时数据，累计满对应天数后自动开放。`;
-                focusEl.hidden = false;
-            } else {
+            } else if (focusPeriodCode && isPeriodUnlocked(focusPeriodCode)) {
                 focusEl.hidden = true;
+            } else {
+                const reason = focusPeriodCode && p?.lockedReasons?.[focusPeriodCode];
+                if (reason) {
+                    focusEl.textContent = `未解锁原因：${reason}`;
+                    focusEl.hidden = false;
+                } else if (focusPeriodCode && focusPeriodCode !== "HOURS_24") {
+                    const label = PERIOD_META[focusPeriodCode]?.badgePrefix || focusPeriodCode;
+                    focusEl.textContent = `${label}暂未解锁：每日物理存储 24 小时数据，累计满对应天数后自动开放。`;
+                    focusEl.hidden = false;
+                } else {
+                    focusEl.hidden = true;
+                }
             }
         }
         const storyEl = document.getElementById("unlockGuideAuthorStory");
@@ -2034,12 +2171,14 @@
         }
         modal.hidden = false;
         syncBodyModalLock();
+        onModalOpened("unlockGuideModal", modal);
     }
 
-    function closeUnlockGuideModal() {
+    function closeUnlockGuideModal(fromPopstate = false) {
         const modal = document.getElementById("unlockGuideModal");
         if (modal) modal.hidden = true;
         syncBodyModalLock();
+        onModalClosed("unlockGuideModal", fromPopstate);
     }
 
     async function checkinWorkspaceUsage() {
@@ -2114,12 +2253,15 @@
         const pMeta = normalizePeriod(report.periodCode, report.windowDays);
 
         // 左下角本人身份
+        const retryCardEl = document.getElementById("workspaceRetryCard");
+        if (retryCardEl) retryCardEl.hidden = true;
         $("railDisplayName").textContent = p.displayName;
         syncUsageHandleDisplay(p.username);
         $("railAvatar").outerHTML = avatarHtml(p, "sm").replace(
             'class="avatar-circle sm"',
             'class="avatar-circle sm" id="railAvatar"'
         );
+        syncSettingsAccountMenu(p);
 
         // 吸顶栏：仅展示统计起止窗口与极简模式标记（窄屏精简日期防截断）
         const hintEl = $("topbarWindowHint");
@@ -2349,7 +2491,9 @@
         const maxBucketTotal = Math.max(1, ...series.map((d) => d.posts + d.quotes + d.replies + (d.threadReplies ?? 0)));
         const labelStep = series.length >= 40 ? 8 : series.length >= 28 ? 6 : series.length >= 20 ? 4 : 1;
 
-        $("dailyTrendChart").innerHTML = series
+        const chartEl = $("dailyTrendChart");
+        chartEl.classList.toggle("is-scrollable", series.length > 12);
+        chartEl.innerHTML = series
             .map((d, idx) => {
                 const threadReplies = d.threadReplies ?? 0;
                 const authored = d.posts + d.quotes + threadReplies;
@@ -2392,11 +2536,14 @@
 
     /* ==================== 模块 2：推友双向互动率深度拆解（1帖=1次精准账本） ==================== */
     function syncInteractionFilterUI(inter) {
+        const allPeers = Array.isArray(inter.peerStats) ? inter.peerStats.length : Number(inter.totalInteractedPeers || 0);
         const iOwe = Number(inter.inboundHeavyPeers || 0);
         const unreplied = Number(inter.unrepliedMyPostPeers || 0);
         const theyOwe = Number(inter.outboundHeavyPeers || 0);
         const mutual = Number(inter.balancedMutualPeers || 0);
 
+        const allBtn = document.getElementById("pillAllPeersBtn");
+        if (allBtn) allBtn.textContent = `全部 ${allPeers}`;
         $("pillIOweBtn").textContent = `待回访 ${iOwe}`;
         $("pillUnrepliedBtn").textContent = `待回复 ${unreplied}`;
         $("pillTheyOweBtn").textContent = `未回访我 ${theyOwe}`;
@@ -2600,15 +2747,17 @@
         const listEl = $("peerInteractionList");
         let list = [...(report.interactions.peerStats || [])];
 
-        const activeFilter = ["I_OWE", "UNREPLIED_POST", "THEY_OWE", "MUTUAL"].includes(state.peerRelFilter)
+        const activeFilter = ["ALL", "I_OWE", "UNREPLIED_POST", "THEY_OWE", "MUTUAL"].includes(state.peerRelFilter)
             ? state.peerRelFilter
             : "MUTUAL";
-        list = list.filter((p) => {
-            if (activeFilter === "UNREPLIED_POST") {
-                return Number(p.unrepliedInMyPostCount || 0) > 0;
-            }
-            return p.reciprocityCode === activeFilter;
-        });
+        if (activeFilter !== "ALL") {
+            list = list.filter((p) => {
+                if (activeFilter === "UNREPLIED_POST") {
+                    return Number(p.unrepliedInMyPostCount || 0) > 0;
+                }
+                return p.reciprocityCode === activeFilter;
+            });
+        }
         if (state.peerSearchQuery) {
             const q = state.peerSearchQuery.replace(/^@/, "").toLowerCase();
             list = list.filter(
@@ -2671,17 +2820,21 @@
 
         if (list.length === 0) {
             const filterEmptyMsg = {
+                ALL: "这个时间段内还没有互动记录",
                 I_OWE: "暂无待回访推友",
                 UNREPLIED_POST: "主推评论均已回复",
                 THEY_OWE: "暂无未回访我的推友",
-                MUTUAL: "当前窗口暂无双向互评推友"
+                MUTUAL: "当前窗口暂无双向互评推友，可切换「全部」查看单向互动"
             };
             const msg = state.peerSearchQuery
                 ? `没有找到「${state.peerSearchQuery}」`
                 : filterEmptyMsg[activeFilter] || "这个时间段内还没有互动记录";
             const inter = report.interactions || {};
+            const totalPeersCount = (inter.peerStats || []).length;
             const altActions = [];
-            if (activeFilter !== "I_OWE" && Number(inter.inboundHeavyPeers || 0) > 0) {
+            if (activeFilter !== "ALL" && totalPeersCount > 0) {
+                altActions.push({ text: `查看全部 ${totalPeersCount} 位互动推友`, action: "peerFilter:ALL" });
+            } else if (activeFilter !== "I_OWE" && Number(inter.inboundHeavyPeers || 0) > 0) {
                 altActions.push({ text: "查看待回访", action: "peerFilter:I_OWE" });
             } else if (activeFilter !== "THEY_OWE" && Number(inter.outboundHeavyPeers || 0) > 0) {
                 altActions.push({ text: "查看未回访我的推友", action: "peerFilter:THEY_OWE" });
@@ -2690,7 +2843,9 @@
             }
             const acts = state.peerSearchQuery
                 ? [{ text: "清空搜索", action: "clearPeerSearch" }]
-                : [...altActions, ...widerPeriodActions()];
+                : altActions.length > 0
+                    ? altActions
+                    : widerPeriodActions();
             listEl.innerHTML = emptyStateHtml(msg, acts);
             return;
         }
@@ -3146,14 +3301,28 @@
         const container = $("contentAssistantSummary");
         if (!container) return;
         const sources = dashboard.sources || [];
+        const topics = Array.isArray(dashboard.topics) ? dashboard.topics : [];
         const activeSources = sources.filter((source) => String(source.status || "ACTIVE") === "ACTIVE").length;
+        const topicCount = Math.max(Number(dashboard.topicCount || 0), topics.length);
+        const recommendedCount = Math.max(
+            Number(dashboard.recommendedTopicCount || 0),
+            topics.filter((t) => String(t.status || "").toUpperCase() === "RECOMMENDED").length
+        );
+        const needsConfirmationCount = Math.max(
+            Number(dashboard.needsConfirmationCount || 0),
+            topics.filter((t) => String(t.status || "").toUpperCase() === "NEEDS_CONFIRMATION").length
+        );
+        const draftedCount = Math.max(
+            Number(dashboard.draftedTopicCount || 0),
+            topics.filter((t) => String(t.status || "").toUpperCase() === "DRAFTED" || Number(t.draftCount || 0) > 0).length
+        );
         const activeStatus = state.assistantTopicStatus || "";
         const inTopics = state.assistantView === "assistant";
         const cards = [
-            { value: dashboard.topicCount ?? 0, label: "全部选题", attr: `data-assistant-summary-status=""`, active: inTopics && activeStatus === "" },
-            { value: dashboard.recommendedTopicCount ?? 0, label: "高分推荐", attr: `data-assistant-summary-status="RECOMMENDED"`, active: inTopics && activeStatus === "RECOMMENDED" },
-            { value: dashboard.needsConfirmationCount ?? 0, label: "待确认", attr: `data-assistant-summary-status="NEEDS_CONFIRMATION"`, active: inTopics && activeStatus === "NEEDS_CONFIRMATION" },
-            { value: dashboard.draftedTopicCount ?? 0, label: "已有初稿", attr: `data-assistant-summary-status="DRAFTED"`, active: inTopics && activeStatus === "DRAFTED" },
+            { value: topicCount, label: "全部选题", attr: `data-assistant-summary-status=""`, active: inTopics && activeStatus === "" },
+            { value: recommendedCount, label: "高分推荐", attr: `data-assistant-summary-status="RECOMMENDED"`, active: inTopics && activeStatus === "RECOMMENDED" },
+            { value: needsConfirmationCount, label: "待确认", attr: `data-assistant-summary-status="NEEDS_CONFIRMATION"`, active: inTopics && activeStatus === "NEEDS_CONFIRMATION" },
+            { value: draftedCount, label: "已有初稿", attr: `data-assistant-summary-status="DRAFTED"`, active: inTopics && activeStatus === "DRAFTED" },
             { value: activeSources, label: "监听作者", attr: `data-assistant-summary-view="monitor"`, active: state.assistantView === "monitor" }
         ];
         container.innerHTML = cards.map((card) =>
@@ -3704,6 +3873,8 @@
         const settings = dashboard.settings || {};
         const settingsForm = $("assistantSettingsForm");
         if (!settingsForm.dataset.editRevision || settingsForm.dataset.version === undefined) {
+            const activeProvider = String(settings.provider || dashboard.providerDefaults?.provider || "commandcode").toLowerCase();
+            if ($("assistantProvider")) $("assistantProvider").value = activeProvider === "minimax" ? "minimax" : "commandcode";
             $("assistantEnabled").checked = settings.enabled !== false;
             $("assistantInterval").value = settings.intervalMinutes ?? 5;
             $("assistantThreshold").value = settings.threshold ?? 80;
@@ -3758,7 +3929,7 @@
             }).join("") : `<div class="assistant-empty compact">尚未添加监听作者。</div>`;
         const capabilities = dashboard.capabilities || {};
         const providerDefaults = dashboard.providerDefaults || {};
-        const providerId = String(providerDefaults.provider || settings.provider || "commandcode").toLowerCase();
+        const providerId = String(settings.provider || providerDefaults.provider || "commandcode").toLowerCase();
         const providerHintEl = $("assistantProviderHint");
         if (providerHintEl) {
             providerHintEl.textContent = providerId === "minimax" ? "MiniMax · MiniMax-M2.7" : "CommandCode · gpt-5.4";
@@ -3911,6 +4082,8 @@
     function renderContentAssistant() {
         const allowed = state.assistantAccess?.allowed === true;
         $("contentAssistantShell").hidden = !allowed;
+        const quickNav = document.getElementById("timingQuickNav");
+        if (quickNav) quickNav.hidden = !allowed;
         if ($("contentAssistantAccessNotice")) $("contentAssistantAccessNotice").hidden = true;
         if (!allowed || !state.assistantDashboard) return;
         const dashboard = state.assistantDashboard;
@@ -5088,8 +5261,19 @@
     function loadDraftIntoSimulator(text, opts = {}) {
         const inputEl = $("draftSimulatorInput");
         if (!inputEl) return;
+        const prevRaw = String(inputEl.value || "");
+        const nextRaw = String(text || "");
+        if (prevRaw.trim() && prevRaw.trim() !== nextRaw.trim()) {
+            state.draftUndoSnapshot = {
+                text: prevRaw,
+                hasMedia: Boolean($("draftHasMediaCheck")?.checked),
+                isThread: Boolean($("draftIsThreadCheck")?.checked)
+            };
+            const undoBar = document.getElementById("draftUndoBar");
+            if (undoBar) undoBar.hidden = false;
+        }
         switchTab("timing");
-        inputEl.value = String(text || "");
+        inputEl.value = nextRaw;
         const mediaChk = $("draftHasMediaCheck");
         if (mediaChk && typeof opts.hasMedia === "boolean") {
             mediaChk.checked = opts.hasMedia;
@@ -5110,17 +5294,27 @@
     function evaluatePrePostDraft() {
         const inputEl = $("draftSimulatorInput");
         const outEl = $("draftSimulatorResult");
+        const livePill = document.getElementById("draftLiveScorePill");
         if (!inputEl || !outEl) return;
 
         const text = (inputEl.value || "").trim();
         if (!text) {
             outEl.hidden = true;
+            if (livePill) {
+                livePill.hidden = true;
+                livePill.textContent = "";
+            }
             return;
         }
 
         const hasMedia = Boolean($("draftHasMediaCheck") && $("draftHasMediaCheck").checked);
         const isThread = Boolean($("draftIsThreadCheck") && $("draftIsThreadCheck").checked);
         const res = analyzeDraftByXAlgo(text, { hasMedia, isThread });
+        if (livePill) {
+            livePill.textContent = `${res.finalScore} 分 · ${res.gradeLabel}`;
+            livePill.className = `draft-live-score-pill tone-${res.tone || "blue"}`;
+            livePill.hidden = false;
+        }
 
         const dimsHtml = res.dimensions
             .map((d) => {
@@ -5199,12 +5393,21 @@
             clrBtn.addEventListener("click", () => {
                 inputEl.value = "";
                 outEl.hidden = true;
+                if (livePill) {
+                    livePill.hidden = true;
+                    livePill.textContent = "";
+                }
+                const undoBar = document.getElementById("draftUndoBar");
+                if (undoBar) undoBar.hidden = true;
+                state.draftUndoSnapshot = null;
             });
         }
         const toSchedBtn = $("sendDraftToScheduleBtn");
         if (toSchedBtn) {
             toSchedBtn.addEventListener("click", () => {
-                sendTextDraftToSchedule(res.text);
+                if (sendTextDraftToSchedule(res.text) !== false) {
+                    showToast("已将草稿填入定时发布");
+                }
             });
         }
     }
@@ -5312,19 +5515,46 @@
     /* ==================== 模块 5：核心铁粉圈层 & Canvas 高清晒单战报卡 ==================== */
     function getEffectiveShareTweetText(report) {
         const sc = report.innerCircle.shareCard;
+        const uname = String(report.profile?.username || "").replace(/^@+/, "");
+        const viaSuffix = uname && uname.toLowerCase() !== "elidlicom" ? " via @elidlicom" : "";
         let raw = (sc.shareTweetText || "").replace(/平均互动率/g, "平均公开互动率");
         if (!hasMetricSample(sc, "engagementRateSampleCount")) {
             raw = raw.replace(/平均公开互动率\s*[\d.]+%/g, "平均公开互动率 --");
         }
         if (sc.metricsNote && !raw.includes(sc.metricsNote)) raw += `\n${sc.metricsNote}`;
-        if (!state.shareHideFollowRate) {
-            return globalThis.XOpsI18n?.translate(raw) ?? raw;
+        if (state.shareHideFollowRate) {
+            raw = raw.replace(
+                /(?:🤝\s*)?(?:关注|样本)回关率\s*[\d.]+%(?:[ \t]*[（(][^）)\r\n]*[）)])?/g,
+                `📈 周期总浏览 ${hasMetricSample(report.activity, "viewSampleCount") ? fmtNum(report.activity.totalViews) : "--"}`
+            );
         }
-        const redacted = raw.replace(
-            /(?:🤝\s*)?(?:关注|样本)回关率\s*[\d.]+%(?:[ \t]*[（(][^）)\r\n]*[）)])?/g,
-            `📈 周期总浏览 ${hasMetricSample(report.activity, "viewSampleCount") ? fmtNum(report.activity.totalViews) : "--"}`
-        );
-        return globalThis.XOpsI18n?.translate(redacted) ?? redacted;
+        if (uname && /我的\s*X\s*社区运营/.test(raw)) {
+            raw = raw.replace(
+                /^📊\s*我的\s*X\s*社区运营([^\n（(]+)[（(]@?([^｜|\n）)]+)[｜|]([^）)\n]+)[）)]/m,
+                `📊 @${uname} $1（$3）${viaSuffix}`
+            );
+        }
+        let translated = globalThis.XOpsI18n?.translate(raw) ?? raw;
+        if (typeof computeWeightedTweetLength === "function" && computeWeightedTweetLength(translated) > 255) {
+            const act = report.activity || {};
+            const periodLabel = sc.periodLabel || PERIOD_META[report.periodCode]?.badgePrefix || "24h";
+            const erText = hasMetricSample(sc, "engagementRateSampleCount")
+                ? `${Number(sc.avgEngagementRatePct || 0).toFixed(2)}%`
+                : "--";
+            const metricRight = state.shareHideFollowRate
+                ? `📈 浏览 ${hasMetricSample(act, "viewSampleCount") ? fmtNum(act.totalViews) : "--"}`
+                : `🤝 回关率 ${Number(sc.followBackRatePct || 0).toFixed(1)}%`;
+            const scoreStr = Number(sc.activityHealthScore) >= 0 ? `${sc.activityHealthScore}/100` : "--";
+            const compactZh = [
+                `📊 @${uname || "me"} ${periodLabel}${viaSuffix}`,
+                `✍️ 发帖 ${sc.authoredTotal ?? 0} ｜ 💬 回复 ${sc.repliesCount ?? 0}（${Number(sc.replyToPostRatio || 0).toFixed(1)}x）`,
+                `⚡ 互动率 ${erText} ｜ ${metricRight}`,
+                `🏆 ${sc.personaTag || "活跃运营"}（${scoreStr}）`,
+                "#BuildInPublic #X运营"
+            ].join("\n");
+            translated = globalThis.XOpsI18n?.translate(compactZh) ?? compactZh;
+        }
+        return translated;
     }
 
     function ensureCanvasAvatarLoaded(avatarUrl) {
@@ -5407,7 +5637,7 @@
                         ${verifiedSvgHtml(m.user.verified)}
                     </div>
                     <div class="user-handle-muted"><span data-i18n-ignore>@${escapeHtml(m.user.username)}</span>${m.mutualFollow ? " · 互关" : ""}</div>
-                    <div class="circle-reason">${escapeHtml(m.highlightReason)}</div>
+                    <div class="circle-reason">${escapeHtml(String(m.highlightReason || "").replace(/（回礼率\s*TA来评\s*\d+\s*帖）/g, "（待回礼）"))}</div>
                     <div class="circle-card-actions">
                         <a class="x-outline-pill sm" href="${escapeHtml(peerLatestPostsUrl(m.user.username))}" target="_blank" rel="noopener noreferrer" title="直达 TA 最新原创主推去评论">去回评 ↗</a>
                         ${myUsername ? `<a class="x-outline-pill sm" href="${escapeHtml(peerDialogueUrl(myUsername, m.user.username))}" target="_blank" rel="noopener noreferrer" title="查看双方历史互动对话">对话 ↗</a>` : ""}
@@ -5768,9 +5998,17 @@
                         href: safeHttpUrl(item.externalUrl, "https://x.com")
                     });
                 } else {
+                    let targetGo = item.actionTarget || "tab:timing";
+                    if (
+                        (item.code === "CADENCE_SPACING" || targetGo === "tab:schedule") &&
+                        hasScheduleAccessDecision() &&
+                        !isScheduleEligible()
+                    ) {
+                        targetGo = "tab:timing|scrollId:topTweetsList";
+                    }
                     todo.push({
                         text: title,
-                        go: item.actionTarget || "tab:timing",
+                        go: targetGo,
                         tone: prio === "HIGH" ? "amber" : ""
                     });
                 }
@@ -5879,6 +6117,7 @@
     }
 
     function validateAndMergeScheduleFiles(existingFiles, incomingFiles) {
+        const baseCount = (existingFiles || []).length;
         const list = [...(existingFiles || [])];
         const incoming = Array.from(incomingFiles || []).filter(Boolean);
         const allowedMimes = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
@@ -5891,28 +6130,34 @@
             return "";
         };
 
-        for (const f of incoming) {
+        let truncatedCount = 0;
+        for (let idx = 0; idx < incoming.length; idx++) {
+            const f = incoming[idx];
             const mime = allowedMimes.has(f.type) ? f.type : extMime(f.name);
             if (!allowedMimes.has(mime)) {
-                return { ok: false, files: list, error: "仅支持 PNG、JPG、WEBP 或 GIF 格式图片" };
+                return { ok: false, files: list, error: "仅支持 PNG、JPG、WEBP 或 GIF 格式图片", truncatedCount: 0 };
             }
             const isGif = mime === "image/gif";
             const maxBytes = isGif ? 15 * 1024 * 1024 : 5 * 1024 * 1024;
             if (Number(f.size || 0) <= 0) {
-                return { ok: false, files: list, error: "图片文件为空，请重新选择" };
+                return { ok: false, files: list, error: "图片文件为空，请重新选择", truncatedCount: 0 };
             }
             if (Number(f.size || 0) > maxBytes) {
-                return { ok: false, files: list, error: `图片体积超出限制（${isGif ? "GIF 最大 15MB" : "单张静态图最大 5MB"}）` };
+                return { ok: false, files: list, error: `图片体积超出限制（${isGif ? "GIF 最大 15MB" : "单张静态图最大 5MB"}）`, truncatedCount: 0 };
             }
             const existingHasGif = list.some((it) => it.mime === "image/gif");
             if (isGif && list.length > 0) {
-                return { ok: false, files: list, error: "GIF 动图每次仅支持 1 张，且不可与其他图片混发" };
+                return { ok: false, files: list, error: "GIF 动图每次仅支持 1 张，且不可与其他图片混发", truncatedCount: 0 };
             }
             if (existingHasGif) {
-                return { ok: false, files: list, error: "已添加 GIF 动图，不能再添加其他图片" };
+                return { ok: false, files: list, error: "已添加 GIF 动图，不能再添加其他图片", truncatedCount: 0 };
             }
             if (list.length >= 4) {
-                return { ok: false, files: list, error: "单条定时推文最多附带 4 张静态图片" };
+                if (baseCount >= 4) {
+                    return { ok: false, files: list, error: "单条定时推文最多附带 4 张静态图片", truncatedCount: 0 };
+                }
+                truncatedCount = incoming.length - idx;
+                break;
             }
             list.push({
                 file: f,
@@ -5923,12 +6168,12 @@
             });
         }
         // 全部文件通过校验后才创建预览，避免后一个文件无效时泄漏前面的 Blob。
-        for (let i = (existingFiles || []).length; i < list.length; i++) {
+        for (let i = baseCount; i < list.length; i++) {
             if (typeof URL !== "undefined" && URL.createObjectURL) {
                 list[i].previewUrl = URL.createObjectURL(list[i].file);
             }
         }
-        return { ok: true, files: list, error: "" };
+        return { ok: true, files: list, error: "", truncatedCount };
     }
 
     function getTzDateParts(epochMs, timezone) {
@@ -6158,6 +6403,13 @@
         return MIN_SCHEDULE_INTERVAL_MS + getRecommendedScheduleJitterMin(draftItem) * 60_000;
     }
 
+    const MIN_RECOMMENDED_SCHEDULE_LEAD_MS = 15 * 60_000;
+
+    function getRecommendedBaselineEpochMs(nowMs = Date.now()) {
+        const stepMs = 5 * 60_000;
+        return Math.ceil((nowMs + MIN_RECOMMENDED_SCHEDULE_LEAD_MS) / stepMs) * stepMs;
+    }
+
     function getRecommendedScheduleEpochMs(preferredMs, {
         draftIndex = state.activeScheduleDraftIdx,
         nowMs = Date.now(),
@@ -6170,7 +6422,6 @@
         const gap = Number.isFinite(gapMs) && gapMs >= MIN_SCHEDULE_INTERVAL_MS
             ? gapMs
             : getRecommendedScheduleGapMs(activeDraft);
-        const jitterMs = Math.max(60_000, gap - MIN_SCHEDULE_INTERVAL_MS);
         const latest = getLatestPublishedEpochMs(nowMs);
         const occupied = [];
         for (const job of getCurrentUserScheduleJobs()) {
@@ -6186,7 +6437,7 @@
             const time = parseDraftItemEpochMs(item);
             if (Number.isFinite(time) && time > nowMs) occupied.push(time);
         });
-        const preferred = Number.isFinite(preferredMs) ? preferredMs : nowMs + jitterMs;
+        const preferred = Number.isFinite(preferredMs) ? preferredMs : getRecommendedBaselineEpochMs(nowMs);
         const earliestByLastPost = latest > 0 ? latest + gap : 0;
         return computeNextAvailableScheduleMs(Math.max(nowMs + 60_000, earliestByLastPost, preferred), occupied, gap);
     }
@@ -6215,13 +6466,12 @@
         const activeDraft = idx >= 0 ? items[idx] : null;
         const jitterMin = getRecommendedScheduleJitterMin(activeDraft);
         const gapMs = MIN_SCHEDULE_INTERVAL_MS + jitterMin * 60_000;
-        const jitterMs = jitterMin * 60_000;
         const untouchedDraftMs = activeDraft && !activeDraft.timeTouched ? parseDraftItemEpochMs(activeDraft) : NaN;
         const previousDraftMs = idx > 0 ? parseDraftItemEpochMs(items[idx - 1]) : NaN;
         const recommendedBaseMs = Math.max(
             Number.isFinite(untouchedDraftMs) && untouchedDraftMs >= nowMs + 60_000
                 ? untouchedDraftMs
-                : nowMs + jitterMs,
+                : getRecommendedBaselineEpochMs(nowMs),
             Number.isFinite(previousDraftMs) ? previousDraftMs + gapMs : 0
         );
         const candidates = [{ epochMs: recommendedBaseMs, recommended: true }];
@@ -6258,11 +6508,10 @@
             const input = document.querySelector('#scheduleDraftItemsList [data-draft-time="' + index + '"]');
             if (item.timeTouched || (input && document.activeElement === input)) continue;
             const gap = getRecommendedScheduleGapMs(item);
-            const jitterMs = Math.max(60_000, gap - MIN_SCHEDULE_INTERVAL_MS);
             const current = parseDraftItemEpochMs(item);
             const previous = index > 0 ? parseDraftItemEpochMs(items[index - 1]) : NaN;
             const preferred = Math.max(
-                Number.isFinite(current) && current >= nowMs + 60_000 ? current : nowMs + jitterMs,
+                Number.isFinite(current) && current >= nowMs + 60_000 ? current : getRecommendedBaselineEpochMs(nowMs),
                 Number.isFinite(previous) ? previous + gap : 0
             );
             const next = getRecommendedScheduleEpochMs(preferred, {
@@ -6287,12 +6536,11 @@
             ? jitterMin
             : (existingItems.length === 0 ? getRecommendedScheduleJitterMin(null) : randomScheduleJitterMinutes());
         const gapMs = MIN_SCHEDULE_INTERVAL_MS + resolvedJitter * 60_000;
-        const jitterMs = resolvedJitter * 60_000;
         const lastDraftEpoch = !Number.isFinite(epochMs) && existingItems.length > 0
             ? parseDraftItemEpochMs(existingItems[existingItems.length - 1])
             : NaN;
         const defaultPreferred = Math.max(
-            Date.now() + jitterMs,
+            getRecommendedBaselineEpochMs(Date.now()),
             Number.isFinite(lastDraftEpoch) ? lastDraftEpoch + gapMs : 0
         );
         const resolvedMs = Number.isFinite(epochMs)
@@ -6832,18 +7080,36 @@
             }
         }
 
-        const writeOk = Boolean(state.authStatus?.writeAuthorized && state.authStatus?.mediaWriteAuthorized);
+        const draftItems = state.scheduleDraftItems || [];
+        const draftCount = draftItems.length;
+        const anyHasFiles = draftItems.some((it) => (it.files || []).length > 0);
+        const writeAuth = Boolean(state.authStatus?.writeAuthorized);
+        const mediaAuth = Boolean(state.authStatus?.mediaWriteAuthorized);
+        const writeOk = anyHasFiles ? (writeAuth && mediaAuth) : writeAuth;
         const offlineOk = state.authStatus?.offlineRefreshable !== false;
+        const hasAuthExpiredJob = (state.scheduleJobs || []).some((j) =>
+            (j.status === "FAILED" || j.status === "OVERDUE_CONFIRM_REQUIRED")
+            && /二次授权|授权已过期|授权已失效|访问令牌已过期|授权范围已变更|HTTP 401|Unauthorized/i.test(j.lastError || "")
+        );
+        const cardVisible = loggedIn && !locked && (!writeOk || !offlineOk || Boolean(state.schedulePublishAuthError));
         const card = document.getElementById("scheduleWriteAuthCard");
         if (card) {
-            card.hidden = !loggedIn || locked || (writeOk && offlineOk && !state.schedulePublishAuthError);
+            card.hidden = !cardVisible;
             const titleEl = document.getElementById("scheduleWriteAuthTitle");
             const descEl = document.getElementById("scheduleWriteAuthDesc");
             const btnEl = document.getElementById("triggerPublishAuthBtn");
-            if (!writeOk) {
-                if (titleEl) titleEl.textContent = "需开启发推授权";
+            if (!writeAuth) {
+                if (titleEl) titleEl.textContent = hasAuthExpiredJob ? "发推授权已过期" : "需开启发推授权";
                 if (descEl) {
-                    descEl.textContent = "单独授予发推、传图与自动续期权限。";
+                    descEl.textContent = hasAuthExpiredJob
+                        ? "重新授予发推、传图与自动续期权限后，即可恢复排期与补发。"
+                        : "单独授予发推、传图与自动续期权限。";
+                }
+                if (btnEl) btnEl.textContent = hasAuthExpiredJob ? "重新授权" : "去授权";
+            } else if (anyHasFiles && !mediaAuth) {
+                if (titleEl) titleEl.textContent = "需开启传图授权";
+                if (descEl) {
+                    descEl.textContent = "已有纯文本发推权限；发送图片需补充媒体上传授权。";
                 }
                 if (btnEl) btnEl.textContent = "去授权";
             } else if (!offlineOk) {
@@ -6852,7 +7118,25 @@
                     descEl.textContent = "当前令牌约 2 小时过期，升级后自动续期。";
                 }
                 if (btnEl) btnEl.textContent = "去升级";
+            } else if (state.schedulePublishAuthError) {
+                if (titleEl) titleEl.textContent = "发推授权异常";
+                if (descEl) {
+                    descEl.textContent = "单独授予发推、传图与自动续期权限。";
+                }
+                if (btnEl) btnEl.textContent = "重新授权";
             }
+        }
+        const reauthBtn = document.getElementById("reauthorizePublishBtn");
+        if (reauthBtn) {
+            reauthBtn.hidden = !loggedIn || locked || cardVisible;
+            reauthBtn.disabled = locked || state.scheduleDraftRestoring;
+        }
+
+        const shareSchedBtn = document.getElementById("scheduleShareCardBtn");
+        if (shareSchedBtn) {
+            shareSchedBtn.classList.toggle("is-locked-action", locked);
+            shareSchedBtn.textContent = locked ? "🔒 定时发布" : "定时发布";
+            shareSchedBtn.title = locked ? getScheduleLockedReason() : "将战报图与文案加入定时发布队列";
         }
 
         const publishError = document.getElementById("schedulePublishAuthError");
@@ -6864,8 +7148,6 @@
         if (composeCard) {
             composeCard.classList.toggle("is-locked-card", locked);
         }
-        const draftItems = state.scheduleDraftItems || [];
-        const draftCount = draftItems.length;
         ["alignScheduleGapBtn", "clearScheduleDraftBtn", "createScheduleBtn"].forEach((id) => {
             const el = document.getElementById(id);
             if (el) el.disabled = locked || state.scheduleDraftRestoring
@@ -6883,13 +7165,12 @@
         }
         const createBtn = document.getElementById("createScheduleBtn");
         if (createBtn) {
-            const hasFiles = draftItems.some((it) => (it.files || []).length > 0);
             if (state.scheduleDraftRestoring) {
                 createBtn.textContent = "正在恢复图片…";
             } else if (state.scheduleMutations.has("create")) {
                 createBtn.textContent = "提交中…";
-            } else if (!locked && !writeOk && !hasFiles) {
-                createBtn.textContent = "二次授权并去定时";
+            } else if (!locked && !writeOk) {
+                createBtn.textContent = anyHasFiles && writeAuth ? "授权传图并去定时" : "二次授权并去定时";
             } else if (draftCount > 1) {
                 createBtn.textContent = `批量加入队列（${draftCount} 条）`;
             } else {
@@ -7070,8 +7351,19 @@
         }
     }
 
+    function getLocalTimezoneBadge() {
+        const offsetMin = -new Date().getTimezoneOffset();
+        const sign = offsetMin >= 0 ? "+" : "-";
+        const absMin = Math.abs(offsetMin);
+        const hrs = Math.floor(absMin / 60);
+        const mins = absMin % 60;
+        return mins > 0 ? `UTC${sign}${hrs}:${String(mins).padStart(2, "0")}` : `UTC${sign}${hrs}`;
+    }
+
     function scheduleDraftCardHtml(item, idx, isSingle) {
         const placeholder = isSingle ? "输入定时推文内容…" : `第 ${idx + 1} 条推文内容…`;
+        const minAttrVal = formatEpochToDatetimeLocalValue(Date.now() + 60_000);
+        const tzBadge = getLocalTimezoneBadge();
         return `<div class="schedule-draft-item" data-draft-idx="${idx}" data-draft-key="${escapeHtml(item.draftId)}">
             <div class="schedule-draft-item-head" data-draft-head="${idx}" ${isSingle ? "hidden" : ""}>
                 <div class="schedule-draft-head-left">
@@ -7094,7 +7386,8 @@
                     <button type="button" class="x-outline-pill sm" data-draft-action="check-algo" data-draft-idx="${idx}" hidden>体检</button>
                 </div>
                 <div class="schedule-compose-right">
-                    <input type="datetime-local" class="schedule-time-input" data-draft-time="${idx}" aria-label="第 ${idx + 1} 条定时发布时间" value="${escapeHtml(item.scheduledAtValue || "")}" />
+                    <span class="schedule-tz-badge" data-i18n-ignore title="本地时区">${escapeHtml(tzBadge)}</span>
+                    <input type="datetime-local" class="schedule-time-input" data-draft-time="${idx}" min="${escapeHtml(minAttrVal)}" aria-label="第 ${idx + 1} 条定时发布时间" value="${escapeHtml(item.scheduledAtValue || "")}" />
                 </div>
             </div>
         </div>`;
@@ -7106,6 +7399,9 @@
         const items = state.scheduleDraftItems || [];
         const isSingle = items.length === 1;
         listEl.classList.toggle("is-single", isSingle);
+        const batchHint = document.getElementById("scheduleBatchHint");
+        if (batchHint) batchHint.hidden = isSingle;
+        const minAttrVal = formatEpochToDatetimeLocalValue(Date.now() + 60_000);
         const existing = new Map(Array.from(listEl.children).map((card) => [card.dataset.draftKey, card]));
         const keep = new Set();
         items.forEach((item, idx) => {
@@ -7141,6 +7437,7 @@
             const time = card.querySelector('input[type="datetime-local"]');
             if (time) {
                 time.setAttribute("aria-label", "第 " + (idx + 1) + " 条定时发布时间");
+                if (minAttrVal) time.min = minAttrVal;
                 if (document.activeElement !== time && time.value !== item.scheduledAtValue) time.value = item.scheduledAtValue;
             }
             if (listEl.children[idx] !== card) listEl.insertBefore(card, listEl.children[idx] || null);
@@ -7189,6 +7486,9 @@
             renderScheduleDraftMedia(idx);
             clearScheduleComposeErrorForDraft(idx);
             syncScheduleAuthBanner();
+        }
+        if (res.truncatedCount > 0) {
+            showToast("单条推文最多 4 张图片，已自动保留前 4 张");
         }
     }
 
@@ -7265,9 +7565,8 @@
             idx = items.length;
             const jitterMin = randomScheduleJitterMinutes();
             const gapMs = MIN_SCHEDULE_INTERVAL_MS + jitterMin * 60_000;
-            const jitterMs = jitterMin * 60_000;
             const last = parseDraftItemEpochMs(items[items.length - 1]);
-            const preferred = Math.max(Date.now() + jitterMs, Number.isFinite(last) ? last + gapMs : 0);
+            const preferred = Math.max(getRecommendedBaselineEpochMs(Date.now()), Number.isFinite(last) ? last + gapMs : 0);
             item = createScheduleDraftItem("", getRecommendedScheduleEpochMs(preferred, { draftIndex: idx, gapMs }), [], false, null, jitterMin);
             items.push(item);
         } else {
@@ -7278,7 +7577,7 @@
         if (!item.timeTouched) {
             const jitterMin = getRecommendedScheduleJitterMin(item);
             const gapMs = MIN_SCHEDULE_INTERVAL_MS + jitterMin * 60_000;
-            const preferred = Math.max(parseDraftItemEpochMs(item) || 0, Date.now() + jitterMin * 60_000);
+            const preferred = Math.max(parseDraftItemEpochMs(item) || 0, getRecommendedBaselineEpochMs(Date.now()));
             item.scheduledAtValue = formatEpochToDatetimeLocalValue(getRecommendedScheduleEpochMs(preferred, { draftIndex: idx, gapMs }));
         }
         state.activeScheduleDraftIdx = idx;
@@ -7405,7 +7704,9 @@
         const listEl = $("scheduledTweetsList");
         if (!listEl) return;
         const all = state.scheduleJobs || [];
-        const signature = JSON.stringify([all, state.scheduleFilter, state.rescheduleEditingJobId]);
+        const writeAuth = Boolean(state.authStatus?.writeAuthorized);
+        const mediaAuth = Boolean(state.authStatus?.mediaWriteAuthorized);
+        const signature = JSON.stringify([all, state.scheduleFilter, state.rescheduleEditingJobId, writeAuth, mediaAuth]);
         if (signature === state.scheduleRenderedSignature) return;
         const focusedJobId = document.activeElement?.getAttribute?.("data-resched-input");
         const overdueConfirmable = all.filter((j) => j.status === "OVERDUE_CONFIRM_REQUIRED" && !j.uncertainDelivery);
@@ -7478,9 +7779,10 @@
                     job.status === "FAILED" ||
                     job.status === "CANCELLED";
                 const showRescheduleBox = state.rescheduleEditingJobId === job.id && canEditTime;
+                const rescheduleMinVal = formatEpochToDatetimeLocalValue(Date.now() + 60_000);
                 const rescheduleBoxHtml = showRescheduleBox
                     ? `<div class="schedule-reschedule-box">
-                        <input type="datetime-local" class="x-mini-input" data-resched-input="${escapeHtml(job.id)}" aria-label="新的发布时间" aria-describedby="reschedule-error-${escapeHtml(job.id)}" aria-invalid="${state.rescheduleError ? "true" : "false"}" value="${escapeHtml(state.rescheduleDraftValue ?? formatEpochToDatetimeLocalValue(Math.max(job.scheduledAtEpochMs || 0, Date.now() + 15 * 60_000)))}" />
+                        <input type="datetime-local" class="x-mini-input" data-resched-input="${escapeHtml(job.id)}" min="${escapeHtml(rescheduleMinVal)}" aria-label="新的发布时间" aria-describedby="reschedule-error-${escapeHtml(job.id)}" aria-invalid="${state.rescheduleError ? "true" : "false"}" value="${escapeHtml(state.rescheduleDraftValue ?? formatEpochToDatetimeLocalValue(Math.max(job.scheduledAtEpochMs || 0, Date.now() + 15 * 60_000)))}" />
                         <button type="button" class="x-blue-pill sm" data-job-action="save-reschedule" data-job-id="${escapeHtml(job.id)}">保存</button>
                         <button type="button" class="x-outline-pill sm" data-job-action="close-reschedule" data-job-id="${escapeHtml(job.id)}">放弃修改</button>
                         <p class="schedule-reschedule-error" id="reschedule-error-${escapeHtml(job.id)}" data-resched-error="${escapeHtml(job.id)}" role="alert" ${state.rescheduleError ? "" : "hidden"}>${escapeHtml(state.rescheduleError || "")}</p>
@@ -7491,10 +7793,19 @@
                 if (job.text && job.text.trim()) {
                     actions.push(`<button type="button" class="x-outline-pill sm" data-job-action="copy-text" data-job-id="${escapeHtml(job.id)}" aria-label="复制原文">复制</button>`);
                 }
-                if (job.status === "OVERDUE_CONFIRM_REQUIRED") {
-                    actions.push(`<button type="button" class="x-blue-pill sm" data-job-action="open-confirm" data-job-id="${escapeHtml(job.id)}">确认补发</button>`);
-                } else if (job.status === "FAILED") {
-                    actions.push(`<button type="button" class="x-blue-pill sm" data-job-action="open-confirm" data-job-id="${escapeHtml(job.id)}">确认重发</button>`);
+                const jobMissingAuth = !writeAuth || ((job.media || []).length > 0 && !mediaAuth);
+                const jobHasAuthErr = /二次授权|授权已过期|授权已失效|访问令牌已过期|授权范围已变更|HTTP 401|Unauthorized/i.test(job.lastError || "");
+                if (job.status === "OVERDUE_CONFIRM_REQUIRED" || job.status === "FAILED") {
+                    const resendLabel = job.status === "OVERDUE_CONFIRM_REQUIRED" ? "确认补发" : "确认重发";
+                    if (jobMissingAuth) {
+                        actions.push(`<button type="button" class="x-blue-pill sm" data-job-action="reauth" data-job-id="${escapeHtml(job.id)}">重新授权</button>`);
+                        actions.push(`<button type="button" class="x-outline-pill sm" data-job-action="open-confirm" data-job-id="${escapeHtml(job.id)}">${resendLabel}</button>`);
+                    } else {
+                        actions.push(`<button type="button" class="x-blue-pill sm" data-job-action="open-confirm" data-job-id="${escapeHtml(job.id)}">${resendLabel}</button>`);
+                        if (jobHasAuthErr) {
+                            actions.push(`<button type="button" class="x-outline-pill sm" data-job-action="reauth" data-job-id="${escapeHtml(job.id)}">重新授权</button>`);
+                        }
+                    }
                 }
                 if (canEditTime) {
                     actions.push(`<button type="button" class="x-outline-pill sm" data-job-action="toggle-reschedule" data-job-id="${escapeHtml(job.id)}">改期</button>`);
@@ -7516,7 +7827,7 @@
                     ? `原定 ${formatScheduleEpochLabel(job.scheduledAtEpochMs)}`
                     : "";
 
-                return `<article class="schedule-job-card">
+                return `<article class="schedule-job-card${showRescheduleBox ? " is-rescheduling" : ""}">
                     <div class="schedule-job-head">
                         <span class="mini-tag ${st.cls}">${escapeHtml(st.label)}</span>
                         <span class="schedule-job-time" ${timeTitle ? `title="${escapeHtml(timeTitle)}"` : ""}>${escapeHtml(timePrefix)}</span>
@@ -7565,15 +7876,18 @@
             mediaBox.innerHTML = "";
         }
         syncConfirmResendSubmitState();
-        $("confirmResendModal").hidden = false;
+        const resendModal = $("confirmResendModal");
+        resendModal.hidden = false;
         syncBodyModalLock();
+        if (typeof onModalOpened === "function") onModalOpened("confirmResendModal", resendModal);
     }
 
-    function closeConfirmResendModal() {
+    function closeConfirmResendModal(fromPopstate = false) {
         const modal = document.getElementById("confirmResendModal");
         if (modal) modal.hidden = true;
         state.pendingConfirmJob = null;
         syncBodyModalLock();
+        if (typeof onModalClosed === "function") onModalClosed("confirmResendModal", fromPopstate);
     }
 
     function refreshSchedulePollingState() {
@@ -8211,6 +8525,7 @@
     function bindEvents() {
         if ("scrollRestoration" in window.history) window.history.scrollRestoration = "manual";
         window.addEventListener("popstate", (event) => {
+            if (typeof handleModalPopstate === "function" && handleModalPopstate(event)) return;
             if (!isLoggedIn()) return;
             const tabId = new URL(window.location.href).searchParams.get("tab") || "activity";
             const sameOwner = event.state?.xopsOwnerId === stableUserId(state.authStatus?.user);
@@ -8580,7 +8895,8 @@
         });
         $("applyAssistantPresetBtn")?.addEventListener("click", () => {
             const dashboard = state.assistantDashboard || {};
-            const provider = String(dashboard.providerDefaults?.provider || dashboard.settings?.provider || "commandcode").toLowerCase();
+            const selectedProvider = $("assistantProvider")?.value;
+            const provider = String(selectedProvider || dashboard.settings?.provider || dashboard.providerDefaults?.provider || "commandcode").toLowerCase();
             const preset = provider === "minimax"
                 ? { model: "MiniMax-M2.7", protocol: "MESSAGES", contextTokens: 200000 }
                 : { model: "gpt-5.4", protocol: "RESPONSES", contextTokens: 128000 };
@@ -8591,7 +8907,34 @@
             if (form) form.dataset.editRevision = String(Number(form.dataset.editRevision || 0) + 1);
             showToast(`已填入 ${provider === "minimax" ? "MiniMax" : "CommandCode"} 推荐预设`);
         });
-        $("assistantSettingsForm")?.addEventListener("input", markAssistantEdit);
+        $("assistantProvider")?.addEventListener("change", async (event) => {
+            const select = event.currentTarget;
+            const nextProvider = select.value;
+            const form = $("assistantSettingsForm");
+            const dashboard = state.assistantDashboard;
+            if (!form || !dashboard || form.dataset.version === undefined) return;
+            const saved = await runAssistantMutation("settings-provider", "/settings", {
+                version: Number(form.dataset.version),
+                provider: nextProvider
+            });
+            if (!saved) {
+                select.value = String(dashboard.settings?.provider || "commandcode").toLowerCase();
+                return;
+            }
+            dashboard.settings = saved;
+            if (dashboard.providerDefaults) dashboard.providerDefaults.provider = saved.provider;
+            form.dataset.version = String(saved.version);
+            delete form.dataset.editRevision;
+            renderAssistantMonitor(dashboard);
+            showToast(`已切换至 ${saved.provider === "minimax" ? "MiniMax" : "CommandCode"}`);
+            if (saved.credentialConfigured && saved.modelEnabled !== false && Boolean(saved.model) && Number(saved.contextTokens) > 0) {
+                await runAssistantMutation("verify", "/capabilities/verify", { clientRequestId: newClientRequestId() }, 180000);
+            }
+        });
+        $("assistantSettingsForm")?.addEventListener("input", (event) => {
+            if (event.target?.id === "assistantProvider") return;
+            markAssistantEdit(event);
+        });
         $("assistantStyleRevisionInput")?.addEventListener("input", markAssistantEdit);
         $("assistantPreferencesInput")?.addEventListener("input", markAssistantEdit);
         $("assistantSettingsForm")?.addEventListener("submit", async (event) => {
@@ -8604,6 +8947,7 @@
             const prevReady = state.assistantDashboard?.capabilities?.ready === true;
             const payload = {
                 version: Number(version),
+                provider: $("assistantProvider") ? $("assistantProvider").value : String(prevSettings.provider || "commandcode"),
                 enabled: $("assistantEnabled").checked,
                 collectionEnabled: $("assistantCollectionEnabled").checked,
                 modelEnabled: $("assistantModelEnabled").checked,
@@ -9211,6 +9555,10 @@
         });
 
         // 模块 2：推友筛选与排序（150ms 输入防抖 + 切换筛选时重置分页）
+        const syncPeerClearBtn = () => {
+            const btn = document.getElementById("clearPeerSearchBtn");
+            if (btn) btn.hidden = !$("peerSearchInput").value;
+        };
         const onPeerSearchDebounced = debounce(() => {
             state.peerSearchQuery = $("peerSearchInput").value.trim();
             state.peerRenderLimit = LIST_PAGE_SIZE;
@@ -9218,7 +9566,16 @@
         }, 150);
 
         $("peerSearchInput").addEventListener("input", (e) => {
+            syncPeerClearBtn();
             onPeerSearchDebounced(e.target.value);
+        });
+        document.getElementById("clearPeerSearchBtn")?.addEventListener("click", () => {
+            $("peerSearchInput").value = "";
+            state.peerSearchQuery = "";
+            state.peerRenderLimit = LIST_PAGE_SIZE;
+            syncPeerClearBtn();
+            if (state.report) renderPeerList(state.report);
+            $("peerSearchInput").focus();
         });
 
         $("peerSortSelect").addEventListener("change", (e) => {
@@ -9228,7 +9585,9 @@
         });
 
         const applyPeerRelFilter = (filterCode) => {
-            state.peerRelFilter = filterCode && filterCode !== "ALL" ? filterCode : "MUTUAL";
+            state.peerRelFilter = ["ALL", "I_OWE", "UNREPLIED_POST", "THEY_OWE", "MUTUAL"].includes(filterCode)
+                ? filterCode
+                : "ALL";
             state.peerFilterTouched = true;
             state.peerRenderLimit = LIST_PAGE_SIZE;
             if (state.report) {
@@ -9248,11 +9607,18 @@
             e.preventDefault();
             const rawGo = String(el.dataset.go || "");
             const hasInPageTarget = rawGo.includes("scrollId:") || rawGo.includes("focusDraft:") || rawGo.includes("openAlgoConfig:");
-            for (const part of rawGo.split("|")) {
+            const timingTargetIds = new Set(["formatCardsGrid", "topTweetsList", "algoCalibrationPanel", "algoPoolSection", "contentAssistantShell", "prePostSimulatorCard"]);
+            const parts = rawGo.split("|");
+            const explicitTab = parts.some((p) => p.startsWith("tab:"));
+            if (!explicitTab && (rawGo.includes("focusDraft:") || rawGo.includes("openAlgoConfig:") || parts.some((p) => p.startsWith("scrollId:") && timingTargetIds.has(p.slice(9))))) {
+                if (state.activeTab !== "timing") switchTab("timing");
+            }
+            for (const part of parts) {
                 const [kind, val] = part.split(":");
                 if (kind === "tab" && val) {
-                    if (!(hasInPageTarget && state.activeTab === val)) {
-                        switchTab(val);
+                    const normalizedTab = val === "content" ? "timing" : val;
+                    if (!(hasInPageTarget && state.activeTab === normalizedTab)) {
+                        switchTab(normalizedTab);
                     }
                 } else if (kind === "peerFilter") {
                     switchTab("interactions");
@@ -9272,26 +9638,37 @@
                 } else if (kind === "clearPeerSearch") {
                     $("peerSearchInput").value = "";
                     state.peerSearchQuery = "";
+                    syncPeerClearBtn();
                     if (state.report) renderPeerList(state.report);
                 } else if (kind === "clearFollowSearch") {
                     $("followFilterInput").value = "";
                     state.followSearchQuery = "";
+                    const fClear = document.getElementById("clearFollowSearchBtn");
+                    if (fClear) fClear.hidden = true;
                     if (state.report) renderFollowAuditPanel(state.report);
                 } else if (kind === "focusDraft") {
-                    const inp = $("draftSimulatorInput");
-                    if (inp) {
-                        inp.scrollIntoView({ behavior: "smooth", block: "center" });
-                        inp.focus();
-                    }
+                    const runFocus = () => {
+                        const inp = $("draftSimulatorInput");
+                        if (inp) {
+                            inp.scrollIntoView({ behavior: "smooth", block: "center" });
+                            inp.focus();
+                        }
+                    };
+                    if (typeof requestAnimationFrame === "function") requestAnimationFrame(runFocus);
+                    else runFocus();
                 } else if (kind === "scrollId" && val) {
-                    const targetEl = document.getElementById(val);
-                    if (targetEl) {
-                        targetEl.scrollIntoView({ behavior: "smooth", block: "center" });
-                        targetEl.classList.remove("is-target-flash");
-                        void targetEl.offsetWidth;
-                        targetEl.classList.add("is-target-flash");
-                        setTimeout(() => targetEl.classList.remove("is-target-flash"), 1400);
-                    }
+                    const runScroll = () => {
+                        const targetEl = document.getElementById(val);
+                        if (!targetEl) return;
+                        const cardEl = val === "formatCardsGrid" ? (targetEl.closest(".x-section-card") || targetEl) : targetEl;
+                        cardEl.scrollIntoView({ behavior: "smooth", block: "center" });
+                        cardEl.classList.remove("is-target-flash");
+                        void cardEl.offsetWidth;
+                        cardEl.classList.add("is-target-flash");
+                        setTimeout(() => cardEl.classList.remove("is-target-flash"), 1400);
+                    };
+                    if (typeof requestAnimationFrame === "function") requestAnimationFrame(runScroll);
+                    else runScroll();
                 } else if (kind === "openAlgoConfig") {
                     openAlgoConfigDrawer(true);
                     const sec = $("algoPoolSection");
@@ -9323,6 +9700,10 @@
             });
         });
 
+        const syncFollowClearBtn = () => {
+            const btn = document.getElementById("clearFollowSearchBtn");
+            if (btn) btn.hidden = !$("followFilterInput").value;
+        };
         const onFollowSearchDebounced = debounce(() => {
             state.followSearchQuery = $("followFilterInput").value.trim();
             state.followRenderLimit = LIST_PAGE_SIZE;
@@ -9330,7 +9711,16 @@
         }, 150);
 
         $("followFilterInput").addEventListener("input", (e) => {
+            syncFollowClearBtn();
             onFollowSearchDebounced(e.target.value);
+        });
+        document.getElementById("clearFollowSearchBtn")?.addEventListener("click", () => {
+            $("followFilterInput").value = "";
+            state.followSearchQuery = "";
+            state.followRenderLimit = LIST_PAGE_SIZE;
+            syncFollowClearBtn();
+            if (state.report) renderFollowAuditPanel(state.report);
+            $("followFilterInput").focus();
         });
 
         $("followSortSelect").addEventListener("change", (e) => {
@@ -9371,6 +9761,27 @@
             const onDraftInput = debounce(() => evaluatePrePostDraft(), 80);
             draftSimInput.addEventListener("input", onDraftInput);
         }
+        document.getElementById("restoreDraftUndoBtn")?.addEventListener("click", () => {
+            const snap = state.draftUndoSnapshot;
+            if (!snap) return;
+            const inputEl = $("draftSimulatorInput");
+            if (inputEl) inputEl.value = snap.text;
+            const mediaChk = $("draftHasMediaCheck");
+            if (mediaChk) mediaChk.checked = Boolean(snap.hasMedia);
+            const threadChk = $("draftIsThreadCheck");
+            if (threadChk) threadChk.checked = Boolean(snap.isThread);
+            state.draftUndoSnapshot = null;
+            const undoBar = document.getElementById("draftUndoBar");
+            if (undoBar) undoBar.hidden = true;
+            evaluatePrePostDraft();
+            showToast("已恢复刚才手写草稿");
+            inputEl?.focus();
+        });
+        document.getElementById("workspaceRetryBtn")?.addEventListener("click", () => {
+            const retryCard = document.getElementById("workspaceRetryCard");
+            if (retryCard) retryCard.hidden = true;
+            void loadSelfReport(false);
+        });
         const draftMediaChk = $("draftHasMediaCheck");
         if (draftMediaChk) {
             draftMediaChk.addEventListener("change", () => evaluatePrePostDraft());
@@ -9462,9 +9873,7 @@
         $("scheduleShareCardBtn")?.addEventListener("click", () => {
             if (!state.report) return;
             if (hasScheduleAccessDecision() && !isScheduleEligible()) {
-                switchTab("schedule");
-                syncScheduleAuthBanner();
-                showError(getScheduleLockedReason());
+                openUnlockGuideModal("SCHEDULE");
                 return;
             }
             drawShareCardCanvas(state.report);
@@ -9693,6 +10102,7 @@
 
         $("createScheduleBtn")?.addEventListener("click", submitCreateScheduledTweet);
         $("triggerPublishAuthBtn")?.addEventListener("click", triggerXPublishAuth);
+        $("reauthorizePublishBtn")?.addEventListener("click", triggerXPublishAuth);
         $("refreshScheduleListBtn")?.addEventListener("click", () => loadScheduledTweets(false));
         $("batchConfirmOverdueBtn")?.addEventListener("click", submitBatchConfirmOverdue);
 
@@ -9759,6 +10169,10 @@
                 }
                 return;
             }
+            if (action === "reauth") {
+                await triggerXPublishAuth();
+                return;
+            }
             if (state.scheduleMutations.has(`job:${jobId}`) || state.scheduleMutations.has("batch-resend")) return;
 
             if (action === "open-confirm") {
@@ -9814,6 +10228,57 @@
                 submitConfirmResend(state.pendingConfirmJob);
             }
         });
+
+        // 移动端触控点按说明气泡（替代桌面 hover title）
+        const tapPopover = document.getElementById("tapInfoPopover");
+        if (tapPopover) {
+            let tapPopoverTimer = null;
+            let tapPopoverAnchor = null;
+            const hideTapPopover = () => {
+                clearTimeout(tapPopoverTimer);
+                tapPopoverTimer = null;
+                tapPopoverAnchor = null;
+                tapPopover.hidden = true;
+            };
+            const showTapPopover = (anchorEl, text) => {
+                if (!text) return;
+                clearTimeout(tapPopoverTimer);
+                tapPopoverAnchor = anchorEl;
+                tapPopover.textContent = text;
+                tapPopover.hidden = false;
+                const rect = anchorEl.getBoundingClientRect();
+                const popRect = tapPopover.getBoundingClientRect();
+                const vw = window.innerWidth || 393;
+                const vh = window.innerHeight || 852;
+                const left = Math.max(12, Math.min(vw - popRect.width - 12, rect.left + rect.width / 2 - popRect.width / 2));
+                const showAbove = rect.top > popRect.height + 16;
+                const top = showAbove
+                    ? Math.max(12, rect.top - popRect.height - 8)
+                    : Math.min(vh - popRect.height - 12, rect.bottom + 8);
+                tapPopover.style.left = `${Math.round(left)}px`;
+                tapPopover.style.top = `${Math.round(top)}px`;
+                tapPopoverTimer = setTimeout(hideTapPopover, 4000);
+            };
+            document.addEventListener("click", (e) => {
+                const isTouchOrNarrow =
+                    (typeof window !== "undefined" && window.matchMedia?.("(pointer: coarse)")?.matches) ||
+                    (typeof window !== "undefined" && window.innerWidth <= 767);
+                const trigger = e.target?.closest?.("#healthScoreChip, #profileMutualRateNum, .kpi-card[title], .stat-inline[title], #mobileAlgoStatusText, #dailyCacheStatusHint, .day-col[title]");
+                if (!trigger || !isTouchOrNarrow) {
+                    if (!tapPopover.hidden && !tapPopover.contains(e.target)) hideTapPopover();
+                    return;
+                }
+                const tipHost = trigger.id === "profileMutualRateNum" ? (trigger.closest("[title]") || trigger) : trigger;
+                const tipText = String(tipHost.getAttribute("title") || tipHost.dataset?.tip || "").trim();
+                if (!tipText) return;
+                if (!tapPopover.hidden && tapPopoverAnchor === tipHost) {
+                    hideTapPopover();
+                    return;
+                }
+                showTapPopover(tipHost, tipText);
+            });
+            window.addEventListener("scroll", hideTapPopover, { passive: true });
+        }
     }
 
     async function init() {
@@ -9863,7 +10328,10 @@
             setPublishAuthError(publishAuthErr);
             cleanAuthQueryParams();
         } else if (authErr) {
-            state.authConnectionError = authErr;
+            const cleanAuthErr = /access_denied/i.test(authErr)
+                ? "你已取消 X 账号授权，如需使用请重新点击登录。"
+                : authErr;
+            state.authConnectionError = cleanAuthErr;
             syncAuthConnectionUI();
             cleanAuthQueryParams();
         }

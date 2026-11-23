@@ -984,7 +984,7 @@ public class CommunityAnalyticsEngine {
                 returnRateLabel = Math.round(returnRatePct) + "%";
             } else if (peerPostVisits > 0) {
                 returnRatePct = 999.0;
-                returnRateLabel = "TA来评 " + peerPostVisits + " 帖";
+                returnRateLabel = "待回礼";
             } else {
                 returnRatePct = myQuotes > 0 ? round1(peerQuotes * 100.0 / myQuotes) : 100.0;
                 returnRateLabel = "仅引用 " + quoteRatioLabel;
@@ -1629,8 +1629,10 @@ public class CommunityAnalyticsEngine {
                         p.totalInteractions(),
                         p.intimacyScore(),
                         p.iFollowThem() && p.theyFollowMe(),
-                        String.format("来评我 %d 帖 · 我去评 %d 帖（回礼率 %s）",
-                                p.peerRepliesToMe(), p.myRepliesToPeer(), p.returnRateLabel())
+                        p.myRepliesToPeer() > 0
+                                ? String.format("来评我 %d 帖 · 我去评 %d 帖（回礼率 %s）",
+                                        p.peerRepliesToMe(), p.myRepliesToPeer(), p.returnRateLabel())
+                                : String.format("来评我 %d 帖 · 我去评 0 帖（待回礼）", p.peerRepliesToMe())
                 ))
                 .toList();
 
@@ -1680,29 +1682,31 @@ public class CommunityAnalyticsEngine {
                 .map(m -> "@" + m.user().username())
                 .toList();
 
+        String shareHandle = profile.username();
+        String viaSuffix = "elidlicom".equalsIgnoreCase(shareHandle) ? "" : " via @elidlicom";
         String buddiesMention = topBuddyHandles.isEmpty()
-                ? "期待结识更多同频推友"
-                : "最佳互动搭子：" + String.join(" ", topBuddyHandles);
+                ? "欢迎交流"
+                : "互动搭子：" + String.join(" ", topBuddyHandles.stream().limit(2).toList());
 
         int authoredTotal = activity.originalPosts() + activity.quotes();
         String sharePeriodLabel = activity.sampleCapped() ? periodLabel + " · 样本" : periodLabel;
         String shareTweetText = String.format(
-                "📊 我的 X 社区运营%s（@%s｜%s）\n\n" +
-                "✍️ 原创及引用 %d 条 ｜ 💬 评论互动 %d 条（回复比 %.1fx）\n" +
+                "📊 @%s %s（%s）%s\n" +
+                "✍️ 发帖 %d ｜ 💬 回复 %d（%.1fx）\n" +
                 "⚡ 平均互动率 %s ｜ 🤝 %s\n" +
-                "🏆 运营状态：%s（综合评分 %s）\n" +
-                "💎 %s\n\n" +
+                "🏆 %s（%s）｜ %s\n" +
                 "#BuildInPublic #X运营",
+                shareHandle,
                 reportShortTitle,
-                profile.username(),
                 sharePeriodLabel,
+                viaSuffix,
                 authoredTotal,
                 activity.replies(),
                 activity.replyToPostRatio(),
-                activity.engagementRateSampleCount() > 0 ? String.format("%.2f%%", activity.avgEngagementRatePct()) : "--（暂无可用样本）",
+                activity.engagementRateSampleCount() > 0 ? String.format("%.2f%%", activity.avgEngagementRatePct()) : "--",
                 followAudit.followBackRateLabel(),
                 activity.personaTag(),
-                activity.activityHealthScore() >= 0 ? activity.activityHealthScore() + "/100" : "--（指标不足）",
+                activity.activityHealthScore() >= 0 ? activity.activityHealthScore() + "/100" : "--",
                 buddiesMention
         );
         if (activity.sampleCapped()) {

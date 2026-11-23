@@ -84,12 +84,23 @@ public final class AssistantIntelligence {
 
     private static TextModelClient createClient(ObjectMapper mapper, Environment environment) {
         var transport = new JavaNetModelTransport(mapper);
-        var provider = AssistantConnection.provider(environment);
         java.util.function.Function<String, String> credential = environment::getProperty;
-        return switch (provider) {
-            case "minimax" -> new MiniMaxTextModelClient(mapper, transport, credential);
-            case "commandcode" -> new CommandCodeTextModelClient(mapper, transport, credential::apply);
-            default -> throw new IllegalArgumentException("不支持的内容助手模型服务");
+        var miniMax = new MiniMaxTextModelClient(mapper, transport, credential);
+        var commandCode = new CommandCodeTextModelClient(mapper, transport, credential::apply);
+        return new TextModelClient() {
+            @Override
+            public ModelResult complete(ModelBinding binding, TextRequest request) {
+                return "minimax".equalsIgnoreCase(binding.connection().serviceName())
+                        ? miniMax.complete(binding, request)
+                        : commandCode.complete(binding, request);
+            }
+
+            @Override
+            public boolean requiresExplicitSearchQuery(ModelBinding binding) {
+                return "minimax".equalsIgnoreCase(binding.connection().serviceName())
+                        ? miniMax.requiresExplicitSearchQuery(binding)
+                        : commandCode.requiresExplicitSearchQuery(binding);
+            }
         };
     }
 
@@ -579,9 +590,9 @@ public final class AssistantIntelligence {
     }
 
     private TextModelClient.ModelBinding binding(ObjectNode settings, Stage role) {
-        String provider = AssistantConnection.provider(environment);
-        String baseUrl = AssistantConnection.endpoint(environment);
-        String credential = AssistantConnection.credentialName(environment);
+        String provider = AssistantConnection.selectedProvider(settings, environment);
+        String baseUrl = AssistantConnection.endpoint(environment, provider);
+        String credential = AssistantConnection.credentialName(provider);
         if (baseUrl == null || baseUrl.isBlank() || environment.getProperty(credential, "").isBlank()) {
             throw new AssistantIntelligenceException(FailureKind.MISSING_CONFIG, false, null, "内容助手模型服务未在服务器配置", null);
         }

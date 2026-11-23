@@ -182,6 +182,14 @@ const fifthBlocked = validateAndMergeScheduleFiles(okFour.files, [makeFile("5.pn
 assert.equal(fifthBlocked.ok, false);
 assert.match(fifthBlocked.error, /4/);
 
+const fiveAtOnce = validateAndMergeScheduleFiles([], [
+    ...fourPngs,
+    makeFile("5.png", "image/png", 100)
+]);
+assert.equal(fiveAtOnce.ok, true);
+assert.equal(fiveAtOnce.files.length, 4);
+assert.equal(fiveAtOnce.truncatedCount, 1);
+
 const oversizedStatic = validateAndMergeScheduleFiles([], [makeFile("big.png", "image/png", 5 * 1024 * 1024 + 1)]);
 assert.equal(oversizedStatic.ok, false);
 assert.match(oversizedStatic.error, /5MB/);
@@ -423,19 +431,19 @@ assert.ok(recommended, "Recent post 10m ago (19:20) shifts recommended preset by
 assert.match(recommended.label, /20:25/);
 
 // Screenshot regression: at 20:14 with last post at 17:51 (18:51 already passed!),
-// both input draft and recommended chip resolve to the EXACT same minute in 20:15..20:24 (never N hours later!)
+// both input draft and recommended chip resolve to the EXACT same >= +15m 5-min rounded slot (20:30, never N hours later!)
 const shotNowMs = new Date(2026, 10, 22, 20, 14).getTime();
 resetScheduleState(shotNowMs);
 state.report = liveReport(new Date(2026, 10, 22, 17, 51).getTime());
 state.scheduleDraftItems = [];
-// Even if buildScheduleQuickPresets runs BEFORE createScheduleDraftItem, both share the exact same jitter!
+// Even if buildScheduleQuickPresets runs BEFORE createScheduleDraftItem, both share the exact same recommended time!
 const preInitPresets = Array.from(buildScheduleQuickPresets(shotNowMs));
 state.scheduleDraftItems = [createScheduleDraftItem("", null, [], false)];
 const postInitPresets = Array.from(buildScheduleQuickPresets(shotNowMs));
 const draftEpochMs = parseDraftItemEpochMs(state.scheduleDraftItems[0]);
 assert.ok(
-    draftEpochMs >= shotNowMs + 1 * MINUTE && draftEpochMs <= shotNowMs + 10 * MINUTE,
-    `Expected draft at 20:14 (with last post 17:51) to be 20:15..20:24, got ${state.scheduleDraftItems[0].scheduledAtValue}`
+    draftEpochMs >= shotNowMs + 15 * MINUTE && draftEpochMs <= shotNowMs + 20 * MINUTE,
+    `Expected draft at 20:14 (with last post 17:51) to be 20:29..20:34, got ${state.scheduleDraftItems[0].scheduledAtValue}`
 );
 assert.equal(preInitPresets[0].epochMs, draftEpochMs, "Pre-init recommended chip matches initialized draft minute");
 assert.equal(postInitPresets[0].epochMs, draftEpochMs, "Post-init recommended chip matches input draft minute");

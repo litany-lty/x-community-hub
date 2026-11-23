@@ -113,6 +113,37 @@ class MiniMaxTextModelClientTest {
         assertThat(store.tx(AssistantWorkflow::settings).path("researchProtocol").asText()).isEqualTo("MESSAGES");
     }
 
+    @Test
+    void onlineSettingsCanSwitchBetweenProvidersAndPreserveBindings(@TempDir Path db) {
+        var store = new AssistantStore(db, mapper);
+        var env = new MockEnvironment()
+                .withProperty(AssistantConnection.MINIMAX_KEY_ENV, "fake-minimax")
+                .withProperty(AssistantIntelligence.API_KEY_ENV, "fake-command");
+        new AssistantConnection(store, env).synchronize();
+
+        var controller = new AssistantController(store, org.mockito.Mockito.mock(SourceCollector.class),
+                org.mockito.Mockito.mock(AssistantWorker.class), org.mockito.Mockito.mock(AssistantPublishing.class),
+                mapper, null, env);
+
+        var toMini = controller.updateSettings(mapper.createObjectNode().put("provider", "minimax"));
+        assertThat(toMini.path("provider").asText()).isEqualTo("minimax");
+        assertThat(toMini.path("credentialConfigured").asBoolean()).isTrue();
+        assertThat(toMini.path("model").asText()).isEqualTo("MiniMax-M3.1-Flash");
+
+        var toCmd = controller.updateSettings(mapper.createObjectNode()
+                .put("provider", "commandcode").put("model", "gpt-5.4").put("contextTokens", 128_000));
+        assertThat(toCmd.path("provider").asText()).isEqualTo("commandcode");
+        assertThat(toCmd.path("model").asText()).isEqualTo("gpt-5.4");
+
+        var backToMini = controller.updateSettings(mapper.createObjectNode().put("provider", "minimax"));
+        assertThat(backToMini.path("provider").asText()).isEqualTo("minimax");
+        assertThat(backToMini.path("model").asText()).isEqualTo("MiniMax-M3.1-Flash");
+
+        var backToCmd = controller.updateSettings(mapper.createObjectNode().put("provider", "commandcode"));
+        assertThat(backToCmd.path("provider").asText()).isEqualTo("commandcode");
+        assertThat(backToCmd.path("model").asText()).isEqualTo("gpt-5.4");
+    }
+
     private static TextModelClient.ModelBinding binding(String uri, String credential) {
         var connection = new TextModelClient.ServiceConnection("minimax", URI.create(uri), credential, 1);
         return new TextModelClient.ModelBinding(connection, "MiniMax-M3.1-Flash",

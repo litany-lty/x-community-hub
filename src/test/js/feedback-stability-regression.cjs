@@ -256,6 +256,44 @@ function testAuthorizationErrorHasIndependentLifetime() {
     ctx.setPublishAuthError('');
     assert.equal(ctx.$('schedulePublishAuthError').hidden, true);
 }
+async function testScheduleReauthorizeEntryPoints() {
+    const ctx = fixture();
+    ctx.syncScheduleAuthBanner();
+    assert.equal(ctx.$('scheduleWriteAuthCard').hidden, true);
+    assert.equal(ctx.$('reauthorizePublishBtn').hidden, false, 'authorized state keeps an explicit reauthorize button');
+
+    ctx.state.authStatus.writeAuthorized = false;
+    ctx.state.scheduleJobs = [{
+        id: 'job-expired',
+        status: 'FAILED',
+        text: 'scheduled post',
+        scheduledAtEpochMs: ctx.Date.now() - 60000,
+        lastError: 'X 发推授权已过期或失效，请前往「定时发布」页完成二次授权：Value passed for the token was invalid.'
+    }];
+    ctx.syncScheduleAuthBanner();
+    assert.equal(ctx.$('scheduleWriteAuthCard').hidden, false);
+    assert.equal(ctx.$('reauthorizePublishBtn').hidden, true, 'toolbar button hides when top reauth card is already visible');
+    assert.equal(ctx.$('scheduleWriteAuthTitle').textContent, '发推授权已过期');
+    assert.equal(ctx.$('triggerPublishAuthBtn').textContent, '重新授权');
+
+    ctx.escapeHtml = s => String(s ?? '');
+    ctx.safeHttpUrl = s => String(s ?? '');
+    ctx.emptyStateHtml = s => s;
+    ctx.formatScheduleEpochLabel = () => '11-23 12:00';
+    ctx.formatEpochToDatetimeLocalValue = () => '2026-11-23T12:00';
+    ctx.statusMetaForScheduledJob = () => ({ cls: 'red', label: '发送失败' });
+    vm.runInContext(section('    function renderScheduledTweetsList(', '    function openConfirmResendModal('), ctx);
+    ctx.renderScheduledTweetsList();
+    assert.match(ctx.$('scheduledTweetsList').innerHTML, /data-job-action="reauth"/);
+
+    let reauthCalls = 0;
+    ctx.triggerXPublishAuth = async () => { reauthCalls++; };
+    let clickHandler;
+    ctx.$('scheduledTweetsList').addEventListener = (event, fn) => { if (event === 'click') clickHandler = fn; };
+    vm.runInContext(section('        $("scheduledTweetsList")?.addEventListener("click",', '        const confirmModal ='), ctx);
+    await clickHandler({ target: { closest: () => ({ dataset: { jobAction: 'reauth', jobId: 'job-expired' } }) } });
+    assert.equal(reauthCalls, 1, 'reauth action on failed job triggers X publish step-up authorization');
+}
 async function testLogoutShowsProgressAndVerifiesAmbiguousResult() {
     const ctx = fixture(); let posts = 0;
     ctx.$('railLogoutBtn').textContent = '退出'; ctx.$('topbarLogoutBtn').textContent = '退出';
@@ -280,6 +318,7 @@ async function testLogoutShowsProgressAndVerifiesAmbiguousResult() {
     await testJsonFastPathAndPreExecutionBusyRejection();
     await testRescheduleUnknownResultKeepsEditor();
     testAuthorizationErrorHasIndependentLifetime();
+    await testScheduleReauthorizeEntryPoints();
     await testLogoutShowsProgressAndVerifiesAmbiguousResult();
-    console.log('feedback-stability-regression: passed (7 behavior groups)');
+    console.log('feedback-stability-regression: passed (8 behavior groups)');
 })().catch(error => { console.error(error); process.exitCode = 1; });

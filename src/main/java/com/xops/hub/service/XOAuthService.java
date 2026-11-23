@@ -308,6 +308,62 @@ public class XOAuthService {
         }
     }
 
+    public String invalidateRejectedWriteToken(String accountId, String rejectedAccessToken) {
+        if (accountId == null || accountId.isBlank()) {
+            return null;
+        }
+        synchronized (lockForAccount(accountId)) {
+            StoredOAuthToken token = tokenStore.load(accountId);
+            if (token == null) {
+                return "X 发推授权已过期或失效，请前往「定时发布」页完成二次授权：HTTP 401";
+            }
+            if (rejectedAccessToken != null && !rejectedAccessToken.isBlank()
+                    && token.accessToken() != null && !rejectedAccessToken.equals(token.accessToken())) {
+                return null;
+            }
+            if (!token.hasRefreshToken()) {
+                tokenStore.delete(accountId);
+                return "X 发推访问令牌已过期且未获得离线刷新权限（offline.access），请前往「定时发布」页完成二次授权";
+            }
+            if (!properties.hasOAuthClient()) {
+                tokenStore.delete(accountId);
+                return "X 发推授权已过期或失效，请前往「定时发布」页完成二次授权：HTTP 401";
+            }
+            try {
+                TokenGrant refreshed = exchangeRefreshToken(accountId, token.refreshToken());
+                String nextRefresh = refreshed.refreshToken().isBlank() ? token.refreshToken() : refreshed.refreshToken();
+                String nextScope = refreshed.scope().isBlank() ? token.scope() : refreshed.scope();
+                long expiresIn = refreshed.expiresInSec() > 0 ? refreshed.expiresInSec() : 7200L;
+                long nowSec = Instant.now().getEpochSecond();
+                tokenStore.save(new StoredOAuthToken(
+                        token.accountId(),
+                        token.username(),
+                        refreshed.accessToken(),
+                        nextRefresh,
+                        nowSec + expiresIn,
+                        nextScope,
+                        nowSec
+                ));
+                return null;
+            } catch (XDataProviderException ex) {
+                return ex.getMessage();
+            }
+        }
+    }
+
+    public void evictStaleTokenBefore(String accountId, long authFailureEpochMs) {
+        if (accountId == null || accountId.isBlank() || authFailureEpochMs <= 0L) {
+            return;
+        }
+        long failureEpochSec = authFailureEpochMs / 1000L;
+        synchronized (lockForAccount(accountId)) {
+            StoredOAuthToken token = tokenStore.load(accountId);
+            if (token != null && token.updatedAtEpochSec() < failureEpochSec) {
+                tokenStore.delete(accountId);
+            }
+        }
+    }
+
     private void persistTokenGrant(AuthenticatedXUser user, TokenGrant grant, AuthPurpose purpose) {
         if (user == null || user.id() == null || user.id().isBlank()) {
             return;
@@ -400,7 +456,7 @@ public class XOAuthService {
         if (resp.statusCode() == 400 || resp.statusCode() == 401) {
             String errCode = json.path("error").asText("");
             String errDesc = json.path("error_description").asText(errCode.isBlank() ? "HTTP " + resp.statusCode() : errCode);
-            if ("invalid_grant".equalsIgnoreCase(errCode) || errDesc.toLowerCase(Locale.ROOT).contains("invalid_grant")) {
+            if (!"invalid_client".equalsIgnoreCase(errCode)) {
                 tokenStore.delete(accountId);
             }
             throw new XDataProviderException(401, "X 发推授权已过期或失效，请前往「定时发布」页完成二次授权：" + errDesc);

@@ -139,6 +139,9 @@ class ScheduledTweetServiceTest {
     private final List<String> tweetBodies = Collections.synchronizedList(new ArrayList<>());
 
     private volatile long tokenDelayMs = 0L;
+    private volatile int tokenResponseStatus = 200;
+    private volatile String tokenErrorCode = "";
+    private volatile String tokenErrorDescription = "";
     private volatile String tokenResponseAccessToken = "tok-initial";
     private volatile String tokenResponseRefreshToken = "rt-initial";
     private volatile String tokenResponseScope = XOAuthService.PUBLISH_OAUTH_SCOPE;
@@ -300,6 +303,89 @@ class ScheduledTweetServiceTest {
         } finally {
             pool.shutdownNow();
         }
+    }
+
+    @Test
+    void expiredOrRevokedPublishTokenClearsWriteCapabilityAndAllowsReauthorization() throws Exception {
+        long nowSec = Instant.now().getEpochSecond();
+        // 1) X OAuth2 refresh_token 过期时常返回 HTTP 400 invalid_request（而非仅 invalid_grant）
+        tokenStore.save(new StoredOAuthToken(
+                "1001",
+                "alice",
+                "tok-expired",
+                "rt-expired",
+                nowSec - 60L,
+                XOAuthService.PUBLISH_OAUTH_SCOPE,
+                nowSec - 3600L
+        ));
+        assertTrue(oauthService.getTokenCapability("1001").writeAuthorized());
+        tokenResponseStatus = 400;
+        tokenErrorCode = "invalid_request";
+        tokenErrorDescription = "Value passed for the token was invalid.";
+
+        XDataProviderException refreshEx = assertThrows(
+                XDataProviderException.class,
+                () -> oauthService.getValidWriteAccessToken("1001", false)
+        );
+        assertEquals(401, refreshEx.getStatusCode());
+        assertFalse(oauthService.getTokenCapability("1001").writeAuthorized(),
+                "400 invalid_request on refresh_token must clear stale write capability so UI shows reauth entry");
+
+        // 2) access_token 本地尚未到期但被 X 侧吊销（/2/tweets 返回 401）且刷新失败时，调度器应同步清除失效令牌
+        long freshSec = Instant.now().getEpochSecond();
+        tokenStore.save(new StoredOAuthToken(
+                "1001",
+                "alice",
+                "tok-revoked-early",
+                "rt-also-revoked",
+                freshSec + 3600L,
+                XOAuthService.PUBLISH_OAUTH_SCOPE,
+                freshSec
+        ));
+        assertTrue(service.listJobs("1001", "alice").writeAuthorized());
+        tweetResponseStatus = 401;
+        long t0 = clock.millis();
+        ScheduledTweetJob job = service.createScheduledTweet(
+                "1001",
+                "alice",
+                "授权吊销测试推文",
+                t0 + 30_000L,
+                "req-revoked-token",
+                List.of()
+        );
+        clock.setMillis(t0 + 31_000L);
+        service.processDueJobsForAccount("1001");
+        ScheduledTweetJob failed = findJobById("1001", job.id());
+        assertEquals(ScheduledTweetStatus.FAILED, failed.status());
+        assertTrue(failed.lastError().contains("二次授权"), "failed message should guide user to re-authorize");
+        assertFalse(service.listJobs("1001", "alice").writeAuthorized(),
+                "401 on publish + failed refresh must flip writeAuthorized to false");
+
+        // 3) 兼容存量卡死状态：旧版失败任务已落盘但旧令牌文件未删，首次读取列表自愈，重新二次授权后恢复
+        tokenStore.save(new StoredOAuthToken(
+                "1001",
+                "alice",
+                "tok-legacy-stale",
+                "rt-legacy-stale",
+                freshSec - 120L,
+                XOAuthService.PUBLISH_OAUTH_SCOPE,
+                (t0 - 10_000L) / 1000L
+        ));
+        assertFalse(service.listJobs("1001", "alice").writeAuthorized(),
+                "legacy stale token older than auth-failed job should be evicted on listJobs");
+
+        tokenResponseStatus = 200;
+        tokenErrorCode = "";
+        tokenErrorDescription = "";
+        tweetResponseStatus = 201;
+        tokenResponseAccessToken = "tok-reauthorized";
+        tokenResponseRefreshToken = "rt-reauthorized";
+        XOAuthService.AuthorizationRequestInfo reauthReq =
+                oauthService.createPublishAuthorizationRequest("http://localhost:8080", "1001");
+        XOAuthService.CallbackResult reauthCb = oauthService.handleCallbackResult("code-reauth", reauthReq.state());
+        assertTrue(reauthCb.writeAuthorized());
+        assertTrue(service.listJobs("1001", "alice").writeAuthorized(),
+                "newly re-authorized token newer than prior failed job must remain writeAuthorized");
     }
 
     @Test
@@ -1117,6 +1203,14 @@ class ScheduledTweetServiceTest {
         if ("/2/oauth2/token".equals(path)) {
             int call = tokenCalls.incrementAndGet();
             sleepQuietly(tokenDelayMs);
+            if (tokenResponseStatus >= 400) {
+                String errJson = objectMapper.writeValueAsString(java.util.Map.of(
+                        "error", tokenErrorCode,
+                        "error_description", tokenErrorDescription
+                ));
+                sendJson(exchange, tokenResponseStatus, errJson);
+                return;
+            }
             String json = objectMapper.writeValueAsString(java.util.Map.of(
                     "token_type", "bearer",
                     "expires_in", 7200,
