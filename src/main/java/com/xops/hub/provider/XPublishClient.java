@@ -96,6 +96,10 @@ public class XPublishClient {
     }
 
     public String createTweet(String userAccessToken, String text, List<String> mediaIds) {
+        return createTweet(userAccessToken, text, mediaIds, null);
+    }
+
+    public String createTweet(String userAccessToken, String text, List<String> mediaIds, String quoteTweetId) {
         if (userAccessToken == null || userAccessToken.isBlank()) {
             throw new XPublishException(401, "缺少有效访问令牌，无法发布推文", false);
         }
@@ -105,6 +109,9 @@ public class XPublishClient {
         }
         if (mediaIds != null && !mediaIds.isEmpty()) {
             payload.put("media", Map.of("media_ids", mediaIds));
+        }
+        if (quoteTweetId != null && !quoteTweetId.isBlank()) {
+            payload.put("quote_tweet_id", quoteTweetId.trim());
         }
         if (payload.isEmpty()) {
             throw new XPublishException(400, "推文正文与媒体不可同时为空", false);

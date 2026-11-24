@@ -16,7 +16,8 @@ import static org.assertj.core.api.Assertions.*;
 
 class UpstreamBudgetGuardTest {
     @TempDir Path directory;
-    private static final URI PROFILE = URI.create("https://api.twitterapi.io/twitter/user/info?userName=test");
+    private static final URI PROFILE = URI.create("http://127.0.0.1:9999/twitter/user/info?userName=test");
+    private static final URI EXTERNAL_PAID_PROFILE = URI.create("https://api.twitterapi.io/twitter/user/info?userName=test");
     private XOpsProperties properties() {
         XOpsProperties p = new XOpsProperties();
         p.setDiskCacheDir(directory.toString());
@@ -27,7 +28,7 @@ class UpstreamBudgetGuardTest {
     @Test void concurrentGuardInstancesShareDurableAdmissionAndCannotOverspend() throws Exception {
         XOpsProperties p = properties();
         p.setHourlyUpstreamApiBudget(7);
-        List<UpstreamBudgetGuard> guards = List.of(new UpstreamBudgetGuard(p), new UpstreamBudgetGuard(p));
+        List<UpstreamBudgetGuard> guards = List.of(new UpstreamBudgetGuard(p, true), new UpstreamBudgetGuard(p, true));
         var executor = Executors.newFixedThreadPool(12);
         try {
             List<Callable<Boolean>> attempts = new ArrayList<>();
@@ -41,50 +42,50 @@ class UpstreamBudgetGuardTest {
             long admitted = 0;
             for (var result : executor.invokeAll(attempts)) if (result.get()) admitted++;
             assertThat(admitted).isEqualTo(7);
-            assertThatThrownBy(() -> new UpstreamBudgetGuard(p).acquirePermit(PROFILE, "twitterapi_io_read"))
+            assertThatThrownBy(() -> new UpstreamBudgetGuard(p, true).acquirePermit(PROFILE, "twitterapi_io_read"))
                 .isInstanceOf(XDataProviderException.class).hasMessageContaining("预算");
         } finally { executor.shutdownNow(); }
     }
     @Test void moneyIsReservedBeforeSendingAndSurvivesRestart() {
         XOpsProperties p = properties();
         p.setHourlyUpstreamUsdBudget("0.00035");
-        new UpstreamBudgetGuard(p).acquirePermit(PROFILE, "twitterapi_io_read");
-        assertThatThrownBy(() -> new UpstreamBudgetGuard(p).acquirePermit(PROFILE, "twitterapi_io_read"))
+        new UpstreamBudgetGuard(p, true).acquirePermit(PROFILE, "twitterapi_io_read");
+        assertThatThrownBy(() -> new UpstreamBudgetGuard(p, true).acquirePermit(PROFILE, "twitterapi_io_read"))
             .isInstanceOf(XDataProviderException.class).hasMessageContaining("预算");
     }
     @Test void dailyAndMonthlyLimitsSurviveHourAndDayRollover() {
         XOpsProperties p = properties();
         p.setDailyUpstreamUsdBudget("0.00035");
         p.setMonthlyUpstreamUsdBudget("0.00035");
-        new UpstreamBudgetGuard(p, false, clock("2026-11-15T01:00:00Z")).acquirePermit(PROFILE, "twitterapi_io_read");
-        assertThatThrownBy(() -> new UpstreamBudgetGuard(p, false, clock("2026-11-15T02:00:00Z"))
+        new UpstreamBudgetGuard(p, true, clock("2026-11-15T01:00:00Z")).acquirePermit(PROFILE, "twitterapi_io_read");
+        assertThatThrownBy(() -> new UpstreamBudgetGuard(p, true, clock("2026-11-15T02:00:00Z"))
             .acquirePermit(PROFILE, "twitterapi_io_read")).isInstanceOf(XDataProviderException.class);
-        assertThatThrownBy(() -> new UpstreamBudgetGuard(p, false, clock("2026-11-16T01:00:00Z"))
+        assertThatThrownBy(() -> new UpstreamBudgetGuard(p, true, clock("2026-11-16T01:00:00Z"))
             .acquirePermit(PROFILE, "twitterapi_io_read")).isInstanceOf(XDataProviderException.class);
-        new UpstreamBudgetGuard(p, false, clock("2026-12-01T01:00:00Z")).acquirePermit(PROFILE, "twitterapi_io_read");
+        new UpstreamBudgetGuard(p, true, clock("2026-12-01T01:00:00Z")).acquirePermit(PROFILE, "twitterapi_io_read");
     }
     @Test void backwardsClockDoesNotResetConsumedBudget() {
         XOpsProperties p = properties(); p.setHourlyUpstreamApiBudget(1);
-        new UpstreamBudgetGuard(p, false, clock("2026-11-15T02:00:00Z")).acquirePermit(PROFILE, "twitterapi_io_read");
-        assertThatThrownBy(() -> new UpstreamBudgetGuard(p, false, clock("2026-11-15T01:00:00Z"))
+        new UpstreamBudgetGuard(p, true, clock("2026-11-15T02:00:00Z")).acquirePermit(PROFILE, "twitterapi_io_read");
+        assertThatThrownBy(() -> new UpstreamBudgetGuard(p, true, clock("2026-11-15T01:00:00Z"))
             .acquirePermit(PROFILE, "twitterapi_io_read")).isInstanceOf(XDataProviderException.class);
     }
     @Test void corruptOrMissingInitializedLedgerBlocksCallsInsteadOfResetting() throws Exception {
-        XOpsProperties p = properties(); new UpstreamBudgetGuard(p).acquirePermit(PROFILE, "twitterapi_io_read");
+        XOpsProperties p = properties(); new UpstreamBudgetGuard(p, true).acquirePermit(PROFILE, "twitterapi_io_read");
         Path ledger = directory.resolve("upstream-budget.json");
         Files.writeString(ledger, "{\"version\":1");
-        assertThatThrownBy(() -> new UpstreamBudgetGuard(p).acquirePermit(PROFILE, "twitterapi_io_read"))
+        assertThatThrownBy(() -> new UpstreamBudgetGuard(p, true).acquirePermit(PROFILE, "twitterapi_io_read"))
             .isInstanceOf(XDataProviderException.class).hasMessageContaining("记录暂不可用");
         Files.delete(ledger);
-        assertThatThrownBy(() -> new UpstreamBudgetGuard(p).acquirePermit(PROFILE, "twitterapi_io_read"))
+        assertThatThrownBy(() -> new UpstreamBudgetGuard(p, true).acquirePermit(PROFILE, "twitterapi_io_read"))
             .isInstanceOf(XDataProviderException.class).hasMessageContaining("记录暂不可用");
     }
     @Test void invalidLedgerPathStopsAdmissionAndZeroMeansNoSpending() throws Exception {
         XOpsProperties p = properties(); Files.createDirectory(directory.resolve("upstream-budget.json"));
-        assertThatThrownBy(() -> new UpstreamBudgetGuard(p).acquirePermit(PROFILE, "twitterapi_io_read"))
+        assertThatThrownBy(() -> new UpstreamBudgetGuard(p, true).acquirePermit(PROFILE, "twitterapi_io_read"))
             .isInstanceOf(XDataProviderException.class);
         p.setDiskCacheDir(directory.resolve("zero").toString()); p.setHourlyUpstreamApiBudget(0);
-        assertThatThrownBy(() -> new UpstreamBudgetGuard(p).acquirePermit(PROFILE, "twitterapi_io_read"))
+        assertThatThrownBy(() -> new UpstreamBudgetGuard(p, true).acquirePermit(PROFILE, "twitterapi_io_read"))
             .isInstanceOf(XDataProviderException.class).hasMessageContaining("预算");
     }
     @Test void loopbackMockDoesNotTouchRealLedgerButEnforcementCanBeTested() {
@@ -94,6 +95,12 @@ class UpstreamBudgetGuardTest {
         assertThat(directory.resolve("upstream-budget.json")).doesNotExist();
         assertThatThrownBy(() -> new UpstreamBudgetGuard(p, true).acquirePermit(mock, "twitterapi_io_read"))
             .isInstanceOf(XDataProviderException.class);
+        assertThatThrownBy(() -> new UpstreamBudgetGuard(p).acquirePermit(EXTERNAL_PAID_PROFILE, "twitterapi_io_read"))
+            .isInstanceOfSatisfying(XDataProviderException.class, ex -> assertThat(ex.getStatusCode()).isEqualTo(403));
+        PaidCapabilityGate.withCaller("elidlicom", "budget-test-owner", () -> {
+            new UpstreamBudgetGuard(p).acquirePermit(EXTERNAL_PAID_PROFILE, "twitterapi_io_read");
+            return null;
+        });
     }
     @Test void estimatesUseResourceCountsAndUnknownEndpointsCannotBypassAccounting() {
         assertThat(UpstreamBudgetGuard.estimateMicros(URI.create("https://api.twitterapi.io/twitter/article?tweet_id=1"),
@@ -104,8 +111,8 @@ class UpstreamBudgetGuardTest {
             "x_official_read", 200000)).isEqualTo(2_000_000);
         assertThat(UpstreamBudgetGuard.estimateMicros(URI.create("https://api.x.com/2/tweets"),
             "x_tweet_create", 200000)).isEqualTo(200_000);
-        assertThatThrownBy(() -> new UpstreamBudgetGuard(properties()).acquirePermit(
-            URI.create("https://api.twitterapi.io/new-paid-endpoint"), "twitterapi_io_read"))
+        assertThatThrownBy(() -> new UpstreamBudgetGuard(properties(), true).acquirePermit(
+            URI.create("http://127.0.0.1:9999/new-paid-endpoint"), "twitterapi_io_read"))
             .isInstanceOf(XDataProviderException.class).hasMessageContaining("未登记");
     }
     @Test void invalidBudgetCannotSilentlyDisableProtection() {
@@ -149,7 +156,7 @@ class UpstreamBudgetGuardTest {
         p.setDiskCacheDir("");
         var guard = new UpstreamBudgetGuard(p);
         guard.acquirePermit(URI.create("http://127.0.0.1:9999/twitter/user/info"), "twitterapi_io_read");
-        assertThatThrownBy(() -> guard.acquirePermit(PROFILE, "twitterapi_io_read"))
+        assertThatThrownBy(() -> new UpstreamBudgetGuard(p, true).acquirePermit(PROFILE, "twitterapi_io_read"))
             .isInstanceOf(XDataProviderException.class).hasMessageContaining("持久化预算目录");
     }
 

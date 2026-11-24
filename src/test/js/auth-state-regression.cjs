@@ -503,5 +503,82 @@ function response(username = 'alice', id = '1001') {
     assert.equal(ownerPerms.isPeriodUnlocked('MONTH'), false, 'unverified handle spoof does not unlock periods');
     assert.equal(ownerPerms.getRequiredScheduleIntervalMs(), 3_600_000, 'unverified handle spoof keeps 1h schedule interval');
 
+    // SWR acceptance notice does not trigger caution state, and auto-opened syncStatusDetails closes once resolved
+    const headerCtx = context();
+    const headerNodes = new Map();
+    const getHeaderNode = id => {
+        if (!headerNodes.has(id)) {
+            const classes = new Set();
+            const listeners = new Map();
+            headerNodes.set(id, {
+                id, textContent: '', innerHTML: '', outerHTML: '', title: '', href: '', hidden: false, open: false,
+                dataset: {},
+                classList: {
+                    add: c => classes.add(c),
+                    remove: c => classes.delete(c),
+                    toggle: (c, on) => on ? classes.add(c) : classes.delete(c),
+                    contains: c => classes.has(c)
+                },
+                addEventListener: (ev, fn) => listeners.set(ev, fn),
+                dispatchToggle: () => listeners.get('toggle')?.()
+            });
+        }
+        return headerNodes.get(id);
+    };
+    headerCtx.$ = getHeaderNode;
+    headerCtx.document.getElementById = getHeaderNode;
+    headerCtx.window = {innerWidth: 390};
+    headerCtx.AUTHOR_AVATAR_URL = '';
+    headerCtx.AUTHOR_BANNER_URL = '';
+    headerCtx.normalizePeriod = () => ({badgePrefix: '24h'});
+    headerCtx.syncUsageHandleDisplay = noop;
+    headerCtx.avatarHtml = () => '<div class="avatar-circle sm"></div><div class="avatar-circle xl"></div>';
+    headerCtx.syncSettingsAccountMenu = noop;
+    headerCtx.fmtClockTime = () => '15:07';
+    headerCtx.applyCoverBanner = noop;
+    headerCtx.fmtNum = v => String(v ?? 0);
+    headerCtx.saveProfileHeaderCache = noop;
+    headerCtx.scheduleMediaBatchWarm = noop;
+    vm.runInContext(section('    function renderProfileHeader(', '    /* ==================== 模块 1：发帖与回复活跃度看板'), headerCtx);
+
+    const baseReport = (bannerNotice) => ({
+        provider: 'TWITTERAPI_IO',
+        periodCode: 'HOURS_24',
+        windowDays: 1,
+        fetchedAt: '2026-11-23T07:07:00Z',
+        bannerNotice,
+        profile: {id: '1001', username: 'alice', displayName: 'Alice', verified: true, bio: 'dev', followingCount: 10, followersCount: 20, totalPostsCount: 30},
+        activity: {coverageNote: '', windowRangeText: '11月22日 15:07 - 11月23日 15:07', personaTag: '高频互动深耕达人', activityHealthScore: 87, sampleCapped: false},
+        followAudit: {followersSampleTruncated: false, followingsSampleTruncated: false, unknownFollowBackCount: 0, unknownFollowingCount: 0, followBackRatePct: 87.3, followBackRateComplete: true, notFollowingBackCount: 0},
+        interactions: {peerStats: []}
+    });
+
+    headerCtx.state.pendingRelationshipChecks = 0;
+    headerCtx.state.dailyCacheStatus = {timelineCovered: true, inboundCovered: true, pendingMetricPosts: 0, unattemptedMetricPosts: 0, canContinue: false, lastAttemptDegraded: false};
+    headerCtx.renderProfileHeader(baseReport('已返回最近一次完整入库快照；后台刷新已受理。'));
+    assert.equal(getHeaderNode('syncStatusSummary').textContent, '最近 24 小时已同步', 'SWR acceptance notice must not trigger 数据状态需留意');
+    assert.equal(getHeaderNode('syncStatusDetails').open, false, 'SWR acceptance notice must not auto-expand details');
+
+    // Degraded state auto-opens details; subsequent clean sync auto-closes it
+    headerCtx.state.dailyCacheStatus = {timelineCovered: true, inboundCovered: true, pendingMetricPosts: 1, unattemptedMetricPosts: 1, canContinue: true, lastAttemptDegraded: true};
+    headerCtx.renderProfileHeader(baseReport('本轮最近 24 小时数据或指标尚未补齐；继续补充可获取数据，未计为完整新鲜缓存。已入库 100 条动态、50 条互动；历史数据仍按原覆盖范围累计。'));
+    assert.equal(getHeaderNode('syncStatusSummary').textContent, '数据状态需留意');
+    assert.equal(getHeaderNode('syncStatusDetails').open, true);
+
+    headerCtx.state.dailyCacheStatus = {timelineCovered: true, inboundCovered: true, pendingMetricPosts: 0, unattemptedMetricPosts: 0, canContinue: false, lastAttemptDegraded: false};
+    headerCtx.renderProfileHeader(baseReport('最近 24 小时数据与指标已完成本轮同步；满 1 小时后再次检查更新。已入库 100 条动态、50 条互动；历史数据仍按原覆盖范围累计。'));
+    assert.equal(getHeaderNode('syncStatusSummary').textContent, '最近 24 小时已同步');
+    assert.equal(getHeaderNode('syncStatusDetails').open, false, 'auto-opened details must close when anomaly clears');
+
+    // Settled partial cycle (e.g. search circuit 503 + paid budget cap reached) stays calm & collapsed instead of yellow 数据状态需留意
+    headerCtx.state.dailyCacheStatus = {timelineCovered: true, inboundCovered: false, pendingMetricPosts: 0, unattemptedMetricPosts: 0, canContinue: false, lastAttemptDegraded: false};
+    const settledPartialReport = baseReport('本轮可请求的数据已尝试完毕，仍有未确认项；保留原值和缺失状态，下一小时再检查，不重复请求本轮失败项。已入库 5889 条动态、2537 条互动；历史数据仍按原覆盖范围累计。');
+    settledPartialReport.activity.sampleCapped = true;
+    settledPartialReport.activity.coverageNote = '实际数据覆盖约 18 小时';
+    headerCtx.renderProfileHeader(settledPartialReport);
+    assert.equal(getHeaderNode('syncStatusSummary').textContent, '数据状态');
+    assert.equal(getHeaderNode('syncStatusDetails').open, false);
+    assert.equal(getHeaderNode('syncStatusDetails').classList.contains('is-attention'), false);
+
     console.log('auth-state-regression: passed');
 })().catch(err => {console.error(err); process.exitCode = 1;});

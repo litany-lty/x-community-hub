@@ -72,7 +72,19 @@ public final class AssistantWorkflow {
         for(String key:List.of("authorId","username","text","quotedText","articleText","sourceUrl","textStatus","authorTextStatus","quotedTextStatus","articleTextStatus","articleRole","publishedAt","quotedId","quotedAuthorId","quotedUsername","articleId","articleUrl"))
             if(source.has(key)) content.set(key,source.get(key));
         String fingerprint=digest(content);
-        if(previous!=null && fingerprint.equals(previous.path("contentFingerprint").asText())) return;
+        if(previous!=null && fingerprint.equals(previous.path("contentFingerprint").asText())) {
+            boolean needAuthorBackfill = (!source.path("authorAvatarUrl").asText("").isBlank()
+                    && previous.path("authorAvatarUrl").asText("").isBlank())
+                    || (!source.path("authorName").asText("").isBlank()
+                    && previous.path("authorName").asText("").isBlank());
+            if (needAuthorBackfill) {
+                tx.put("material", materialId, previous.deepCopy()
+                        .put("authorName", source.path("authorName").asText(previous.path("authorName").asText("")))
+                        .put("authorAvatarUrl", source.path("authorAvatarUrl").asText(previous.path("authorAvatarUrl").asText("")))
+                        .put("authorVerified", source.path("authorVerified").asBoolean(previous.path("authorVerified").asBoolean(false))));
+            }
+            return;
+        }
         long now = System.currentTimeMillis();
         long firstCollectedAt = previous != null && previous.path("collectedAt").asLong(0) > 0
                 ? previous.path("collectedAt").asLong() : source.path("collectedAt").asLong(now);
@@ -182,11 +194,19 @@ public final class AssistantWorkflow {
             weights.topic().forEach(topicWeights::put);
             weights.reach().forEach(reachWeights::put);
         }
-        if (kind.equals("RESEARCH")) {
-            ObjectNode content = ((ObjectNode)input).deepCopy().without("topicVersion");
+        if (kind.equals("RESEARCH") || kind.equals("DRAFT")) {
+            ObjectNode content = ((ObjectNode)input).deepCopy().without(List.of("topicVersion", "research", "winningHint"));
+            if (content.path("skillId").asText("").isBlank()) {
+                List<JsonNode> matList = new ArrayList<>();
+                input.path("materials").forEach(matList::add);
+                String rec = ViralWritingSkills.recommendSkill(input.path("topic"), matList);
+                if (!rec.isEmpty()) content.put("skillId", rec);
+            }
             var topic = content.putObject("topic");
             for (String key : List.of("id", "title", "summary")) topic.put(key,input.path("topic").path(key).asText());
             identity.set("input",content);
+        } else if (input instanceof ObjectNode obj && obj.has("winningHint")) {
+            identity.set("input", obj.deepCopy().without("winningHint"));
         } else identity.set("input",input);
         return digest(identity);
     }
@@ -265,22 +285,127 @@ public final class AssistantWorkflow {
     }
 
     static ObjectNode research(AssistantStore.Tx tx,ObjectNode body) {
-        var replay=replay(tx,"RESEARCH",body);
+        String mode = body.path("mode").asText("RESEARCH").strip().toUpperCase(Locale.ROOT);
+        boolean fastMode = "FAST".equals(mode);
+        var replay=replay(tx, fastMode ? "DRAFT" : "RESEARCH", body);
         if(replay!=null) return replay;
         String mid=field(body,"materialId");
-        if(AssistantTopics.text(required(tx,"material",mid)).isBlank()) throw new IllegalArgumentException("该素材没有可分析文字");
+        var primaryMaterial = required(tx,"material",mid);
+        if(AssistantTopics.text(primaryMaterial).isBlank()) throw new IllegalArgumentException("该素材没有可分析文字");
         String topic=AssistantTopics.topicOf(tx,mid);
         var input=AssistantTopics.snapshot(tx,topic,mid);
-        input.put("instruction",body.path("instruction").asText(""));
+        String instruction = body.path("instruction").asText("").strip();
+        if (instruction.codePointCount(0, instruction.length()) > 500) {
+            throw new IllegalArgumentException("切入角度过长（最多 500 字）");
+        }
+        input.put("instruction", instruction);
+        String rawSkill = body.path("skillId").asText("").strip();
+        String skillId;
+        if (rawSkill.isEmpty() || "AUTO".equalsIgnoreCase(rawSkill)) {
+            List<JsonNode> matList = new ArrayList<>();
+            input.path("materials").forEach(matList::add);
+            skillId = ViralWritingSkills.recommendSkill(input.path("topic"), matList);
+        } else {
+            skillId = ViralWritingSkills.normalizeId(rawSkill);
+        }
+        if (!skillId.isEmpty()) input.put("skillId", skillId);
+        var style=tx.get("meta","style");
+        if(style!=null) input.set("style",style);
+        input.set("preferences",preferences(tx));
+        String winningHint = buildWinningObservationHint(tx);
+        if (!winningHint.isEmpty()) input.put("winningHint", winningHint);
+        if (fastMode) {
+            input.put("fastMode", true);
+            if (body.path("regenerate").asBoolean()) {
+                input.put("newAttempt", field(body, "clientRequestId"));
+            }
+            ObjectNode directResearch = buildDirectMaterialResearch(tx, input);
+            input.set("research", directResearch);
+            return enqueue(tx, "DRAFT", input, field(body, "clientRequestId"), body);
+        }
         if (body.path("regenerate").asBoolean()) {
             input.put("newAttempt",field(body,"clientRequestId"));
             var previous = previousResearch(tx, input);
             if (previous != null) input.set("previousResearch", previous);
         }
-        var style=tx.get("meta","style");
-        if(style!=null) input.set("style",style);
-        input.set("preferences",preferences(tx));
         return enqueue(tx,"RESEARCH",input,field(body,"clientRequestId"),body);
+    }
+
+    private static ObjectNode buildDirectMaterialResearch(AssistantStore.Tx tx, ObjectNode snapshotInput) {
+        String selectedMaterialId = snapshotInput.path("selectedMaterialId").asText("");
+        JsonNode topicNode = snapshotInput.path("topic");
+        String summary = !topicNode.path("summary").asText("").isBlank()
+                ? topicNode.path("summary").asText()
+                : topicNode.path("title").asText("已采集 X 一手素材");
+        var research = object()
+                .put("quality", "MATERIAL_DIRECT")
+                .put("draftable", true)
+                .put("fastMode", true)
+                .put("summary", summary);
+        var claims = research.putArray("claims");
+        var matEv = research.putArray("materialEvidence");
+        List<JsonNode> orderedMaterials = new ArrayList<>();
+        List<JsonNode> secondaryMaterials = new ArrayList<>();
+        for (JsonNode mat : snapshotInput.path("materials")) {
+            if (!selectedMaterialId.isBlank() && selectedMaterialId.equals(mat.path("id").asText(""))) {
+                orderedMaterials.add(mat);
+            } else {
+                secondaryMaterials.add(mat);
+            }
+        }
+        orderedMaterials.addAll(secondaryMaterials);
+        for (JsonNode mat : orderedMaterials) {
+            String matId = mat.path("id").asText("");
+            if (matId.isBlank() || AssistantTopics.text(mat).isBlank()) continue;
+            String rawUname = mat.path("username").asText("").strip();
+            String uname = rawUname.startsWith("@") ? rawUname.substring(1) : rawUname;
+            if (uname.isBlank()) uname = "source";
+            String authorName = mat.path("authorName").asText("").strip();
+            String publisher = authorName.isBlank() ? ("@" + uname) : (authorName + " (@" + uname + ")");
+            String text = formatDirectMaterialText(mat, uname);
+            if (text.isBlank()) continue;
+            String srcId = "material-" + matId + "-author";
+            String excId = srcId + "#p1";
+            String postUrl = !mat.path("sourceUrl").asText("").isBlank()
+                    ? mat.path("sourceUrl").asText()
+                    : ("https://x.com/" + uname + "/status/" + matId);
+            var ev = matEv.addObject()
+                    .put("id", srcId)
+                    .put("url", postUrl)
+                    .put("publisher", publisher)
+                    .put("status", "MATERIAL_FULL");
+            ev.putArray("excerpts").addObject().put("id", excId).put("text", text);
+            var claim = claims.addObject()
+                    .put("claim", text)
+                    .put("relation", "SUPPORTS");
+            claim.putArray("sourceIds").add(srcId);
+            claim.putArray("excerptIds").add(excId);
+        }
+        research.putArray("angles");
+        research.putArray("unverified");
+        research.putArray("sourceReads");
+        research.set("snapshot", snapshotInput.deepCopy().without(List.of("style", "preferences", "research")));
+        return tx.put("research", "fast-" + id(), research);
+    }
+
+    private static String formatDirectMaterialText(JsonNode mat, String uname) {
+        List<String> parts = new ArrayList<>();
+        String authorText = mat.path("text").asText("").strip();
+        if (!authorText.isBlank()) {
+            parts.add("@" + uname + "：" + authorText);
+        }
+        String quotedText = mat.path("quotedText").asText("").strip();
+        if (!quotedText.isBlank()) {
+            String rawQuotedUser = mat.path("quotedUsername").asText("").strip();
+            String quotedUser = rawQuotedUser.startsWith("@") ? rawQuotedUser.substring(1) : rawQuotedUser;
+            String quotePrefix = quotedUser.isBlank() ? "引用：" : ("引用 @" + quotedUser + "：");
+            parts.add(quotePrefix + quotedText);
+        }
+        String articleText = mat.path("articleText").asText("").strip();
+        if (!articleText.isBlank()) {
+            parts.add("长文全文：" + articleText);
+        }
+        return String.join("\n", parts);
     }
 
     private static ObjectNode previousResearch(AssistantStore.Tx tx, ObjectNode input) {
@@ -323,8 +448,17 @@ public final class AssistantWorkflow {
         if(replay!=null) return replay;
         var draft=required(tx,"draft",id);
         expect(draft,body);
+        String skillId = ViralWritingSkills.normalizeId(body.path("skillId").asText(""));
+        String instruction = body.path("instruction").asText("").strip();
+        if (instruction.isBlank() && !skillId.isEmpty()) {
+            instruction = "按所选预置爆款体裁重构全篇钩子、节奏与段落结构，严格保留已核实事实与数据";
+        }
+        if (instruction.isBlank()) {
+            throw new IllegalArgumentException("缺少 instruction");
+        }
         var input=AssistantTopics.snapshot(tx,AssistantTopics.topicOf(tx,draft.path("materialId").asText()),draft.path("materialId").asText());
-        input.put("draftId",id).put("text",draft.path("text").asText()).put("draftVersion",ver(draft)).put("instruction",field(body,"instruction"));
+        input.put("draftId",id).put("text",draft.path("text").asText()).put("draftVersion",ver(draft)).put("instruction",instruction);
+        if (!skillId.isEmpty()) input.put("skillId", skillId);
         input.set("research",draft.path("research"));
         if (memberIds(input).containsAll(memberIds(draft.path("research").path("snapshot")))) {
             var prior = previousResearch(tx, input);
@@ -332,7 +466,89 @@ public final class AssistantWorkflow {
         }
         input.set("preferences",preferences(tx));
         input.set("style",tx.get("meta","style"));
+        String winningHint = buildWinningObservationHint(tx);
+        if (!winningHint.isEmpty()) input.put("winningHint", winningHint);
         return enqueue(tx,"OPTIMIZE",input,field(request,"clientRequestId"),request);
+    }
+
+    static String buildWinningObservationHint(AssistantStore.Tx tx) {
+        Map<String, ObjectNode> latestByPost = new LinkedHashMap<>();
+        for (ObjectNode row : tx.page("observation", 100, 0)) {
+            if (!"OBSERVED".equals(row.path("status").asText(""))) continue;
+            if (row.path("draftId").asText("").isBlank() && row.path("publicationId").asText("").isBlank()) continue;
+            String postId = row.path("postId").asText("").strip();
+            if (postId.isBlank()) continue;
+            ObjectNode prev = latestByPost.get(postId);
+            if (prev == null
+                    || row.path("windowHours").asInt(0) > prev.path("windowHours").asInt(0)
+                    || (row.path("windowHours").asInt(0) == prev.path("windowHours").asInt(0)
+                    && row.path("observedAt").asLong(0) > prev.path("observedAt").asLong(0))) {
+                latestByPost.put(postId, row);
+            }
+        }
+        if (latestByPost.isEmpty()) return "";
+
+        record Winner(ObjectNode row, double pctChange, long weightedScore, double rankScore) { }
+        List<Winner> winners = new ArrayList<>();
+        for (ObjectNode row : latestByPost.values()) {
+            double pctChange = row.at("/baseline/views/percentChange").asDouble(0.0);
+            long weightedScore = row.path("bookmarks").asLong(0) * 10L
+                    + row.path("reposts").asLong(0) * 8L
+                    + row.path("replies").asLong(0) * 10L
+                    + row.path("likes").asLong(0);
+            if (pctChange >= 25.0 || weightedScore >= 50L) {
+                double rankScore = Math.max(0.0, pctChange) * 2.0 + weightedScore;
+                winners.add(new Winner(row, pctChange, weightedScore, rankScore));
+            }
+        }
+        if (winners.isEmpty()) return "";
+        winners.sort(Comparator.comparingDouble(Winner::rankScore).reversed());
+
+        List<String> lines = new ArrayList<>();
+        lines.add("【本账号实测高互动历史参考（仅借鉴开篇节奏与体裁力度，严禁复用其中的任何事实、人物或数字）】");
+        int idx = 1;
+        for (Winner w : winners) {
+            if (idx > 2) break;
+            ObjectNode row = w.row();
+            String draftId = row.path("draftId").asText("");
+            String pubId = row.path("publicationId").asText("");
+            ObjectNode pub = pubId.isBlank() ? null : tx.get("publication", pubId);
+            ObjectNode draft = draftId.isBlank() ? null : tx.get("draft", draftId);
+            String skillId = ViralWritingSkills.normalizeId(row.path("skillId").asText(""));
+            if (skillId.isEmpty() && pub != null) skillId = ViralWritingSkills.normalizeId(pub.path("skillId").asText(""));
+            if (skillId.isEmpty() && draft != null) skillId = ViralWritingSkills.normalizeId(draft.path("skillId").asText(""));
+            String skillName = skillId.isEmpty() ? "默认体裁" : ViralWritingSkills.resolveOrDefault(skillId).name();
+            String rawText = pub != null && !pub.path("text").asText("").isBlank()
+                    ? pub.path("text").asText("")
+                    : (draft != null ? draft.path("text").asText("") : "");
+            String opening = firstParagraphPreview(rawText, 60);
+            String perf = w.pctChange() >= 25.0
+                    ? String.format(Locale.ROOT, "浏览超基线 +%.0f%%", w.pctChange())
+                    : ("高权重互动分 " + w.weightedScore());
+            if (!opening.isBlank()) {
+                lines.add(idx + ". [体裁：" + skillName + "｜" + perf + "] 开篇节奏：" + opening);
+            } else {
+                lines.add(idx + ". [体裁：" + skillName + "｜" + perf + "]");
+            }
+            idx++;
+        }
+        return String.join("\n", lines);
+    }
+
+    private static String firstParagraphPreview(String rawText, int maxCodePoints) {
+        if (rawText == null || rawText.isBlank()) return "";
+        String first = "";
+        for (String line : rawText.split("\\R")) {
+            String trimmed = line.strip();
+            if (!trimmed.isEmpty()) {
+                first = trimmed;
+                break;
+            }
+        }
+        if (first.isEmpty()) return "";
+        int total = first.codePointCount(0, first.length());
+        if (total <= maxCodePoints) return first;
+        return first.substring(0, first.offsetByCodePoints(0, maxCodePoints)) + "…";
     }
 
     static ObjectNode requestTask(AssistantStore.Tx tx,String kind,ObjectNode body,ObjectNode input) {

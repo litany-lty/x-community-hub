@@ -160,7 +160,7 @@ public final class AssistantEvidence {
         String value = material.path("contentFingerprint").asText("");
         return value.isBlank() ? hash(material.path("text").asText("") + "\n" + material.path("quotedText").asText("") + "\n" + material.path("articleText").asText("")) : value;
     }
-    private static String sourceId(String url) { return hash(url); }
+    static String sourceId(String url) { return hash(url); }
     private static String hash(String value) {
         try { return java.util.HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8))); }
         catch (NoSuchAlgorithmException impossible) { throw new IllegalStateException(impossible); }

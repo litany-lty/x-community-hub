@@ -230,21 +230,42 @@ public class AssistantStore {
         }
 
         List<ObjectNode> materials(int size,int offset,String q,String username,String status,String sort) {
-            String order = "published".equalsIgnoreCase(sort)
-                    ? "coalesce(json_extract(r.data,'$.publishedAt'),h.changed) DESC,h.id"
-                    : "h.changed DESC,h.id";
+            String order;
+            if ("engagement".equalsIgnoreCase(sort)) {
+                order = "(coalesce(json_extract(r.data,'$.reposts'),0)*8 + coalesce(json_extract(r.data,'$.replies'),0)*6 + coalesce(json_extract(r.data,'$.likes'),0) + coalesce(json_extract(r.data,'$.views'),0)/100) DESC,coalesce(json_extract(r.data,'$.publishedAt'),h.changed) DESC,h.id";
+            } else if ("published".equalsIgnoreCase(sort)) {
+                order = "coalesce(json_extract(r.data,'$.publishedAt'),h.changed) DESC,h.id";
+            } else {
+                order = "h.changed DESC,h.id";
+            }
             String cleanUser = withoutAt(username == null ? "" : username.strip());
             String cleanQuery = q == null ? "" : q.strip();
             String cleanStatus = status == null ? "" : status.strip();
+            if ("HIGH_SIGNAL".equalsIgnoreCase(cleanStatus)) {
+                return query("""
+                    SELECT r.data FROM heads h JOIN revisions r USING(kind,id,ver) WHERE h.kind='material'
+                    AND (?='' OR instr(lower(coalesce(json_extract(r.data,'$.text'),'')||coalesce(json_extract(r.data,'$.quotedText'),'')||
+                        coalesce(json_extract(r.data,'$.articleText'),'')),lower(?))>0
+                        OR instr(lower(coalesce(json_extract(r.data,'$.username'),'')),lower(?))>0
+                        OR instr(lower(coalesce(json_extract(r.data,'$.authorName'),'')),lower(?))>0)
+                    AND (?='' OR instr(lower(json_extract(r.data,'$.username')),lower(?))>0)
+                    AND coalesce(json_extract(r.data,'$.textStatus'),'') NOT IN ('NO_ANALYZABLE_TEXT','MEDIA_ONLY','MEDIA_URL_ONLY')
+                    AND (length(trim(coalesce(json_extract(r.data,'$.articleText'),'')))>0
+                        OR length(trim(coalesce(json_extract(r.data,'$.quotedText'),'')))>0
+                        OR length(coalesce(json_extract(r.data,'$.text'),''))>=120)
+                    ORDER BY %s LIMIT ? OFFSET ?
+                    """.formatted(order),cleanQuery,cleanQuery,withoutAt(cleanQuery),cleanQuery,cleanUser,cleanUser,size,offset);
+            }
             return query("""
                 SELECT r.data FROM heads h JOIN revisions r USING(kind,id,ver) WHERE h.kind='material'
                 AND (?='' OR instr(lower(coalesce(json_extract(r.data,'$.text'),'')||coalesce(json_extract(r.data,'$.quotedText'),'')||
                     coalesce(json_extract(r.data,'$.articleText'),'')),lower(?))>0
-                    OR instr(lower(coalesce(json_extract(r.data,'$.username'),'')),lower(?))>0)
+                    OR instr(lower(coalesce(json_extract(r.data,'$.username'),'')),lower(?))>0
+                    OR instr(lower(coalesce(json_extract(r.data,'$.authorName'),'')),lower(?))>0)
                 AND (?='' OR instr(lower(json_extract(r.data,'$.username')),lower(?))>0)
                 AND (?='' OR json_extract(r.data,'$.textStatus')=?)
                 ORDER BY %s LIMIT ? OFFSET ?
-                """.formatted(order),cleanQuery,cleanQuery,withoutAt(cleanQuery),cleanUser,cleanUser,cleanStatus,cleanStatus,size,offset);
+                """.formatted(order),cleanQuery,cleanQuery,withoutAt(cleanQuery),cleanQuery,cleanUser,cleanUser,cleanStatus,cleanStatus,size,offset);
         }
 
         public List<ObjectNode> matching(String kind,String field,String value,int limit) {
@@ -262,6 +283,264 @@ public class AssistantStore {
         }
 
         private ObjectNode first(List<ObjectNode> rows) { return rows.isEmpty()?null:rows.get(0); }
+
+        private List<String> ids(String sql, Object... args) {
+            try (PreparedStatement p = c.prepareStatement(sql)) {
+                bind(p, args);
+                try (ResultSet r = p.executeQuery()) {
+                    var out = new ArrayList<String>();
+                    while (r.next()) out.add(r.getString(1));
+                    return out;
+                }
+            } catch (SQLException e) { throw failure(e); }
+        }
+
+        private int deleteByIds(String kind, Collection<String> ids) {
+            for (String id : ids) {
+                update("DELETE FROM heads WHERE kind=? AND id=?", kind, id);
+                update("DELETE FROM revisions WHERE kind=? AND id=?", kind, id);
+            }
+            return ids.size();
+        }
+
+        List<String> purgeExpiredContent(long cutoffMillis) {
+            int changes = 0;
+            List<String> expiredMaterials = ids("""
+                SELECT h.id
+                FROM heads h JOIN revisions r USING(kind,id,ver)
+                WHERE h.kind='material'
+                  AND coalesce(
+                      CASE WHEN typeof(json_extract(r.data,'$.publishedAt'))='integer'
+                            AND json_extract(r.data,'$.publishedAt')>0
+                           THEN json_extract(r.data,'$.publishedAt') END,
+                      CASE WHEN typeof(json_extract(r.data,'$.collectedAt'))='integer'
+                            AND json_extract(r.data,'$.collectedAt')>0
+                           THEN json_extract(r.data,'$.collectedAt') END,
+                      h.changed
+                  ) < ?
+                """, cutoffMillis);
+            changes += deleteByIds("material", expiredMaterials);
+            changes += deleteByIds("membership", expiredMaterials);
+
+            record TopicCandidate(String id, long changed, ObjectNode data) { }
+            var topicCandidates = new ArrayList<TopicCandidate>();
+            try (PreparedStatement p = c.prepareStatement("""
+                SELECT h.id, h.changed, r.data
+                FROM heads h JOIN revisions r USING(kind,id,ver)
+                WHERE h.kind='topic'
+                  AND (
+                      EXISTS (
+                          SELECT 1 FROM json_each(r.data,'$.materialIds') m
+                          WHERE NOT EXISTS (SELECT 1 FROM heads mh WHERE mh.kind='material' AND mh.id=m.value)
+                      )
+                      OR (
+                          coalesce(json_array_length(r.data,'$.materialIds'),0)=0
+                          AND coalesce(
+                              CASE WHEN typeof(json_extract(r.data,'$.publishedAt'))='integer'
+                                    AND json_extract(r.data,'$.publishedAt')>0
+                                   THEN json_extract(r.data,'$.publishedAt') END,
+                              h.changed
+                          ) < ?
+                      )
+                  )
+                """)) {
+                p.setLong(1, cutoffMillis);
+                try (ResultSet r = p.executeQuery()) {
+                    while (r.next()) {
+                        topicCandidates.add(new TopicCandidate(
+                                r.getString(1), r.getLong(2), (ObjectNode) mapper.readTree(r.getString(3))));
+                    }
+                }
+            } catch (SQLException | IOException e) { throw failure(e); }
+
+            List<String> deletedTopics = new ArrayList<>();
+            for (TopicCandidate candidate : topicCandidates) {
+                ObjectNode topic = candidate.data();
+                var rawMembers = topic.path("materialIds");
+                int originalCount = rawMembers.isArray() ? rawMembers.size() : 0;
+                List<String> kept = new ArrayList<>();
+                if (rawMembers.isArray()) {
+                    for (var item : rawMembers) {
+                        String mid = item.asText("");
+                        if (!mid.isBlank() && get("material", mid) != null && !kept.contains(mid)) {
+                            kept.add(mid);
+                        }
+                    }
+                }
+                long topicTime = topic.path("publishedAt").asLong(0) > 0
+                        ? topic.path("publishedAt").asLong() : candidate.changed();
+                if (kept.isEmpty() && (originalCount > 0 || topicTime < cutoffMillis)) {
+                    deletedTopics.add(candidate.id());
+                } else if (kept.size() != originalCount) {
+                    var arr = topic.putArray("materialIds");
+                    kept.forEach(arr::add);
+                    topic.remove("publishedAt");
+                    AssistantTopics.persist(this, candidate.id(), topic);
+                    changes++;
+                }
+            }
+            changes += deleteByIds("topic", deletedTopics);
+
+            List<String> orphanMemberships = ids("""
+                SELECT h.id
+                FROM heads h JOIN revisions r USING(kind,id,ver)
+                WHERE h.kind='membership'
+                  AND (
+                      NOT EXISTS (SELECT 1 FROM heads mh WHERE mh.kind='material' AND mh.id=h.id)
+                      OR NOT EXISTS (SELECT 1 FROM heads th WHERE th.kind='topic' AND th.id=json_extract(r.data,'$.topicId'))
+                  )
+                """);
+            changes += deleteByIds("membership", orphanMemberships);
+
+            var dirtyTerms = new LinkedHashMap<String, ObjectNode>();
+            try (PreparedStatement p = c.prepareStatement("""
+                SELECT h.id, r.data
+                FROM heads h JOIN revisions r USING(kind,id,ver)
+                WHERE h.kind='topicTerm'
+                  AND EXISTS (
+                      SELECT 1 FROM json_each(r.data,'$.ids') t
+                      WHERE NOT EXISTS (SELECT 1 FROM heads th WHERE th.kind='topic' AND th.id=t.value)
+                  )
+                """);
+                 ResultSet r = p.executeQuery()) {
+                while (r.next()) dirtyTerms.put(r.getString(1), (ObjectNode) mapper.readTree(r.getString(2)));
+            } catch (SQLException | IOException e) { throw failure(e); }
+            for (var entry : dirtyTerms.entrySet()) {
+                List<String> aliveIds = new ArrayList<>();
+                for (var tidNode : entry.getValue().path("ids")) {
+                    String tid = tidNode.asText("");
+                    if (!tid.isBlank() && get("topic", tid) != null && !aliveIds.contains(tid)) aliveIds.add(tid);
+                }
+                if (aliveIds.isEmpty()) {
+                    changes += deleteByIds("topicTerm", List.of(entry.getKey()));
+                } else {
+                    var updated = object();
+                    var arr = updated.putArray("ids");
+                    aliveIds.forEach(arr::add);
+                    put("topicTerm", entry.getKey(), updated);
+                    changes++;
+                }
+            }
+
+            List<String> expiredDrafts = ids("""
+                SELECT h.id
+                FROM heads h JOIN revisions r USING(kind,id,ver)
+                WHERE h.kind='draft'
+                  AND (
+                      (coalesce(json_extract(r.data,'$.topicId'),'')<>''
+                       AND NOT EXISTS (SELECT 1 FROM heads th WHERE th.kind='topic' AND th.id=json_extract(r.data,'$.topicId')))
+                      OR (coalesce(json_extract(r.data,'$.materialId'),'')<>''
+                          AND NOT EXISTS (SELECT 1 FROM heads mh WHERE mh.kind='material' AND mh.id=json_extract(r.data,'$.materialId')))
+                      OR (coalesce(json_extract(r.data,'$.topicId'),'')=''
+                          AND coalesce(json_extract(r.data,'$.materialId'),'')=''
+                          AND h.changed < ?)
+                  )
+                """, cutoffMillis);
+            changes += deleteByIds("draft", expiredDrafts);
+
+            List<String> expiredTasks = ids("""
+                SELECT h.id
+                FROM heads h JOIN revisions r USING(kind,id,ver)
+                WHERE h.kind='task'
+                  AND coalesce(json_extract(r.data,'$.kind'),'') NOT IN ('STYLE','COLLECT_STYLE','VERIFY')
+                  AND (
+                      (coalesce(json_extract(r.data,'$.topicId'),'')<>''
+                       AND NOT EXISTS (SELECT 1 FROM heads th WHERE th.kind='topic' AND th.id=json_extract(r.data,'$.topicId')))
+                      OR (coalesce(json_extract(r.data,'$.materialId'),'')<>''
+                          AND NOT EXISTS (SELECT 1 FROM heads mh WHERE mh.kind='material' AND mh.id=json_extract(r.data,'$.materialId')))
+                      OR (coalesce(json_extract(r.data,'$.draftId'),'')<>''
+                          AND NOT EXISTS (SELECT 1 FROM heads dh WHERE dh.kind='draft' AND dh.id=json_extract(r.data,'$.draftId')))
+                      OR (coalesce(json_extract(r.data,'$.topicId'),'')=''
+                          AND coalesce(json_extract(r.data,'$.materialId'),'')=''
+                          AND coalesce(json_extract(r.data,'$.draftId'),'')=''
+                          AND coalesce(
+                              CASE WHEN typeof(json_extract(r.data,'$.createdAt'))='integer'
+                                    AND json_extract(r.data,'$.createdAt')>0
+                                   THEN json_extract(r.data,'$.createdAt') END,
+                              h.changed
+                          ) < ?)
+                  )
+                """, cutoffMillis);
+            changes += deleteByIds("task", expiredTasks);
+
+            List<String> expiredResearch = ids("""
+                SELECT h.id
+                FROM heads h JOIN revisions r USING(kind,id,ver)
+                WHERE h.kind='research'
+                  AND (
+                      NOT EXISTS (SELECT 1 FROM heads th WHERE th.kind='task' AND th.id=h.id)
+                      OR (coalesce(json_extract(r.data,'$.snapshot.topicId'),'')<>''
+                          AND NOT EXISTS (SELECT 1 FROM heads tph WHERE tph.kind='topic' AND tph.id=json_extract(r.data,'$.snapshot.topicId')))
+                  )
+                """);
+            changes += deleteByIds("research", expiredResearch);
+
+            List<String> expiredFingerprints = ids("""
+                SELECT h.id
+                FROM heads h JOIN revisions r USING(kind,id,ver)
+                WHERE h.kind='fingerprint'
+                  AND NOT EXISTS (SELECT 1 FROM heads th WHERE th.kind='task' AND th.id=json_extract(r.data,'$.taskId'))
+                """);
+            changes += deleteByIds("fingerprint", expiredFingerprints);
+
+            List<String> expiredAccepts = ids("""
+                SELECT h.id
+                FROM heads h JOIN revisions r USING(kind,id,ver)
+                WHERE h.kind='accept'
+                  AND NOT EXISTS (SELECT 1 FROM heads th WHERE th.kind='task' AND th.id=json_extract(r.data,'$.taskId'))
+                """);
+            changes += deleteByIds("accept", expiredAccepts);
+
+            List<String> expiredMergeDecisions = ids("""
+                SELECT h.id
+                FROM heads h JOIN revisions r USING(kind,id,ver)
+                WHERE h.kind='merge_decision'
+                  AND (
+                      (coalesce(json_extract(r.data,'$.materialId'),'')<>''
+                       AND NOT EXISTS (SELECT 1 FROM heads mh WHERE mh.kind='material' AND mh.id=json_extract(r.data,'$.materialId')))
+                      OR (coalesce(json_extract(r.data,'$.topicId'),'')<>''
+                          AND NOT EXISTS (SELECT 1 FROM heads th WHERE th.kind='topic' AND th.id=json_extract(r.data,'$.topicId')))
+                      OR h.changed < ?
+                  )
+                """, cutoffMillis);
+            changes += deleteByIds("merge_decision", expiredMergeDecisions);
+
+            List<String> oldEvidenceSources = ids(
+                    "SELECT id FROM heads WHERE kind='evidence_source' AND changed < ?", cutoffMillis);
+            if (!oldEvidenceSources.isEmpty()) {
+                Set<String> referencedSources = new HashSet<>();
+                for (ObjectNode research : all("research")) {
+                    for (var read : research.path("sourceReads")) {
+                        String url = AssistantEvidence.normalizedUrl(read.path("url").asText(""));
+                        if (!url.isBlank()) referencedSources.add(AssistantEvidence.sourceId(url));
+                    }
+                }
+                List<String> unreferenced = oldEvidenceSources.stream()
+                        .filter(id -> !referencedSources.contains(id)).toList();
+                changes += deleteByIds("evidence_source", unreferenced);
+            }
+
+            List<String> expiredAutoReposts = ids("""
+                SELECT h.id
+                FROM heads h JOIN revisions r USING(kind,id,ver)
+                WHERE h.kind='auto_repost'
+                  AND coalesce(
+                      CASE WHEN typeof(json_extract(r.data,'$.sourcePublishedAt'))='integer'
+                            AND json_extract(r.data,'$.sourcePublishedAt')>0
+                           THEN json_extract(r.data,'$.sourcePublishedAt') END,
+                      CASE WHEN typeof(json_extract(r.data,'$.createdAt'))='integer'
+                            AND json_extract(r.data,'$.createdAt')>0
+                           THEN json_extract(r.data,'$.createdAt') END,
+                      h.changed
+                  ) < ?
+                """, cutoffMillis);
+            changes += deleteByIds("auto_repost", expiredAutoReposts);
+
+            if (changes > 0) {
+                update("DELETE FROM revisions WHERE NOT EXISTS (SELECT 1 FROM heads h WHERE h.kind=revisions.kind AND h.id=revisions.id)");
+            }
+            return expiredTasks;
+        }
 
         public ObjectNode put(String kind,String id,ObjectNode data) {
             if (id == null || id.isBlank()) throw new IllegalArgumentException("记录缺少标识");
@@ -302,6 +581,11 @@ public class AssistantStore {
             var owner=t.get("meta","owner");
             return owner!=null && !owner.path("accountId").asText("").isBlank();
         });
+    }
+
+    public List<String> purgeExpiredContent(long cutoffMillis) {
+        if (!Files.isRegularFile(db)) return List.of();
+        return tx(t -> t.purgeExpiredContent(cutoffMillis));
     }
 
     @Scheduled(cron="0 12 3 * * *",zone="Asia/Shanghai")

@@ -501,24 +501,46 @@ public class XOAuthService {
             form.append("&client_id=").append(urlEnc(clientId));
         }
 
-        try {
-            HttpRequest tokenReq = reqBuilder.POST(HttpRequest.BodyPublishers.ofString(form.toString())).build();
-            HttpResponse<String> resp = sharedExecutor.execute(() -> {
-                budgetGuard.acquirePermit(tokenReq.uri(), "x_oauth_token");
-                return httpClient.send(tokenReq, HttpResponse.BodyHandlers.ofString());
-            });
-            JsonNode json;
+        String formBody = form.toString();
+        URI tokenUri = URI.create(resolveOfficialBaseUrl() + "/oauth2/token");
+        boolean loopback = UpstreamBudgetGuard.isLocalLoopbackUri(tokenUri);
+        for (int attempt = 0; attempt <= 2; attempt++) {
             try {
-                json = objectMapper.readTree(resp.body());
-            } catch (Exception parseEx) {
-                throw new XDataProviderException(502, "X OAuth 网关返回非 JSON 响应（HTTP " + resp.statusCode() + "），请稍后重试");
+                if (attempt > 0) {
+                    Thread.sleep(loopback ? 20L : 250L * attempt);
+                }
+                HttpRequest tokenReq = reqBuilder.POST(HttpRequest.BodyPublishers.ofString(formBody)).build();
+                HttpResponse<String> resp = sharedExecutor.execute(() -> {
+                    budgetGuard.acquirePermit(tokenReq.uri(), "x_oauth_token");
+                    return httpClient.send(tokenReq, HttpResponse.BodyHandlers.ofString());
+                });
+                int status = resp.statusCode();
+                if ((status == 502 || status == 503 || status == 504) && attempt < 2) {
+                    continue;
+                }
+                JsonNode json;
+                try {
+                    json = objectMapper.readTree(resp.body());
+                } catch (Exception parseEx) {
+                    if (status >= 500 && attempt < 2) {
+                        continue;
+                    }
+                    throw new XDataProviderException(502, "X OAuth 网关返回非 JSON 响应（HTTP " + status + "），请稍后重试");
+                }
+                return new TokenEndpointResponse(status, json);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                throw new XDataProviderException(503, "请求 X OAuth 令牌接口被中断", ie);
+            } catch (XDataProviderException e) {
+                throw e;
+            } catch (Exception e) {
+                if (e.getCause() instanceof java.net.ConnectException && attempt < 2) {
+                    continue;
+                }
+                throw new XDataProviderException(502, "请求 X OAuth 令牌接口异常：" + e.getMessage(), e);
             }
-            return new TokenEndpointResponse(resp.statusCode(), json);
-        } catch (XDataProviderException e) {
-            throw e;
-        } catch (Exception e) {
-            throw new XDataProviderException(502, "请求 X OAuth 令牌接口异常：" + e.getMessage(), e);
         }
+        throw new XDataProviderException(502, "请求 X OAuth 令牌接口暂不可用，请稍后重试");
     }
 
     private String resolveOfficialBaseUrl() {
@@ -531,11 +553,16 @@ public class XOAuthService {
 
     private AuthenticatedXUser fetchCurrentXUser(String userAccessToken) {
         String url = resolveOfficialBaseUrl() + "/users/me?user.fields=profile_image_url,verified";
+        URI meUri = URI.create(url);
+        boolean loopback = UpstreamBudgetGuard.isLocalLoopbackUri(meUri);
         Exception lastErr = null;
-        for (int attempt = 0; attempt < 2; attempt++) {
+        for (int attempt = 0; attempt <= com.xops.hub.provider.PaidCapabilityGate.MAX_IDEMPOTENT_RETRIES; attempt++) {
             try {
+                if (attempt > 0) {
+                    Thread.sleep(loopback ? 20L : 300L * attempt);
+                }
                 HttpRequest req = HttpRequest.newBuilder()
-                        .uri(URI.create(url))
+                        .uri(meUri)
                         .timeout(Duration.ofSeconds(10))
                         .header("Authorization", "Bearer " + userAccessToken)
                         .header("Accept", "application/json")
@@ -545,15 +572,15 @@ public class XOAuthService {
                     budgetGuard.acquirePermit(req.uri(), "x_oauth_user_me");
                     return httpClient.send(req, HttpResponse.BodyHandlers.ofString());
                 });
-                if (resp.statusCode() >= 500 && attempt == 0) {
-                    Thread.sleep(350L);
+                int code = resp.statusCode();
+                if ((code == 429 || code >= 500) && attempt < com.xops.hub.provider.PaidCapabilityGate.MAX_IDEMPOTENT_RETRIES) {
                     continue;
                 }
                 JsonNode root = objectMapper.readTree(resp.body());
                 JsonNode data = root.path("data");
-                if (resp.statusCode() >= 400 || data.isMissingNode() || data.path("id").asText("").isBlank()
+                if (code >= 400 || data.isMissingNode() || data.path("id").asText("").isBlank()
                         || data.path("username").asText("").isBlank()) {
-                    throw new XDataProviderException(401, "获取已授权 X 账号资料失败（HTTP " + resp.statusCode() + "，请确认开发者后台账户状态正常）");
+                    throw new XDataProviderException(401, "获取已授权 X 账号资料失败（HTTP " + code + "，请确认开发者后台账户状态正常）");
                 }
                 String avatar = data.path("profile_image_url").asText("").replace("_normal.", "_400x400.");
                 return new AuthenticatedXUser(

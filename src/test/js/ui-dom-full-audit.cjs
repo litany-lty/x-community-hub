@@ -31,6 +31,7 @@ function slice(startMarker, endMarker) {
         "assistantDraftSaveState",
         "assistantDraftTitle",
         "assistantDraftSelect",
+        "assistantDraftLiveMetrics",
         "assistantDraftLength",
         "assistantDraftNumberChanges",
         "assistantMoveTarget",

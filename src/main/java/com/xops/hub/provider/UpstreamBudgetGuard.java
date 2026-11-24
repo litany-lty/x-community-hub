@@ -146,6 +146,11 @@ public class UpstreamBudgetGuard {
         if (!knownCategory(category)) {
             throw new XDataProviderException(503, "外部调用未登记预算类别，未发起付费请求");
         }
+        PaidCapabilityGate.requirePaidAllowed(uri, category);
+        if (PaidCapabilityGate.isCurrentCallerPrivileged()) {
+            callsByCategory.computeIfAbsent(category, k -> new AtomicLong()).incrementAndGet();
+            return;
+        }
         if (!enforceOnLocalMock && isLocalLoopbackUri(uri)) {
             localMockCalls.incrementAndGet();
             return;
@@ -199,14 +204,18 @@ public class UpstreamBudgetGuard {
     }
 
     public boolean canAfford(String rawUrl, String category) {
-        return canAffordWithinFraction(rawUrl, category, 1.0);
+        return canAffordWithinFraction(rawUrl, category, 1.0, 1);
+    }
+
+    public boolean canAffordRequests(String rawUrl, String category, int requestCount) {
+        return canAffordWithinFraction(rawUrl, category, 1.0, Math.max(1, requestCount));
     }
 
     public boolean canAffordBackground(String rawUrl, String category) {
-        return canAffordWithinFraction(rawUrl, category, 0.80);
+        return canAffordWithinFraction(rawUrl, category, 0.80, 1);
     }
 
-    private boolean canAffordWithinFraction(String rawUrl, String category, double maxUsageFraction) {
+    private boolean canAffordWithinFraction(String rawUrl, String category, double maxUsageFraction, int requestCount) {
         final URI uri;
         try {
             uri = URI.create(rawUrl);
@@ -219,13 +228,19 @@ public class UpstreamBudgetGuard {
             return false;
         }
         if (!knownCategory(category)) return false;
+        if (PaidCapabilityGate.isCurrentCallerForbidden()) {
+            return false;
+        }
+        if (PaidCapabilityGate.isCurrentCallerPrivileged()) {
+            return true;
+        }
         if (!enforceOnLocalMock && isLocalLoopbackUri(uri)) {
             return true;
         }
         if (ledger == null) return false;
         final long cost;
         try {
-            cost = estimateMicros(uri, category, unpricedRequestMicros);
+            cost = Math.multiplyExact(estimateMicros(uri, category, unpricedRequestMicros), Math.max(1L, requestCount));
         } catch (RuntimeException ex) {
             return false;
         }
@@ -246,14 +261,15 @@ public class UpstreamBudgetGuard {
                         && Files.size(lockFile) > 0;
                 if (!Files.exists(ledger, LinkOption.NOFOLLOW_LINKS)) {
                     if (lockInitialized) return false;
-                    return effectiveHourCalls > 0 && effectiveDayCalls > 0
+                    return effectiveHourCalls >= requestCount && effectiveDayCalls >= requestCount
                             && cost <= effectiveHourMicros && cost <= effectiveDayMicros && cost <= effectiveMonthMicros;
                 }
                 Usage usage = readUsage(lockInitialized).roll(clock.instant(), zoneId);
                 current = usage;
                 ledgerLoaded = true;
                 ledgerHealthy = true;
-                return usage.hourCalls < effectiveHourCalls && usage.dayCalls < effectiveDayCalls
+                return usage.hourCalls + requestCount <= effectiveHourCalls
+                        && usage.dayCalls + requestCount <= effectiveDayCalls
                         && cost <= effectiveHourMicros - usage.hourMicros
                         && cost <= effectiveDayMicros - usage.dayMicros
                         && cost <= effectiveMonthMicros - usage.monthMicros;
@@ -416,7 +432,7 @@ public class UpstreamBudgetGuard {
         }
     }
 
-    static boolean isLocalLoopbackUri(URI uri) {
+    public static boolean isLocalLoopbackUri(URI uri) {
         if (uri == null || uri.getHost() == null) return false;
         return switch (uri.getHost().toLowerCase(java.util.Locale.ROOT)) {
             case "localhost", "127.0.0.1", "::1", "[::1]" -> true;

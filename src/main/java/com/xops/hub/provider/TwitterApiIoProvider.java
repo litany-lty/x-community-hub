@@ -273,6 +273,14 @@ public class TwitterApiIoProvider {
      * Fetches exactly one upstream page. Callers own cursor persistence and only advance it after
      * the returned material has committed, so process restarts cannot silently skip a page.
      */
+    public boolean isUsingLoopbackBaseUrl() {
+        return isLocalMockBaseUrl();
+    }
+
+    public void resetFreeCircuitForActiveSync() {
+        fxTwitterClient.resetCircuitForActiveSync();
+    }
+
     public boolean isPageReadBudgetExhausted() {
         String baseUrl = trimTrailingSlash(properties.getTwitterapiIoBaseUrl());
         return !budgetGuard.canAfford(baseUrl + "/twitter/user/last_tweets?userName=probe", "twitterapi_io_read");
@@ -289,6 +297,28 @@ public class TwitterApiIoProvider {
         String url = baseUrl + "/twitter/user/last_tweets?userName=probe"
                 + (safeCursor.isBlank() ? "" : "&cursor=" + URLEncoder.encode(safeCursor, StandardCharsets.UTF_8));
         return useFreeSource(url);
+    }
+
+    /**
+     * Returns true when none of the remaining daily gaps can advance right now (e.g. free search
+     * circuit is open on upstream 503 AND paid search budget/key is unavailable).
+     */
+    public boolean isDailyContinuationBlocked(boolean needTimeline, boolean needInbound, boolean needMetrics) {
+        if (!needTimeline && !needInbound && !needMetrics) {
+            return false;
+        }
+        String baseUrl = trimTrailingSlash(properties.getTwitterapiIoBaseUrl());
+        String rawKey = properties.getTwitterapiIoKey();
+        String apiKey = rawKey == null ? "" : rawKey.trim();
+        String searchProbeUrl = baseUrl + "/twitter/tweet/advanced_search?queryType=Latest&query=from%3Aprobe";
+        boolean canSearch = useFreeSource(searchProbeUrl)
+                || (!apiKey.isBlank() && budgetGuard.canAfford(searchProbeUrl, "twitterapi_io_read"));
+        String metricsProbeUrl = baseUrl + "/twitter/tweets?tweet_ids=100";
+        boolean canRefreshMetrics = useFreeSource(metricsProbeUrl)
+                || (!apiKey.isBlank() && budgetGuard.canAfford(metricsProbeUrl, "twitterapi_io_read"));
+        boolean anyAdvancable = ((needTimeline || needInbound) && canSearch)
+                || (needMetrics && canRefreshMetrics);
+        return !anyAdvancable;
     }
 
     public TextPostPage fetchTextPostsPage(
@@ -817,12 +847,14 @@ public class TwitterApiIoProvider {
         }
         KeyPacer pacer = pacerFor(apiKey);
         boolean warmExisting = existing != null && existing.syncedAtInstant() != null && existing.profile() != null;
+        boolean ownerFullHistory = AccountStore.retainsFullHistory(username);
         Instant now = Instant.now();
-        boolean staleHead = !warmExisting || Duration.between(existing.syncedAtInstant(), now).toHours() >= 6;
+        boolean staleHead = !warmExisting
+                || Duration.between(existing.syncedAtInstant(), now).toMinutes() >= (ownerFullHistory ? 5 : 360);
         int pageBudget = Math.max(1, Math.min(6, maxPagesPerStream));
         Instant deadline = isLocalMockBaseUrl()
                 ? now.plusSeconds(20)
-                : now.plusSeconds(12);
+                : now.plusSeconds(ownerFullHistory ? 25 : 12);
         AtomicBoolean degraded = new AtomicBoolean(false);
 
         String boundId = expectedAccountId != null && !expectedAccountId.isBlank()
@@ -840,25 +872,44 @@ public class TwitterApiIoProvider {
 
         Instant syncTo = staleHead ? now : existing.syncedAtInstant();
         Instant cutoff30 = cutoffForWindowDays(syncTo, 30);
+        Instant targetCutoff = cutoff30;
+        Instant lowerFloor = cutoff30;
         long headTo = syncTo.getEpochSecond();
         List<long[]> tweetCoverage = warmExisting ? existing.tweetCoverage() : List.of();
         List<long[]> inboundCoverage = warmExisting ? existing.inboundCoverage() : List.of();
         if (AccountStore.missingRanges(tweetCoverage, cutoff30.getEpochSecond(), headTo).isEmpty()
                 && AccountStore.missingRanges(inboundCoverage, cutoff30.getEpochSecond(), headTo).isEmpty()) {
-            return new SyncOutcome(existing, false, false, true, 0);
+            Instant joinedAt = ownerFullHistory ? parseAccountJoinedInstant(profile.joinedDate()) : null;
+            long earliestTweetCov = AccountStore.contiguousFrom(tweetCoverage, headTo);
+            if (joinedAt != null && warmExisting
+                    && existing.tweets().size() < profile.totalPostsCount()
+                    && earliestTweetCov > joinedAt.getEpochSecond()) {
+                lowerFloor = joinedAt;
+                targetCutoff = Instant.ofEpochSecond(Math.max(
+                        joinedAt.getEpochSecond(),
+                        earliestTweetCov - Duration.ofDays(14).getSeconds()
+                ));
+            } else {
+                return new SyncOutcome(existing, false, false, true, 0);
+            }
         }
 
         SearchReplyRoots searchRoots = properties.isFxtwitterEnabled()
                 ? SearchReplyRoots.from(existing, profile.id(), profile.username()) : SearchReplyRoots.empty();
         boolean allowNativeHead = staleHead;
         boolean allowOwnNativeHead = staleHead || fxTwitterClient.isSearchCircuitOpen();
+        AtomicBoolean silentTweetsDegraded = new AtomicBoolean(false);
+        AtomicBoolean silentInboundDegraded = new AtomicBoolean(false);
         CompletableFuture<StreamFill> tweetsF = startTweetsFillAsync(
-                baseUrl, searchRoots, encodedUser, profile, tweetCoverage, cutoff30, cutoff30, headTo,
-                allowOwnNativeHead, false, apiKey, pacer, pageBudget, deadline, degraded);
+                baseUrl, searchRoots, encodedUser, profile, tweetCoverage, targetCutoff, lowerFloor, headTo,
+                allowOwnNativeHead, false, apiKey, pacer, pageBudget, deadline, silentTweetsDegraded);
         CompletableFuture<StreamFill> inboundF = startInboundFillAsync(
-                baseUrl, searchRoots, encodedUser, profile.username(), profile.id(), inboundCoverage, cutoff30, cutoff30, headTo,
-                allowNativeHead, false, apiKey, pacer, pageBudget, deadline, degraded);
+                baseUrl, searchRoots, encodedUser, profile.username(), profile.id(), inboundCoverage, targetCutoff, lowerFloor, headTo,
+                allowNativeHead, false, apiKey, pacer, pageBudget, deadline, silentInboundDegraded);
         CompletableFuture.allOf(tweetsF, inboundF).join();
+        if (silentTweetsDegraded.get() || silentInboundDegraded.get()) {
+            degraded.set(true);
+        }
         StreamFill tweets = tweetsF.join();
         StreamFill inbound = inboundF.join();
 
@@ -963,16 +1014,22 @@ public class TwitterApiIoProvider {
                 Instant targetCutoff = cutoffForWindowHours(syncTo, effectiveHours);
                 long headTo = syncTo.getEpochSecond();
 
+                AtomicBoolean tweetsDegraded = new AtomicBoolean(false);
+                AtomicBoolean inboundDegraded = new AtomicBoolean(false);
+                AtomicBoolean metricsDegraded = new AtomicBoolean(false);
                 CompletableFuture<StreamFill> tweetsF = startTweetsFillAsync(
                         baseUrl, searchRoots, encodedUser, profile, tweetCoverage, targetCutoff, cutoff30, headTo, false, false,
-                        apiKey, pacer, pageBudget, deadline, degraded);
+                        apiKey, pacer, pageBudget, deadline, tweetsDegraded);
                 CompletableFuture<StreamFill> inboundF = startInboundFillAsync(
                         baseUrl, searchRoots, encodedUser, self, profile.id(), inboundCoverage, targetCutoff, cutoff30, headTo, false, false,
-                        apiKey, pacer, pageBudget, deadline, degraded);
+                        apiKey, pacer, pageBudget, deadline, inboundDegraded);
                 CompletableFuture<DailyMetricRefreshResult> metricsF = lightweightDailyOnly
-                        ? startDailyMetricsRefreshAsync(baseUrl, existing, syncTo, dailyCycleStart, apiKey, pacer, deadline, degraded)
+                        ? startDailyMetricsRefreshAsync(baseUrl, existing, syncTo, dailyCycleStart, apiKey, pacer, deadline, metricsDegraded)
                         : CompletableFuture.completedFuture(DailyMetricRefreshResult.empty());
                 CompletableFuture.allOf(tweetsF, inboundF, metricsF).join();
+                if (tweetsDegraded.get() || inboundDegraded.get() || metricsDegraded.get()) {
+                    degraded.set(true);
+                }
                 tweets = tweetsF.join();
                 inbound = inboundF.join();
                 parallelDailyMetrics = metricsF.join();
@@ -982,7 +1039,8 @@ public class TwitterApiIoProvider {
                 // 热更新重叠加速：已有持久化账号时，推文/互动未缓存区间与 24h 主帖指标刷新并发启动
                 Instant nowSync = Instant.now();
                 long sinceLastSyncSec = Duration.between(existing.syncedAtInstant(), nowSync).getSeconds();
-                syncTo = (sinceLastSyncSec >= 0 && sinceLastSyncSec < 60)
+                boolean privilegedOwner = AccountStore.retainsFullHistory(existing.profile().username());
+                syncTo = (!privilegedOwner && sinceLastSyncSec >= 0 && sinceLastSyncSec < 60)
                         ? existing.syncedAtInstant()
                         : nowSync;
                 dailyCycleStart = lightweightDailyOnly ? syncTo.getEpochSecond() : 0L;
@@ -1000,11 +1058,12 @@ public class TwitterApiIoProvider {
                         ? CompletableFuture.completedFuture(preflightProfile)
                         : getJsonWithRetryAsync(baseUrl + "/twitter/user/info?userName=" + encodedUser, apiKey, pacer)
                                 .thenApply(root -> parseValidatedUserProfile(root, username));
+                AtomicBoolean graphDegraded = new AtomicBoolean(false);
+                AtomicBoolean tweetsDegraded = new AtomicBoolean(false);
+                AtomicBoolean inboundDegraded = new AtomicBoolean(false);
+                AtomicBoolean metricsDegraded = new AtomicBoolean(false);
                 CompletableFuture<HeadGraphStage> headStageF = profileF.thenCompose(freshProfile -> {
                     requireSameAccountId(freshProfile, boundId);
-                    if (apiKey.isBlank()) {
-                        return CompletableFuture.completedFuture(new HeadGraphStage(freshProfile, existing.hasGraph(), false, null, null));
-                    }
                     long graphAgeHours = existing.hasGraph()
                             ? Duration.between(Instant.ofEpochSecond(existing.graphFetchedAt()), syncTo).toHours()
                             : Long.MAX_VALUE;
@@ -1020,7 +1079,41 @@ public class TwitterApiIoProvider {
                     if (reuseFg && reuseFr) {
                         return CompletableFuture.completedFuture(new HeadGraphStage(freshProfile, true, false, null, null));
                     }
-                    CompletableFuture<PagedUserResult> fgF = reuseFg
+                    String fgUrl = baseUrl + "/twitter/user/followings?userName=" + encodedUser + "&pageSize=200";
+                    String frUrl = baseUrl + "/twitter/user/followers?userName=" + encodedUser + "&pageSize=200";
+                    int fgMaxPages = pacer.freeTierSlowMode ? 1 : Math.max(1, properties.getMaxFollowingPages());
+                    int frMaxPages = pacer.freeTierSlowMode ? 1 : Math.max(1, properties.getMaxFollowerPages());
+                    int fgNeededPages = Math.min(fgMaxPages, Math.max(1, (freshProfile.followingCount() + 199) / 200));
+                    int frNeededPages = Math.min(frMaxPages, Math.max(1, (freshProfile.followersCount() + 199) / 200));
+                    boolean canFetchFg = !apiKey.isBlank() && (freshProfile.followingCount() <= 0
+                            || !existing.hasGraph()
+                            || budgetGuard.canAffordRequests(fgUrl, "twitterapi_io_read", fgNeededPages));
+                    boolean canFetchFr = !apiKey.isBlank() && (freshProfile.followersCount() <= 0
+                            || !existing.hasGraph()
+                            || budgetGuard.canAffordRequests(frUrl, "twitterapi_io_read", frNeededPages));
+                    if ((reuseFg || !canFetchFg) && (reuseFr || !canFetchFr)) {
+                        if (!existing.hasGraph() && (freshProfile.followingCount() > 0 || freshProfile.followersCount() > 0)) {
+                            graphDegraded.set(true);
+                            return CompletableFuture.completedFuture(new HeadGraphStage(freshProfile, false, false, null, null));
+                        }
+                        if (existing.hasGraph()
+                                && (existing.graphRefreshFailed() || existing.followersTruncated() || existing.followingsTruncated())
+                                && existing.followings().size() == freshProfile.followingCount()
+                                && existing.followers().size() == freshProfile.followersCount()) {
+                            return CompletableFuture.completedFuture(new HeadGraphStage(
+                                    freshProfile,
+                                    true,
+                                    true,
+                                    new PagedUserResult(AccountStore.followingUsers(existing),
+                                            new HashSet<>(existing.explicitFollowedBy()), false, false, existing.followingOrderById()),
+                                    new PagedUserResult(AccountStore.followerUsers(existing),
+                                            Set.of(), false, false, existing.followerOrderById())));
+                        }
+                        return CompletableFuture.completedFuture(new HeadGraphStage(freshProfile, existing.hasGraph(), false, null, null));
+                    }
+                    boolean effectiveReuseFg = reuseFg || !canFetchFg;
+                    boolean effectiveReuseFr = reuseFr || !canFetchFr;
+                    CompletableFuture<PagedUserResult> fgF = effectiveReuseFg
                             ? CompletableFuture.completedFuture(new PagedUserResult(
                                     AccountStore.followingUsers(existing),
                                     new HashSet<>(existing.explicitFollowedBy()),
@@ -1028,11 +1121,10 @@ public class TwitterApiIoProvider {
                                     false, existing.followingOrderById()))
                             : (freshProfile.followingCount() > 0
                                     ? fetchPagedUsersAsync(
-                                            baseUrl + "/twitter/user/followings?userName=" + encodedUser + "&pageSize=200",
-                                            apiKey, pacer, pacer.freeTierSlowMode ? 1 : Math.max(1, properties.getMaxFollowingPages()),
-                                            freshProfile.followingCount(), "followings", deadline, degraded)
+                                            fgUrl, apiKey, pacer, fgMaxPages,
+                                            freshProfile.followingCount(), "followings", deadline, graphDegraded)
                                     : CompletableFuture.completedFuture(null));
-                    CompletableFuture<PagedUserResult> frF = reuseFr
+                    CompletableFuture<PagedUserResult> frF = effectiveReuseFr
                             ? CompletableFuture.completedFuture(new PagedUserResult(
                                     AccountStore.followerUsers(existing),
                                     Set.of(),
@@ -1041,8 +1133,8 @@ public class TwitterApiIoProvider {
                             : (freshProfile.followersCount() > 0
                                     ? fetchFollowersAsync(
                                             baseUrl, encodedUser, freshProfile.id(),
-                                            apiKey, pacer, pacer.freeTierSlowMode ? 1 : Math.max(1, properties.getMaxFollowerPages()),
-                                            freshProfile.followersCount(), deadline, degraded)
+                                            apiKey, pacer, frMaxPages,
+                                            freshProfile.followersCount(), deadline, graphDegraded)
                                     : CompletableFuture.completedFuture(null));
                     return CompletableFuture.allOf(fgF, frF)
                             .thenApply(v -> new HeadGraphStage(freshProfile, false, true, fgF.join(), frF.join()));
@@ -1050,16 +1142,16 @@ public class TwitterApiIoProvider {
 
                 CompletableFuture<StreamFill> tweetsF = startTweetsFillAsync(
                         baseUrl, searchRoots, encodedUser, existing.profile(), tweetCoverage, targetCutoff, cutoff30, headTo, allowOwnNativeHead, false,
-                        apiKey, pacer, pageBudget, deadline, degraded);
+                        apiKey, pacer, pageBudget, deadline, tweetsDegraded);
                 CompletableFuture<StreamFill> inboundF = startInboundFillAsync(
                         baseUrl, searchRoots, encodedUser, knownSelf, existing.profile().id(), inboundCoverage, targetCutoff, cutoff30, headTo, allowNativeHead, false,
-                        apiKey, pacer, pageBudget, deadline, degraded);
+                        apiKey, pacer, pageBudget, deadline, inboundDegraded);
                 CompletableFuture<DailyMetricRefreshResult> metricsF = lightweightDailyOnly
-                        ? startDailyMetricsRefreshAsync(baseUrl, existing, syncTo, dailyCycleStart, apiKey, pacer, deadline, degraded)
+                        ? startDailyMetricsRefreshAsync(baseUrl, existing, syncTo, dailyCycleStart, apiKey, pacer, deadline, metricsDegraded)
                         : CompletableFuture.completedFuture(DailyMetricRefreshResult.empty());
 
                 CompletableFuture.allOf(headStageF, tweetsF, inboundF, metricsF).join();
-                if (apiKey.isBlank()) {
+                if (graphDegraded.get() || tweetsDegraded.get() || inboundDegraded.get() || metricsDegraded.get()) {
                     degraded.set(true);
                 }
                 HeadGraphStage stage = headStageF.join();
@@ -1089,29 +1181,33 @@ public class TwitterApiIoProvider {
                 Instant targetCutoff = cutoffForWindowHours(syncTo, effectiveHours);
                 long headTo = syncTo.getEpochSecond();
 
+                AtomicBoolean tweetsDegraded = new AtomicBoolean(false);
+                AtomicBoolean inboundDegraded = new AtomicBoolean(false);
+                AtomicBoolean graphDegraded = new AtomicBoolean(false);
                 CompletableFuture<StreamFill> tweetsF = startTweetsFillAsync(
                         baseUrl, searchRoots, encodedUser, profile, tweetCoverage, targetCutoff, cutoff30, headTo, allowOwnNativeHead, true,
-                        apiKey, pacer, pageBudget, deadline, degraded);
+                        apiKey, pacer, pageBudget, deadline, tweetsDegraded);
                 CompletableFuture<StreamFill> inboundF = startInboundFillAsync(
                         baseUrl, searchRoots, encodedUser, self, profile.id(), inboundCoverage, targetCutoff, cutoff30, headTo, allowNativeHead, true,
-                        apiKey, pacer, pageBudget, deadline, degraded);
+                        apiKey, pacer, pageBudget, deadline, inboundDegraded);
                 CompletableFuture<PagedUserResult> followingsF = (!apiKey.isBlank() && profile.followingCount() > 0)
                         ? fetchPagedUsersAsync(
                                 baseUrl + "/twitter/user/followings?userName=" + encodedUser + "&pageSize=200",
                                 apiKey, pacer, pacer.freeTierSlowMode ? 1 : Math.max(1, properties.getMaxFollowingPages()),
-                                profile.followingCount(), "followings", deadline, degraded)
+                                profile.followingCount(), "followings", deadline, graphDegraded)
                         : CompletableFuture.completedFuture(apiKey.isBlank() && profile.followingCount() > 0
                                 ? new PagedUserResult(List.of(), Set.of(), true, true) : null);
                 CompletableFuture<PagedUserResult> followersF = (!apiKey.isBlank() && profile.followersCount() > 0)
                         ? fetchFollowersAsync(
                                 baseUrl, encodedUser, profile.id(),
                                 apiKey, pacer, pacer.freeTierSlowMode ? 1 : Math.max(1, properties.getMaxFollowerPages()),
-                                profile.followersCount(), deadline, degraded)
+                                profile.followersCount(), deadline, graphDegraded)
                         : CompletableFuture.completedFuture(apiKey.isBlank() && profile.followersCount() > 0
                                 ? new PagedUserResult(List.of(), Set.of(), true, true) : null);
 
                 CompletableFuture.allOf(tweetsF, inboundF, followingsF, followersF).join();
-                if (apiKey.isBlank() && (profile.followingCount() > 0 || profile.followersCount() > 0)) {
+                if (tweetsDegraded.get() || inboundDegraded.get() || graphDegraded.get()
+                        || (apiKey.isBlank() && (profile.followingCount() > 0 || profile.followersCount() > 0))) {
                     degraded.set(true);
                 }
                 tweets = tweetsF.join();
@@ -1343,10 +1439,15 @@ public class TwitterApiIoProvider {
         if (lightweightDailyOnly) {
             long from = syncTo.minus(Duration.ofHours(24)).getEpochSecond();
             long to = syncTo.getEpochSecond();
+            boolean reuseRecentOwnerMetrics = existing != null
+                    && existing.profile() != null
+                    && AccountStore.retainsFullHistory(existing.profile().username())
+                    && to - existing.syncedAt() < 180L;
+            long metricFloor = reuseRecentOwnerMetrics ? Math.max(0L, to - 180L) : dailyCycleStart;
             for (AccountStore.StoredTweet tweet : merged.tweets()) {
                 if (tweet.createdAt() < from || tweet.createdAt() > to || !isDailyMetricTarget(tweet)) continue;
-                if (tweet.metricsAttemptedAt() < dailyCycleStart) pendingDailyMetrics++;
-                if (tweet.metricsFetchedAt() < dailyCycleStart || !tweet.unavailableMetrics().isEmpty()) incompleteDailyMetrics++;
+                if (tweet.metricsAttemptedAt() < metricFloor) pendingDailyMetrics++;
+                if (tweet.metricsFetchedAt() < metricFloor || !tweet.unavailableMetrics().isEmpty()) incompleteDailyMetrics++;
             }
             dailyComplete = !degraded.get() && incompleteDailyMetrics == 0
                     && AccountStore.missingRanges(merged.tweetCoverage(), from, to).isEmpty()
@@ -1566,10 +1667,13 @@ public class TwitterApiIoProvider {
         }
         long from = syncTo.minus(Duration.ofHours(24)).getEpochSecond();
         long to = syncTo.getEpochSecond();
+        boolean reuseRecentOwnerMetrics = AccountStore.retainsFullHistory(existing.profile().username())
+                && to - existing.syncedAt() < 180L;
+        long metricFloor = reuseRecentOwnerMetrics ? Math.max(0L, to - 180L) : dailyCycleStart;
         List<String> candidateIds = existing.tweets().stream()
                 .filter(t -> t.createdAt() >= from && t.createdAt() <= to)
                 .filter(TwitterApiIoProvider::isDailyMetricTarget)
-                .filter(t -> t.metricsAttemptedAt() < dailyCycleStart)
+                .filter(t -> t.metricsAttemptedAt() < metricFloor || !t.unavailableMetrics().isEmpty())
                 .sorted(java.util.Comparator.comparingLong(AccountStore.StoredTweet::metricsAttemptedAt)
                         .thenComparingInt(t -> !t.unavailableMetrics().isEmpty()
                                 && ((t.kind() == 'P' && (t.flags() & 4) == 0) || t.kind() == 'Q') ? 0 : 1))
@@ -1634,7 +1738,9 @@ public class TwitterApiIoProvider {
                 }
                 if (includesFreeData(refreshed) && !jsonIds(refreshed, "__incomplete_ids").isEmpty()) {
                     degraded.set(true);
-                    anyBatchFailed = true;
+                    if ((apiKey != null && !apiKey.isBlank()) || jsonIds(refreshed, "__attempted_ids").isEmpty()) {
+                        anyBatchFailed = true;
+                    }
                 }
                 long observedAt = Instant.now().getEpochSecond();
                 Set<String> chunkSet = new HashSet<>(chunkIds);
@@ -1705,15 +1811,20 @@ public class TwitterApiIoProvider {
             long from = Math.max(targetCutoff.getEpochSecond(), cutoff30.getEpochSecond());
             String repliesAndMentionsQuery = "(to:" + self + " OR @" + self + ") -from:" + self;
             String quotesQuery = "quoted_user_id:" + selfId + " -from:" + self;
+            AtomicBoolean rmDegraded = new AtomicBoolean(false);
+            AtomicBoolean qtDegraded = new AtomicBoolean(false);
             CompletableFuture<StreamFill> repliesMentionsF = fillStreamAsync(
                     baseUrl, searchRoots, nativeMentionsUrl, repliesAndMentionsQuery, null,
                     coverage, targetCutoff, cutoff30, headTo, allowNativeHead, initialFetch,
-                    apiKey, pacer, pageBudget, deadline, degraded, inboundParser);
+                    apiKey, pacer, pageBudget, deadline, rmDegraded, inboundParser);
             CompletableFuture<StreamFill> quotesF = fillStreamAsync(
                     baseUrl, searchRoots, nativeMentionsUrl, quotesQuery, null,
                     coverage, targetCutoff, cutoff30, headTo, false, initialFetch,
-                    apiKey, pacer, pageBudget, deadline, degraded, inboundParser);
+                    apiKey, pacer, pageBudget, deadline, qtDegraded, inboundParser);
             CompletableFuture<StreamFill> combined = repliesMentionsF.thenCombine(quotesF, (rm, qt) -> {
+                if (rmDegraded.get() || qtDegraded.get()) {
+                    degraded.set(true);
+                }
                 Map<String, Object> dedupedById = new LinkedHashMap<>();
                 List<Object> extra = new ArrayList<>();
                 for (Object obj : rm.items()) {
@@ -1912,13 +2023,39 @@ public class TwitterApiIoProvider {
         }
         String url = ctx.nativeUrl()
                 + (cursor.isEmpty() ? "" : "&cursor=" + URLEncoder.encode(cursor, StandardCharsets.UTF_8));
-        return getJsonOptionalAsync(url, ctx.apiKey(), ctx.pacer(), ctx.degraded(), ctx.deadline(), ctx.searchRoots()).thenCompose(root -> {
+        boolean freeOpportunisticHead = useFreeSource(url) && url.contains("/twitter/user/last_tweets");
+        boolean fallbackToSearch = freeOpportunisticHead
+                && ctx.sliceQuery() != null && !ctx.sliceQuery().isBlank()
+                && (!fxTwitterClient.isSearchCircuitOpen() || (ctx.apiKey() != null && !ctx.apiKey().isBlank()));
+        AtomicBoolean headDegraded = fallbackToSearch ? new AtomicBoolean(false) : ctx.degraded();
+        String headApiKey = freeOpportunisticHead ? "" : ctx.apiKey();
+        return getJsonOptionalAsync(url, headApiKey, ctx.pacer(), headDegraded, ctx.deadline(), ctx.searchRoots()).thenCompose(root -> {
             if (root.path("__degraded").asBoolean(false)) {
+                if (fallbackToSearch) {
+                    if (tailSoFar != null && tailSoFar.getEpochSecond() < b) {
+                        ctx.newCoverage().add(new long[]{Math.max(a, tailSoFar.getEpochSecond()), b});
+                    }
+                    long searchUpper = tailSoFar != null ? Math.min(b, tailSoFar.getEpochSecond()) : b;
+                    if (searchUpper <= a) {
+                        ctx.newCoverage().add(new long[]{a, b});
+                        return CompletableFuture.completedFuture(null);
+                    }
+                    return fillSearchRangeWithAdaptiveShardsAsync(ctx, a, searchUpper);
+                }
                 recordPartialIfAny(ctx, a, b, tailSoFar);
                 return CompletableFuture.completedFuture(null);
             }
             List<JsonNode> batch = extractArray(root, "tweets", "data");
             if (!hasArray(root, "tweets", "data") || invalidPagination(root, batch)) {
+                if (fallbackToSearch) {
+                    if (tailSoFar != null && tailSoFar.getEpochSecond() < b) {
+                        ctx.newCoverage().add(new long[]{Math.max(a, tailSoFar.getEpochSecond()), b});
+                    }
+                    long searchUpper = tailSoFar != null ? Math.min(b, tailSoFar.getEpochSecond()) : b;
+                    return searchUpper <= a
+                            ? CompletableFuture.completedFuture(null)
+                            : fillSearchRangeWithAdaptiveShardsAsync(ctx, a, searchUpper);
+                }
                 ctx.degraded().set(true);
                 return CompletableFuture.completedFuture(null);
             }
@@ -2657,9 +2794,10 @@ public class TwitterApiIoProvider {
     }
 
     /**
-     * Public endpoints fully covered by free FxTwitter reads where skipping TwitterAPI.io
-     * does not sacrifice capabilities (profile info, timeline statuses, tweet metrics, articles).
-     * Follow graphs, relationship checks, mentions, and search fallbacks keep TwitterAPI.io support.
+     * Timeline head statuses use free FxTwitter as an opportunistic shortcut and fall back to
+     * time-bounded search rather than spending on paid /twitter/user/last_tweets.
+     * Profile, tweet metric verification (for deleted/missing IDs), and article reads try free
+     * FxTwitter first and retain paid fallback when an API key is configured.
      */
     private boolean isPureFreeEndpoint(String url) {
         if (!useFreeSource(url) || isLocalMockBaseUrl()) {
@@ -2667,10 +2805,7 @@ public class TwitterApiIoProvider {
         }
         try {
             String path = URI.create(url).getPath();
-            return path.endsWith("/twitter/user/info")
-                    || path.endsWith("/twitter/user/last_tweets")
-                    || path.endsWith("/twitter/tweets")
-                    || path.endsWith("/twitter/article");
+            return path.endsWith("/twitter/user/last_tweets");
         } catch (RuntimeException ex) {
             return false;
         }
@@ -3283,6 +3418,10 @@ public class TwitterApiIoProvider {
                 inReplyToId,
                 replyTo
         );
+    }
+
+    public static Instant parseAccountJoinedInstant(String rawJoinedDate) {
+        return parseFlexibleTimestamp(rawJoinedDate);
     }
 
     static Instant parseFlexibleTimestamp(String raw) {

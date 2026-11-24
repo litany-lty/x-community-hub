@@ -19,6 +19,7 @@ import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -174,6 +175,148 @@ class SelectiveFreeRoutingTest {
             paidServer.stop(0);
             freeServer.stop(0);
         }
+    }
+
+    @Test
+    void metricFailureDoesNotAbortConcurrentStreamPaginationAndMissingMetricVerifiesViaPaidWhenConfigured() throws Exception {
+        Instant now = Instant.now().truncatedTo(ChronoUnit.SECONDS);
+        AtomicInteger searchPageCalls = new AtomicInteger();
+        AtomicInteger paidMetricCalls = new AtomicInteger();
+
+        AtomicBoolean failPaidMetrics = new AtomicBoolean(false);
+        HttpServer paidServer = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        paidServer.createContext("/twitter/tweets", ex -> {
+            paidMetricCalls.incrementAndGet();
+            if (failPaidMetrics.get()) {
+                ex.sendResponseHeaders(500, -1);
+                ex.close();
+                return;
+            }
+            ObjectNode root = MAPPER.createObjectNode();
+            root.putArray("tweets"); // confirms deleted-9099 was deleted
+            byte[] bytes = MAPPER.writeValueAsBytes(root);
+            ex.getResponseHeaders().set("Content-Type", "application/json");
+            ex.sendResponseHeaders(200, bytes.length);
+            ex.getResponseBody().write(bytes);
+            ex.close();
+        });
+        paidServer.createContext("/twitter/tweet/advanced_search", ex -> {
+            String query = ex.getRequestURI().getQuery();
+            boolean secondPage = query != null && query.contains("cursor=page-2");
+            searchPageCalls.incrementAndGet();
+            try {
+                Thread.sleep(80);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            ObjectNode root = MAPPER.createObjectNode();
+            ArrayNode rows = root.putArray("tweets");
+            if (query != null && query.contains("from:alice") && !query.contains("-from:alice")) {
+                if (!secondPage) {
+                    rows.add(paidPost("9101", "1001", "alice", now.minusSeconds(1200)));
+                    root.put("has_next_page", true).put("next_cursor", "page-2");
+                } else {
+                    rows.add(paidPost("9102", "1001", "alice", now.minusSeconds(95_000)));
+                    root.put("has_next_page", false);
+                }
+            } else {
+                root.put("has_next_page", false);
+            }
+            byte[] bytes = MAPPER.writeValueAsBytes(root);
+            ex.getResponseHeaders().set("Content-Type", "application/json");
+            ex.sendResponseHeaders(200, bytes.length);
+            ex.getResponseBody().write(bytes);
+            ex.close();
+        });
+        paidServer.start();
+
+        HttpServer freeServer = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        freeServer.createContext("/2/profile/alice", ex -> {
+            ObjectNode body = MAPPER.createObjectNode().put("code", 200);
+            body.set("user", freeUser("1001", "alice", 0, 0));
+            byte[] bytes = MAPPER.writeValueAsBytes(body);
+            ex.getResponseHeaders().set("Content-Type", "application/json");
+            ex.sendResponseHeaders(200, bytes.length);
+            ex.getResponseBody().write(bytes);
+            ex.close();
+        });
+        freeServer.createContext("/2/status/9099", ex -> {
+            byte[] bytes = "{\"code\":404,\"message\":\"Not found\"}".getBytes(StandardCharsets.UTF_8);
+            ex.getResponseHeaders().set("Content-Type", "application/json");
+            ex.sendResponseHeaders(404, bytes.length);
+            ex.getResponseBody().write(bytes);
+            ex.close();
+        });
+        freeServer.createContext("/2/search", ex -> {
+            byte[] bytes = "{\"code\":503,\"message\":\"search unavailable\"}".getBytes(StandardCharsets.UTF_8);
+            ex.getResponseHeaders().set("Content-Type", "application/json");
+            ex.sendResponseHeaders(503, bytes.length);
+            ex.getResponseBody().write(bytes);
+            ex.close();
+        });
+        freeServer.start();
+
+        XOpsProperties props = new XOpsProperties();
+        props.setTwitterapiIoKey("");
+        props.setTwitterapiIoBaseUrl("http://127.0.0.1:" + paidServer.getAddress().getPort());
+        props.setFxtwitterEnabled(true);
+        props.setFxtwitterBaseUrl("http://127.0.0.1:" + freeServer.getAddress().getPort() + "/2");
+        props.setDiskCacheDir(temp.resolve("cache3").toString());
+        props.setSplitInboundSearchQueries(false);
+
+        SharedApiExecutor pool = new SharedApiExecutor(props);
+        try {
+            XUserSummary self = new XUserSummary("1001", "alice", "Alice", "", "", false, 0, 0, 10, "");
+            var staleTweet = new AccountStore.StoredTweet("9099", now.minusSeconds(1800).getEpochSecond(), 'P',
+                    "deleted post", null, List.of(), 0, new long[]{10, 1, 0, 0, 0}, null, null,
+                    now.minusSeconds(7200).getEpochSecond(), now.minusSeconds(7200).getEpochSecond(), Set.of(), true);
+            var seeded = new AccountStore.StoredAccount(AccountStore.VERSION, self, now.minusSeconds(7200).getEpochSecond(),
+                    Map.of(), List.of(staleTweet), List.of(), List.of(), List.of(), List.of(), List.of(), List.of(),
+                    now.minusSeconds(3600).getEpochSecond(), false, false, false, List.of(), Map.of(), 0, 0);
+
+            // 1) Fast-failing metric batch (404 + paid 500) must NOT abort concurrent multi-page stream pagination!
+            props.setTwitterapiIoKey("valid-test-key");
+            failPaidMetrics.set(true);
+            TwitterApiIoProvider provider = new TwitterApiIoProvider(props, MAPPER, pool);
+            var degradedMetricRun = provider.syncStoreByHours("alice", seeded, 24, true, true, null, "1001");
+            long from24First = degradedMetricRun.store().syncedAt() - 86_400L;
+            assertThat(AccountStore.missingRanges(degradedMetricRun.store().tweetCoverage(), from24First, degradedMetricRun.store().syncedAt())).isEmpty();
+            assertThat(AccountStore.missingRanges(degradedMetricRun.store().inboundCoverage(), from24First, degradedMetricRun.store().syncedAt())).isEmpty();
+            assertThat(degradedMetricRun.store().tweets()).extracting(AccountStore.StoredTweet::id)
+                    .contains("9101", "9102", "9099");
+
+            // 2) Normal paid verification of missing free ID prunes deleted tweet and completes daily refresh cleanly
+            failPaidMetrics.set(false);
+            var synced = provider.syncStoreByHours("alice", seeded, 24, true, true, null, "1001");
+            long from24 = synced.store().syncedAt() - 86_400L;
+            assertThat(AccountStore.missingRanges(synced.store().tweetCoverage(), from24, synced.store().syncedAt())).isEmpty();
+            assertThat(AccountStore.missingRanges(synced.store().inboundCoverage(), from24, synced.store().syncedAt())).isEmpty();
+            assertThat(synced.store().tweets()).extracting(AccountStore.StoredTweet::id)
+                    .contains("9101", "9102")
+                    .doesNotContain("9099");
+            assertThat(paidMetricCalls.get()).isEqualTo(2);
+            assertThat(synced.dailyDataComplete()).isTrue();
+        } finally {
+            pool.shutdown();
+            paidServer.stop(0);
+            freeServer.stop(0);
+        }
+    }
+
+    private static ObjectNode paidPost(String id, String authorId, String handle, Instant createdAt) {
+        ObjectNode node = MAPPER.createObjectNode()
+                .put("id", id)
+                .put("text", "post " + id)
+                .put("createdAt", createdAt.toString())
+                .put("conversationId", id)
+                .put("viewCount", 100)
+                .put("likeCount", 5)
+                .put("replyCount", 1)
+                .put("retweetCount", 0)
+                .put("quoteCount", 0)
+                .put("bookmarkCount", 2);
+        node.putObject("author").put("id", authorId).put("userName", handle).put("name", "Alice");
+        return node;
     }
 
     private static ObjectNode freeUser(String id, String screenName, int followers, int following) {

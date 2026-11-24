@@ -349,7 +349,7 @@ public final class AccountStore {
             }
         }
         String selfKey = profile != null ? key(profile.username()) : (b.profile() != null ? key(b.profile().username()) : "");
-        long minKeep = syncedAt.minus(RETENTION).getEpochSecond();
+        long minKeep = retainsFullHistory(selfKey) ? 0L : syncedAt.minus(RETENTION).getEpochSecond();
 
         long syncEpoch = syncedAt.getEpochSecond();
         Map<String, StoredUser> users = new LinkedHashMap<>(b.users());
@@ -537,7 +537,7 @@ public final class AccountStore {
         boolean sliceNewer = sliceResult.syncedAt() >= latest.syncedAt();
         XUserSummary profile = sliceNewer ? sliceResult.profile() : latest.profile();
         long syncedAt = Math.max(latest.syncedAt(), sliceResult.syncedAt());
-        long minKeep = Instant.ofEpochSecond(syncedAt).minus(RETENTION).getEpochSecond();
+        long minKeep = retainsFullHistory(profile.username()) ? 0L : Instant.ofEpochSecond(syncedAt).minus(RETENTION).getEpochSecond();
 
         Map<String, StoredUser> users = new LinkedHashMap<>(sliceNewer ? latest.users() : sliceResult.users());
         users.putAll(sliceNewer ? sliceResult.users() : latest.users());
@@ -637,12 +637,19 @@ public final class AccountStore {
         return pruneToRollingWindow(combined, Instant.ofEpochSecond(syncedAt));
     }
 
+    public static boolean retainsFullHistory(String rawUsername) {
+        return com.xops.hub.provider.PaidCapabilityGate.isPrivilegedUsername(rawUsername);
+    }
+
     /**
-     * 按给定基准时间动态裁剪保留近 30 天（721 小时）滚动窗口数据，自动淘汰过期动态、互动、覆盖区间与不再被引用的推友字典。
+     * 按给定基准时间动态裁剪保留近 30 天（721 小时）滚动窗口数据；@elidlicom 本人账号全量持久化入库不裁剪。
      */
     public static StoredAccount pruneToRollingWindow(StoredAccount s, Instant referenceNow) {
         if (s == null) {
             return null;
+        }
+        if (s.profile() != null && retainsFullHistory(s.profile().username())) {
+            return s;
         }
         Instant ref = referenceNow != null
                 ? referenceNow

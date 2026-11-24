@@ -324,6 +324,30 @@ class HourlyDailyCacheTest {
         assertThat(report.hours24().cacheRemainingSeconds()).isZero();
     }
 
+    @Test
+    void blockedSearchBudgetSettlesCurrentHourWithoutStuckContinueOrDegradedWarning() throws Exception {
+        long now = Instant.now().getEpochSecond();
+        persist(store(now - 4000, true));
+        var partialInbound = AccountStore.withCoverage(store(now, false),
+                List.of(new long[]{now - 86_400L, now}),
+                List.of(new long[]{now - 86_400L, now - 3600L}));
+        when(twitter.syncStoreByHours(eq(self.username()), any(), eq(24), eq(true), eq(true), isNull(), eq(self.id())))
+                .thenReturn(new TwitterApiIoProvider.SyncOutcome(partialInbound, false, true, true, 0, 0, 0, false, false));
+        when(twitter.isDailyContinuationBlocked(eq(false), eq(true), eq(false))).thenReturn(true);
+
+        var settled = load(true);
+        assertThat(settled.dailyCacheStatus().canContinue()).isFalse();
+        assertThat(settled.dailyCacheStatus().lastAttemptDegraded()).isFalse();
+        assertThat(settled.hours24().bannerNotice()).startsWith("本轮可请求的数据已尝试完毕");
+        assertThat(settled.hours24().nextRefreshAt()).isEqualTo(Instant.ofEpochSecond(now + 3600));
+
+        // Follow-up check within the same hour reuses settled cache instead of hammering blocked upstream
+        var second = load(true);
+        assertThat(second.hours24().fromCache()).isTrue();
+        assertThat(second.dailyCacheStatus().canContinue()).isFalse();
+        verify(twitter, times(1)).syncStoreByHours(eq(self.username()), any(), eq(24), eq(true), eq(true), isNull(), eq(self.id()));
+    }
+
     private MultiPeriodDashboardBundle load(boolean refresh) {
         return service.analyzeWorkspaceBundle(self.username(), ReportPeriod.HOURS_24, null, refresh, "test", self.id(), false);
     }

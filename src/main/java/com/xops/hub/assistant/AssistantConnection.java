@@ -29,7 +29,9 @@ final class AssistantConnection {
         String explicit=environment.getProperty(PROVIDER_ENV,"").strip().toLowerCase(Locale.ROOT);
         String defaultProvider=provider(environment);
         // Only the one-way comparison value is retained in the private settings index.
+        boolean chatgptReady = isProviderConfigured(environment, "chatgpt");
         var connection=object()
+                .put("chatgptOAuthReady",chatgptReady)
                 .put("minimaxEndpoint",endpoint(environment,"minimax"))
                 .put("minimaxCredential",environment.getProperty(MINIMAX_KEY_ENV,""))
                 .put("commandEndpoint",endpoint(environment,"commandcode"))
@@ -38,13 +40,18 @@ final class AssistantConnection {
         String fingerprint=AssistantWorkflow.digest(connection);
         store.tx(tx->{
             var previous=tx.get("server","connection");
-            if(previous!=null && fingerprint.equals(previous.path("fingerprint").asText())) return null;
-            var next=tx.put("server","connection",object().put("fingerprint",fingerprint));
             var settings=AssistantWorkflow.settings(tx);
+            boolean shouldUpgradeToChatGpt = explicit.isEmpty() && chatgptReady && "chatgpt".equals(defaultProvider)
+                    && !"chatgpt".equals(settings.path("provider").asText(""))
+                    && !settings.path("providerManuallySelected").asBoolean(false);
+            if(previous!=null && fingerprint.equals(previous.path("fingerprint").asText()) && !shouldUpgradeToChatGpt) return null;
+            var next=tx.put("server","connection",object().put("fingerprint",fingerprint));
             String priorProvider=settings.path("provider").asText("");
             String targetProvider;
             if (!explicit.isEmpty()) {
                 targetProvider=defaultProvider;
+            } else if (chatgptReady && "chatgpt".equals(defaultProvider) && !settings.path("providerManuallySelected").asBoolean(false)) {
+                targetProvider="chatgpt";
             } else if (isSupportedProvider(priorProvider) && isProviderConfigured(environment,priorProvider)) {
                 targetProvider=normalizeProvider(priorProvider);
             } else {
@@ -81,6 +88,11 @@ final class AssistantConnection {
     }
 
     private static ObjectNode defaultBinding(String provider) {
+        if (provider.equals("chatgpt")) {
+            return object().put("model",ChatGptOAuthTextModelClient.DEFAULT_MODEL_SPEC).put("protocol","RESPONSES")
+                    .put("contextTokens",200_000).put("researchModel",ChatGptOAuthTextModelClient.DEFAULT_MODEL_SPEC)
+                    .put("researchProtocol","RESPONSES").put("researchContextTokens",200_000);
+        }
         if (provider.equals("minimax")) {
             return object().put("model","MiniMax-M3.1-Flash").put("protocol","CHAT_COMPLETIONS")
                     .put("contextTokens",32_000).put("researchModel","").put("researchProtocol","CHAT_COMPLETIONS")
@@ -93,12 +105,14 @@ final class AssistantConnection {
     static boolean isSupportedProvider(String raw) {
         if (raw == null) return false;
         String v = raw.strip().toLowerCase(Locale.ROOT);
-        return "commandcode".equals(v) || "minimax".equals(v);
+        return "chatgpt".equals(v) || "chatgpt-oauth".equals(v) || "codex".equals(v)
+                || "commandcode".equals(v) || "minimax".equals(v);
     }
 
     static String normalizeProvider(String raw) {
         String configured = raw == null ? "" : raw.strip().toLowerCase(Locale.ROOT);
         return switch (configured) {
+            case "chatgpt", "chatgpt-oauth", "codex" -> "chatgpt";
             case "commandcode", "minimax" -> configured;
             default -> throw new IllegalArgumentException("Unsupported content assistant model provider");
         };
@@ -113,7 +127,13 @@ final class AssistantConnection {
     static String provider(Environment environment) {
         String configured=environment==null?"":environment.getProperty(PROVIDER_ENV,"").strip().toLowerCase(Locale.ROOT);
         if (!configured.isEmpty()) return normalizeProvider(configured);
-        if (isProviderConfigured(environment,"minimax") && !isProviderConfigured(environment,"commandcode")) {
+        if (isProviderConfigured(environment,"commandcode")) {
+            return "commandcode";
+        }
+        if (isProviderConfigured(environment,"chatgpt")) {
+            return "chatgpt";
+        }
+        if (isProviderConfigured(environment,"minimax")) {
             return "minimax";
         }
         return "commandcode";
@@ -124,6 +144,7 @@ final class AssistantConnection {
     }
 
     static String credentialName(String provider) {
+        if ("chatgpt".equalsIgnoreCase(provider)) return ChatGptOAuthTextModelClient.CREDENTIAL_REF;
         return "minimax".equalsIgnoreCase(provider) ? MINIMAX_KEY_ENV : AssistantIntelligence.API_KEY_ENV;
     }
 
@@ -132,6 +153,9 @@ final class AssistantConnection {
     }
 
     static String endpoint(Environment environment, String provider) {
+        if ("chatgpt".equalsIgnoreCase(provider)) {
+            return ChatGptOAuthTextModelClient.BASE_URL;
+        }
         if ("minimax".equalsIgnoreCase(provider))
             return environment == null ? "https://api.minimax.cn/v1"
                     : environment.getProperty(MINIMAX_BASE_ENV,"https://api.minimax.cn/v1");
@@ -141,14 +165,24 @@ final class AssistantConnection {
 
     static boolean isProviderConfigured(Environment environment, String provider) {
         if (environment == null || !isSupportedProvider(provider)) return false;
-        String base = endpoint(environment, provider);
-        String key = environment.getProperty(credentialName(provider), "");
+        String normalized = normalizeProvider(provider);
+        if ("chatgpt".equals(normalized)) {
+            if ("true".equalsIgnoreCase(environment.getProperty("xops.test-disable-chatgpt-oauth", "false"))) {
+                return false;
+            }
+            return ChatGptOAuthTextModelClient.isOAuthReady(environment);
+        }
+        String base = endpoint(environment, normalized);
+        String key = environment.getProperty(credentialName(normalized), "");
         return base != null && !base.isBlank() && !key.isBlank();
     }
 
     static boolean supportsProtocol(String provider, String protocol) {
         if ("minimax".equalsIgnoreCase(provider)) {
             return "CHAT_COMPLETIONS".equalsIgnoreCase(protocol) || "MESSAGES".equalsIgnoreCase(protocol);
+        }
+        if ("chatgpt".equalsIgnoreCase(provider)) {
+            return "RESPONSES".equalsIgnoreCase(protocol) || "CHAT_COMPLETIONS".equalsIgnoreCase(protocol);
         }
         return true;
     }

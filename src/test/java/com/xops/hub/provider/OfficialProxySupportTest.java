@@ -117,10 +117,13 @@ class OfficialProxySupportTest {
 
             ObjectMapper mapper = new ObjectMapper();
             XPublishClient publishClient = new XPublishClient(props, mapper);
-            assertThrows(XPublishClient.XPublishException.class,
-                    () -> publishClient.uploadMedia("acc_jp", new byte[]{1, 2, 3, 4}, "image/png", "cover.png"));
-            assertThrows(XPublishClient.XPublishException.class,
-                    () -> publishClient.createTweet("acc_jp", "Hello via JP proxy", List.of()));
+            PaidCapabilityGate.withCaller("elidlicom", "proxy-test-1", () -> {
+                assertThrows(XPublishClient.XPublishException.class,
+                        () -> publishClient.uploadMedia("acc_jp", new byte[]{1, 2, 3, 4}, "image/png", "cover.png"));
+                assertThrows(XPublishClient.XPublishException.class,
+                        () -> publishClient.createTweet("acc_jp", "Hello via JP proxy", List.of()));
+                return null;
+            });
 
             XOAuthService oauthService = new XOAuthService(props, mapper);
             XOAuthService.AuthorizationRequestInfo authReq =
@@ -164,10 +167,10 @@ class OfficialProxySupportTest {
 
         ObjectMapper mapper = new ObjectMapper();
         XPublishClient publishClient = new XPublishClient(props, mapper);
-        XPublishClient.XPublishException publishEx = assertThrows(
+        XPublishClient.XPublishException publishEx = PaidCapabilityGate.withCaller("elidlicom", "proxy-test-2", () -> assertThrows(
                 XPublishClient.XPublishException.class,
                 () -> publishClient.createTweet("acc_jp", "Should fail closed", List.of())
-        );
+        ));
         assertEquals(502, publishEx.getStatusCode());
 
         XOAuthService oauthService = new XOAuthService(props, mapper);

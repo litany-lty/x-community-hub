@@ -10,9 +10,12 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /** Validates structured model output before it can change assistant state. */
 public final class ContentIntelligenceEngine {
+    private static final Pattern CLAIM_ID_PATTERN = Pattern.compile("^(?:claim[-_]?|c)?(\\d+)$", Pattern.CASE_INSENSITIVE);
     private final ObjectMapper mapper;
 
     public ContentIntelligenceEngine(ObjectMapper mapper) { this.mapper = mapper; }
@@ -81,10 +84,9 @@ public final class ContentIntelligenceEngine {
         String draft = requiredText(json, "draft");
         Map<String, Claim> acceptedClaims = indexedClaims(research);
         List<String> claims;
-        if (json.has("usedClaimIds")) {
-            List<String> ids = strings(json.path("usedClaimIds"));
-            if (!acceptedClaims.keySet().containsAll(ids))
-                throw new IllegalArgumentException("usedClaimIds must come from the accepted research result");
+        JsonNode usedClaimIdsNode = json.path("usedClaimIds");
+        if (!usedClaimIdsNode.isMissingNode() && !usedClaimIdsNode.isNull()) {
+            List<String> ids = parseUsedClaimIds(usedClaimIdsNode, acceptedClaims);
             claims = ids.stream().distinct().map(id -> acceptedClaims.get(id).claim()).toList();
         } else {
             claims = strings(json.path("usedClaims"));
@@ -112,6 +114,76 @@ public final class ContentIntelligenceEngine {
             indexed.put("claim-" + (i + 1), research.claims().get(i));
         }
         return indexed;
+    }
+
+    private static List<String> parseUsedClaimIds(JsonNode node, Map<String, Claim> acceptedClaims) {
+        if (!node.isArray()) {
+            throw new IllegalArgumentException("usedClaimIds must come from the accepted research result");
+        }
+        int size = acceptedClaims.size();
+        boolean hasZero = false;
+        boolean allZeroBasedInBounds = node.size() > 0;
+        for (JsonNode item : node) {
+            Integer numeric = parseBareNonNegativeInt(item);
+            if (numeric == null || numeric >= size) {
+                allZeroBasedInBounds = false;
+                break;
+            }
+            if (numeric == 0) {
+                hasZero = true;
+            }
+        }
+        boolean zeroBased = hasZero && allZeroBasedInBounds;
+
+        List<String> normalized = new ArrayList<>();
+        for (JsonNode item : node) {
+            String resolved = normalizeClaimId(item, zeroBased);
+            if (resolved == null || !acceptedClaims.containsKey(resolved)) {
+                throw new IllegalArgumentException("usedClaimIds must come from the accepted research result");
+            }
+            normalized.add(resolved);
+        }
+        return List.copyOf(normalized);
+    }
+
+    private static Integer parseBareNonNegativeInt(JsonNode item) {
+        if (item.isIntegralNumber() && item.canConvertToInt()) {
+            int val = item.asInt();
+            return val >= 0 ? val : null;
+        }
+        if (item.isTextual()) {
+            String raw = item.asText().strip();
+            if (raw.matches("\\d+")) {
+                try {
+                    return Integer.parseInt(raw);
+                } catch (NumberFormatException ignored) {
+                    return null;
+                }
+            }
+        }
+        return null;
+    }
+
+    private static String normalizeClaimId(JsonNode item, boolean zeroBased) {
+        Integer bare = parseBareNonNegativeInt(item);
+        if (bare != null) {
+            int oneBased = zeroBased ? bare + 1 : bare;
+            return oneBased >= 1 ? ("claim-" + oneBased) : null;
+        }
+        if (item.isTextual()) {
+            String raw = item.asText().strip();
+            if (raw.isEmpty()) return null;
+            Matcher m = CLAIM_ID_PATTERN.matcher(raw);
+            if (m.matches()) {
+                try {
+                    int num = Integer.parseInt(m.group(1));
+                    return num >= 1 ? ("claim-" + num) : null;
+                } catch (NumberFormatException ignored) {
+                    return null;
+                }
+            }
+        }
+        return null;
     }
 
     public static ScoreWeights defaultWeights() {

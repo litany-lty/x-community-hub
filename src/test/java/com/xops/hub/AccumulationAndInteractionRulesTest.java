@@ -706,29 +706,20 @@ class AccumulationAndInteractionRulesTest {
             Path authorStoreFile = dir.resolve("users/by-id/9000/store_v" + AccountStore.VERSION + ".json.gz");
             AccountStore.write(authorStoreFile, authorSeed, objectMapper);
 
-            // Even with unclosed inboundCoverage tail, longHistoryCandidates keeps @elidlicom + Top 1..10 (11 total)
+            // Long-history durable archive is restricted strictly to @elidlicom (non-owner accounts retain 30d rolling window without full-history backfill)
             List<CommunityHubService.LongHistoryCandidate> candidates = service.longHistoryCandidates();
-            assertThat(candidates).hasSize(11);
+            assertThat(candidates).hasSize(1);
             assertThat(candidates.get(0).owner()).isTrue();
             assertThat(candidates.get(0).user().username()).isEqualTo("elidlicom");
-            assertThat(candidates.stream().skip(1).map(c -> c.user().username()).toList())
-                    .containsExactly("top_peer_1", "top_peer_2", "top_peer_3", "top_peer_4", "top_peer_5",
-                            "top_peer_6", "top_peer_7", "top_peer_8", "top_peer_9", "top_peer_10")
-                    .doesNotContain("top_peer_11", "top_peer_12");
 
-            // 3. Step 1 prioritizes @elidlicom (owner) 30d silent backfill, then Top 1..10 peers, never touching rank 11/12
-            for (int step = 0; step < 11; step++) {
-                assertThat(service.runOneSilentTop10HistoryStepNow()).isTrue();
-            }
-            assertThat(service.runOneSilentTop10HistoryStepNow()).isFalse(); // All 11 now have complete 30d coverage!
-            assertThat(silentlySyncedHandles.get(0)).isEqualTo("elidlicom");
-            assertThat(silentlySyncedHandles).hasSize(11)
-                    .contains("elidlicom", "top_peer_1", "top_peer_10")
-                    .doesNotContain("top_peer_11", "top_peer_12");
+            // 3. Silent history warmup runs exclusively for @elidlicom, never touching any peer account
+            assertThat(service.runOneSilentTop10HistoryStepNow()).isTrue();
+            assertThat(service.runOneSilentTop10HistoryStepNow()).isFalse();
+            assertThat(silentlySyncedHandles).containsExactly("elidlicom");
             assertThat(AccountStore.read(authorStoreFile, objectMapper).tweets())
                     .extracting(AccountStore.StoredTweet::id).contains("hist_elidlicom");
-            assertThat(AccountStore.read(dir.resolve("users/by-id/7010/store_v" + AccountStore.VERSION + ".json.gz"), objectMapper).tweets())
-                    .extracting(AccountStore.StoredTweet::id).contains("hist_top_peer_10");
+            assertThat(dir.resolve("users/by-id/7001/store_v" + AccountStore.VERSION + ".json.gz")).doesNotExist();
+            assertThat(dir.resolve("users/by-id/7010/store_v" + AccountStore.VERSION + ".json.gz")).doesNotExist();
             assertThat(dir.resolve("users/by-id/7011/store_v" + AccountStore.VERSION + ".json.gz")).doesNotExist();
         } finally {
             service.stopBackgroundRefreshes();

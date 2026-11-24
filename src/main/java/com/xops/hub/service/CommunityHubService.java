@@ -173,6 +173,12 @@ public class CommunityHubService {
     private final XAlgorithmProfileRegistry algoProfileRegistry;
     private final CommunityAnalyticsEngine analyticsEngine;
     private final AssistantStore assistantStore;
+    @Autowired(required = false)
+    private com.xops.hub.provider.PaidCapabilityGate paidCapabilityGate;
+
+    public void setPaidCapabilityGate(com.xops.hub.provider.PaidCapabilityGate paidCapabilityGate) {
+        this.paidCapabilityGate = paidCapabilityGate;
+    }
 
     private final ConcurrentHashMap<String, CachedSnapshot> snapshotCache = new ConcurrentHashMap<>();
     private static final int ACCOUNT_LOCK_STRIPES = 256;
@@ -440,7 +446,8 @@ public class CommunityHubService {
         Object lock = fetchLockFor(ownerKey);
         AtomicBoolean runningRefresh = backgroundRefreshes.get(cacheKey);
         CachedSnapshot activeSnapshot = snapshotCache.get(cacheKey);
-        if (!backgroundExecution && !continueRelations && runningRefresh != null && runningRefresh.get()
+        if (!backgroundExecution && !continueRelations && (!forceRefresh || preferStored)
+                && runningRefresh != null && runningRefresh.get()
                 && cacheIdentityMatches(activeSnapshot, handleKey, expectedAccountId)) {
             return refreshWorkspaceTimestamps(activeSnapshot.bundle(), true,
                     activeSnapshot.ttlSeconds(), activeSnapshot.expiresAt(), activeSnapshot.bundle().accessPolicy());
@@ -461,6 +468,20 @@ public class CommunityHubService {
                 if (resolvedMode != ProviderMode.TWITTERAPI_IO) {
                     throw new XDataProviderException(400, "当前数据源不支持逐人继续核验");
                 }
+                boolean isOwner = isAuthorIdentity(handleKey, expectedAccountId);
+                if (!isOwner && (!twitterApiIoProvider.isUsingLoopbackBaseUrl() || paidCapabilityGate != null)) {
+                    if (paidCapabilityGate != null) {
+                        paidCapabilityGate.scheduleIdempotentRetry(
+                                "continue-relations:" + handleKey,
+                                "twitterapi_io_relation",
+                                handleKey,
+                                expectedAccountId,
+                                com.xops.hub.provider.PaidCapabilityGate.PAID_FORBIDDEN_MESSAGE,
+                                () -> {}
+                        );
+                    }
+                    throw new XDataProviderException(403, com.xops.hub.provider.PaidCapabilityGate.PAID_FORBIDDEN_MESSAGE);
+                }
                 checkLiveSyncRateLimit(handleKey, clientIp, expectedAccountId);
                 checkContinueRelationsRateLimit(handleKey, expectedAccountId);
                 AccountStore.StoredAccount stored = loadStore(handleKey, expectedAccountId);
@@ -468,9 +489,25 @@ public class CommunityHubService {
                 TwitterApiIoProvider.SyncOutcome continued;
                 activeForegroundSyncs.incrementAndGet();
                 try {
-                    continued = twitterApiIoProvider.continueRelationships(handle, stored, expectedAccountId);
+                    continued = isOwner
+                            ? com.xops.hub.provider.PaidCapabilityGate.withCaller(
+                                    com.xops.hub.provider.PaidCapabilityGate.PRIVILEGED_USERNAME, expectedAccountId,
+                                    () -> twitterApiIoProvider.continueRelationships(handle, stored, expectedAccountId))
+                            : twitterApiIoProvider.continueRelationships(handle, stored, expectedAccountId);
                 } finally {
                     activeForegroundSyncs.decrementAndGet();
+                }
+                if (isOwner && continued.degraded() && paidCapabilityGate != null) {
+                    paidCapabilityGate.scheduleIdempotentRetry(
+                            "continue-relations:elidlicom:" + today,
+                            "twitterapi_io_relation",
+                            com.xops.hub.provider.PaidCapabilityGate.PRIVILEGED_USERNAME,
+                            expectedAccountId,
+                            "逐人关系核验存在未完成项",
+                            () -> analyzeWorkspaceBundle(handle, ReportPeriod.HOURS_24, requestedProvider, false, clientIp, expectedAccountId, true)
+                    );
+                } else if (isOwner && paidCapabilityGate != null) {
+                    paidCapabilityGate.markSucceeded("continue-relations:elidlicom:" + today);
                 }
                 verifyAccountOwner(continued.store().profile(), handleKey, expectedAccountId);
                 saveStore(handleKey, expectedAccountId, continued.store());
@@ -492,14 +529,18 @@ public class CommunityHubService {
             }
 
             // Every request reads real persistence under the same account lock, including cold starts.
+            boolean authorCaller = isAuthorIdentity(handleKey, expectedAccountId);
             AccountStore.StoredAccount rawStored = resolvedMode == ProviderMode.DEMO
                     ? null : loadStore(handleKey, expectedAccountId);
             if (rawStored != null) verifyAccountOwner(rawStored.profile(), handleKey, expectedAccountId);
             AccountStore.StoredAccount stored = AccountStore.pruneToRollingWindow(rawStored, now);
             boolean completedDaily = isDailyRefreshComplete(stored);
-            boolean freshDaily = completedDaily && now.getEpochSecond() >= stored.dailyRefreshedAt()
+            boolean enforceHourlyCache = !authorCaller;
+            boolean freshDaily = enforceHourlyCache && completedDaily && now.getEpochSecond() >= stored.dailyRefreshedAt()
                     && now.getEpochSecond() < stored.dailyRefreshedAt() + DAILY_REFRESH_SECONDS;
-            boolean exhaustedDailyAttempts = canContinueDailyRefresh(stored, now) && !dailyCanContinue(stored);
+            boolean exhaustedDailyAttempts = enforceHourlyCache
+                    && canContinueDailyRefresh(stored, now)
+                    && !dailyCanContinue(stored);
             if (preferStored && forceRefresh && !backgroundExecution && resolvedMode != ProviderMode.DEMO
                     && stored != null && !freshDaily && !exhaustedDailyAttempts) {
                 return serveStoredAndScheduleRefresh(
@@ -507,15 +548,16 @@ public class CommunityHubService {
                         stored, completedDaily, quotaEntry, zone, today, initialRank, configuredTtl, now, algoFp,
                         "已返回最近一次完整入库快照；后台刷新已受理。");
             }
-            boolean coalesced = active != null && active.computedAt() != null
-                    && !active.computedAt().isBefore(requestedAt);
+            boolean coalesced = !backgroundExecution && active != null && active != activeSnapshot
+                    && active.computedAt() != null && !active.computedAt().isBefore(requestedAt);
             BackgroundRefreshStatus latestBg = backgroundRefreshStatuses.get(cacheKey);
+            long recentBgWindowSeconds = authorCaller ? 5L : 60L;
             boolean recentBgResult = !backgroundExecution && latestBg != null
                     && "SUCCEEDED".equals(latestBg.state()) && latestBg.completedAt() != null
                     && active != null && active.computedAt() != null
                     && !active.computedAt().isBefore(latestBg.completedAt().minusSeconds(2))
-                    && Duration.between(latestBg.completedAt(), now).getSeconds() < 60;
-            boolean recentDegradedCooldown = !backgroundExecution && active != null && active.computedAt() != null
+                    && Duration.between(latestBg.completedAt(), now).getSeconds() < recentBgWindowSeconds;
+            boolean recentDegradedCooldown = !authorCaller && !backgroundExecution && active != null && active.computedAt() != null
                     && active.bundle() != null && active.bundle().dailyCacheStatus() != null
                     && active.bundle().dailyCacheStatus().lastAttemptDegraded()
                     && Duration.between(active.computedAt(), now).getSeconds() < 60;
@@ -576,8 +618,16 @@ public class CommunityHubService {
                 AccountStore.StoredAccount officialStored = null;
                 RawAccountSnapshot snap = switch (resolvedMode) {
                     case X_OFFICIAL_V2 -> {
-                        checkLiveSyncRateLimit(handleKey, clientIp);
-                        RawAccountSnapshot fetched = officialXApiV2Provider.fetchSnapshot(handle, null);
+                        boolean officialOwner = isAuthorIdentity(handleKey, expectedAccountId);
+                        if (!officialOwner && paidCapabilityGate != null) {
+                            throw new XDataProviderException(403, com.xops.hub.provider.PaidCapabilityGate.PAID_FORBIDDEN_MESSAGE);
+                        }
+                        checkLiveSyncRateLimit(handleKey, clientIp, expectedAccountId);
+                        RawAccountSnapshot fetched = officialOwner
+                                ? com.xops.hub.provider.PaidCapabilityGate.withCaller(
+                                        com.xops.hub.provider.PaidCapabilityGate.PRIVILEGED_USERNAME, expectedAccountId,
+                                        () -> officialXApiV2Provider.fetchSnapshot(handle, null))
+                                : officialXApiV2Provider.fetchSnapshot(handle, null);
                         verifyAccountOwner(fetched.profile(), handleKey, expectedAccountId);
                         Instant syncAt = fetched.fetchedAt() != null ? fetched.fetchedAt() : now;
                         Instant cutoff24 = syncAt.minus(Duration.ofHours(ReportPeriod.HOURS_24.windowHours));
@@ -654,16 +704,66 @@ public class CommunityHubService {
             boolean lightweightDaily = true;
             int targetSyncHours = ReportPeriod.HOURS_24.windowHours;
 
+            boolean bindPaidScope = authorCaller || !twitterApiIoProvider.isUsingLoopbackBaseUrl() || paidCapabilityGate != null;
+            String scopedCaller = authorCaller ? com.xops.hub.provider.PaidCapabilityGate.PRIVILEGED_USERNAME : handleKey;
+            if (forceRefresh && twitterApiIoProvider != null) {
+                twitterApiIoProvider.resetFreeCircuitForActiveSync();
+            }
             TwitterApiIoProvider.SyncOutcome outcome;
             activeForegroundSyncs.incrementAndGet();
             try {
-                outcome = twitterApiIoProvider.syncStoreByHours(
-                        handle, stored, targetSyncHours, !canContinueDailyRefresh(stored, now), lightweightDaily, null, expectedAccountId);
+                AccountStore.StoredAccount baseStore = stored;
+                boolean doHeadSync = (authorCaller && forceRefresh) || !canContinueDailyRefresh(stored, now);
+                outcome = bindPaidScope
+                        ? com.xops.hub.provider.PaidCapabilityGate.withCaller(scopedCaller, expectedAccountId,
+                                () -> twitterApiIoProvider.syncStoreByHours(
+                                        handle, baseStore, targetSyncHours, doHeadSync, lightweightDaily, null, expectedAccountId))
+                        : twitterApiIoProvider.syncStoreByHours(
+                                handle, baseStore, targetSyncHours, doHeadSync, lightweightDaily, null, expectedAccountId);
                 verifyAccountOwner(outcome.store().profile(), handleKey, expectedAccountId);
                 saveStore(handleKey, expectedAccountId, outcome.store());
+                if (paidCapabilityGate != null && (authorCaller || properties.isFxtwitterEnabled())) {
+                    String retryCategory = authorCaller ? "twitterapi_io_read" : "fxtwitter_free_read";
+                    String syncRetryKey = (authorCaller ? "workspace-sync:elidlicom:" : "workspace-free-sync:" + handleKey + ":")
+                            + Math.max(1L, outcome.store().dailyRefreshStartedAt());
+                    String dayRetryKey = (authorCaller ? "workspace-sync:elidlicom:" : "workspace-free-sync:" + handleKey + ":") + today;
+                    if (outcome.degraded()) {
+                        paidCapabilityGate.scheduleIdempotentRetry(
+                                syncRetryKey,
+                                retryCategory,
+                                scopedCaller,
+                                expectedAccountId,
+                                authorCaller ? "工作台付费同步存在未完成项" : "工作台免费公开数据同步存在未完成项",
+                                () -> analyzeWorkspaceBundle(handle, ReportPeriod.HOURS_24, requestedProvider, true, clientIp, expectedAccountId, false),
+                                forceRefresh
+                        );
+                    } else {
+                        paidCapabilityGate.markSucceeded(syncRetryKey);
+                        paidCapabilityGate.markSucceeded(dayRetryKey);
+                    }
+                }
             } catch (XDataProviderException ex) {
+                boolean retryableFreeFailure = !authorCaller
+                        && properties.isFxtwitterEnabled()
+                        && ex.getStatusCode() != 401
+                        && ex.getStatusCode() != 403
+                        && ex.getStatusCode() != 404;
+                if (paidCapabilityGate != null && (authorCaller || retryableFreeFailure)) {
+                    String retryCategory = authorCaller ? "twitterapi_io_read" : "fxtwitter_free_read";
+                    String errRetryKey = (authorCaller ? "workspace-sync:elidlicom:" : "workspace-free-sync:" + handleKey + ":") + today;
+                    paidCapabilityGate.scheduleIdempotentRetry(
+                            errRetryKey,
+                            retryCategory,
+                            scopedCaller,
+                            expectedAccountId,
+                            ex.getMessage(),
+                            () -> analyzeWorkspaceBundle(handle, ReportPeriod.HOURS_24, requestedProvider, true, clientIp, expectedAccountId, false),
+                            forceRefresh
+                    );
+                }
                 if (stored != null && stored.profile() != null
-                        && (ex.getStatusCode() == 503 || ex.getStatusCode() == 429)) {
+                        && (ex.getStatusCode() == 503 || ex.getStatusCode() == 502 || ex.getStatusCode() == 504
+                        || ex.getStatusCode() == 500 || ex.getStatusCode() == 429)) {
                     log.warn("workspace_refresh refresh_id={} stage=snapshot_fallback result=served status={}",
                             MDC.get("workspaceRefreshId"), ex.getStatusCode());
                     RawAccountSnapshot fallbackSnap = TwitterApiIoProvider.snapshotOf(
@@ -702,11 +802,17 @@ public class CommunityHubService {
 
             Instant expiresAt = dailyRefreshExpiresAt(outcome.store(), now);
             boolean hasMore = !complete;
+            long cycleAnchor = outcome.store().dailyRefreshStartedAt();
+            boolean continuationBlocked = !complete && cycleAnchor > 0 && twitterApiIoProvider != null
+                    && twitterApiIoProvider.isDailyContinuationBlocked(
+                            !streamCoversDaily(outcome.store().tweetCoverage(), cycleAnchor),
+                            !streamCoversDaily(outcome.store().inboundCoverage(), cycleAnchor),
+                            unattemptedDailyMetrics(outcome.store()) > 0);
             MultiPeriodDashboardBundle bundle = buildWorkspaceBundle(
                     snap, policy, false, configuredTtl, expiresAt, hasMore,
                     TwitterApiIoProvider.pendingRelationshipChecks(outcome.store()))
                     .withDailyCacheStatus(dailyCacheStatus(outcome.store(), outcome.dailyMetricBatchFailed()
-                            || (outcome.degraded() && !outcome.progressed())));
+                            || (outcome.degraded() && !outcome.progressed() && !continuationBlocked)));
             if (configuredTtl > 0) {
                 pruneCacheIfNeeded();
                 putSnapshotCache(cacheKey, snap, bundle, configuredTtl, expiresAt, algoFp);
@@ -755,6 +861,27 @@ public class CommunityHubService {
                         refreshId, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - acceptedNanos));
                 MultiPeriodDashboardBundle bundle = analyzeWorkspaceBundle(
                         handle, period, provider, true, clientIp, accountId, false, true, false);
+                DailyCacheStatus prevStatus = bundle.dailyCacheStatus();
+                Instant cycleStart = prevStatus != null ? prevStatus.cycleStartedAt() : null;
+                int batchStep = 1;
+                while (batchStep < 12
+                        && !Thread.currentThread().isInterrupted()
+                        && prevStatus != null
+                        && prevStatus.canContinue()
+                        && !prevStatus.lastAttemptDegraded()
+                        && cycleStart != null) {
+                    MultiPeriodDashboardBundle nextBundle = analyzeWorkspaceBundle(
+                            handle, ReportPeriod.HOURS_24, provider, false, clientIp, accountId, false, true, false);
+                    bundle = nextBundle;
+                    DailyCacheStatus nextStatus = nextBundle.dailyCacheStatus();
+                    if (nextStatus == null
+                            || !Objects.equals(cycleStart, nextStatus.cycleStartedAt())
+                            || !dailyStatusProgressed(prevStatus, nextStatus)) {
+                        break;
+                    }
+                    prevStatus = nextStatus;
+                    batchStep++;
+                }
                 backgroundRefreshStatuses.put(key,
                         new BackgroundRefreshStatus("SUCCEEDED", startedAt, Instant.now(), "", refreshId));
                 boolean partial = bundle.hasMoreHistoryForTarget()
@@ -844,11 +971,29 @@ public class CommunityHubService {
                 .filter(t -> t.metricsAttemptedAt() < anchor).count();
     }
 
-    private static boolean dailyCanContinue(AccountStore.StoredAccount stored) {
+    private boolean dailyCanContinue(AccountStore.StoredAccount stored) {
         if (stored == null || stored.dailyRefreshStartedAt() <= 0) return false;
         long anchor = stored.dailyRefreshStartedAt();
-        return !streamCoversDaily(stored.tweetCoverage(), anchor)
-                || !streamCoversDaily(stored.inboundCoverage(), anchor) || unattemptedDailyMetrics(stored) > 0;
+        boolean needTimeline = !streamCoversDaily(stored.tweetCoverage(), anchor);
+        boolean needInbound = !streamCoversDaily(stored.inboundCoverage(), anchor);
+        boolean needMetrics = unattemptedDailyMetrics(stored) > 0;
+        if (!needTimeline && !needInbound && !needMetrics) return false;
+        return twitterApiIoProvider == null
+                || !twitterApiIoProvider.isDailyContinuationBlocked(needTimeline, needInbound, needMetrics);
+    }
+
+    private static boolean dailyStatusProgressed(DailyCacheStatus prev, DailyCacheStatus next) {
+        if (prev == null || next == null) return false;
+        if (next.unattemptedMetricPosts() < prev.unattemptedMetricPosts()) return true;
+        if (!prev.timelineCovered() && next.timelineCovered()) return true;
+        if (!prev.inboundCovered() && next.inboundCovered()) return true;
+        if (next.recentPosts() > prev.recentPosts() || next.recentInbound() > prev.recentInbound()) return true;
+        if (next.timelineCoveredFrom() != null
+                && (prev.timelineCoveredFrom() == null || next.timelineCoveredFrom().isBefore(prev.timelineCoveredFrom()))) {
+            return true;
+        }
+        return next.inboundCoveredFrom() != null
+                && (prev.inboundCoveredFrom() == null || next.inboundCoveredFrom().isBefore(prev.inboundCoveredFrom()));
     }
 
     private static boolean isDailyRefreshComplete(AccountStore.StoredAccount stored) {
@@ -867,7 +1012,7 @@ public class CommunityHubService {
                 && now.getEpochSecond() < stored.dailyRefreshStartedAt() + DAILY_REFRESH_SECONDS;
     }
 
-    private static Instant dailyRefreshExpiresAt(AccountStore.StoredAccount stored, Instant now) {
+    private Instant dailyRefreshExpiresAt(AccountStore.StoredAccount stored, Instant now) {
         if (canContinueDailyRefresh(stored, now) && !dailyCanContinue(stored)) {
             return Instant.ofEpochSecond(stored.dailyRefreshStartedAt() + DAILY_REFRESH_SECONDS);
         }
@@ -876,11 +1021,11 @@ public class CommunityHubService {
                 : (stored != null && stored.syncedAtInstant() != null ? stored.syncedAtInstant() : now);
     }
 
-    private static DailyCacheStatus dailyCacheStatus(AccountStore.StoredAccount stored) {
+    private DailyCacheStatus dailyCacheStatus(AccountStore.StoredAccount stored) {
         return dailyCacheStatus(stored, false);
     }
 
-    private static DailyCacheStatus dailyCacheStatus(AccountStore.StoredAccount stored, boolean lastAttemptDegraded) {
+    private DailyCacheStatus dailyCacheStatus(AccountStore.StoredAccount stored, boolean lastAttemptDegraded) {
         long anchor = stored.dailyRefreshStartedAt() > 0 ? stored.dailyRefreshStartedAt() : stored.syncedAt();
         int posts = (int) stored.tweets().stream()
                 .filter(t -> t.createdAt() >= anchor - 86_400L && t.createdAt() <= anchor).count();
@@ -901,7 +1046,7 @@ public class CommunityHubService {
                 latestMetricFetchedAt > 0 ? Instant.ofEpochSecond(latestMetricFetchedAt) : null);
     }
 
-    private static String buildDailyRefreshNotice(AccountStore.StoredAccount stored, boolean complete) {
+    private String buildDailyRefreshNotice(AccountStore.StoredAccount stored, boolean complete) {
         return (complete ? "最近 24 小时数据与指标已完成本轮同步；满 1 小时后再次检查更新。"
                 : (dailyCanContinue(stored) ? "本轮最近 24 小时数据或指标尚未补齐；继续补充可获取数据，未计为完整新鲜缓存。"
                     : "本轮可请求的数据已尝试完毕，仍有未确认项；保留原值和缺失状态，下一小时再检查，不重复请求本轮失败项。"))
@@ -990,6 +1135,20 @@ public class CommunityHubService {
                 if (resolvedMode != ProviderMode.TWITTERAPI_IO) {
                     throw new XDataProviderException(400, "当前数据源不支持逐人继续核验");
                 }
+                boolean isOwner = isAuthorIdentity(handleKey, expectedAccountId);
+                if (!isOwner && (!twitterApiIoProvider.isUsingLoopbackBaseUrl() || paidCapabilityGate != null)) {
+                    if (paidCapabilityGate != null) {
+                        paidCapabilityGate.scheduleIdempotentRetry(
+                                "continue-relations:" + handleKey,
+                                "twitterapi_io_relation",
+                                handleKey,
+                                expectedAccountId,
+                                com.xops.hub.provider.PaidCapabilityGate.PAID_FORBIDDEN_MESSAGE,
+                                () -> {}
+                        );
+                    }
+                    throw new XDataProviderException(403, com.xops.hub.provider.PaidCapabilityGate.PAID_FORBIDDEN_MESSAGE);
+                }
                 checkLiveSyncRateLimit(handleKey, clientIp, expectedAccountId);
                 checkContinueRelationsRateLimit(handleKey, expectedAccountId);
                 AccountStore.StoredAccount stored = loadStore(handleKey, expectedAccountId);
@@ -997,9 +1156,26 @@ public class CommunityHubService {
                 TwitterApiIoProvider.SyncOutcome continued;
                 activeForegroundSyncs.incrementAndGet();
                 try {
-                    continued = twitterApiIoProvider.continueRelationships(handle, stored, expectedAccountId);
+                    continued = isOwner
+                            ? com.xops.hub.provider.PaidCapabilityGate.withCaller(
+                                    com.xops.hub.provider.PaidCapabilityGate.PRIVILEGED_USERNAME, expectedAccountId,
+                                    () -> twitterApiIoProvider.continueRelationships(handle, stored, expectedAccountId))
+                            : twitterApiIoProvider.continueRelationships(handle, stored, expectedAccountId);
                 } finally {
                     activeForegroundSyncs.decrementAndGet();
+                }
+                String obtainToday = LocalDate.now(resolveZoneId()).toString();
+                if (isOwner && continued.degraded() && paidCapabilityGate != null) {
+                    paidCapabilityGate.scheduleIdempotentRetry(
+                            "continue-relations:elidlicom:" + obtainToday,
+                            "twitterapi_io_relation",
+                            com.xops.hub.provider.PaidCapabilityGate.PRIVILEGED_USERNAME,
+                            expectedAccountId,
+                            "逐人关系核验存在未完成项",
+                            () -> analyzeWorkspaceBundle(handle, ReportPeriod.HOURS_24, requestedProvider, false, clientIp, expectedAccountId, true)
+                    );
+                } else if (isOwner && paidCapabilityGate != null) {
+                    paidCapabilityGate.markSucceeded("continue-relations:elidlicom:" + obtainToday);
                 }
                 verifyAccountOwner(continued.store().profile(), handleKey, expectedAccountId);
                 saveStore(handleKey, expectedAccountId, continued.store());
@@ -1032,8 +1208,17 @@ public class CommunityHubService {
                 // 演示 / 官方 API 模式：不做持久化，只做 5 分钟服务端内存缓存
                 RawAccountSnapshot snap = switch (resolvedMode) {
                     case X_OFFICIAL_V2 -> {
-                        checkLiveSyncRateLimit(handleKey, clientIp);
-                        yield officialXApiV2Provider.fetchSnapshot(handle, null);
+                        boolean officialOwner = isAuthorIdentity(handleKey, expectedAccountId);
+                        if (!officialOwner && paidCapabilityGate != null) {
+                            throw new XDataProviderException(403, com.xops.hub.provider.PaidCapabilityGate.PAID_FORBIDDEN_MESSAGE);
+                        }
+                        checkLiveSyncRateLimit(handleKey, clientIp, expectedAccountId);
+                        yield officialOwner
+                                ? com.xops.hub.provider.PaidCapabilityGate.withCaller(
+                                        com.xops.hub.provider.PaidCapabilityGate.PRIVILEGED_USERNAME,
+                                        expectedAccountId,
+                                        () -> officialXApiV2Provider.fetchSnapshot(handle, null))
+                                : officialXApiV2Provider.fetchSnapshot(handle, null);
                     }
                     case DEMO -> demoSnapshotForAccount(handle, expectedAccountId);
                     default -> throw new XDataProviderException(500, "不支持的数据源模式");
@@ -1049,20 +1234,56 @@ public class CommunityHubService {
                 return new ResolvedBundleHolder(bundle, false, configuredTtl, expiresAt);
             }
 
-            // TwitterAPI.io：以每账号独立隔离的 30 天滚动持久化存储为准，只请求尚未入库的时间段
-            checkLiveSyncRateLimit(handleKey, clientIp);
+            // TwitterAPI.io：以每账号独立隔离的持久化存储为准，只请求尚未入库的时间段
+            checkLiveSyncRateLimit(handleKey, clientIp, expectedAccountId);
             AccountStore.StoredAccount stored = loadStore(handleKey, expectedAccountId);
             boolean headSync = !cacheValid;
+            boolean authorCaller = isAuthorIdentity(handleKey, expectedAccountId);
+            boolean bindPaidScope = authorCaller || !twitterApiIoProvider.isUsingLoopbackBaseUrl() || paidCapabilityGate != null;
+            String callerName = authorCaller ? com.xops.hub.provider.PaidCapabilityGate.PRIVILEGED_USERNAME : handleKey;
             TwitterApiIoProvider.SyncOutcome outcome;
             try {
-                outcome = expectedAccountId == null
+                java.util.function.Supplier<TwitterApiIoProvider.SyncOutcome> syncCall = () -> expectedAccountId == null
                         ? twitterApiIoProvider.syncStore(handle, stored, requiredDays, headSync, null)
                         : twitterApiIoProvider.syncStore(handle, stored, requiredDays, headSync, null, expectedAccountId);
+                outcome = bindPaidScope
+                        ? com.xops.hub.provider.PaidCapabilityGate.withCaller(callerName, expectedAccountId, syncCall)
+                        : syncCall.get();
                 verifyAccountOwner(outcome.store().profile(), handleKey, expectedAccountId);
                 saveStore(handleKey, expectedAccountId, outcome.store());
+                if (paidCapabilityGate != null && (authorCaller || properties.isFxtwitterEnabled())) {
+                    String bundleKey = (authorCaller ? "bundle-sync:elidlicom:" : "bundle-free-sync:" + handleKey + ":")
+                            + LocalDate.now(resolveZoneId());
+                    if (outcome.degraded()) {
+                        paidCapabilityGate.scheduleIdempotentRetry(
+                                bundleKey,
+                                authorCaller ? "twitterapi_io_read" : "fxtwitter_free_read",
+                                callerName,
+                                expectedAccountId,
+                                "快照同步存在未完成项",
+                                () -> obtainBundle(handle, requiredDays, requestedProvider, clientIp, expectedAccountId, false)
+                        );
+                    } else {
+                        paidCapabilityGate.markSucceeded(bundleKey);
+                    }
+                }
             } catch (XDataProviderException ex) {
+                if (paidCapabilityGate != null
+                        && (authorCaller || (properties.isFxtwitterEnabled() && ex.getStatusCode() != 401 && ex.getStatusCode() != 403 && ex.getStatusCode() != 404))) {
+                    String bundleKey = (authorCaller ? "bundle-sync:elidlicom:" : "bundle-free-sync:" + handleKey + ":")
+                            + LocalDate.now(resolveZoneId());
+                    paidCapabilityGate.scheduleIdempotentRetry(
+                            bundleKey,
+                            authorCaller ? "twitterapi_io_read" : "fxtwitter_free_read",
+                            callerName,
+                            expectedAccountId,
+                            ex.getMessage(),
+                            () -> obtainBundle(handle, requiredDays, requestedProvider, clientIp, expectedAccountId, false)
+                    );
+                }
                 if (stored != null && stored.profile() != null
-                        && (ex.getStatusCode() == 503 || ex.getStatusCode() == 429)) {
+                        && (ex.getStatusCode() == 503 || ex.getStatusCode() == 502 || ex.getStatusCode() == 504
+                        || ex.getStatusCode() == 500 || ex.getStatusCode() == 429)) {
                     log.warn("Peak queue/rate guard triggered for @{}; serving persisted store immediately: {}", handle, ex.getMessage());
                     RawAccountSnapshot fallbackSnap = TwitterApiIoProvider.snapshotOf(
                             AccountStore.withoutRelationshipEvidence(stored), "", true);
@@ -2216,7 +2437,7 @@ public class CommunityHubService {
 
         String accumulationNote = top5Full
                 ? (selfIsAuthor
-                        ? "作者账号已解锁全部时间维度；单次加载 24 小时并落盘，动态保留近 30 天窗口数据。"
+                        ? "作者账号已解锁全部时间维度；本人账号与付费数据全量持久化入库。"
                         : String.format("你是 @%s 互动前 %d 好朋友（第 %d 名），已解锁全部时间维度；单次加载 24 小时并每日物理落盘，动态保留近 30 天窗口数据。",
                                 AUTHOR_USERNAME, TOP_FREE_FULL_RANK, authorRank))
                 : (top50AutoSync
@@ -2269,22 +2490,15 @@ public class CommunityHubService {
             boolean followsAuthor,
             Integer authorRank
     ) {
-        boolean inTop100 = authorRank != null && authorRank >= 1 && authorRank <= TOP_SCHEDULED_PUBLISH_RANK;
-        boolean allowed = selfIsAuthor || inTop100;
-        if (allowed) {
-            return new ScheduledPublishAccess(true, followsAuthor, authorRank, null);
+        if (selfIsAuthor) {
+            return new ScheduledPublishAccess(true, true, authorRank, null);
         }
-        String reason;
-        if (authorRank == null) {
-            reason = String.format(
-                    "定时发布仅限与 @%s 互动频率前 %d 的推友可用（当前暂未进入与 @%s 的互动频率前 %d）。",
-                    AUTHOR_USERNAME, TOP_SCHEDULED_PUBLISH_RANK, AUTHOR_USERNAME, TOP_SCHEDULED_PUBLISH_RANK);
-        } else {
-            reason = String.format(
-                    "定时发布仅限与 @%s 互动频率前 %d 的推友可用（当前位列互动频率第 %d 名，进入前 %d 名自动解锁）。",
-                    AUTHOR_USERNAME, TOP_SCHEDULED_PUBLISH_RANK, authorRank, TOP_SCHEDULED_PUBLISH_RANK);
-        }
-        return new ScheduledPublishAccess(false, followsAuthor, authorRank, reason);
+        return new ScheduledPublishAccess(
+                false,
+                followsAuthor,
+                authorRank,
+                "定时发布付费能力仅对 @" + AUTHOR_USERNAME + " 开放使用。"
+        );
     }
 
     private int computeStoredCoveredDays(AccountStore.StoredAccount stored) {
@@ -2338,7 +2552,7 @@ public class CommunityHubService {
                     .thenComparing(p -> p.peer() != null && p.peer().username() != null
                             ? p.peer().username().toLowerCase(Locale.ROOT) : "");
 
-    /** Stable owner plus the current interaction top ten, used by both silent 30d store backfill and durable history archive. */
+    /** Durable long-history archive candidate: restricted strictly to @elidlicom (non-owner accounts keep 30d rolling window). */
     public List<LongHistoryCandidate> longHistoryCandidates() {
         AccountStore.StoredAccount authorStore = null;
         if (assistantStore != null) {
@@ -2359,33 +2573,21 @@ public class CommunityHubService {
             authorStore = findAuthorStoredAccount();
         }
         if (authorStore == null || authorStore.profile() == null
-                || authorStore.profile().id() == null || authorStore.profile().id().isBlank()) {
+                || authorStore.profile().id() == null || authorStore.profile().id().isBlank()
+                || !com.xops.hub.provider.PaidCapabilityGate.isPrivilegedUsername(authorStore.profile().username())) {
             return List.of();
         }
         RawAccountSnapshot snapshot = TwitterApiIoProvider.snapshotOf(authorStore, "", false);
-        CommunityDashboardReport report = analyticsEngine.analyze(
-                snapshot, ReportPeriod.MONTH, true, resolveZoneId(), true, 0L, snapshot.fetchedAt());
-        List<PeerInteractionStat> ranked = new ArrayList<>(report.interactions().peerStats());
-        ranked.sort(PEER_RANK_ORDER);
-        List<LongHistoryCandidate> result = new ArrayList<>();
         int qualificationDays = snapshot.coveredWindowDays();
         boolean provisional = qualificationDays < 30;
-        result.add(new LongHistoryCandidate(authorStore.profile(), 0, true, qualificationDays, provisional,
-                authorStore.syncedAt() * 1000L));
-        Set<String> ids = new LinkedHashSet<>();
-        ids.add(authorStore.profile().id());
-        int rank = 1;
-        for (PeerInteractionStat stat : ranked) {
-            if (rank > 10) break;
-            XUserSummary peer = stat.peer();
-            if (peer == null || peer.id() == null || peer.id().isBlank() || peer.username() == null
-                    || peer.username().isBlank() || !ids.add(peer.id())) {
-                continue;
-            }
-            result.add(new LongHistoryCandidate(peer, rank++, false, qualificationDays, provisional,
-                    authorStore.syncedAt() * 1000L));
-        }
-        return List.copyOf(result);
+        return List.of(new LongHistoryCandidate(
+                authorStore.profile(),
+                0,
+                true,
+                qualificationDays,
+                provisional,
+                authorStore.syncedAt() * 1000L
+        ));
     }
 
     @Scheduled(fixedDelayString = "${xops.top10-silent-history-poll-ms:45000}")
@@ -2486,15 +2688,34 @@ public class CommunityHubService {
             verifyAccountOwner(before.profile(), handleKey, uid);
         }
         silentHistoryLastAttemptMs.put(ownerKey, nowMs);
-        TwitterApiIoProvider.SyncOutcome outcome = twitterApiIoProvider.syncStoreSilentHistoryStep(handle, before, 3, uid);
+        boolean chosenOwner = chosen.owner() || isAuthorIdentity(handleKey, uid);
+        boolean bindSilentScope = chosenOwner || !twitterApiIoProvider.isUsingLoopbackBaseUrl() || paidCapabilityGate != null;
+        String silentCaller = chosenOwner ? com.xops.hub.provider.PaidCapabilityGate.PRIVILEGED_USERNAME : handleKey;
+        TwitterApiIoProvider.SyncOutcome outcome = bindSilentScope
+                ? com.xops.hub.provider.PaidCapabilityGate.withCaller(
+                        silentCaller, uid, () -> twitterApiIoProvider.syncStoreSilentHistoryStep(handle, before, 3, uid))
+                : twitterApiIoProvider.syncStoreSilentHistoryStep(handle, before, 3, uid);
         if (outcome.degraded() && !outcome.progressed()) {
-            long cooldownUntil = System.currentTimeMillis() + 300_000L;
+            long cooldownUntil = System.currentTimeMillis() + com.xops.hub.provider.PaidCapabilityGate.RETRY_INTERVAL_MS;
             silentHistoryDegradedCooldownUntilMs.put(ownerKey, cooldownUntil);
-            if (twitterApiIoProvider.isBackgroundPaidBudgetExhausted()) {
+            if (chosenOwner && paidCapabilityGate != null) {
+                paidCapabilityGate.scheduleIdempotentRetry(
+                        "silent-history:elidlicom:" + LocalDate.now(resolveZoneId()),
+                        "twitterapi_io_read",
+                        com.xops.hub.provider.PaidCapabilityGate.PRIVILEGED_USERNAME,
+                        uid,
+                        "静默历史回填暂未推进",
+                        this::runOneSilentTop10HistoryStepNow
+                );
+            }
+            if (!chosenOwner && twitterApiIoProvider.isBackgroundPaidBudgetExhausted()) {
                 silentHistoryBudgetCooldownUntilMs = cooldownUntil;
             }
         } else {
             silentHistoryDegradedCooldownUntilMs.remove(ownerKey);
+            if (chosenOwner && paidCapabilityGate != null) {
+                paidCapabilityGate.markSucceeded("silent-history:elidlicom:" + LocalDate.now(resolveZoneId()));
+            }
         }
         if (outcome.store() == null || outcome.store().profile() == null || (!outcome.progressed() && before != null)) {
             return false;
@@ -2534,13 +2755,23 @@ public class CommunityHubService {
         if (stored == null || stored.profile() == null || stored.syncedAtInstant() == null) {
             return true;
         }
-        if (Duration.between(stored.syncedAtInstant(), now).toHours() >= 6) {
+        boolean ownerFullHistory = AccountStore.retainsFullHistory(stored.profile().username());
+        if (Duration.between(stored.syncedAtInstant(), now).toMinutes() >= (ownerFullHistory ? 5 : 360)) {
             return true;
         }
         long to = stored.syncedAt();
         long from = TwitterApiIoProvider.cutoffForWindowDays(stored.syncedAtInstant(), 30).getEpochSecond();
-        return !AccountStore.missingRanges(stored.tweetCoverage(), from, to).isEmpty()
-                || !AccountStore.missingRanges(stored.inboundCoverage(), from, to).isEmpty();
+        if (!AccountStore.missingRanges(stored.tweetCoverage(), from, to).isEmpty()
+                || !AccountStore.missingRanges(stored.inboundCoverage(), from, to).isEmpty()) {
+            return true;
+        }
+        if (ownerFullHistory && stored.tweets().size() < stored.profile().totalPostsCount()) {
+            Instant joined = TwitterApiIoProvider.parseAccountJoinedInstant(stored.profile().joinedDate());
+            if (joined != null && AccountStore.contiguousFrom(stored.tweetCoverage(), to) > joined.getEpochSecond()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private CachedAuthorRanks getOrComputeAuthorRanks() {
@@ -2706,17 +2937,46 @@ public class CommunityHubService {
                         String priorDate = base.syncedAtInstant() != null
                                 ? base.syncedAtInstant().atZone(zone).toLocalDate().toString()
                                 : null;
-                        var outcome = twitterApiIoProvider.syncStoreByHours(
-                                uname, base, 24, !canContinueDailyRefresh(base, checkedAt), true, null, uid);
+                        boolean doHead = !canContinueDailyRefresh(base, checkedAt);
+                        boolean bindTop50Scope = !twitterApiIoProvider.isUsingLoopbackBaseUrl() || paidCapabilityGate != null;
+                        var outcome = bindTop50Scope
+                                ? com.xops.hub.provider.PaidCapabilityGate.withCaller(
+                                        handleKey, uid,
+                                        () -> twitterApiIoProvider.syncStoreByHours(uname, base, 24, doHead, true, null, uid))
+                                : twitterApiIoProvider.syncStoreByHours(uname, base, 24, doHead, true, null, uid);
                         verifyAccountOwner(outcome.store().profile(), handleKey, uid);
                         saveStore(handleKey, uid, outcome.store());
                         snapshotCache.remove(lockKey);
+                        String top50RetryKey = "top50-free-sync:" + ownerKey + ":" + today;
                         if (isDailyRefreshComplete(outcome.store())) {
                             recordAccumulatedDateOnly(ownerKey, today, priorDate);
                             syncedCount++;
+                            if (paidCapabilityGate != null) {
+                                paidCapabilityGate.markSucceeded(top50RetryKey);
+                            }
+                        } else if (outcome.degraded() && paidCapabilityGate != null && properties.isFxtwitterEnabled()) {
+                            paidCapabilityGate.scheduleIdempotentRetry(
+                                    top50RetryKey,
+                                    "fxtwitter_free_read",
+                                    handleKey,
+                                    uid,
+                                    "前 50 活跃推友每日免费同步存在未完成项",
+                                    this::runTop50AutoSyncNow
+                            );
                         }
                     }
                 } catch (Exception ex) {
+                    if (paidCapabilityGate != null && properties.isFxtwitterEnabled()
+                            && !(ex instanceof XDataProviderException xde && xde.getStatusCode() == 403)) {
+                        paidCapabilityGate.scheduleIdempotentRetry(
+                                "top50-free-sync:" + ownerKey + ":" + today,
+                                "fxtwitter_free_read",
+                                handleKey,
+                                uid,
+                                ex.getMessage(),
+                                this::runTop50AutoSyncNow
+                        );
+                    }
                     log.warn("Top-50 daily auto-sync failed for @{} (rank={}): {}", uname, rank, ex.getMessage());
                 }
             }

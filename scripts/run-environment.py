@@ -57,7 +57,6 @@ def load_local_minimax(env, path):
     for key in keys:
         env.pop(key, None)
     env.update(values)
-    env["X_CONTENT_ASSISTANT_MODEL_PROVIDER"] = "minimax"
 
 
 def local_minimax_file(explicit):

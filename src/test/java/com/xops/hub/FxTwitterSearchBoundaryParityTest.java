@@ -128,7 +128,7 @@ class FxTwitterSearchBoundaryParityTest {
             try (var f = new Fixture(paid, free, false)) { paidResult = sync(f, original); }
             int beforeFree = paidRequests.size();
             try (var f = new Fixture(paid, free, true)) { freeResult = sync(f, original); }
-            assertThat(freeRequests).hasSize(2);
+            assertThat(freeRequests).hasSize(4);
             List<URI> fallback = paidRequests.subList(beforeFree, paidRequests.size());
             assertThat(fallback).hasSize(2);
             assertThat(query(fallback.get(0))).doesNotContainKey("cursor");
@@ -168,7 +168,7 @@ class FxTwitterSearchBoundaryParityTest {
             return unavailable();
         }); var f = new Fixture(paid, free, true)) {
             var result = sync(f, original);
-            assertThat(freeRequests).hasSize(2);
+            assertThat(freeRequests).hasSize(4);
             assertThat(paidRequests).hasSize(2);
             assertThat(query(paidRequests.get(1)).get("cursor")).isEqualTo("paid-continue");
             assertThat(result.store().inbound()).extracting(AccountStore.StoredInbound::id)

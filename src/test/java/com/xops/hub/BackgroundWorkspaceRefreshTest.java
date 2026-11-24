@@ -204,4 +204,70 @@ class BackgroundWorkspaceRefreshTest {
             pool.shutdown();
         }
     }
+
+    @Test
+    void backgroundRefreshContinuesResumableDailyBatchesUntilComplete() throws Exception {
+        ObjectMapper mapper = new ObjectMapper().findAndRegisterModules();
+        XOpsProperties properties = new XOpsProperties();
+        properties.setDiskCacheDir(temp.resolve("multi").toString());
+        properties.setTwitterapiIoKey("fixture-key");
+        properties.setDefaultProvider("TWITTERAPI_IO");
+        SharedApiExecutor pool = new SharedApiExecutor(properties);
+        Instant cycleAt = Instant.now().minusSeconds(5);
+        long anchor = cycleAt.getEpochSecond();
+        XUserSummary profile = new XUserSummary("multi-id", "multi_owner", "Multi Owner", "", "", false, 0, 0, 2, "");
+        java.util.concurrent.atomic.AtomicInteger syncCalls = new java.util.concurrent.atomic.AtomicInteger();
+        TwitterApiIoProvider provider = new TwitterApiIoProvider(properties, mapper, pool) {
+            @Override
+            public SyncOutcome syncStoreByHours(String username, AccountStore.StoredAccount existing,
+                    int hours, boolean head, boolean daily, String key, String expectedId) {
+                int call = syncCalls.incrementAndGet();
+                long from = anchor - 24 * 3600L;
+                if (call == 1) {
+                    var unattempted = new AccountStore.StoredTweet("p-2", anchor - 120, 'P', "post 2", null, List.of(),
+                            0, new long[]{10, 1, 0, 0, 0}, null, null, anchor - 4000, anchor - 4000, Set.of(), true);
+                    var partial = new AccountStore.StoredAccount(AccountStore.VERSION, profile, anchor, java.util.Map.of(),
+                            List.of(unattempted), List.of(), List.of(new long[]{from, anchor}), List.of(new long[]{from, anchor}),
+                            List.of(), List.of(), List.of(), anchor, false, false, false, List.of(), java.util.Map.of(),
+                            anchor, 0);
+                    return new SyncOutcome(partial, true, false, true, 1, 1, 1, false, false);
+                }
+                var refreshed = new AccountStore.StoredTweet("p-2", anchor - 120, 'P', "post 2", null, List.of(),
+                        0, new long[]{50, 5, 0, 0, 0}, null, null, anchor + 1, anchor + 1, Set.of(), true);
+                var complete = new AccountStore.StoredAccount(AccountStore.VERSION, profile, anchor, java.util.Map.of(),
+                        List.of(refreshed), List.of(), List.of(new long[]{from, anchor}), List.of(new long[]{from, anchor}),
+                        List.of(), List.of(), List.of(), anchor, false, false, false, List.of(), java.util.Map.of(),
+                        anchor, anchor);
+                return new SyncOutcome(complete, true, false, false, 0, 0, 0, true, false);
+            }
+        };
+        AccountStore.StoredAccount old = AccountStore.merge(null, profile, cycleAt.minusSeconds(3600), List.of(), List.of(),
+                List.of(), List.of(), new AccountStore.GraphUpdate(
+                        List.of(), List.of(), Set.of(), false, false, false, false));
+        AccountStore.write(temp.resolve("multi/users/by-id/multi-id/store_v" + AccountStore.VERSION + ".json.gz"), old, mapper);
+        CommunityHubService service = new CommunityHubService(
+                properties, new DemoXDataProvider(), provider, null, mapper);
+        try {
+            var immediate = service.analyzeWorkspaceBundle(
+                    "multi_owner", ReportPeriod.HOURS_24, "TWITTERAPI_IO", false, "127.0.0.1", "multi-id", false, true);
+            assertThat(immediate.backgroundRefreshStatus().state()).isEqualTo("RUNNING");
+            long waitDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+            while (!"SUCCEEDED".equals(service.workspaceRefreshStatus("multi_owner", "TWITTERAPI_IO", "multi-id").state())
+                    && System.nanoTime() < waitDeadline) {
+                Thread.sleep(10);
+            }
+            assertThat(service.workspaceRefreshStatus("multi_owner", "TWITTERAPI_IO", "multi-id").state()).isEqualTo("SUCCEEDED");
+            assertThat(syncCalls.get()).isEqualTo(2);
+
+            var reloaded = service.analyzeWorkspaceBundle(
+                    "multi_owner", ReportPeriod.HOURS_24, "TWITTERAPI_IO", false, "127.0.0.1", "multi-id", false, false);
+            assertThat(reloaded.dailyCacheStatus().canContinue()).isFalse();
+            assertThat(reloaded.dailyCacheStatus().unattemptedMetricPosts()).isZero();
+            assertThat(reloaded.hasMoreHistoryForTarget()).isFalse();
+            assertThat(reloaded.hours24().bannerNotice()).startsWith("最近 24 小时数据与指标已完成本轮同步");
+        } finally {
+            service.stopBackgroundRefreshes();
+            pool.shutdown();
+        }
+    }
 }

@@ -104,7 +104,10 @@
         assistantReviewTag: "",
         assistantReviewScoreBand: "",
         assistantReviewDraftVersion: "",
+        assistantReviewSkill: "",
         assistantSelectedDraftByTopic: {},
+        assistantSelectedSkill: "AUTO",
+        assistantCreationAngle: "",
         assistantOrganizeMode: false,
         assistantLoading: false,
         assistantMutation: "",
@@ -245,6 +248,7 @@
         state.assistantReviewTag = "";
         state.assistantReviewScoreBand = "";
         state.assistantReviewDraftVersion = "";
+        state.assistantReviewSkill = "";
         if ($("assistantTopicSearch")) $("assistantTopicSearch").value = "";
         if ($("assistantTopicStatus")) $("assistantTopicStatus").value = "";
         if ($("assistantTopicAuthor")) $("assistantTopicAuthor").value = "";
@@ -257,10 +261,13 @@
         if ($("assistantReviewTag")) $("assistantReviewTag").value = "";
         if ($("assistantReviewScoreBand")) $("assistantReviewScoreBand").value = "";
         if ($("assistantReviewDraftVersion")) $("assistantReviewDraftVersion").value = "";
+        if ($("assistantReviewSkill")) $("assistantReviewSkill").value = "";
         state.assistantTopicOffset = 0;
         state.assistantRequestedTopicOffset = 0;
         state.assistantTopicHasNext = false;
         state.assistantSelectedDraftByTopic = {};
+        state.assistantCreationAngle = "";
+        if ($("assistantCreationAngleInput")) $("assistantCreationAngleInput").value = "";
         state.assistantOrganizeMode = false;
         state.assistantLoading = false;
         state.assistantMutation = "";
@@ -646,6 +653,44 @@
         return false;
     }
 
+    function isExplicitNonOwnerSession() {
+        const auth = state.authStatus;
+        if (!auth || !auth.loggedIn) return false;
+        if (auth.ownerAllPermissions === true) return false;
+        const uname = String(auth.user?.username || "").replace(/^@+/, "").trim().toLowerCase();
+        if (uname) return uname !== "elidlicom";
+        return auth.ownerAllPermissions === false;
+    }
+
+    function syncPaidUiVisibility() {
+        if (typeof document === "undefined") return;
+        const ownerAllowed = isOwnerAllPermissions();
+        if (typeof document.querySelectorAll === "function") {
+            document.querySelectorAll("[data-paid-entry]").forEach((el) => {
+                el.hidden = !ownerAllowed;
+            });
+        }
+        if (!ownerAllowed) {
+            [
+                "navUnfollowBadge",
+                "navScheduleBadge",
+                "mobileScheduleBadge",
+                "overdueGlobalBanner",
+                "relationshipContinueControls",
+                "contentAssistantShell",
+                "timingQuickNav",
+                "scheduleShareCardBtn",
+                "sendDraftToScheduleBtn"
+            ].forEach((id) => {
+                const el = typeof document.getElementById === "function" ? document.getElementById(id) : null;
+                if (el) el.hidden = true;
+            });
+            if (state.activeTab === "follow-audit" || state.activeTab === "schedule") {
+                switchTab("activity", { historyMode: "replace" });
+            }
+        }
+    }
+
     function hasPeriodAccessDecision() {
         if (isOwnerAllPermissions()) return true;
         return Boolean(
@@ -860,6 +905,7 @@
             sideBtn.title = `当前参数：${nameText} (${verText})`;
         }
 
+        const canManage = Boolean(status && status.canManage);
         const metaEl = $("algoConfigMetaLine");
         if (metaEl) {
             const srcLabel = status && status.source === "LOCAL_OVERRIDE" ? "本地热覆盖" : "内置基线";
@@ -870,7 +916,7 @@
             const rankerLabel = { vm_ranker: "主排序模型", heavy_ranker: "精排模型", light_ranker: "粗排模型" }[rankerRaw] || rankerRaw;
             const commitLabel = ev && ev.upstreamCommit ? ` · 上游基线 ${ev.upstreamCommit}（${rankerLabel}）` : "";
             const overridePath = status && status.overridePath ? status.overridePath : "";
-            metaEl.textContent = `生效规则：${nameText} (${verText})${commitLabel} · 更新日期 ${updatedAt} · 来源：${srcLabel} · 指纹 ${fp}${overridePath ? ` · 覆盖文件 ${overridePath}` : ""}`;
+            metaEl.textContent = `生效规则：${nameText} (${verText})${commitLabel} · ${updatedAt} · ${srcLabel} · 指纹 ${fp}${overridePath ? ` · ${overridePath}` : ""}${canManage ? "" : " · 只读"}`;
         }
 
         const logsEl = $("algoChangelogList");
@@ -881,16 +927,8 @@
                 .join("");
         }
 
-        const canManage = Boolean(status && status.canManage);
         const actionRow = $("algoConfigActionRow");
         if (actionRow) actionRow.hidden = !canManage;
-
-        const hintEl = $("algoConfigPermHint");
-        if (hintEl) {
-            hintEl.textContent = canManage
-                ? "当前会话具备算法热更新权限：修改下方 JSON 后点击「保存并热生效」，系统将立即无外部 API 开销重算推荐与评分（也可直接修改磁盘覆盖文件自动热加载）。"
-                : "只读视图：仅授权管理员或本地调试模式可修改全局规则；磁盘覆盖文件变更后后端会自动零停机重载。";
-        }
 
         const editorEl = $("algoProfileJsonInput");
         if (editorEl) {
@@ -1120,6 +1158,17 @@
         if (!isLoggedIn()) {
             showToast("请先使用 X 账号授权登录");
             return;
+        }
+        if (
+            (tabId === "follow-audit" || tabId === "schedule") &&
+            state.authStatus?.ownerAllPermissions !== true &&
+            (state.authStatus?.ownerAllPermissions === false ||
+                Boolean(
+                    state.authStatus?.user?.username &&
+                        String(state.authStatus.user.username).replace(/^@+/, "").trim().toLowerCase() !== "elidlicom"
+                ))
+        ) {
+            tabId = "activity";
         }
         if (state.activeTab === tabId && historyMode === "push") {
             window.scrollTo({ top: 0, behavior: "smooth" });
@@ -1462,6 +1511,7 @@
             if (state.authStatus?.ownerAllPermissions === true && !state.assistantAccess) {
                 state.assistantAccess = { allowed: true };
             }
+            syncPaidUiVisibility();
             syncPeriodButtons();
             syncScheduleAuthBanner();
         } else {
@@ -1479,6 +1529,7 @@
             syncSettingsAccountMenu(null);
 
             $("oauthAdminSetupHint").hidden = true;
+            syncPaidUiVisibility();
         }
         syncAuthConnectionUI();
     }
@@ -1532,7 +1583,7 @@
 
     function updateRefreshButtonState() {
         const relationshipControls = $("relationshipContinueControls");
-        relationshipControls.hidden = state.storedMode || !isLoggedIn() || state.pendingRelationshipChecks <= 0;
+        relationshipControls.hidden = !isOwnerAllPermissions() || state.storedMode || !isLoggedIn() || state.pendingRelationshipChecks <= 0;
         const relationshipBtn = $("continueRelationshipsBtn");
         relationshipBtn.disabled = state.isFetching || state.isLoggingOut;
         relationshipBtn.textContent = `继续核验（${state.pendingRelationshipChecks}）`;
@@ -2013,12 +2064,12 @@
         const handle = String(author.username || "elidlicom").replace(/^@+/, "");
         const badgeEl = document.getElementById("authorModalBadge");
         if (badgeEl) {
-            if (data.modalReasonCode === "MANUAL_PREVIEW") {
-                const countVal = Number(data.usageCount || state.usageCount || 0);
-                badgeEl.textContent = countVal > 0 ? `作者主页 · 第 ${countVal} 次使用` : "作者主页 · 开源说明";
-            } else {
-                badgeEl.textContent = data.modalBadgeText || `第 ${data.usageCount || state.usageCount || 3} 次使用`;
-            }
+            const countVal = Number(data.usageCount || state.usageCount || 0);
+            const badgeText = data.modalReasonCode === "MANUAL_PREVIEW"
+                ? (countVal > 0 ? `第 ${countVal} 次使用` : "")
+                : (data.modalBadgeText || `第 ${countVal || 3} 次使用`);
+            badgeEl.textContent = badgeText;
+            badgeEl.hidden = !badgeText;
         }
         $("authorModalTitle").textContent = data.modalTitle || `你好，我是作者 @${handle}`;
 
@@ -2339,18 +2390,22 @@
             const isDemo = report.provider === "DEMO" || /DEMO|仿真|演示/i.test(rawNotice);
             // Only recognize complete, built-in notices; unfamiliar text stays visible as a caution.
             const knownDailyNotice = /^(?:最近 24 小时数据与指标已完成本轮同步；满 1 小时后再次检查更新。|本轮最近 24 小时数据或指标尚未补齐；继续补充可获取数据，未计为完整新鲜缓存。|本轮可请求的数据已尝试完毕，仍有未确认项；保留原值和缺失状态，下一小时再检查，不重复请求本轮失败项。)已入库 \d+ 条动态、\d+ 条互动；历史数据仍按原覆盖范围累计。$/.test(rawNotice);
+            const knownSwrNotice = rawNotice === "已返回最近一次完整入库快照；后台刷新已受理。";
             const knownStorageNotice =
                 /^单次加载 24 小时并已完成物理落盘（当前滚动保留近 30 天共 \d+ 条动态、\d+ 条互动）(?:（@\w+ 互动第 \d+ 名·已解锁全时间窗口）)?$/.test(rawNotice) ||
                 /^每日物理存储模式：\d+ 条动态、\d+ 条互动已落盘。(?:你位列 @\w+ 互动前 \d+（第 \d+ 名），每日自动同步最近 24 小时并落盘；)?单次仅加载 24 小时，动态保留近 30 天窗口数据。$/.test(rawNotice);
-            const dataIncomplete = status?.timelineCovered === false || status?.inboundCovered === false ||
-                (pendingMetrics > 0 && (!Number.isFinite(unattemptedMetrics) || unattemptedMetrics > 0));
-            const metricsUnavailable = pendingMetrics > 0 && unattemptedMetrics === 0;
-            const relationIncomplete = audit.followersSampleTruncated || audit.followingsSampleTruncated ||
-                Number(audit.unknownFollowBackCount || 0) > 0 || Number(audit.unknownFollowingCount || 0) > 0 ||
-                state.pendingRelationshipChecks > 0;
-            const needsAttention = Boolean(status?.lastAttemptDegraded || relationIncomplete || act.sampleCapped ||
-                shortCoverage || (rawNotice && !isDemo && !knownDailyNotice && !knownStorageNotice) ||
-                (status?.canContinue && !dataIncomplete && !metricsUnavailable));
+            const canContinueSync = Boolean(status?.canContinue);
+            const dataIncomplete = canContinueSync && (status?.timelineCovered === false || status?.inboundCovered === false ||
+                (pendingMetrics > 0 && (!Number.isFinite(unattemptedMetrics) || unattemptedMetrics > 0)));
+            const metricsUnavailable = !canContinueSync && pendingMetrics > 0 && unattemptedMetrics === 0;
+            const followRateComplete = audit.followBackRateComplete ??
+                (!audit.followersSampleTruncated && !audit.followingsSampleTruncated && Number(audit.unknownFollowBackCount || 0) === 0);
+            const relationIncomplete = state.pendingRelationshipChecks > 0 ||
+                !followRateComplete || Number(audit.unknownFollowBackCount || 0) > 0;
+            const unexpectedNotice = Boolean(rawNotice && !isDemo && !knownDailyNotice && !knownSwrNotice && !knownStorageNotice);
+            const needsAttention = Boolean(status?.lastAttemptDegraded || relationIncomplete || unexpectedNotice ||
+                (!status && (act.sampleCapped || shortCoverage)) ||
+                (canContinueSync && !dataIncomplete && !metricsUnavailable));
             let summaryText = "数据状态";
             if (state.storedMode) {
                 summaryText = needsAttention ? "查看已保存数据 · 数据状态需留意" : "查看已保存数据";
@@ -2368,13 +2423,31 @@
             syncSummary.textContent = summaryText;
             const syncDetails = document.getElementById("syncStatusDetails");
             if (syncDetails) {
-                syncDetails.classList?.toggle?.("is-attention", isDemo || needsAttention || dataIncomplete || metricsUnavailable);
+                if (!syncDetails._toggleBound && typeof syncDetails.addEventListener === "function") {
+                    syncDetails._toggleBound = true;
+                    syncDetails.addEventListener("toggle", () => {
+                        if (!syncDetails._programmaticToggle) {
+                            syncDetails._autoOpened = false;
+                        }
+                    });
+                }
+                syncDetails.classList?.toggle?.("is-attention", isDemo || needsAttention || dataIncomplete);
                 const attentionKey = needsAttention && !isDemo
                     ? [rawNotice, shortCoverage, summaryText, Boolean(status?.lastAttemptDegraded),
                         audit.followersSampleTruncated, audit.followingsSampleTruncated,
                         audit.unknownFollowBackCount, audit.unknownFollowingCount, state.pendingRelationshipChecks].join("|")
                     : "";
-                if (attentionKey && attentionKey !== syncDetails._lastAttentionKey) syncDetails.open = true;
+                if (attentionKey && attentionKey !== syncDetails._lastAttentionKey) {
+                    syncDetails._programmaticToggle = true;
+                    syncDetails.open = true;
+                    syncDetails._autoOpened = true;
+                    syncDetails._programmaticToggle = false;
+                } else if (!attentionKey && syncDetails._autoOpened) {
+                    syncDetails._programmaticToggle = true;
+                    syncDetails.open = false;
+                    syncDetails._autoOpened = false;
+                    syncDetails._programmaticToggle = false;
+                }
                 syncDetails._lastAttentionKey = attentionKey;
             }
         }
@@ -3244,6 +3317,7 @@
 
     function assistantTaskKindLabel(kind) {
         const map = {
+            DRAFT: "极速成稿",
             RESEARCH: "深度研究与成稿",
             OPTIMIZE: "定向改稿润色",
             CLASSIFY: "选题智能归并",
@@ -3371,39 +3445,90 @@
         }) : "";
     }
 
+    function assistantAuthorChipHtml(author, options = {}) {
+        if (!author) return "";
+        const username = String(author.username || author.handle || "").replace(/^@+/, "");
+        const displayName = String(author.displayName || author.authorName || username || "未知作者").trim();
+        const avatarUrl = String(author.avatarUrl || author.authorAvatarUrl || "").trim();
+        const verified = Boolean(author.verified || author.authorVerified);
+        const avatar = avatarHtml({ username: username || displayName, displayName, avatarUrl }, "sm");
+        const extraCount = Number(options.extraCount || 0);
+        return `<span class="assistant-author-chip${options.topic ? " is-topic" : ""}" data-i18n-ignore>
+            ${avatar}
+            <span class="assistant-author-name">${escapeHtml(displayName)}</span>
+            ${verifiedSvgHtml(verified)}
+            ${username ? `<span class="assistant-author-handle">@${escapeHtml(username)}</span>` : ""}
+            ${extraCount > 0 ? `<span class="assistant-author-extra">+${extraCount}</span>` : ""}
+        </span>`;
+    }
+
+    function resolveTopicAuthors(topic, topicMaterials, sourcesByKey) {
+        if (Array.isArray(topic?.authors) && topic.authors.length) return topic.authors;
+        const result = [];
+        const seen = new Set();
+        for (const mat of (topicMaterials || [])) {
+            const uname = String(mat.username || "").replace(/^@+/, "");
+            const key = (mat.authorId || uname.toLowerCase()).trim();
+            if (!key || seen.has(key)) continue;
+            seen.add(key);
+            const fallbackSrc = sourcesByKey?.get(mat.authorId) || sourcesByKey?.get(uname.toLowerCase());
+            result.push({
+                authorId: mat.authorId || "",
+                username: uname,
+                displayName: mat.authorName || fallbackSrc?.displayName || uname,
+                avatarUrl: mat.authorAvatarUrl || fallbackSrc?.avatarUrl || "",
+                verified: Boolean(mat.authorVerified || fallbackSrc?.verified)
+            });
+        }
+        return result;
+    }
+
     function renderAssistantTopics(dashboard) {
         const topics = dashboard.topics || [];
         const list = $("assistantTopicList");
         $("assistantTopicPageLabel").textContent = `第 ${Math.floor(state.assistantTopicOffset / 100) + 1} 页`;
         $("assistantTopicPrevBtn").disabled = state.assistantTopicOffset === 0;
         $("assistantTopicNextBtn").disabled = !state.assistantTopicHasNext;
+        renderAssistantSkillBar(dashboard);
         renderAssistantHotTagChips($("assistantTopicTagChips"), dashboard, state.assistantTopicTag || "", "data-assistant-topic-tag-chip");
         const drafts = dashboard.drafts || [];
         const materials = dashboard.materials || [];
+        const sourcesByKey = new Map();
+        for (const src of (dashboard.sources || [])) {
+            if (src.authorId) sourcesByKey.set(src.authorId, src);
+            if (src.username) sourcesByKey.set(String(src.username).toLowerCase(), src);
+        }
         const draftedTopicIds = new Set(drafts.map((item) => item.topicId).filter(Boolean));
         const isAnalyzable = (material) => Boolean(materialText(material))
             && !["NO_ANALYZABLE_TEXT", "MEDIA_ONLY", "MEDIA_URL_ONLY"].includes(String(material?.textStatus || "").toUpperCase());
         list.innerHTML = topics.length ? topics.map((topic) => {
             const selected = topic.id === state.assistantSelectedTopicId;
             const assessment = topic.assessment || {};
-            const scoreStage = Number.isFinite(topic.score)
-                ? (assessment.evidenceStatus === "RESEARCH_VERIFIED" ? " · 研究后" : " · 初评") : "";
+            const scoreStage = Number.isFinite(topic.score) && assessment.evidenceStatus === "RESEARCH_VERIFIED"
+                ? " · 已核验" : "";
             const hasDraft = draftedTopicIds.has(topic.id);
             const topicMaterials = materials.filter((material) =>
                 material.topicId === topic.id || (topic.materialIds || []).includes(material.id));
+            const topicAuthors = resolveTopicAuthors(topic, topicMaterials, sourcesByKey);
+            const authorHtml = topicAuthors.length
+                ? assistantAuthorChipHtml(topicAuthors[0], { topic: true, extraCount: topicAuthors.length - 1 })
+                : "";
             const primaryMaterialId = topicMaterials.length
                 ? (topicMaterials.find(isAnalyzable)?.id || "")
                 : (Array.isArray(topic.materialIds) && topic.materialIds.length ? topic.materialIds[0] : "");
             const quickActionHtml = hasDraft
-                ? `<button type="button" class="x-outline-pill sm assistant-quick-btn" data-assistant-focus-draft="${escapeHtml(topic.id)}">定位改稿</button>`
+                ? `<button type="button" class="x-outline-pill sm assistant-quick-btn" data-assistant-focus-draft="${escapeHtml(topic.id)}">改稿</button>`
                 : (primaryMaterialId
-                    ? `<button type="button" class="x-blue-pill sm assistant-quick-btn" data-assistant-research="${escapeHtml(primaryMaterialId)}" data-assistant-topic-id="${escapeHtml(topic.id)}">一键研究成稿</button>`
+                    ? `<button type="button" class="x-blue-pill sm assistant-quick-btn" data-assistant-research="${escapeHtml(primaryMaterialId)}" data-research-mode="FAST" data-assistant-topic-id="${escapeHtml(topic.id)}">极速成稿</button><button type="button" class="x-outline-pill sm assistant-quick-btn" data-assistant-research="${escapeHtml(primaryMaterialId)}" data-research-mode="RESEARCH" data-assistant-topic-id="${escapeHtml(topic.id)}">联网深挖</button>`
                     : "");
+            const recSkillText = topic.recommendedSkillName ? ` · ${escapeHtml(topic.recommendedSkillName)}` : "";
             return `<div role="button" tabindex="0" class="assistant-topic-card${selected ? " active" : ""}" data-assistant-topic="${escapeHtml(topic.id)}">
                 <span class="assistant-topic-score">${assistantScoreText(topic.score)}</span>
-                <span class="assistant-topic-copy"><strong>${escapeHtml(topic.title || "未命名选题")}</strong>
+                <span class="assistant-topic-copy">
+                    ${authorHtml}
+                    <strong>${escapeHtml(topic.title || "未命名选题")}</strong>
                     <small>${escapeHtml(topic.summary || topic.reason || "等待补充摘要")}</small>
-                    <span class="assistant-score-line">价值 ${assistantScoreText(topic.valueScore)}${assistantScoreCoverage(assessment.topicCoverage)} · 传播 ${assistantScoreText(topic.reachScore)}${assistantScoreCoverage(assessment.reachCoverage)}${scoreStage} · ${(topic.materialIds || []).length} 条来源</span>
+                    <span class="assistant-score-line">价值 ${assistantScoreText(topic.valueScore)} · 传播 ${assistantScoreText(topic.reachScore)} · ${(topic.materialIds || []).length} 源${scoreStage}${recSkillText}</span>
                     ${quickActionHtml ? `<span class="assistant-topic-quick-actions">${quickActionHtml}</span>` : ""}
                 </span>
             </div>`;
@@ -3586,6 +3711,78 @@
         return `当前 ${length.actual} 个汉字 · 目标 ${length.min}–${length.max} · ${length.met ? "已达标" : "未达标"}`;
     }
 
+    function computeAssistantDraftMetrics(rawText) {
+        const text = String(rawText || "");
+        const trimmed = text.trim();
+        const hanMatches = trimmed.match(/\p{Script=Han}/gu);
+        const hanCount = hanMatches ? hanMatches.length : 0;
+        const fallbackWeighted = (src) => {
+            if (!src) return 0;
+            const normalized = src.replace(/https?:\/\/\S+/gi, "x".repeat(23));
+            let len = 0;
+            for (const ch of normalized) {
+                len += ch.codePointAt(0) <= 0x7f ? 1 : 2;
+            }
+            return len;
+        };
+        const weighted = typeof computeWeightedTweetLength === "function"
+            ? computeWeightedTweetLength(text)
+            : fallbackWeighted(text);
+        const tier = weighted <= 280 ? "STANDARD" : "PREMIUM";
+        const tierLabel = weighted <= 280
+            ? `X 权重 ${weighted}/280（标准帖）`
+            : `X 权重 ${weighted}/280（Premium 长帖）`;
+        let hook = { warn: false, label: "" };
+        if (trimmed) {
+            const firstSegment = trimmed.split(/\r?\n/)[0] || "";
+            const firstHan = (firstSegment.match(/\p{Script=Han}/gu) || []).length;
+            if (/^\s*(值得注意的是|总而言之|今天我们来|让我们看看|接下来|在当今|随着.{1,15}发展|众所周知|大家好)/.test(firstSegment)) {
+                hook = { warn: true, label: "首句偏铺垫，宜直接抛判断" };
+            } else if (firstHan > 90) {
+                hook = { warn: true, label: "首段偏密，前两行宜断句留白" };
+            } else {
+                hook = { warn: false, label: "前两行钩子紧凑" };
+            }
+        }
+        const urlMatches = text.match(/https?:\/\/[^\s<>"')\]）】，。；！？]+/gi) || [];
+        const hasExternalLink = urlMatches.some((rawUrl) => {
+            const hostMatch = rawUrl.match(/^https?:\/\/([^/?#:]+)/i);
+            const host = hostMatch ? hostMatch[1].toLowerCase() : "";
+            return Boolean(host)
+                && host !== "x.com" && !host.endsWith(".x.com")
+                && host !== "twitter.com" && !host.endsWith(".twitter.com");
+        });
+        return { hanCount, weighted, tier, tierLabel, hook, hasExternalLink };
+    }
+
+    function renderAssistantDraftMetricsHtml(rawText) {
+        const m = computeAssistantDraftMetrics(rawText);
+        const esc = typeof escapeHtml === "function" ? escapeHtml : (v) => String(v ?? "");
+        const parts = [
+            `<span>${m.hanCount} 汉字</span>`,
+            `<span class="${m.weighted > 280 ? "is-premium" : "is-standard"}">${esc(m.tierLabel)}</span>`
+        ];
+        if (m.hook.label) {
+            parts.push(`<span class="${m.hook.warn ? "is-warn" : "is-ok"}">${esc(m.hook.label)}</span>`);
+        }
+        if (m.hasExternalLink) {
+            parts.push(`<span class="is-warn">正文含外链，宜移至首评规避降权</span>`);
+        }
+        return parts.join("");
+    }
+
+    function resolveAssistantDraftSourcePost(draft, materials) {
+        const list = Array.isArray(materials) ? materials : [];
+        const matched = (draft?.materialId ? list.find((item) => item?.id === draft.materialId) : null) || list[0] || null;
+        if (!matched) return null;
+        const rawId = String(matched.id || "").trim();
+        const urlMatch = String(matched.sourceUrl || "").match(/https?:\/\/(?:(?:www|mobile)\.)?(?:x|twitter)\.com\/([A-Za-z0-9_]{1,15})\/status\/([0-9]+)/i);
+        const tweetId = /^[0-9]+$/.test(rawId) ? rawId : (urlMatch ? urlMatch[2] : "");
+        const rawUser = String(matched.username || (urlMatch ? urlMatch[1] : "") || "").trim().replace(/^@/, "");
+        if (!tweetId || !/^[A-Za-z0-9_]{1,15}$/.test(rawUser)) return null;
+        return { tweetId, url: `https://x.com/${rawUser}/status/${tweetId}` };
+    }
+
     function assistantDraftNumberChangesText(changes) {
         return changes?.met === false && changes.added?.length
             ? `较基线新增数字 ${changes.added.join("、")}，请审核。` : "";
@@ -3656,6 +3853,42 @@
         return parts.join("");
     }
 
+    const DEFAULT_ASSISTANT_SKILLS = [
+        { id: "BREAKING_FLASH", name: "突发快评", badge: "快讯爆款", summary: "首句爆点定性 + 核心增量事实 + 二阶影响判断" },
+        { id: "DEEP_BREAKDOWN", name: "深度拆解", badge: "高藏高转", summary: "反常识立论 + 底层机制拆解 + 隐含边界" },
+        { id: "SHARP_OPINION", name: "犀利观点", badge: "高评论互动", summary: "非共识判断 + 事实支点 + 具象分歧点" },
+        { id: "ACTIONABLE_LIST", name: "干货清单", badge: "高收藏转化", summary: "直击问题 + 高信噪比要点清单 + 适用场景" }
+    ];
+
+    function assistantWritingSkills(dashboard) {
+        const list = dashboard?.writingSkills;
+        return Array.isArray(list) && list.length ? list : DEFAULT_ASSISTANT_SKILLS;
+    }
+
+    function assistantSkillLabel(skillId, dashboard) {
+        if (!skillId) return "";
+        const found = assistantWritingSkills(dashboard || state.assistantDashboard).find((item) => item.id === skillId);
+        return found ? found.name : skillId;
+    }
+
+    function renderAssistantSkillBar(dashboard) {
+        const bar = $("assistantSkillBar");
+        if (!bar) return;
+        const skills = assistantWritingSkills(dashboard);
+        const validIds = new Set(["AUTO", ...skills.map((item) => item.id)]);
+        const activeId = validIds.has(state.assistantSelectedSkill)
+            ? state.assistantSelectedSkill : "AUTO";
+        state.assistantSelectedSkill = activeId;
+        const selectedTopic = (dashboard?.topics || []).find((item) => item.id === state.assistantSelectedTopicId);
+        const autoHint = selectedTopic?.recommendedSkillName || "自动";
+        const autoActive = activeId === "AUTO";
+        const autoChip = `<button type="button" class="pill-chip sm assistant-skill-chip${autoActive ? " active" : ""}" data-assistant-skill="AUTO" aria-pressed="${autoActive ? "true" : "false"}" title="按当前选题内容特征自动匹配最合适的爆款体裁">智能匹配<em>${escapeHtml(autoHint)}</em></button>`;
+        bar.innerHTML = autoChip + skills.map((skill) => {
+            const active = skill.id === activeId;
+            return `<button type="button" class="pill-chip sm assistant-skill-chip${active ? " active" : ""}" data-assistant-skill="${escapeHtml(skill.id)}" aria-pressed="${active ? "true" : "false"}" title="${escapeHtml(skill.summary || "")}">${escapeHtml(skill.name)}</button>`;
+        }).join("");
+    }
+
     function renderAssistantMaterialCard(material, draftedMaterialIds, options = {}) {
         const badge = assistantMaterialStatusBadge(material);
         const fmt = typeof formatAssistantDateTime === "function" ? formatAssistantDateTime : () => "";
@@ -3666,18 +3899,42 @@
             : (material.text || material.quotedText || material.articleText))
             && !["NO_ANALYZABLE_TEXT", "MEDIA_ONLY", "MEDIA_URL_ONLY"].includes(String(material.textStatus || "").toUpperCase());
         const url = material.sourceUrl && typeof safeHttpUrl === "function" ? safeHttpUrl(material.sourceUrl) : "";
+        const fallbackSrc = (state.assistantDashboard?.sources || []).find((s) =>
+            (material.authorId && s.authorId === material.authorId)
+            || (material.username && String(s.username || "").toLowerCase() === String(material.username).toLowerCase()));
+        const fallbackName = material.authorName || fallbackSrc?.displayName || material.username || fallbackSrc?.username || "unknown";
+        const authorHtml = typeof assistantAuthorChipHtml === "function"
+            ? assistantAuthorChipHtml({
+                username: material.username || fallbackSrc?.username || "unknown",
+                displayName: fallbackName,
+                avatarUrl: material.authorAvatarUrl || fallbackSrc?.avatarUrl || "",
+                verified: Boolean(material.authorVerified || fallbackSrc?.verified)
+            })
+            : `<strong>@${escapeHtml(material.username || "unknown")}</strong>`;
+        const formatMetric = (n) => typeof fmtNum === "function" ? fmtNum(n) : String(n);
+        const engagementParts = [];
+        if (Number(material.views) > 0) engagementParts.push(`浏览 ${formatMetric(Number(material.views))}`);
+        if (Number(material.reposts) > 0) engagementParts.push(`转 ${formatMetric(Number(material.reposts))}`);
+        if (Number(material.replies) > 0) engagementParts.push(`评 ${formatMetric(Number(material.replies))}`);
+        if (Number(material.likes) > 0) engagementParts.push(`赞 ${formatMetric(Number(material.likes))}`);
+        const engagementHtml = engagementParts.length
+            ? `<span class="assistant-material-engagement">${escapeHtml(engagementParts.join(" · "))}</span>`
+            : "";
         return `<article class="assistant-material">
             ${options.selectable ? `<label class="assistant-material-select"><input type="checkbox" data-assistant-material-id="${escapeHtml(material.id)}" />选择</label>` : ""}
-            <div class="assistant-material-meta"><strong>@${escapeHtml(material.username || "unknown")}</strong>
+            <div class="assistant-material-meta">${authorHtml}
                 ${publishedText ? `<span>${escapeHtml(publishedText)}</span>` : ""}
                 ${collectedText ? `<span>${escapeHtml(collectedText)}</span>` : ""}
+                ${engagementHtml}
                 <span class="assistant-state ${badge.cls}">${escapeHtml(badge.label)}</span>
             </div>
             ${renderAssistantMaterialBody(material)}
             <div class="assistant-material-actions">
                 ${url ? `<a href="${url}" target="_blank" rel="noopener noreferrer">查看原帖 ↗</a>` : ""}
                 ${options.showTopicJump && material.topicId ? `<button type="button" class="link-inline-btn" data-assistant-open-topic="${escapeHtml(material.topicId)}">查看所属选题</button>` : ""}
+                ${analyzable ? `<button type="button" class="link-inline-btn" data-assistant-research="${escapeHtml(material.id)}" data-research-mode="FAST">极速成稿</button>` : ""}
                 ${analyzable ? `<button type="button" class="link-inline-btn" data-assistant-research="${escapeHtml(material.id)}">研究并生成</button>` : ""}
+                ${analyzable && draftedMaterialIds.has(material.id) ? `<button type="button" class="link-inline-btn" data-assistant-research="${escapeHtml(material.id)}" data-research-mode="FAST" data-regenerate="true">极速重成稿</button>` : ""}
                 ${analyzable && draftedMaterialIds.has(material.id) ? `<button type="button" class="link-inline-btn" data-assistant-research="${escapeHtml(material.id)}" data-regenerate="true">重新研究</button>` : ""}
             </div>
         </article>`;
@@ -3723,34 +3980,50 @@
         const researchBlockHtml = draft?.research && typeof renderAssistantResearch === "function"
             ? `<details class="assistant-collapsible assistant-evidence-collapsible"><summary>研究依据</summary>${renderAssistantResearch(draft.research)}</details>`
             : "";
+        const sourcePost = draft ? resolveAssistantDraftSourcePost(draft, materials) : null;
         const draftHtml = draft ? `<div class="assistant-draft" data-draft-id="${escapeHtml(draft.id)}" data-draft-version="${Number(draft.version || 0)}">
             <div class="assistant-pane-head"><h3 id="assistantDraftTitle">初稿 v${Number(draft.version || 0)}</h3>
                 <div class="assistant-draft-head-actions">
+                    ${draft.skillId ? `<span class="assistant-state ok">${escapeHtml(assistantSkillLabel(draft.skillId, dashboard))}</span>` : ""}
                     ${topicDrafts.length > 1 ? `<select id="assistantDraftSelect" class="x-select" aria-label="选择独立稿件">${topicDrafts.map((item, index) =>
                         `<option value="${escapeHtml(item.id)}"${item.id === draft.id ? " selected" : ""}>稿件 ${index + 1} · v${Number(item.version || 0)}</option>`).join("")}</select>` : ""}
                     <button type="button" class="x-outline-pill sm" data-assistant-history="${escapeHtml(draft.id)}">版本记录</button>
                 </div></div>
             ${renderAssistantEvidenceChanges(draft, materials[0]?.id)}
+            ${draft.angleInstruction ? `<small class="assistant-draft-angle">${escapeHtml(draft.angleInstruction)}</small>` : ""}
             <textarea id="assistantDraftEditor" rows="9" data-i18n-ignore>${escapeHtml(draft.text || "")}</textarea>
+            <div id="assistantDraftLiveMetrics" class="assistant-draft-metrics" data-i18n-ignore>${renderAssistantDraftMetricsHtml(draft.text || "")}</div>
             <p id="assistantDraftLength" class="inline-feedback"${draft.hanLength ? "" : " hidden"}>${escapeHtml(assistantDraftLengthText(draft.hanLength))}</p>
             <p id="assistantDraftNumberChanges" class="inline-feedback is-error"${numberChangesText ? "" : " hidden"}>${escapeHtml(numberChangesText)}</p>
             ${renderAssistantConstraintRepair(draft.constraintRepair, "SUCCEEDED")}
             <p class="inline-feedback" id="assistantDraftSaveState" role="status"></p>
-            <div class="assistant-optimize-presets" role="group" aria-label="快捷改稿指令">
-                <button type="button" class="pill-chip sm" data-assistant-optimize-preset="将正文控制在180–220个汉字以内，保留核心事实与原始数据，不要新增任何数字" data-draft-id="${escapeHtml(draft.id)}">180–220字</button>
-                <button type="button" class="pill-chip sm" data-assistant-optimize-preset="结论前置：第一句直接给出核心判断，再展开关键论据，不要新增任何数字" data-draft-id="${escapeHtml(draft.id)}">结论前置</button>
-                <button type="button" class="pill-chip sm" data-assistant-optimize-preset="改为更自然口语化的表达，去除AI腔、套话与生硬过渡词，保持原意且不新增数字" data-draft-id="${escapeHtml(draft.id)}">口语化去AI味</button>
-                <button type="button" class="pill-chip sm" data-assistant-optimize-preset="仅做文字润色与节奏优化，保持原有结构，严禁新增任何数字、百分比或未核实信息" data-draft-id="${escapeHtml(draft.id)}">仅润色禁增数字</button>
-            </div>
-            <div class="assistant-draft-actions">
-                <input id="assistantOptimizeInstruction" type="text" placeholder="输入改稿要求…" aria-label="改稿要求" />
-                <button type="button" class="x-outline-pill sm" data-assistant-optimize="${escapeHtml(draft.id)}">生成新版本</button>
+            <div class="assistant-revision-panel">
+                <div class="assistant-optimize-presets" role="group" aria-label="切换体裁与改稿快捷项">
+                    ${assistantWritingSkills(dashboard).map((skill) =>
+                        `<button type="button" class="pill-chip sm${draft.skillId === skill.id ? " active" : ""}" data-assistant-skill-rewrite="${escapeHtml(skill.id)}" data-draft-id="${escapeHtml(draft.id)}">${escapeHtml(skill.name)}</button>`
+                    ).join("")}
+                    <span class="assistant-preset-sep" aria-hidden="true"></span>
+                    <button type="button" class="pill-chip sm" data-assistant-optimize-preset="精炼为单条标准推文篇幅（控制在115个汉字以内，总长不超过280权重），第一句直接给出最硬结论，保留核心事实且不要新增任何数字" data-draft-id="${escapeHtml(draft.id)}">≤280短帖</button>
+                    <button type="button" class="pill-chip sm" data-assistant-optimize-preset="将正文控制在180–220个汉字以内，保留核心事实与原始数据，不要新增任何数字" data-draft-id="${escapeHtml(draft.id)}">180–220字</button>
+                    <button type="button" class="pill-chip sm" data-assistant-optimize-preset="结论前置：第一句直接给出核心判断，再展开关键论据，不要新增任何数字" data-draft-id="${escapeHtml(draft.id)}">结论前置</button>
+                    <button type="button" class="pill-chip sm" data-assistant-optimize-preset="改为更自然口语化的表达，去除AI腔、套话与生硬过渡词，保持原意且不新增数字" data-draft-id="${escapeHtml(draft.id)}">去AI味</button>
+                    <button type="button" class="pill-chip sm" data-assistant-optimize-preset="仅做文字润色与节奏优化，保持原有结构，严禁新增任何数字、百分比或未核实信息" data-draft-id="${escapeHtml(draft.id)}">仅润色</button>
+                </div>
+                <div class="assistant-draft-actions">
+                    <input id="assistantOptimizeInstruction" type="text" placeholder="改稿要求…" aria-label="改稿要求" />
+                    <button type="button" class="x-outline-pill sm" data-assistant-optimize="${escapeHtml(draft.id)}">改写新版本</button>
+                </div>
             </div>
             <div class="assistant-draft-export-actions">
-                <button type="button" class="x-blue-pill sm" data-assistant-schedule="${escapeHtml(draft.id)}">转入定时</button>
-                <button type="button" class="x-outline-pill sm" data-assistant-copy-draft="${escapeHtml(draft.id)}">复制文案</button>
-                <button type="button" class="x-outline-pill sm" data-assistant-simulate-draft="${escapeHtml(draft.id)}">送入草稿体检</button>
-                <button type="button" class="x-outline-pill sm" data-assistant-tweet-intent="${escapeHtml(draft.id)}">直接发推 ↗</button>
+                <div class="assistant-export-secondary">
+                    <button type="button" class="x-outline-pill sm" data-assistant-copy-draft="${escapeHtml(draft.id)}">复制文案</button>
+                    <button type="button" class="x-outline-pill sm" data-assistant-simulate-draft="${escapeHtml(draft.id)}">草稿体检</button>
+                </div>
+                <div class="assistant-export-primary">
+                    <button type="button" class="x-outline-pill sm" data-assistant-tweet-intent="${escapeHtml(draft.id)}">发推 ↗</button>
+                    ${sourcePost ? `<button type="button" class="x-outline-pill sm" data-assistant-quote-intent="${escapeHtml(draft.id)}" data-quote-url="${escapeHtml(sourcePost.url)}">引用原帖 ↗</button><button type="button" class="x-outline-pill sm" data-assistant-publish-now="${escapeHtml(draft.id)}" data-quote-source="true">引用直发</button>` : ""}
+                    <button type="button" class="x-blue-pill sm" data-assistant-schedule="${escapeHtml(draft.id)}">转入定时</button>
+                </div>
             </div>
             ${researchBlockHtml}
             <div id="assistantDraftVersions" class="assistant-version-list" hidden></div>
@@ -3776,9 +4049,9 @@
         const hasObservations = Array.isArray(dashboard.observations)
             && dashboard.observations.some((row) => row.topicId === topic.id || topicDrafts.some((d) => d.id === row.draftId));
         const headPrimaryAction = draft
-            ? `<button type="button" class="x-outline-pill sm" data-assistant-focus-draft="${escapeHtml(topic.id)}">定位改稿</button>`
+            ? ""
             : (primaryMaterial
-                ? `<button type="button" class="x-blue-pill sm" data-assistant-research="${escapeHtml(primaryMaterial.id)}">一键研究成稿</button>`
+                ? `<button type="button" class="x-blue-pill sm" data-assistant-research="${escapeHtml(primaryMaterial.id)}" data-research-mode="FAST">极速成稿</button><button type="button" class="x-outline-pill sm" data-assistant-research="${escapeHtml(primaryMaterial.id)}" data-research-mode="RESEARCH">联网深挖</button>`
                 : "");
         const organizeToggleHtml = materials.length
             ? `<button type="button" class="link-inline-btn" data-assistant-toggle-organize>${organizeMode ? "完成整理" : "整理归并"}</button>`
@@ -3836,8 +4109,8 @@
             lastBackup: "最近自动备份", collectionSpaceAvailable: "采集空间状态"
         };
         const valueMap = {
-            RESPONSES: "Responses 接口", CHAT_COMPLETIONS: "Chat Completions 接口", MESSAGES: "Messages 接口",
-            ready: "正常", not_loaded: "待初始化", unavailable: "暂不可用", SHARED_FILE_ACTIVE: "正常（共享账本生效中）"
+            RESPONSES: "Responses", CHAT_COMPLETIONS: "Chat Completions", MESSAGES: "Messages",
+            ready: "正常", not_loaded: "待初始化", unavailable: "暂不可用", SHARED_FILE_ACTIVE: "正常"
         };
         const formatBytes = (bytes) => {
             const n = Number(bytes);
@@ -3873,8 +4146,10 @@
         const settings = dashboard.settings || {};
         const settingsForm = $("assistantSettingsForm");
         if (!settingsForm.dataset.editRevision || settingsForm.dataset.version === undefined) {
-            const activeProvider = String(settings.provider || dashboard.providerDefaults?.provider || "commandcode").toLowerCase();
-            if ($("assistantProvider")) $("assistantProvider").value = activeProvider === "minimax" ? "minimax" : "commandcode";
+            const activeProvider = String(settings.provider || dashboard.providerDefaults?.provider || "chatgpt").toLowerCase();
+            if ($("assistantProvider")) {
+                $("assistantProvider").value = ["chatgpt", "minimax", "commandcode"].includes(activeProvider) ? activeProvider : "commandcode";
+            }
             $("assistantEnabled").checked = settings.enabled !== false;
             $("assistantInterval").value = settings.intervalMinutes ?? 5;
             $("assistantThreshold").value = settings.threshold ?? 80;
@@ -3903,40 +4178,162 @@
                 selectEl.value = currentVal;
             }
         }
-        $("assistantSourcesList").innerHTML = (dashboard.sources || []).length
-            ? dashboard.sources.map((source) => {
-                const paused = String(source.status || "").toUpperCase() === "PAUSED" || source.enabled === false;
-                const lagging = !paused && source.lagging === true;
-                const gapCount = Array.isArray(source.gaps) ? source.gaps.length : 0;
-                const metaParts = [];
-                if (source.lastSuccessAt) metaParts.push("最近成功 " + fmt(source.lastSuccessAt));
-                if (source.lastAttemptAt && source.lastAttemptAt !== source.lastSuccessAt) {
-                    metaParts.push("最新检查 " + fmt(source.lastAttemptAt));
-                }
-                if (!metaParts.length && !source.error) metaParts.push("等待首次检查");
-                if (lagging) metaParts.push("采集滞后");
-                if (gapCount > 0) metaParts.push(`历史缺口 ${gapCount} 处`);
-                const isBudgetPaused = !paused && Boolean(source.error && String(source.error).includes("外部调用预算已达保护上限"));
-                const stateClass = paused ? "muted" : (isBudgetPaused ? "running" : (source.error ? "error" : (lagging ? "running" : "ok")));
-                const stateText = paused ? "已暂停" : (isBudgetPaused ? "预算保护" : (source.error ? "采集异常" : (lagging ? "采集滞后" : "监听中")));
-                return `<div class="assistant-source-row"><span><strong>@${esc(source.username || source.handle || source.id)}</strong>
-                    <small class="assistant-source-meta-line">${esc(metaParts.join(" · "))}</small>
-                    ${source.error ? `<small class="assistant-source-error-line">${isBudgetPaused ? "保护暂停：" : "异常："}${esc(source.error)}</small>` : ""}</span>
-                    <span class="assistant-state ${stateClass}">${stateText}</span>
-                    <button type="button" class="link-inline-btn" data-assistant-source-action="${paused ? "resume" : "pause"}" data-source-id="${esc(source.id)}">${paused ? "恢复" : "暂停"}</button>
-                    <button type="button" class="link-inline-btn danger" data-assistant-source-action="remove" data-source-id="${esc(source.id)}">移除</button>
-                </div>`;
-            }).join("") : `<div class="assistant-empty compact">尚未添加监听作者。</div>`;
+        const sourcesListEl = $("assistantSourcesList");
+        if (sourcesListEl && !sourcesListEl.contains(document.activeElement)) {
+            sourcesListEl.innerHTML = (dashboard.sources || []).length
+                ? dashboard.sources.map((source) => {
+                    const paused = String(source.status || "").toUpperCase() === "PAUSED" || source.enabled === false;
+                    const lagging = !paused && source.lagging === true;
+                    const gapCount = Array.isArray(source.gaps) ? source.gaps.length : 0;
+                    const tier = [1, 5, 30].includes(Number(source.intervalMinutes)) ? Number(source.intervalMinutes) : 5;
+                    const autoOn = source.autoRepostEnabled === true;
+                    const textMode = String(source.autoRepostTextMode || "AI").toUpperCase() === "TEMPLATE" ? "TEMPLATE" : "AI";
+                    const minScore = Number.isFinite(Number(source.autoRepostMinScore)) ? Number(source.autoRepostMinScore) : 82;
+                    const uname = String(source.username || source.handle || source.id || "").replace(/^@+/, "");
+                    const displayName = String(source.displayName || uname || source.id).trim();
+                    const avatar = typeof avatarHtml === "function"
+                        ? avatarHtml({ username: uname || displayName, displayName, avatarUrl: source.avatarUrl || "" }, "sm")
+                        : "";
+                    const verifiedHtml = typeof verifiedSvgHtml === "function" ? verifiedSvgHtml(Boolean(source.verified)) : "";
+                    const metaParts = [];
+                    const lastOkText = source.lastSuccessAt ? fmt(source.lastSuccessAt) : "";
+                    const lastTryText = source.lastAttemptAt && source.lastAttemptAt !== source.lastSuccessAt
+                        ? fmt(source.lastAttemptAt) : "";
+                    if (lastOkText) metaParts.push(lastOkText);
+                    if (lastTryText && lastTryText !== lastOkText) metaParts.push("检查 " + lastTryText);
+                    if (!metaParts.length && !source.lastSuccessAt && !source.error) metaParts.push("待同步");
+                    if (lagging && source.error) metaParts.push("采集滞后");
+                    if (gapCount > 0) metaParts.push(`历史缺口 ${gapCount} 处`);
+                    const isBudgetPaused = !paused && Boolean(source.error && String(source.error).includes("外部调用预算已达保护上限"));
+                    const stateClass = paused ? "muted" : (isBudgetPaused ? "running" : (source.error ? "error" : (lagging ? "running" : "ok")));
+                    const stateText = paused ? "已暂停" : (isBudgetPaused ? "预算保护" : (source.error ? "采集异常" : (lagging ? "采集滞后" : "监听中")));
+                    return `<div class="assistant-source-card" data-source-row="${esc(source.id)}">
+                        <div class="assistant-source-head">
+                            <div class="assistant-source-identity" data-i18n-ignore>
+                                ${avatar}
+                                <div class="assistant-source-identity-copy">
+                                    <span class="assistant-source-title-line">
+                                        <strong>${esc(displayName)}</strong>
+                                        ${verifiedHtml}
+                                        <span class="assistant-author-handle">@${esc(uname)}</span>
+                                    </span>
+                                    <small class="assistant-source-meta-line">${esc(metaParts.join(" · "))}</small>
+                                    ${source.error ? `<small class="assistant-source-error-line">${isBudgetPaused ? "保护暂停：" : "异常："}${esc(source.error)}</small>` : ""}
+                                </div>
+                            </div>
+                            <div class="assistant-source-controls">
+                                <label class="assistant-setting-toggle is-inline"><input type="checkbox" data-source-autorepost-toggle="${esc(source.id)}"${autoOn ? " checked" : ""} /><span>自动转推</span></label>
+                                <select class="x-select assistant-tier-select" data-assistant-source-tier="${esc(source.id)}" aria-label="采集档位">
+                                    <option value="1"${tier === 1 ? " selected" : ""}>1 分钟</option>
+                                    <option value="5"${tier === 5 ? " selected" : ""}>5 分钟</option>
+                                    <option value="30"${tier === 30 ? " selected" : ""}>30 分钟</option>
+                                </select>
+                                <span class="assistant-state ${stateClass}">${stateText}</span>
+                                <button type="button" class="link-inline-btn" data-assistant-source-action="${paused ? "resume" : "pause"}" data-source-id="${esc(source.id)}">${paused ? "恢复" : "暂停"}</button>
+                                <button type="button" class="link-inline-btn danger" data-assistant-source-action="remove" data-source-id="${esc(source.id)}">移除</button>
+                            </div>
+                        </div>
+                        ${autoOn ? `<div class="assistant-source-autorepost">
+                            <select class="x-select assistant-tier-select" data-source-autorepost-mode="${esc(source.id)}" aria-label="附带文字生成方式">
+                                <option value="AI"${textMode === "AI" ? " selected" : ""}>AI 评述</option>
+                                <option value="TEMPLATE"${textMode === "TEMPLATE" ? " selected" : ""}>固定文案</option>
+                            </select>
+                            <input type="number" class="autorepost-score-input" min="60" max="99" value="${minScore}" data-source-autorepost-score="${esc(source.id)}" aria-label="热度阈值" title="热度阈值（60-99）" />
+                            ${textMode === "TEMPLATE"
+                                ? `<input type="text" class="autorepost-tpl-input" maxlength="240" placeholder="固定附文（支持 {summary}）" value="${esc(source.autoRepostTemplate || "")}" data-source-autorepost-template="${esc(source.id)}" />`
+                                : `<input type="text" class="autorepost-tpl-input" maxlength="200" placeholder="侧重方向（如：重大人事、新品发布）" value="${esc(source.autoRepostRuleHint || "")}" data-source-autorepost-hint="${esc(source.id)}" />`}
+                            <button type="button" class="x-outline-pill sm" data-source-autorepost-save="${esc(source.id)}">保存</button>
+                        </div>` : ""}
+                    </div>`;
+                }).join("") : `<div class="assistant-empty compact">尚未添加监听作者。</div>`;
+        }
+        const piBarEl = $("assistantPiAgentBar");
+        if (piBarEl) {
+            const piInfo = dashboard.piAgent;
+            if (piInfo && piInfo.ready !== true) {
+                piBarEl.hidden = false;
+                const badgeCls = piInfo.installed === false ? "error" : "running";
+                piBarEl.innerHTML = `<div class="assistant-pi-bar-copy">
+                        <span><span class="assistant-state ${badgeCls}">待登录 ChatGPT</span></span>
+                        <small>${esc(piInfo.message || "")}</small>
+                        ${piInfo.loginCommand ? `<code>${esc(piInfo.loginCommand)}</code>` : ""}
+                    </div>
+                    <button type="button" class="x-outline-pill sm" id="verifyPiAgentBtn">检测授权</button>`;
+            } else {
+                piBarEl.hidden = true;
+                piBarEl.innerHTML = "";
+            }
+        }
+        const autoFeedEl = $("assistantAutoRepostFeed");
+        if (autoFeedEl) {
+            const items = Array.isArray(dashboard.autoReposts) ? dashboard.autoReposts.slice(0, 8) : [];
+            if (items.length) {
+                autoFeedEl.hidden = false;
+                const statusLabels = {
+                    PUBLISHED: ["ok", "已引用转发"],
+                    EVALUATING: ["running", "判定中"],
+                    SENDING: ["running", "发送中"],
+                    SKIPPED: ["muted", "未达爆款线"],
+                    SKIPPED_DUPLICATE: ["muted", "同事件去重"],
+                    SKIPPED_LIMIT: ["muted", "达日上限"],
+                    SKIPPED_COOLDOWN: ["muted", "冷却跳过"],
+                    AUTH_REQUIRED: ["error", "需发推授权"],
+                    JUDGE_FAILED: ["error", "判定异常"],
+                    UNCERTAIN: ["error", "回执待核"],
+                    FAILED: ["error", "发送失败"]
+                };
+                autoFeedEl.innerHTML = items.map((item) => {
+                    const st = String(item.status || "").toUpperCase();
+                    const [cls, label] = statusLabels[st] || ["muted", st || "记录"];
+                    const scorePart = Number.isFinite(Number(item.viralScore)) && Number(item.viralScore) > 0
+                        ? ` · 热度 ${Number(item.viralScore)}` : "";
+                    const pubUrl = item.publishedTweetUrl && typeof safeHttpUrl === "function" ? safeHttpUrl(item.publishedTweetUrl) : "";
+                    const srcUrl = item.sourceUrl && typeof safeHttpUrl === "function" ? safeHttpUrl(item.sourceUrl) : "";
+                    const detailText = item.commentText || item.reason || item.error || item.summary || "";
+                    const canRetry = ["AUTH_REQUIRED", "JUDGE_FAILED", "FAILED", "SKIPPED_COOLDOWN"].includes(st);
+                    const itemId = item.materialId || item.id || "";
+                    const retryBtnHtml = canRetry && itemId
+                        ? `<button type="button" class="link-inline-btn" data-autorepost-retry="${esc(itemId)}">重试</button>`
+                        : "";
+                    return `<div class="assistant-autorepost-item">
+                        <div>
+                            <span class="assistant-state ${cls}">${esc(label)}</span>
+                            <strong>@${esc(item.username || "source")}${esc(scorePart)}</strong>
+                            ${detailText ? `<small>${esc(detailText)}</small>` : ""}
+                        </div>
+                        <div class="assistant-draft-head-actions">
+                            ${retryBtnHtml}
+                            ${pubUrl ? `<a href="${pubUrl}" target="_blank" rel="noopener noreferrer">已发推文 ↗</a>`
+                                : (srcUrl ? `<a href="${srcUrl}" target="_blank" rel="noopener noreferrer">原帖 ↗</a>` : "")}
+                        </div>
+                    </div>`;
+                }).join("");
+            } else {
+                autoFeedEl.hidden = true;
+                autoFeedEl.innerHTML = "";
+            }
+        }
         const capabilities = dashboard.capabilities || {};
         const providerDefaults = dashboard.providerDefaults || {};
-        const providerId = String(settings.provider || providerDefaults.provider || "commandcode").toLowerCase();
+        const providerId = String(settings.provider || providerDefaults.provider || "chatgpt").toLowerCase();
         const providerHintEl = $("assistantProviderHint");
         if (providerHintEl) {
-            providerHintEl.textContent = providerId === "minimax" ? "MiniMax · MiniMax-M2.7" : "CommandCode · gpt-5.4";
+            providerHintEl.textContent = providerId === "chatgpt"
+                ? "gpt-6.2-astra low · 200K"
+                : (providerId === "minimax" ? "MiniMax-M2.7 · 200K" : "gpt-5.4 · 128K");
         }
         const advancedDetails = $("assistantAdvancedSettings");
-        if (advancedDetails && (!settings.model || capabilities.ready !== true) && !advancedDetails.dataset?.userToggled) {
-            advancedDetails.open = true;
+        const chatGptOAuthReady = providerId === "chatgpt" && dashboard.piAgent?.ready === true;
+        const capFailed = capabilities.ready !== true
+            && Boolean((capabilities.main && typeof capabilities.main === "object")
+                || (capabilities.research && typeof capabilities.research === "object")
+                || capabilities.checkedAt);
+        if (advancedDetails && !advancedDetails.dataset?.userToggled) {
+            if (chatGptOAuthReady && !capFailed) {
+                advancedDetails.open = false;
+            } else if (!settings.model || capabilities.ready !== true) {
+                advancedDetails.open = true;
+            }
         }
         const suggestedEl = $("assistantSuggestedPeers");
         if (suggestedEl) {
@@ -3985,7 +4382,10 @@
         const mainCap = capabilities.main && typeof capabilities.main === "object" ? capabilities.main : null;
         const resCap = capabilities.research && typeof capabilities.research === "object" ? capabilities.research : null;
         const capabilityDisplay = {};
-        if (capabilities.ready === true) {
+        if (providerId === "chatgpt") {
+            capabilityDisplay["订阅授权"] = dashboard.piAgent?.ready === true ? "已授权" : "待登录";
+        }
+        if (capabilities.ready === true || chatGptOAuthReady) {
             capabilityDisplay["能力验证"] = "已就绪";
         } else if (mainCap || resCap || capabilities.checkedAt) {
             capabilityDisplay["能力验证"] = "未通过";
@@ -4014,22 +4414,29 @@
         $("assistantCapabilityStatus").innerHTML = assistantKeyValueRows(capabilityDisplay);
         const style = dashboard.style || {};
         const coverage = style.coverage || {};
-        const styleStatus = { COMPLETE: "采集完成", EXHAUSTED: "上游可读取样本已耗尽", PENDING: "待续采",
-            LIMITED: "采集受限", COLLECTING: "正在采集" }[coverage.state];
+        const styleStatus = { COMPLETE: "已完成", EXHAUSTED: "样本已尽", PENDING: "待续采",
+            LIMITED: "受限", COLLECTING: "采集中" }[coverage.state];
         $("assistantStyleMeta").textContent = [
-            `已学习 ${Number(style.learnedCount || 0)} 条，已采集 ${Number(coverage.collected ?? style.sampleCount ?? 0)} / ${Number(coverage.target || 100)} 条`,
-            style.editor === "OWNER" ? "含人工修订" : "",
+            `已学 ${Number(style.learnedCount || 0)} · 样本 ${Number(coverage.collected ?? style.sampleCount ?? 0)}/${Number(coverage.target || 100)}`,
+            style.editor === "OWNER" ? "已修订" : "",
             styleStatus, coverage.error
         ].filter(Boolean).join(" · ");
-        $("assistantStyleProfile").replaceChildren(document.createTextNode(style.profile || "尚未提炼风格。"));
-        if (Array.isArray(style.examples) && style.examples.some((example) => example.text)) {
-            const examples = document.createElement("ul");
-            for (const example of style.examples.filter((item) => item.text)) {
-                const row = document.createElement("li");
-                row.textContent = example.text;
-                examples.appendChild(row);
+        const styleProfileEl = $("assistantStyleProfile");
+        const exampleItems = Array.isArray(style.examples) ? style.examples.filter((item) => item?.text) : [];
+        if (styleProfileEl) {
+            if (exampleItems.length && typeof document?.createElement === "function") {
+                const examples = document.createElement("ul");
+                for (const example of exampleItems) {
+                    const row = document.createElement("li");
+                    row.textContent = example.text;
+                    examples.appendChild(row);
+                }
+                styleProfileEl.replaceChildren(examples);
+                styleProfileEl.hidden = false;
+            } else {
+                styleProfileEl.replaceChildren();
+                styleProfileEl.hidden = true;
             }
-            $("assistantStyleProfile").appendChild(examples);
         }
         const styleRevisionInput = $("assistantStyleRevisionInput");
         if (styleRevisionInput && (!styleRevisionInput.dataset.editRevision || styleRevisionInput.dataset.version === undefined)) {
@@ -4080,7 +4487,8 @@
     }
 
     function renderContentAssistant() {
-        const allowed = state.assistantAccess?.allowed === true;
+        const ownerAllowed = typeof isOwnerAllPermissions === "function" ? isOwnerAllPermissions() : true;
+        const allowed = ownerAllowed && state.assistantAccess?.allowed === true;
         $("contentAssistantShell").hidden = !allowed;
         const quickNav = document.getElementById("timingQuickNav");
         if (quickNav) quickNav.hidden = !allowed;
@@ -4101,6 +4509,9 @@
         if ($("contentMaterialsView")) $("contentMaterialsView").hidden = state.assistantView !== "materials";
         if ($("contentReviewView")) $("contentReviewView").hidden = state.assistantView !== "review";
         $("contentMonitorView").hidden = state.assistantView !== "monitor";
+        if ($("assistantCreationToolbar")) {
+            $("assistantCreationToolbar").hidden = !(state.assistantView === "assistant" || state.assistantView === "materials");
+        }
         renderAssistantSummary(dashboard);
         renderAssistantTopics(dashboard);
         renderAssistantMaterialsView(dashboard);
@@ -4257,9 +4668,12 @@
             renderAssistantHotTagChips($("assistantReviewTagChips"), dashboard, state.assistantReviewTag || "", "data-assistant-review-tag-chip");
         }
         const topicsById = new Map((dashboard.topics || []).map((t) => [t.id, t]));
+        const draftsById = new Map((dashboard.drafts || []).map((d) => [d.id, d]));
+        const resolveRowSkillId = (row) => row.skillId || draftsById.get(row.draftId)?.skillId || "";
         const tagFilter = (state.assistantReviewTag || "").trim().toLowerCase();
         const bandFilter = state.assistantReviewScoreBand || "";
         const verFilter = state.assistantReviewDraftVersion || "";
+        const skillFilter = state.assistantReviewSkill || "";
         const observations = (Array.isArray(dashboard.observations) ? dashboard.observations : []).filter((row) => {
             const topic = topicsById.get(row.topicId);
             if (tagFilter) {
@@ -4275,11 +4689,16 @@
             }
             if (verFilter === "initial" && Number(row.draftVersion || 0) !== 1) return false;
             if (verFilter === "revised" && Number(row.draftVersion || 0) < 2) return false;
+            if (skillFilter && resolveRowSkillId(row) !== skillFilter) return false;
             return true;
         });
         const metrics = [["views", "浏览"], ["likes", "赞"], ["replies", "评论"], ["reposts", "转发"], ["bookmarks", "收藏"]];
         const cards = observations.length ? observations.map((row) => {
             const topic = topicsById.get(row.topicId);
+            const effectiveSkillId = resolveRowSkillId(row);
+            const skillBadgeHtml = effectiveSkillId
+                ? `<span class="assistant-state ok">${escapeHtml(assistantSkillLabel(effectiveSkillId, dashboard))}</span>`
+                : "";
             const status = String(row.status || "").toUpperCase();
             const windowLabel = Number(row.windowHours) === 168 ? "7d" : `${Number(row.windowHours || 0)}h`;
             const missing = new Set(Array.isArray(row.missingMetrics) ? row.missingMetrics : []);
@@ -4293,7 +4712,7 @@
             return `<article class="assistant-observation-card">
                 <div class="assistant-pane-head">
                     <strong>${escapeHtml(topic?.title || row.postId || "已发布内容")} · ${windowLabel}</strong>
-                    <span class="assistant-state ${assistantStatusClass(status)}">${escapeHtml(assistantStatusLabel(status))}</span>
+                    <span class="assistant-draft-head-actions">${skillBadgeHtml}<span class="assistant-state ${assistantStatusClass(status)}">${escapeHtml(assistantStatusLabel(status))}</span></span>
                 </div>
                 <p class="assistant-observation-time">
                     ${Number.isFinite(Number(topic?.score)) ? `综合分 ${Math.round(topic.score)} · ` : ""}
@@ -5376,7 +5795,7 @@
                 </div>
                 <div class="draft-score-actions">
                     <button type="button" class="x-outline-pill sm" id="clearDraftSimBtn">清空</button>
-                    <button type="button" class="x-outline-pill sm" id="sendDraftToScheduleBtn">转入定时</button>
+                    <button type="button" class="x-outline-pill sm" id="sendDraftToScheduleBtn"${isOwnerAllPermissions() ? "" : " hidden"}>转入定时</button>
                     <a class="x-blue-pill sm" href="https://x.com/intent/tweet?text=${encodeURIComponent(res.text)}" target="_blank" rel="noopener noreferrer">
                         发推 ↗
                     </a>
@@ -5982,15 +6401,17 @@
 
         // 每条行动都可点击直达对应页面/筛选（go）或外部链接（href）
         const todo = [];
+        const ownerPaidUi = isOwnerAllPermissions();
         const effectiveUnfollow = computeEffectiveSuggestUnfollowCount(report);
         if (ah && Array.isArray(ah.opsRecommendations) && ah.opsRecommendations.length > 0) {
             for (const item of ah.opsRecommendations) {
                 if (!item) continue;
                 let title = item.title || item.detail || "";
                 if (item.code === "CLEAN_LOW_SIGNAL_FOLLOWS") {
-                    if (effectiveUnfollow <= 0) continue;
+                    if (!ownerPaidUi || effectiveUnfollow <= 0) continue;
                     title = `${effectiveUnfollow} 个低互动未回关可清理`;
                 }
+                if (!ownerPaidUi && String(item.actionTarget || "").includes("follow")) continue;
                 const prio = String(item.priority || "MEDIUM").toUpperCase();
                 if (item.externalUrl) {
                     todo.push({
@@ -6001,8 +6422,7 @@
                     let targetGo = item.actionTarget || "tab:timing";
                     if (
                         (item.code === "CADENCE_SPACING" || targetGo === "tab:schedule") &&
-                        hasScheduleAccessDecision() &&
-                        !isScheduleEligible()
+                        (!ownerPaidUi || (hasScheduleAccessDecision() && !isScheduleEligible()))
                     ) {
                         targetGo = "tab:timing|scrollId:topTweetsList";
                     }
@@ -6028,12 +6448,15 @@
             if (ah && ah.linkViewLossPct >= 20) {
                 todo.push({ text: `外链帖浏览低 ${ah.linkViewLossPct}%`, go: "tab:timing|focusDraft:1" });
             } else if (ah && ah.rapidFirePostCount > 0) {
-                todo.push({ text: `${ah.rapidFirePostCount} 条推文间隔 <3h`, go: "tab:schedule" });
+                todo.push({
+                    text: `${ah.rapidFirePostCount} 条推文间隔 <3h`,
+                    go: ownerPaidUi ? "tab:schedule" : "tab:timing|focusDraft:1"
+                });
             }
-            if (effectiveUnfollow > 0) {
+            if (ownerPaidUi && effectiveUnfollow > 0) {
                 todo.push({ text: `${effectiveUnfollow} 个低互动未回关可清理`, go: "followTab:NOT_FOLLOWING_BACK|followCat:SUGGEST_CLEAN" });
             }
-            if (audit.fansNotFollowedBackCount > 0) {
+            if (ownerPaidUi && audit.fansNotFollowedBackCount > 0) {
                 todo.push({ text: `${audit.fansNotFollowedBackCount} 位粉丝待回关`, go: "followTab:FAN_ONLY" });
             }
             if (act.originalPosts === 0) {
@@ -6649,7 +7072,16 @@
     }
 
     function hasScheduleAccessDecision() {
-        if (isOwnerAllPermissions()) return true;
+        if (typeof isOwnerAllPermissions === "function" && isOwnerAllPermissions()) return true;
+        if (
+            state.authStatus?.ownerAllPermissions === false ||
+            Boolean(
+                state.authStatus?.user?.username &&
+                    String(state.authStatus.user.username).replace(/^@+/, "").trim().toLowerCase() !== "elidlicom"
+            )
+        ) {
+            return true;
+        }
         return Boolean(
             state.scheduleAccess
             || (state.accessPolicy && typeof state.accessPolicy.scheduledPublishAllowed === "boolean")
@@ -6657,7 +7089,16 @@
     }
 
     function isScheduleEligible() {
-        if (isOwnerAllPermissions()) return true;
+        if (typeof isOwnerAllPermissions === "function" && isOwnerAllPermissions()) return true;
+        if (
+            state.authStatus?.ownerAllPermissions === false ||
+            Boolean(
+                state.authStatus?.user?.username &&
+                    String(state.authStatus.user.username).replace(/^@+/, "").trim().toLowerCase() !== "elidlicom"
+            )
+        ) {
+            return false;
+        }
         if (state.scheduleAccess) {
             return Boolean(state.scheduleAccess.allowed);
         }
@@ -6671,7 +7112,7 @@
         return (
             state.scheduleAccess?.reason
             || state.accessPolicy?.scheduledPublishLockedReason
-            || "定时发布仅限与 @elidlicom 互动频率前 100 的推友可用。"
+            || "定时发布付费能力仅对 @elidlicom 开放使用。"
         );
     }
 
@@ -7134,6 +7575,8 @@
 
         const shareSchedBtn = document.getElementById("scheduleShareCardBtn");
         if (shareSchedBtn) {
+            const ownerAllowed = typeof isOwnerAllPermissions === "function" ? isOwnerAllPermissions() : !locked;
+            shareSchedBtn.hidden = !ownerAllowed;
             shareSchedBtn.classList.toggle("is-locked-action", locked);
             shareSchedBtn.textContent = locked ? "🔒 定时发布" : "定时发布";
             shareSchedBtn.title = locked ? getScheduleLockedReason() : "将战报图与文案加入定时发布队列";
@@ -7399,8 +7842,6 @@
         const items = state.scheduleDraftItems || [];
         const isSingle = items.length === 1;
         listEl.classList.toggle("is-single", isSingle);
-        const batchHint = document.getElementById("scheduleBatchHint");
-        if (batchHint) batchHint.hidden = isSingle;
         const minAttrVal = formatEpochToDatetimeLocalValue(Date.now() + 60_000);
         const existing = new Map(Array.from(listEl.children).map((card) => [card.dataset.draftKey, card]));
         const keep = new Set();
@@ -7631,6 +8072,13 @@
     }
 
     function updateScheduleBadgesAndBanner() {
+        if (typeof isOwnerAllPermissions === "function" && !isOwnerAllPermissions()) {
+            ["navScheduleBadge", "mobileScheduleBadge", "overdueGlobalBanner"].forEach((id) => {
+                const el = $(id);
+                if (el) el.hidden = true;
+            });
+            return;
+        }
         const overdue = Number(state.scheduleOverdueCount || 0);
         const pending = Number(state.schedulePendingCount || 0);
         const badgeCount = overdue > 0 ? overdue : pending;
@@ -8736,11 +9184,16 @@
             }
             const research = event.target.closest("[data-assistant-research]");
             if (research) {
-                await runAssistantMutation("research", "/research", {
+                const instruction = ($("assistantCreationAngleInput")?.value ?? state.assistantCreationAngle ?? "").trim();
+                const payload = {
                     materialId: research.dataset.assistantResearch,
+                    mode: research.dataset.researchMode || "RESEARCH",
+                    skillId: state.assistantSelectedSkill || "AUTO",
                     clientRequestId: newClientRequestId(),
                     regenerate: research.dataset.regenerate === "true"
-                }, 180000);
+                };
+                if (instruction) payload.instruction = instruction;
+                await runAssistantMutation("research", "/research", payload, 180000);
                 state.assistantView = "assistant";
                 renderContentAssistant();
             }
@@ -8760,6 +9213,10 @@
             state.assistantReviewDraftVersion = event.target.value || "";
             refreshReviewFilter();
         });
+        $("assistantReviewSkill")?.addEventListener("change", (event) => {
+            state.assistantReviewSkill = event.target.value || "";
+            refreshReviewFilter();
+        });
         $("contentAssistantSummary")?.addEventListener("click", (event) => {
             const viewBtn = event.target.closest("[data-assistant-summary-view]");
             if (viewBtn) {
@@ -8776,6 +9233,15 @@
             state.assistantTopicStatus = nextStatus;
             if ($("assistantTopicStatus")) $("assistantTopicStatus").value = nextStatus;
             void loadAssistantTopicPage(0);
+        });
+        $("assistantSkillBar")?.addEventListener("click", (event) => {
+            const chip = event.target.closest("[data-assistant-skill]");
+            if (!chip) return;
+            state.assistantSelectedSkill = chip.dataset.assistantSkill || "AUTO";
+            renderAssistantSkillBar(state.assistantDashboard);
+        });
+        $("assistantCreationAngleInput")?.addEventListener("input", (event) => {
+            state.assistantCreationAngle = event.target.value || "";
         });
         $("assistantTopicTagChips")?.addEventListener("click", (event) => {
             const chip = event.target.closest("[data-assistant-topic-tag-chip]");
@@ -8812,12 +9278,18 @@
                 if (topicId && topicId !== state.assistantSelectedTopicId) {
                     state.assistantSelectedTopicId = topicId;
                     state.assistantOrganizeMode = false;
+                    renderAssistantSkillBar(state.assistantDashboard);
                 }
-                await runAssistantMutation("research", "/research", {
+                const instruction = ($("assistantCreationAngleInput")?.value ?? state.assistantCreationAngle ?? "").trim();
+                const payload = {
                     materialId: researchBtn.dataset.assistantResearch,
+                    mode: researchBtn.dataset.researchMode || "RESEARCH",
+                    skillId: state.assistantSelectedSkill || "AUTO",
                     clientRequestId: newClientRequestId(),
                     regenerate: researchBtn.dataset.regenerate === "true"
-                }, 180000);
+                };
+                if (instruction) payload.instruction = instruction;
+                await runAssistantMutation("research", "/research", payload, 180000);
                 return;
             }
             const focusDraftBtn = event.target.closest("[data-assistant-focus-draft]");
@@ -8849,10 +9321,14 @@
             event.preventDefault();
             card.click();
         });
-        const submitAssistantSources = async (rawInput) => {
+        const submitAssistantSources = async (rawInput, explicitTier) => {
             const value = String(rawInput || "").trim();
             if (!value) return null;
-            const result = await runAssistantMutation("add-source", "/sources", { input: value });
+            const tierVal = Number(explicitTier ?? $("assistantSourceTier")?.value ?? 5);
+            const payload = [1, 5, 30].includes(tierVal)
+                ? { input: value, intervalMinutes: tierVal }
+                : { input: value };
+            const result = await runAssistantMutation("add-source", "/sources", payload);
             if (!result) return null;
             if (typeof result.addedCount === "number") {
                 const errList = Array.isArray(result.errors) ? result.errors : [];
@@ -8860,10 +9336,10 @@
                     showToast(`已添加 ${result.addedCount} 个，${errList.length} 个失败`);
                     setContentAssistantError(errList.map((e) => `${e.input}: ${e.error}`).join("；"));
                 } else {
-                    showToast(`已添加 ${result.addedCount} 个监听作者`);
+                    showToast(`已添加 ${result.addedCount} 个监听作者（${tierVal} 分钟档）`);
                 }
             } else {
-                showToast(`已添加监听 @${result.username || value.replace(/^@/, "")}`);
+                showToast(`已添加监听 @${result.username || value.replace(/^@/, "")}（${result.intervalMinutes || tierVal} 分钟档）`);
             }
             return result;
         };
@@ -8872,19 +9348,106 @@
             const input = $("assistantSourceInput");
             const value = input.value.trim();
             if (!value) return;
-            if (await submitAssistantSources(value)) input.value = "";
+            if (await submitAssistantSources(value, $("assistantSourceTier")?.value)) input.value = "";
         });
         $("assistantSuggestedPeers")?.addEventListener("click", async (event) => {
             const btn = event.target.closest("[data-assistant-add-suggested]");
             if (!btn) return;
-            await submitAssistantSources(btn.dataset.assistantAddSuggested);
+            await submitAssistantSources(btn.dataset.assistantAddSuggested, $("assistantSourceTier")?.value);
         });
-        $("assistantSourcesList")?.addEventListener("click", (event) => {
+        const collectSourceAutoRepostPayload = (row, sourceId) => {
+            const toggle = row?.querySelector(`[data-source-autorepost-toggle="${CSS.escape(sourceId)}"]`);
+            const modeEl = row?.querySelector(`[data-source-autorepost-mode="${CSS.escape(sourceId)}"]`);
+            const scoreEl = row?.querySelector(`[data-source-autorepost-score="${CSS.escape(sourceId)}"]`);
+            const tplEl = row?.querySelector(`[data-source-autorepost-template="${CSS.escape(sourceId)}"]`);
+            const hintEl = row?.querySelector(`[data-source-autorepost-hint="${CSS.escape(sourceId)}"]`);
+            const payload = {};
+            if (toggle) payload.autoRepostEnabled = Boolean(toggle.checked);
+            if (modeEl) payload.autoRepostTextMode = modeEl.value;
+            if (scoreEl && scoreEl.value !== "") payload.autoRepostMinScore = Number(scoreEl.value);
+            if (tplEl) payload.autoRepostTemplate = tplEl.value.trim();
+            if (hintEl) payload.autoRepostRuleHint = hintEl.value.trim();
+            return payload;
+        };
+        $("assistantSourcesList")?.addEventListener("change", async (event) => {
+            const tierSelect = event.target.closest("[data-assistant-source-tier]");
+            if (tierSelect) {
+                const sourceId = tierSelect.dataset.assistantSourceTier;
+                const intervalMinutes = Number(tierSelect.value);
+                const updated = await runAssistantMutation("source-tier",
+                    `/sources/${encodeURIComponent(sourceId)}/config`, { intervalMinutes });
+                if (updated) showToast(`已切换为 ${intervalMinutes} 分钟采集档`);
+                return;
+            }
+            const autoToggle = event.target.closest("[data-source-autorepost-toggle]");
+            if (autoToggle) {
+                const sourceId = autoToggle.dataset.sourceAutorepostToggle;
+                const enabled = Boolean(autoToggle.checked);
+                const existing = (state.assistantDashboard?.sources || []).find((s) => s.id === sourceId) || {};
+                const nextMode = existing.autoRepostTextMode === "TEMPLATE" && !existing.autoRepostTemplate
+                    ? "AI" : (existing.autoRepostTextMode || "AI");
+                if (document.activeElement && $("assistantSourcesList")?.contains(document.activeElement)) {
+                    document.activeElement.blur();
+                }
+                const updated = await runAssistantMutation("source-autorepost",
+                    `/sources/${encodeURIComponent(sourceId)}/config`,
+                    { autoRepostEnabled: enabled, autoRepostTextMode: nextMode });
+                if (updated) showToast(enabled ? "已开启高热度自动引用转推" : "已关闭自动引用转推");
+                return;
+            }
+            const modeSelect = event.target.closest("[data-source-autorepost-mode]");
+            if (modeSelect) {
+                const sourceId = modeSelect.dataset.sourceAutorepostMode;
+                const mode = modeSelect.value;
+                if (mode === "TEMPLATE") {
+                    const src = (state.assistantDashboard?.sources || []).find((s) => s.id === sourceId);
+                    if (src) {
+                        src.autoRepostTextMode = "TEMPLATE";
+                        if (document.activeElement) document.activeElement.blur();
+                        renderAssistantMonitor(state.assistantDashboard);
+                    }
+                    return;
+                }
+                if (document.activeElement) document.activeElement.blur();
+                await runAssistantMutation("source-autorepost-mode",
+                    `/sources/${encodeURIComponent(sourceId)}/config`, { autoRepostTextMode: "AI" });
+            }
+        });
+        $("assistantSourcesList")?.addEventListener("click", async (event) => {
+            const saveBtn = event.target.closest("[data-source-autorepost-save]");
+            if (saveBtn) {
+                const sourceId = saveBtn.dataset.sourceAutorepostSave;
+                const row = saveBtn.closest("[data-source-row]");
+                const payload = collectSourceAutoRepostPayload(row, sourceId);
+                if (document.activeElement && $("assistantSourcesList")?.contains(document.activeElement)) {
+                    document.activeElement.blur();
+                }
+                const updated = await runAssistantMutation("source-autorepost-save",
+                    `/sources/${encodeURIComponent(sourceId)}/config`, payload);
+                if (updated) showToast("已保存自动转推规则");
+                return;
+            }
             const button = event.target.closest("[data-assistant-source-action]");
             if (!button) return;
             const action = button.dataset.assistantSourceAction;
             void runAssistantMutation("source-" + action,
                 `/sources/${encodeURIComponent(button.dataset.sourceId)}/${action}`, {});
+        });
+        $("assistantPiAgentBar")?.addEventListener("click", async (event) => {
+            const btn = event.target.closest("#verifyPiAgentBtn");
+            if (!btn) return;
+            const res = await runAssistantMutation("verify-pi-agent", "/pi-agent/verify", {});
+            if (res) {
+                showToast(res.ready ? "ChatGPT OAuth 授权已就绪" : (res.message || "尚未完成 ChatGPT 登录"));
+            }
+        });
+        $("assistantAutoRepostFeed")?.addEventListener("click", async (event) => {
+            const retryBtn = event.target.closest("[data-autorepost-retry]");
+            if (!retryBtn) return;
+            const id = (retryBtn.dataset.autorepostRetry || "").trim();
+            if (!id) return;
+            const res = await runAssistantMutation("autorepost-retry", `/auto-reposts/${encodeURIComponent(id)}/retry`, {});
+            if (res) showToast("已重新提交自动引用转推");
         });
         const markAssistantEdit = (event) => {
             const field = event.currentTarget;
@@ -8896,16 +9459,18 @@
         $("applyAssistantPresetBtn")?.addEventListener("click", () => {
             const dashboard = state.assistantDashboard || {};
             const selectedProvider = $("assistantProvider")?.value;
-            const provider = String(selectedProvider || dashboard.settings?.provider || dashboard.providerDefaults?.provider || "commandcode").toLowerCase();
-            const preset = provider === "minimax"
-                ? { model: "MiniMax-M2.7", protocol: "MESSAGES", contextTokens: 200000 }
-                : { model: "gpt-5.4", protocol: "RESPONSES", contextTokens: 128000 };
+            const provider = String(selectedProvider || dashboard.settings?.provider || dashboard.providerDefaults?.provider || "chatgpt").toLowerCase();
+            const preset = provider === "chatgpt"
+                ? { model: "gpt-6.2-astra low", protocol: "RESPONSES", contextTokens: 200000, label: "ChatGPT OAuth" }
+                : (provider === "minimax"
+                    ? { model: "MiniMax-M2.7", protocol: "MESSAGES", contextTokens: 200000, label: "MiniMax" }
+                    : { model: "gpt-5.4", protocol: "RESPONSES", contextTokens: 128000, label: "CommandCode" });
             if ($("assistantModel")) $("assistantModel").value = preset.model;
             if ($("assistantProtocol")) $("assistantProtocol").value = preset.protocol;
             if ($("assistantContextTokens")) $("assistantContextTokens").value = String(preset.contextTokens);
             const form = $("assistantSettingsForm");
             if (form) form.dataset.editRevision = String(Number(form.dataset.editRevision || 0) + 1);
-            showToast(`已填入 ${provider === "minimax" ? "MiniMax" : "CommandCode"} 推荐预设`);
+            showToast(`已填入 ${preset.label} 推荐预设`);
         });
         $("assistantProvider")?.addEventListener("change", async (event) => {
             const select = event.currentTarget;
@@ -8918,7 +9483,7 @@
                 provider: nextProvider
             });
             if (!saved) {
-                select.value = String(dashboard.settings?.provider || "commandcode").toLowerCase();
+                select.value = String(dashboard.settings?.provider || "chatgpt").toLowerCase();
                 return;
             }
             dashboard.settings = saved;
@@ -8926,7 +9491,10 @@
             form.dataset.version = String(saved.version);
             delete form.dataset.editRevision;
             renderAssistantMonitor(dashboard);
-            showToast(`已切换至 ${saved.provider === "minimax" ? "MiniMax" : "CommandCode"}`);
+            const providerLabel = saved.provider === "chatgpt"
+                ? "ChatGPT OAuth"
+                : (saved.provider === "minimax" ? "MiniMax" : "CommandCode");
+            showToast(`已切换至 ${providerLabel}`);
             if (saved.credentialConfigured && saved.modelEnabled !== false && Boolean(saved.model) && Number(saved.contextTokens) > 0) {
                 await runAssistantMutation("verify", "/capabilities/verify", { clientRequestId: newClientRequestId() }, 180000);
             }
@@ -9046,7 +9614,11 @@
             if (dashboard) renderAssistantMonitor(dashboard);
         });
         $("assistantTopicDetail")?.addEventListener("input", (event) => {
-            if (event.target.id === "assistantDraftEditor") queueAssistantDraftSave();
+            if (event.target.id === "assistantDraftEditor") {
+                const metrics = $("assistantDraftLiveMetrics");
+                if (metrics) metrics.innerHTML = renderAssistantDraftMetricsHtml(event.target.value);
+                queueAssistantDraftSave();
+            }
         });
         $("assistantTopicDetail")?.addEventListener("change", async (event) => {
             if (event.target.id !== "assistantDraftSelect") return;
@@ -9064,11 +9636,16 @@
         $("assistantTopicDetail")?.addEventListener("click", async (event) => {
             const research = event.target.closest("[data-assistant-research]");
             if (research) {
-                await runAssistantMutation("research", "/research", {
+                const instruction = ($("assistantCreationAngleInput")?.value ?? state.assistantCreationAngle ?? "").trim();
+                const payload = {
                     materialId: research.dataset.assistantResearch,
+                    mode: research.dataset.researchMode || "RESEARCH",
+                    skillId: state.assistantSelectedSkill || "AUTO",
                     clientRequestId: newClientRequestId(),
                     regenerate: research.dataset.regenerate === "true"
-                }, 180000);
+                };
+                if (instruction) payload.instruction = instruction;
+                await runAssistantMutation("research", "/research", payload, 180000);
                 return;
             }
             const taskAction = event.target.closest("[data-assistant-task-action]");
@@ -9154,6 +9731,8 @@
                 try {
                     if (!await saveAssistantDraftEditor() || !isCurrentDraft()) return;
                     editor.value = text;
+                    const metrics = $("assistantDraftLiveMetrics");
+                    if (metrics) metrics.innerHTML = renderAssistantDraftMetricsHtml(editor.value);
                     queueAssistantDraftSave();
                     if (!await saveAssistantDraftEditor() || !isCurrentDraft()) return;
                     preview.hidden = true;
@@ -9172,6 +9751,24 @@
                 if (!draft) return;
                 await runAssistantMutation("optimize", `/drafts/${encodeURIComponent(draft.id)}/optimize`, {
                     version: draft.version,
+                    instruction,
+                    clientRequestId: newClientRequestId()
+                }, 180000);
+                return;
+            }
+            const skillRewrite = event.target.closest("[data-assistant-skill-rewrite]");
+            if (skillRewrite) {
+                const draftId = skillRewrite.dataset.draftId;
+                const skillId = (skillRewrite.dataset.assistantSkillRewrite || "").trim();
+                const instruction = ($("assistantOptimizeInstruction")?.value || "").trim();
+                if (!await saveAssistantDraftEditor()) return;
+                const draft = (state.assistantDashboard?.drafts || []).find((item) => item.id === draftId);
+                if (!draft || !skillId) return;
+                state.assistantSelectedSkill = skillId;
+                renderAssistantSkillBar(state.assistantDashboard);
+                await runAssistantMutation("optimize", `/drafts/${encodeURIComponent(draft.id)}/optimize`, {
+                    version: draft.version,
+                    skillId,
                     instruction,
                     clientRequestId: newClientRequestId()
                 }, 180000);
@@ -9244,6 +9841,44 @@
                     return;
                 }
                 window.open("https://x.com/intent/tweet?text=" + encodeURIComponent(text), "_blank", "noopener,noreferrer");
+                return;
+            }
+            const quoteIntent = event.target.closest("[data-assistant-quote-intent]");
+            if (quoteIntent) {
+                const text = ($("assistantDraftEditor")?.value || "").trim();
+                const quoteUrl = quoteIntent.dataset.quoteUrl || "";
+                if (!text) {
+                    showToast("当前稿件为空");
+                    return;
+                }
+                if (!quoteUrl) return;
+                window.open(
+                    "https://x.com/intent/tweet?text=" + encodeURIComponent(text) + "&url=" + encodeURIComponent(quoteUrl),
+                    "_blank",
+                    "noopener,noreferrer"
+                );
+                return;
+            }
+            const publishNow = event.target.closest("[data-assistant-publish-now]");
+            if (publishNow) {
+                const draftId = publishNow.dataset.assistantPublishNow;
+                const quoteSource = publishNow.dataset.quoteSource === "true";
+                if (!await saveAssistantDraftEditor()) return;
+                const currentDraft = (state.assistantDashboard?.drafts || []).find((item) => item.id === draftId);
+                if (!currentDraft) return;
+                const result = await runAssistantMutation(
+                    "publish-now",
+                    `/drafts/${encodeURIComponent(currentDraft.id)}/publish-now`,
+                    {
+                        version: currentDraft.version,
+                        quoteSource,
+                        clientRequestId: newClientRequestId()
+                    },
+                    60000
+                );
+                if (result) {
+                    showToast(quoteSource ? "已引用原帖发布并登记复盘" : "已发布并登记复盘");
+                }
                 return;
             }
             const schedule = event.target.closest("[data-assistant-schedule]");
@@ -10337,13 +10972,22 @@
         }
 
         if (isLoggedIn()) {
+            const nonOwner =
+                state.authStatus?.ownerAllPermissions !== true &&
+                (state.authStatus?.ownerAllPermissions === false ||
+                    Boolean(
+                        state.authStatus?.user?.username &&
+                            String(state.authStatus.user.username).replace(/^@+/, "").trim().toLowerCase() !== "elidlicom"
+                    ));
             const validTabs = new Set(["activity", "interactions", "follow-audit", "timing", "circle", "schedule"]);
-            const initialTab = urlTab === "schedule" || authResult === "publish_ok" || publishAuthErr
+            const initialTab = !nonOwner && (urlTab === "schedule" || authResult === "publish_ok" || publishAuthErr)
                 ? "schedule" : urlTab && validTabs.has(urlTab) ? urlTab : state.activeTab;
             switchTab(initialTab, { historyMode: "replace" });
-            await restoreScheduleDraftAfterStepUpAuth();
-            if (state.activeTab !== "schedule") {
-                void loadScheduledTweets(true);
+            if (!nonOwner) {
+                await restoreScheduleDraftAfterStepUpAuth();
+                if (state.activeTab !== "schedule") {
+                    void loadScheduledTweets(true);
+                }
             }
             await loadSelfReport(false);
             if (!state.storedMode && isLoggedIn()) {

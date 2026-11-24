@@ -54,6 +54,9 @@ public final class AssistantWorker {
         var expired = store.tx(tx -> {
             long now = System.currentTimeMillis();
             var ids = new ArrayList<String>();
+            for (String runningId : active.keySet()) {
+                if (tx.get("task", runningId) == null) ids.add(runningId);
+            }
             for (var task : tx.matching("task", "status", "RUNNING", -1)) {
                 long deadline = task.path("deadline").asLong();
                 if (deadline <= 0 || deadline > now) continue;
@@ -86,11 +89,18 @@ public final class AssistantWorker {
                 if(stage.equals("DRAFT") && !task.path("input").path("style").isObject()) {
                     var style=tx.get("meta","style");
                     if(style==null) {
-                        task.put("status","WAITING_STYLE");
-                        tx.put("task",task.path("id").asText(),task);
-                        continue;
+                        boolean bypassStyleBlock = task.path("input").path("fastMode").asBoolean(false)
+                                || "chatgpt".equalsIgnoreCase(task.path("settings").path("provider").asText(""));
+                        if (bypassStyleBlock) {
+                            ((ObjectNode)task.path("input")).set("style", object().put("profile", ""));
+                        } else {
+                            task.put("status","WAITING_STYLE");
+                            tx.put("task",task.path("id").asText(),task);
+                            continue;
+                        }
+                    } else {
+                        ((ObjectNode)task.path("input")).set("style",style);
                     }
-                    ((ObjectNode)task.path("input")).set("style",style);
                 }
                 long start=System.currentTimeMillis();
                 var storedInput = (ObjectNode) task.path("input");
@@ -218,8 +228,14 @@ public final class AssistantWorker {
             if(server!=null && config.path("connectionVersion").asInt()!=server.path("version").asInt())
                 throw new MissingConfiguration("服务端连接已更换，请明确重试以采用新配置");
             var input=(ObjectNode)task.path("input");
-            if(config.path("model").asText("").isBlank() || config.path("contextTokens").asInt()<=0)
+            boolean isChatGptProvider = "chatgpt".equalsIgnoreCase(config.path("provider").asText(""));
+            if (!isChatGptProvider && (config.path("model").asText("").isBlank() || config.path("contextTokens").asInt()<=0))
                 throw new MissingConfiguration("请配置模型名称及可用上下文长度");
+            if (isChatGptProvider) {
+                if (config.path("model").asText("").isBlank()) config.put("model", ChatGptOAuthTextModelClient.DEFAULT_MODEL_ALIAS);
+                if (config.path("contextTokens").asInt()<=0) config.put("contextTokens", 200_000);
+                if (config.path("protocol").asText("").isBlank()) config.put("protocol", "RESPONSES");
+            }
             if ("OPTIMIZE_REVISION".equals(stage) && !reserveCorrection(task)) return;
             var output=models.run(stage,config,input);
             commit(task,(tx,now)->complete(tx,now,stage,output));
@@ -346,6 +362,8 @@ public final class AssistantWorker {
                         .put("topicVersion",input.path("topicVersion").asInt()).put("materialId",input.path("selectedMaterialId").asText())
                         .put("styleVersion",ver(input.path("style"))).put("preferenceVersion",ver(input.path("preferences")))
                         .put("researchId",input.path("research").path("id").asText()).put("originTaskId",task.path("id").asText()).put("editor","MODEL");
+                String appliedSkill = result.path("skillId").asText(input.path("skillId").asText(""));
+                if (!appliedSkill.isBlank()) draft.put("skillId", appliedSkill);
                 draft.set("research",input.path("research"));
                 draft.set("generation",output);
                 draft.set("factChanges",result.path("factChanges"));
@@ -355,6 +373,13 @@ public final class AssistantWorker {
                 if (task.path("constraintRepair").isObject()) draft.set("constraintRepair",task.get("constraintRepair"));
                 String target=input.path("draftId").asText("");
                 var base=target.isEmpty()?null:tx.get("draft",target);
+                if ("DRAFT".equals(stage)) {
+                    String angle = input.path("instruction").asText("").strip();
+                    if (!angle.isBlank()) draft.put("angleInstruction", angle);
+                } else if (base != null && base.hasNonNull("angleInstruction")
+                        && !base.path("angleInstruction").asText("").isBlank()) {
+                    draft.put("angleInstruction", base.path("angleInstruction").asText(""));
+                }
                 if(base!=null) draft.put("baseDraftId",target).put("baseVersion",input.path("draftVersion").asInt());
                 if(base==null || ver(base)!=input.path("draftVersion").asInt()) target=id();
                 var saved=tx.put("draft",target,draft);
@@ -391,7 +416,8 @@ public final class AssistantWorker {
         var material=tx.get("material",mid);
         if(ver(material)!=ver(input.path("material")) || !own.equals(AssistantTopics.topicOf(tx,mid))
                 || ver(tx.get("membership",mid))!=input.path("membershipVersion").asInt()) return;
-        var topic=AssistantTopics.required(tx,"topic",own);
+        var topic=tx.get("topic",own);
+        if(topic==null) return;
         if (input.has("topicVersion") && ver(topic) != input.path("topicVersion").asInt()) {
             input.put("topicVersion", ver(topic));
             input.set("candidates", AssistantTopics.candidates(tx,material,own));
@@ -446,8 +472,8 @@ public final class AssistantWorker {
 
     private void scoreResult(AssistantStore.Tx tx,ObjectNode task,ObjectNode input,ObjectNode result) {
         String id=input.path("topicId").asText();
-        var t=AssistantTopics.required(tx,"topic",id);
-        if(ver(t)!=input.path("topicVersion").asInt()) return;
+        var t=tx.get("topic",id);
+        if(t==null || ver(t)!=input.path("topicVersion").asInt()) return;
         int weight=task.path("settings").path("valueWeight").asInt(50);
         double v=result.path("topicValue").asDouble(), r=result.path("reachPotential").asDouble();
         long composite = Math.round((v * weight + r * (100 - weight)) / 100);

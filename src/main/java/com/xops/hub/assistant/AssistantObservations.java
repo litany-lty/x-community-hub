@@ -16,7 +16,6 @@ import java.time.ZoneId;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
@@ -70,15 +69,18 @@ public final class AssistantObservations {
         });
     }
 
-    private void runTick() {
+    void runTick() {
         Owner owner = owner();
         if (owner == null) return;
-        reconcile.run();
-        long now = clock.millis();
-        syncPublishedTargets(owner, now);
-        syncRecentHistoryTargets(owner, now);
-        Target due = store.tx(tx -> nextDue(tx, now));
-        if (due != null) observe(owner, due, now);
+        com.xops.hub.provider.PaidCapabilityGate.runWithCaller(
+                com.xops.hub.provider.PaidCapabilityGate.PRIVILEGED_USERNAME, owner.id(), () -> {
+            reconcile.run();
+            long now = clock.millis();
+            syncPublishedTargets(owner, now);
+            syncRecentHistoryTargets(owner, now);
+            Target due = store.tx(tx -> nextDue(tx, now));
+            if (due != null) observe(owner, due, now);
+        });
     }
 
     @Scheduled(cron = "${xops.content-assistant-followers-cron:0 20 3 * * *}", zone = "Asia/Shanghai")
@@ -94,7 +96,9 @@ public final class AssistantObservations {
         String day = LocalDate.now(clock.withZone(USER_ZONE)).toString();
         if (store.tx(tx -> tx.get("followers", day)) != null) return;
         try {
-            ObjectNode observed = client.owner(owner.id(), owner.username());
+            ObjectNode observed = com.xops.hub.provider.PaidCapabilityGate.withCaller(
+                    com.xops.hub.provider.PaidCapabilityGate.PRIVILEGED_USERNAME, owner.id(),
+                    () -> client.owner(owner.id(), owner.username()));
             long observedAt = requiredObservedAt(observed);
             store.tx(tx -> {
                 ObjectNode row = object().put("localDate", day).put("status", "OBSERVED").put("observedAt", observedAt);
@@ -170,12 +174,26 @@ public final class AssistantObservations {
 
     private void putTarget(AssistantStore.Tx tx, String postId, long publishedAt, String publicationId, String source, ObjectNode origin) {
         if(postId.isBlank()) return;
+        String draftId = origin.path("draftId").asText("");
+        String skillId = ViralWritingSkills.normalizeId(origin.path("skillId").asText(""));
+        if (skillId.isEmpty() && !draftId.isBlank()) {
+            int draftVersion = origin.path("draftVersion").asInt(0);
+            ObjectNode d = draftVersion > 0 ? tx.version("draft", draftId, draftVersion) : tx.get("draft", draftId);
+            if (d == null) d = tx.get("draft", draftId);
+            if (d != null) skillId = ViralWritingSkills.normalizeId(d.path("skillId").asText(""));
+        }
         var existing=tx.get("observation_target",postId);
-        if(existing!=null && (publicationId.isEmpty() || publicationId.equals(existing.path("publicationId").asText()))) return;
+        if(existing!=null && (publicationId.isEmpty() || publicationId.equals(existing.path("publicationId").asText()))) {
+            if (existing.path("skillId").asText("").isBlank() && !skillId.isEmpty()) {
+                tx.put("observation_target", postId, existing.deepCopy().put("skillId", skillId));
+            }
+            return;
+        }
         ObjectNode target = object().put("postId", postId).put("publishedAt", publishedAt)
                 .put("publicationId", publicationId).put("source", source)
-                .put("topicId", origin.path("topicId").asText("")).put("draftId", origin.path("draftId").asText(""))
+                .put("topicId", origin.path("topicId").asText("")).put("draftId", draftId)
                 .put("draftVersion", origin.path("draftVersion").asInt(0));
+        if (!skillId.isEmpty()) target.put("skillId", skillId);
         tx.put("observation_target", postId, target);
     }
 
@@ -268,10 +286,13 @@ public final class AssistantObservations {
     }
 
     private static ObjectNode baseObservation(ObjectNode target, int hours, long targetAt) {
-        return object().put("postId", target.path("postId").asText()).put("publicationId", target.path("publicationId").asText(""))
+        ObjectNode row = object().put("postId", target.path("postId").asText()).put("publicationId", target.path("publicationId").asText(""))
                 .put("source", target.path("source").asText()).put("publishedAt", target.path("publishedAt").asLong())
                 .put("targetAt", targetAt).put("windowHours", hours).put("topicId", target.path("topicId").asText(""))
                 .put("draftId", target.path("draftId").asText("")).put("draftVersion", target.path("draftVersion").asInt(0));
+        String skillId = ViralWritingSkills.normalizeId(target.path("skillId").asText(""));
+        if (!skillId.isEmpty()) row.put("skillId", skillId);
+        return row;
     }
 
     static boolean withinWindow(long observedAt, long targetAt) { return Math.abs(observedAt - targetAt) <= WINDOW_TOLERANCE_MS; }

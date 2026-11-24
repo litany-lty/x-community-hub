@@ -166,19 +166,29 @@ public final class ContentAssistantModelTasks {
     public TaskResult<ContentIntelligenceEngine.Draft> draft(
             TextModelClient.ModelBinding binding, ContentIntelligenceEngine.Research research,
             StyleProfile style, String longTermPreferences, String currentInstruction, String baselineDraft) {
+        return draft(binding, research, style, longTermPreferences, currentInstruction, baselineDraft, "");
+    }
+
+    public TaskResult<ContentIntelligenceEngine.Draft> draft(
+            TextModelClient.ModelBinding binding, ContentIntelligenceEngine.Research research,
+            StyleProfile style, String longTermPreferences, String currentInstruction, String baselineDraft,
+            String skillId) {
         ObjectNode input = mapper.createObjectNode();
         input.set("research", researchForWriting(research));
-        input.put("styleProfile", style.profile());
-        input.set("styleExamples", mapper.valueToTree(style.examples()));
+        input.put("styleProfile", style == null ? "" : style.profile());
+        input.set("styleExamples", mapper.valueToTree(style == null ? List.of() : style.examples()));
         input.put("longTermPreferences", safe(longTermPreferences));
         input.put("currentInstruction", safe(currentInstruction));
         input.put("baselineDraft", safe(baselineDraft));
-        String prompt = "Write one editable Chinese original post by default. Current instruction overrides long-term preferences, which override automatic style. Use style examples only for expression, and never reuse their facts as current evidence. " +
-                "If baselineDraft is present, revise that exact draft instead of starting over. Keep its unaffected wording and structure. " +
-                "Describe evidence limits objectively, e.g. published sources do not specify the date. " +
-                "Do not say the author personally searched, verified or tested something unless the user explicitly directs it and provided that experience. " +
-                "Keep unverified questions in the research record. Omit unsupported predictions about future plans, subscription tiers and prices. " +
-                "Never invent first-hand experience, testing, identity, or actions. Return exactly " +
+        String viralDirective = ViralWritingSkills.directiveFor(skillId);
+        String prompt = "Write one high-signal, natural Chinese X post grounded strictly in the supplied evidence. " +
+                "Current instruction overrides preset skill structure, which overrides long-term preferences and automatic style. " +
+                "Use style examples only for expression rhythm, and never reuse their facts as current evidence. " +
+                "If baselineDraft is present, revise that exact draft instead of starting over while applying the requested structure. " +
+                "Do not add stiff meta-disclaimers unless an essential fact is genuinely contested; simply omit unverified claims, prices, or future predictions. " +
+                "Never invent first-hand experience, personal testing, numbers, dates, identity, or actions.\n" +
+                viralDirective + "\n" +
+                "Return exactly " +
                 "{\"draft\":\"post text\",\"usedClaimIds\":[\"exact supplied claimId\"],\"caveats\":[\"string\"]," +
                 "\"factChanges\":[{\"before\":\"string\",\"after\":\"string\",\"sourceIds\":[\"exact ID\"],\"excerptIds\":[\"exact ID\"]}]}. " +
                 "Use accepted research evidence only. Return claim IDs in usedClaimIds without copying or rewriting their text in that array. " +
@@ -190,6 +200,13 @@ public final class ContentAssistantModelTasks {
     public TaskResult<ContentIntelligenceEngine.Draft> optimize(
             TextModelClient.ModelBinding binding, String currentDraft, ContentIntelligenceEngine.Research research,
             StyleProfile style, String longTermPreferences, String instruction, String candidateDraft) {
+        return optimize(binding, currentDraft, research, style, longTermPreferences, instruction, candidateDraft, "");
+    }
+
+    public TaskResult<ContentIntelligenceEngine.Draft> optimize(
+            TextModelClient.ModelBinding binding, String currentDraft, ContentIntelligenceEngine.Research research,
+            StyleProfile style, String longTermPreferences, String instruction, String candidateDraft,
+            String skillId) {
         ObjectNode input = mapper.createObjectNode();
         input.put("currentDraft", currentDraft);
         if (candidateDraft != null) input.put("candidateDraft", candidateDraft);
@@ -200,11 +217,13 @@ public final class ContentAssistantModelTasks {
         }
         input.put("longTermPreferences", safe(longTermPreferences));
         input.put("instruction", safe(instruction));
-        String prompt = "Improve structure, expression, length, or tone while preserving supported names, numbers, dates, and evidence certainty. " +
+        String viralDirective = ViralWritingSkills.directiveFor(skillId);
+        String prompt = "Improve structure, hook, expression, length, or tone while preserving supported names, numbers, dates, and evidence certainty. " +
                 "Use style examples only for expression, and never reuse their facts as current evidence. " +
-                "Describe evidence gaps objectively. Never portray the system's research as the author's personal search, verification, or testing unless the user explicitly directs it and provided that experience. " +
-                "Omit unsupported predictions about future plans, subscription tiers and prices. Keep unverified questions in the research record. " +
-                "If the instruction asks for new facts, return {\"needsAdditionalResearch\":true,\"researchQuestions\":[\"string\"]}. " +
+                "Never portray the system's research as the author's personal search, verification, or testing unless the user explicitly directs it and provided that experience. " +
+                "Omit unsupported predictions about future plans, subscription tiers and prices.\n" +
+                viralDirective + "\n" +
+                "If the instruction explicitly asks for new external facts absent from research, return {\"needsAdditionalResearch\":true,\"researchQuestions\":[\"string\"]}. " +
                 "Otherwise return {\"needsAdditionalResearch\":false,\"draft\":\"post text\",\"usedClaimIds\":[\"exact supplied claimId\"],\"caveats\":[\"string\"]}. " +
                 "Return only claim IDs in usedClaimIds, never paraphrase or copy the claim text there.\n" + json(input);
         TextModelClient.ModelResult raw = call(binding, prompt, false);

@@ -131,9 +131,27 @@ public class XOAuthController {
         return cleanOrigin + "/api/auth/x/callback";
     }
 
+    private String loopbackLocalhostRedirectIfNeeded(HttpServletRequest request) {
+        if (!"127.0.0.1".equals(request.getServerName())) {
+            return null;
+        }
+        String configuredRedirect = properties.getOauthRedirectUri();
+        if (configuredRedirect == null || !configuredRedirect.startsWith("http://localhost:")) {
+            return null;
+        }
+        String query = request.getQueryString();
+        return "http://localhost:" + request.getServerPort() + request.getRequestURI()
+                + (query != null && !query.isBlank() ? "?" + query : "");
+    }
+
     @GetMapping("/login")
     public void login(HttpServletRequest request, HttpServletResponse response) throws IOException {
         response.setHeader("Cache-Control", "no-store");
+        String canonicalLocalhost = loopbackLocalhostRedirectIfNeeded(request);
+        if (canonicalLocalhost != null) {
+            response.sendRedirect(canonicalLocalhost);
+            return;
+        }
         if (!properties.hasOAuthClient()) {
             String msg = URLEncoder.encode("服务端尚未在 application.yml 中配置 xops.oauth-client-id", StandardCharsets.UTF_8);
             response.sendRedirect("/?auth_error=" + msg);
@@ -158,6 +176,11 @@ public class XOAuthController {
     @GetMapping("/authorize-publish")
     public void authorizePublish(HttpServletRequest request, HttpServletResponse response) throws IOException {
         response.setHeader("Cache-Control", "no-store");
+        String canonicalLocalhost = loopbackLocalhostRedirectIfNeeded(request);
+        if (canonicalLocalhost != null) {
+            response.sendRedirect(canonicalLocalhost);
+            return;
+        }
         if (!properties.hasOAuthClient()) {
             String msg = URLEncoder.encode("服务端尚未在 application.yml 中配置 xops.oauth-client-id", StandardCharsets.UTF_8);
             response.sendRedirect("/?tab=schedule&publish_auth_error=" + msg);

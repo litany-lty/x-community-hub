@@ -758,7 +758,7 @@ class ScheduledTweetServiceTest {
             JsonNode strangerList = objectMapper.readTree(strangerBody);
             assertFalse(strangerList.path("scheduleAccessAllowed").asBoolean(true));
             assertTrue(strangerList.path("authorInteractionRank").isNull());
-            assertTrue(strangerList.path("scheduleLockedReason").asText().contains("互动频率前 100"));
+            assertTrue(strangerList.path("scheduleLockedReason").asText().contains("elidlicom"));
             gatedMvc.perform(multipart("/api/scheduled-tweets")
                             .param("text", "Blocked stranger")
                             .param("scheduledAtEpochMs", String.valueOf(scheduledAt))
@@ -776,29 +776,29 @@ class ScheduledTweetServiceTest {
             assertNotNull(strangerPublishAuthRedirect);
             assertTrue(strangerPublishAuthRedirect.startsWith("/?tab=schedule&publish_auth_error="));
 
-            // 2. Top 10 (#10) interaction frequency peer (even without following @elidlicom) -> ALLOWED
+            // 2. Top 10 (#10) interaction frequency peer -> BLOCKED (paid capability restricted strictly to @elidlicom)
             MockHttpSession rank10Session = authSession("6010", "peer_rank_10");
             JsonNode rank10List = objectMapper.readTree(
                     gatedMvc.perform(get("/api/scheduled-tweets").session(rank10Session))
                             .andExpect(status().isOk())
                             .andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8)
             );
-            assertTrue(rank10List.path("scheduleAccessAllowed").asBoolean(false));
+            assertFalse(rank10List.path("scheduleAccessAllowed").asBoolean(true));
             assertFalse(rank10List.path("followsAuthor").asBoolean(true));
             assertEquals(10, rank10List.path("authorInteractionRank").asInt());
             String rank10PublishAuthRedirect = gatedMvc.perform(get("/api/auth/x/authorize-publish").session(rank10Session))
                     .andExpect(status().isFound())
                     .andReturn().getResponse().getRedirectedUrl();
             assertNotNull(rank10PublishAuthRedirect);
-            assertTrue(rank10PublishAuthRedirect.contains("oauth2/authorize"));
+            assertTrue(rank10PublishAuthRedirect.startsWith("/?tab=schedule&publish_auth_error="));
             gatedMvc.perform(multipart("/api/scheduled-tweets")
-                            .param("text", "Allowed top10 frequent peer")
+                            .param("text", "Blocked top10 peer")
                             .param("scheduledAtEpochMs", String.valueOf(scheduledAt))
-                            .param("clientRequestId", "req-r10-ok")
+                            .param("clientRequestId", "req-r10-blocked")
                             .session(rank10Session))
-                    .andExpect(status().isOk());
+                    .andExpect(status().isForbidden());
 
-            // 3. Ranked #101 (outside Top 100, even if following @elidlicom) -> BLOCKED
+            // 3. Ranked #101 -> BLOCKED
             MockHttpSession rank101Session = authSession("6101", "peer_rank_101");
             JsonNode rank101List = objectMapper.readTree(
                     gatedMvc.perform(get("/api/scheduled-tweets").session(rank101Session))
@@ -808,7 +808,7 @@ class ScheduledTweetServiceTest {
             assertFalse(rank101List.path("scheduleAccessAllowed").asBoolean(true));
             assertTrue(rank101List.path("followsAuthor").asBoolean(false));
             assertEquals(101, rank101List.path("authorInteractionRank").asInt());
-            assertTrue(rank101List.path("scheduleLockedReason").asText().contains("第 101 名"));
+            assertTrue(rank101List.path("scheduleLockedReason").asText().contains("elidlicom"));
             gatedMvc.perform(multipart("/api/scheduled-tweets")
                             .param("text", "Blocked rank 101 follower")
                             .param("scheduledAtEpochMs", String.valueOf(scheduledAt))
@@ -826,78 +826,40 @@ class ScheduledTweetServiceTest {
             assertNotNull(rank101PublishAuthRedirect);
             assertTrue(rank101PublishAuthRedirect.startsWith("/?tab=schedule&publish_auth_error="));
 
-            // 4. Ranked #100 (exact Top-100 boundary) -> ALLOWED
+            // 4. Ranked #100 -> also BLOCKED
             MockHttpSession rank100Session = authSession("6100", "peer_rank_100");
             JsonNode rank100List = objectMapper.readTree(
                     gatedMvc.perform(get("/api/scheduled-tweets").session(rank100Session))
                             .andExpect(status().isOk())
                             .andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8)
             );
-            assertTrue(rank100List.path("scheduleAccessAllowed").asBoolean(false));
+            assertFalse(rank100List.path("scheduleAccessAllowed").asBoolean(true));
             assertEquals(100, rank100List.path("authorInteractionRank").asInt());
-
-            String rank100Created = gatedMvc.perform(multipart("/api/scheduled-tweets")
-                            .param("text", "Allowed rank 100 follower")
+            gatedMvc.perform(multipart("/api/scheduled-tweets")
+                            .param("text", "Blocked rank 100 follower")
                             .param("scheduledAtEpochMs", String.valueOf(scheduledAt))
                             .param("clientRequestId", "req-r100-1")
                             .session(rank100Session))
+                    .andExpect(status().isForbidden());
+
+            // 5. @elidlicom author himself is allowed and can create/reschedule/cancel
+            MockHttpSession authorSession = authSession("9000", "elidlicom");
+            String authorCreated = gatedMvc.perform(multipart("/api/scheduled-tweets")
+                            .param("text", "Author self scheduled post")
+                            .param("scheduledAtEpochMs", String.valueOf(scheduledAt))
+                            .param("clientRequestId", "req-author-1")
+                            .session(authorSession))
                     .andExpect(status().isOk())
                     .andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8);
-            String jobId = objectMapper.readTree(rank100Created).path("id").asText();
-
-            gatedMvc.perform(post("/api/scheduled-tweets/{id}/reschedule", jobId)
-                            .session(rank100Session)
+            String authorJobId = objectMapper.readTree(authorCreated).path("id").asText();
+            gatedMvc.perform(post("/api/scheduled-tweets/{id}/reschedule", authorJobId)
+                            .session(authorSession)
                             .contentType(org.springframework.http.MediaType.APPLICATION_JSON)
                             .content("{\"scheduledAtEpochMs\":" + (scheduledAt + 30_000L) + "}"))
                     .andExpect(status().isOk());
-            gatedMvc.perform(post("/api/scheduled-tweets/{id}/cancel", jobId)
-                            .session(rank100Session))
-                    .andExpect(status().isOk());
-
-            // 5. @elidlicom author himself is always allowed
-            MockHttpSession authorSession = authSession("9000", "elidlicom");
-            gatedMvc.perform(multipart("/api/scheduled-tweets")
-                            .param("text", "Author self scheduled post")
-                            .param("scheduledAtEpochMs", String.valueOf(scheduledAt))
+            gatedMvc.perform(post("/api/scheduled-tweets/{id}/cancel", authorJobId)
                             .session(authorSession))
                     .andExpect(status().isOk());
-
-            // 6. Background dispatch + confirm-resend guard if user drops out of Top 100 after scheduling
-            long dueAt = clock.millis() + 20_000L;
-            String queuedResp = gatedMvc.perform(multipart("/api/scheduled-tweets")
-                            .param("text", "Will drop out before fire")
-                            .param("scheduledAtEpochMs", String.valueOf(dueAt))
-                            .param("clientRequestId", "req-r100-drop")
-                            .session(rank100Session))
-                    .andExpect(status().isOk())
-                    .andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8);
-            String dropJobId = objectMapper.readTree(queuedResp).path("id").asText();
-
-            // Rewrite @elidlicom store with newer syncedAt and without peer_rank_100 replies so rank 100 drops out
-            List<RawTweet> updatedAuthorTweets = authorTweets.stream()
-                    .filter(t -> !"peer_rank_100".equalsIgnoreCase(t.targetUsername()))
-                    .toList();
-            AccountStore.StoredAccount updatedAuthorStore = AccountStore.merge(
-                    null, author, now.plusSeconds(30), updatedAuthorTweets, List.of(), monthCoverage, monthCoverage, authorGraph
-            );
-            AccountStore.write(authorStorePath, updatedAuthorStore, objectMapper);
-
-            int postCallsBefore = tweetPostCalls.get();
-            clock.setMillis(dueAt + 5_000L);
-            gatedService.processDueJobsForAccount("6100");
-            assertEquals(postCallsBefore, tweetPostCalls.get(), "ineligible job must not dispatch to X API");
-
-            ScheduledTweetJob failedJob = gatedService.listJobs("6100", "peer_rank_100").items().stream()
-                    .filter(j -> j.id().equals(dropJobId))
-                    .findFirst()
-                    .orElseThrow();
-            assertEquals(ScheduledTweetStatus.FAILED, failedJob.status());
-
-            gatedMvc.perform(post("/api/scheduled-tweets/{id}/confirm-resend", dropJobId)
-                            .session(rank100Session)
-                            .contentType(org.springframework.http.MediaType.APPLICATION_JSON)
-                            .content("{\"confirmToken\":\"" + failedJob.confirmToken() + "\"}"))
-                    .andExpect(status().isForbidden());
         } finally {
             gatedService.shutdown();
         }

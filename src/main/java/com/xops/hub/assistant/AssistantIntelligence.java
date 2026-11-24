@@ -87,17 +87,26 @@ public final class AssistantIntelligence {
         java.util.function.Function<String, String> credential = environment::getProperty;
         var miniMax = new MiniMaxTextModelClient(mapper, transport, credential);
         var commandCode = new CommandCodeTextModelClient(mapper, transport, credential::apply);
+        var chatGpt = new ChatGptOAuthTextModelClient(mapper, environment);
         return new TextModelClient() {
             @Override
             public ModelResult complete(ModelBinding binding, TextRequest request) {
-                return "minimax".equalsIgnoreCase(binding.connection().serviceName())
+                String svc = binding.connection().serviceName();
+                if ("chatgpt".equalsIgnoreCase(svc)) {
+                    return chatGpt.complete(binding, request);
+                }
+                return "minimax".equalsIgnoreCase(svc)
                         ? miniMax.complete(binding, request)
                         : commandCode.complete(binding, request);
             }
 
             @Override
             public boolean requiresExplicitSearchQuery(ModelBinding binding) {
-                return "minimax".equalsIgnoreCase(binding.connection().serviceName())
+                String svc = binding.connection().serviceName();
+                if ("chatgpt".equalsIgnoreCase(svc)) {
+                    return chatGpt.requiresExplicitSearchQuery(binding);
+                }
+                return "minimax".equalsIgnoreCase(svc)
                         ? miniMax.requiresExplicitSearchQuery(binding)
                         : commandCode.requiresExplicitSearchQuery(binding);
             }
@@ -218,6 +227,11 @@ public final class AssistantIntelligence {
                 searchAttempt = tasks.search(binding, topic, Math.max(System.nanoTime() + TimeUnit.SECONDS.toNanos(5), searchDeadline));
                 TextModelClient.ModelResult first = searchAttempt.result();
                 if (first.toolEvents().isEmpty() || first.searchResults().isEmpty()) {
+                    if (!materialEvidence(workingInput).isEmpty()) {
+                        lastSearch = first;
+                        firstQueryPlan = searchAttempt.queryPlan();
+                        break;
+                    }
                     throw new AssistantIntelligenceException(FailureKind.DEFINITE_FAILURE, false, first.requestId(),
                             "research model returned no web-search event or source results", null);
                 }
@@ -323,8 +337,10 @@ public final class AssistantIntelligence {
                 .forEach(targetId -> relations.addObject().put("fromSourceId", sourceId).put("toSourceId", targetId)
                         .put("relation", "LINKED_IN_BODY")));
 
-        var output = mapper.createObjectNode().put("quality", sources.isEmpty() ? "NO_USABLE_EVIDENCE" : "PARTIAL")
-                .put("draftable", false).put("pendingSynthesis", !sources.isEmpty());
+        var matEv = materialEvidence(workingInput);
+        boolean hasAnyEvidence = !sources.isEmpty() || !matEv.isEmpty();
+        var output = mapper.createObjectNode().put("quality", hasAnyEvidence ? "PARTIAL" : "NO_USABLE_EVIDENCE")
+                .put("draftable", false).put("pendingSynthesis", hasAnyEvidence);
         output.put("sourcesRead", sources.size());
         output.put("searchRounds", roundsCompleted);
         output.put("boundaryReached", boundaryReached);
@@ -335,18 +351,18 @@ public final class AssistantIntelligence {
         output.set("sourceReads", readRecords);
         output.set("sourceRelations", relations);
         output.set("searchEvents", mapper.valueToTree(allSearchEvents));
-        output.set("searchUsage", mapper.valueToTree(lastSearch.usage()));
+        if (lastSearch != null) output.set("searchUsage", mapper.valueToTree(lastSearch.usage()));
         if (!articleBackfills.isEmpty()) output.set("articleBackfills", articleBackfills);
-        if (!sources.isEmpty()) {
+        if (hasAnyEvidence) {
             var included = new ArrayList<>(sources);
-            included.addAll(materialEvidence(workingInput));
+            included.addAll(matEv);
             var prepared = tasks.prepareEvidence(topic, included, binding);
             output.set("evidence", mapper.valueToTree(prepared.stream().filter(source -> !isMaterialSource(source.id())).toList()));
             output.set("materialEvidence", mapper.valueToTree(prepared.stream().filter(source -> isMaterialSource(source.id())).toList()));
         }
         if (firstQueryPlan != null) output.set("searchQueryPlan", mapper.valueToTree(firstQueryPlan));
         if (queryPlans.size() > 1) output.set("searchQueryPlans", queryPlans);
-        output.put("searchRequestId", lastSearch.requestId());
+        if (lastSearch != null) output.put("searchRequestId", lastSearch.requestId());
         return result(output, lastSearch);
     }
 
@@ -440,12 +456,15 @@ public final class AssistantIntelligence {
             output.setAll((ObjectNode) mapper.valueToTree(value.value()));
             boolean draftable = value.value().claims().stream().anyMatch(claim ->
                     claim.relation() == ContentIntelligenceEngine.EvidenceRelation.SUPPORTS
+                            && !claim.sourceIds().isEmpty());
+            boolean hasExternalSupport = value.value().claims().stream().anyMatch(claim ->
+                    claim.relation() == ContentIntelligenceEngine.EvidenceRelation.SUPPORTS
                             && claim.sourceIds().stream().anyMatch(id -> !isMaterialSource(id)));
             boolean unresolved = value.value().claims().stream().anyMatch(claim ->
                     claim.relation() == ContentIntelligenceEngine.EvidenceRelation.REFUTES || claim.relation() == ContentIntelligenceEngine.EvidenceRelation.UNVERIFIED);
             boolean fullyCovered = evidence.stream().allMatch(source -> source.originalCodePoints() == source.coveredCodePoints());
             output.put("draftable", draftable);
-            output.put("quality", draftable && !unresolved && value.value().unverified().isEmpty()
+            output.put("quality", hasExternalSupport && !unresolved && value.value().unverified().isEmpty()
                     && output.path("allSourcesRead").asBoolean() && fullyCovered ? "SUPPORTED" : "PARTIAL");
         }
         return result(output, value.raw());
@@ -500,17 +519,20 @@ public final class AssistantIntelligence {
 
     private ObjectNode draft(TextModelClient.ModelBinding binding, ObjectNode input) {
         var research = draftResearch(input.path("research"));
-        var style = draftStyle(input.path("style"));
+        var style = input.path("style").isObject() ? draftStyle(input.path("style")) : null;
         String instruction = input.path("instruction").asText("");
+        String skillId = input.path("skillId").asText("");
         String baseline = input.path("text").asText("");
         boolean revision = !input.path("draftId").asText().isEmpty();
         var constraints = DraftRevisionConstraints.from(revision ? instruction : "");
         instruction += constraints.prompt(baseline);
         if (input.path("questions").isArray() && !input.path("questions").isEmpty())
             instruction += "\n补充研究需要落实的问题：" + input.path("questions");
-        var value = tasks.draft(binding, research, style, input.path("preferences").path("text").asText(""),
-                instruction, baseline);
-        return result(writingResult(value.value(), constraints, baseline), value.raw());
+        var value = tasks.draft(binding, research, style, mergePreferencesWithWinningHint(input),
+                instruction, baseline, skillId);
+        ObjectNode out = writingResult(value.value(), constraints, baseline);
+        if (!ViralWritingSkills.normalizeId(skillId).isEmpty()) out.put("skillId", ViralWritingSkills.normalizeId(skillId));
+        return result(out, value.raw());
     }
 
     private ObjectNode optimize(TextModelClient.ModelBinding binding, ObjectNode input, boolean correcting) {
@@ -518,16 +540,18 @@ public final class AssistantIntelligence {
         var style = input.path("style").isObject() ? draftStyle(input.path("style")) : null;
         String baseline = input.path("text").asText("");
         String instruction = input.path("instruction").asText("");
+        String skillId = input.path("skillId").asText("");
         var constraints = DraftRevisionConstraints.from(instruction);
         instruction += constraints.prompt(baseline);
         var first = input.path("correctionCandidate");
         if (correcting) instruction += DraftRevisionConstraints.correctionPrompt(DraftRevisionConstraints.checks(first));
         try {
             var value = tasks.optimize(binding, baseline, research, style,
-                    input.path("preferences").path("text").asText(""), instruction,
-                    correcting ? first.path("text").asText() : null);
+                    mergePreferencesWithWinningHint(input), instruction,
+                    correcting ? first.path("text").asText() : null, skillId);
             ObjectNode output = writingResult(value.value(), constraints, baseline);
             output.put("needsAdditionalResearch", false);
+            if (!ViralWritingSkills.normalizeId(skillId).isEmpty()) output.put("skillId", ViralWritingSkills.normalizeId(skillId));
             return result(output, value.raw());
         } catch (ContentAssistantModelTasks.AdditionalResearchRequiredException e) {
             if (correcting) throw new AssistantIntelligenceException(FailureKind.DEFINITE_FAILURE, false, null,
@@ -537,6 +561,13 @@ public final class AssistantIntelligence {
             output.put("originalText", e.originalDraft());
             return result(output, null);
         }
+    }
+
+    private static String mergePreferencesWithWinningHint(ObjectNode input) {
+        String prefs = input.path("preferences").path("text").asText("");
+        String winningHint = input.path("winningHint").asText("").strip();
+        if (winningHint.isBlank()) return prefs;
+        return prefs.isBlank() ? winningHint : (prefs + "\n" + winningHint);
     }
 
     private ObjectNode writingResult(ContentIntelligenceEngine.Draft draft, DraftRevisionConstraints constraints, String baseline) {
@@ -593,12 +624,30 @@ public final class AssistantIntelligence {
         String provider = AssistantConnection.selectedProvider(settings, environment);
         String baseUrl = AssistantConnection.endpoint(environment, provider);
         String credential = AssistantConnection.credentialName(provider);
-        if (baseUrl == null || baseUrl.isBlank() || environment.getProperty(credential, "").isBlank()) {
+        if ("chatgpt".equalsIgnoreCase(provider)) {
+            if (!AssistantConnection.isProviderConfigured(environment, "chatgpt")) {
+                throw new AssistantIntelligenceException(FailureKind.MISSING_CONFIG, false, null,
+                        "ChatGPT OAuth 尚未登录就绪，请执行 codex login --device-auth 完成第三方授权", null);
+            }
+        } else if (baseUrl == null || baseUrl.isBlank() || environment.getProperty(credential, "").isBlank()) {
             throw new AssistantIntelligenceException(FailureKind.MISSING_CONFIG, false, null, "内容助手模型服务未在服务器配置", null);
         }
-        required(settings, "model");
-        required(settings, "protocol");
-        var config = roleBinding(settings, role, provider);
+        ObjectNode effectiveSettings = settings;
+        if ("chatgpt".equalsIgnoreCase(provider)) {
+            effectiveSettings = settings.deepCopy();
+            if (effectiveSettings.path("model").asText("").isBlank()) {
+                effectiveSettings.put("model", ChatGptOAuthTextModelClient.DEFAULT_MODEL_ALIAS);
+            }
+            if (effectiveSettings.path("protocol").asText("").isBlank()) {
+                effectiveSettings.put("protocol", "RESPONSES");
+            }
+            if (effectiveSettings.path("contextTokens").asInt(0) <= 0) {
+                effectiveSettings.put("contextTokens", 200_000);
+            }
+        }
+        required(effectiveSettings, "model");
+        required(effectiveSettings, "protocol");
+        var config = roleBinding(effectiveSettings, role, provider);
         TextModelClient.Protocol protocol = TextModelClient.Protocol.valueOf(config.protocol());
         if (!modelClient.supportedProtocols().contains(protocol) || !AssistantConnection.supportsProtocol(provider, config.protocol()))
             throw new AssistantIntelligenceException(FailureKind.MISSING_CONFIG, false, null,
@@ -606,11 +655,11 @@ public final class AssistantIntelligence {
         if (config.context() < 1024 || config.maxOutput() > config.context() - 512)
             throw new AssistantIntelligenceException(FailureKind.MISSING_CONFIG, false, null,
                     role.name()+" 的上下文必须至少保留 512 token 输入空间", null);
-        String version = required(settings, "version") + ":" + role.name() + ":" + Integer.toUnsignedString(
+        String version = required(effectiveSettings, "version") + ":" + role.name() + ":" + Integer.toUnsignedString(
                 java.util.Objects.hash(config.model(),config.protocol(),config.context(),config.timeout(),config.maxOutput()));
         return new TextModelClient.ModelBinding(
                 new TextModelClient.ServiceConnection(provider, URI.create(baseUrl), credential,
-                        settings.path("connectionVersion").asLong()),
+                        effectiveSettings.path("connectionVersion").asLong()),
                 config.model(), protocol, config.context(),
                 Duration.ofSeconds(config.timeout()), config.maxOutput(), version);
     }

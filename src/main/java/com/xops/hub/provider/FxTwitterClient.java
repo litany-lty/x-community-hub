@@ -41,6 +41,8 @@ public final class FxTwitterClient {
     private static final long THREAD_LOOKUP_BUDGET_MS = 1500;
     private static final long SEARCH_UNAVAILABLE_COOLDOWN_MS = Duration.ofMinutes(30).toMillis();
     private static final long SEARCH_HTTP_TIMEOUT_MS = 4500L;
+    public static final int MAX_INLINE_IDEMPOTENT_RETRIES = 2;
+    private static final long MIN_INLINE_RETRY_BUDGET_MS = 900L;
     private static final String CURSOR_PREFIX = "fx:";
     private static final Pattern TWEET_ID = Pattern.compile("[0-9]{2,20}");
     private static final Pattern USER_ID = Pattern.compile("[0-9]{1,20}");
@@ -50,6 +52,7 @@ public final class FxTwitterClient {
     private final ObjectMapper mapper;
     private final SharedApiExecutor executor;
     private final HttpClient httpClient;
+    private final ConcurrentHashMap<String, CompletableFuture<Fetched>> inFlightGets = new ConcurrentHashMap<>();
     private volatile long searchDisabledUntilEpochMs = 0L;
     private final java.util.concurrent.atomic.AtomicInteger consecutiveSearchFailures =
             new java.util.concurrent.atomic.AtomicInteger();
@@ -157,52 +160,119 @@ public final class FxTwitterClient {
     private CompletableFuture<Fetched> request(String path, Instant deadline, AtomicBoolean requestStarted, Runnable onStarted) {
         long remaining = deadline == null ? 0 : Duration.between(Instant.now(), deadline).toMillis();
         if (remaining <= 0) return CompletableFuture.failedFuture(invalid("公开数据请求已超过本轮时限"));
+        String base = properties.getFxtwitterBaseUrl().replaceAll("/+$", "");
+        String canonicalGetKey = base + path;
+        if (onStarted == null) {
+            CompletableFuture<Fetched> existing = inFlightGets.get(canonicalGetKey);
+            if (existing != null && !existing.isDone()) {
+                if (requestStarted != null) requestStarted.set(true);
+                CompletableFuture<Fetched> follower = new CompletableFuture<>();
+                existing.whenComplete((val, err) -> {
+                    if (err != null) follower.completeExceptionally(err);
+                    else follower.complete(val);
+                });
+                return follower.orTimeout(remaining, TimeUnit.MILLISECONDS);
+            }
+        }
         CompletableFuture<Fetched> future = executor.submitAsync(() -> {
-            long timeLeft = Duration.between(Instant.now(), deadline).toMillis();
-            if (timeLeft <= 0 || Thread.currentThread().isInterrupted()) throw invalid("公开数据请求已超过本轮时限");
-            String base = properties.getFxtwitterBaseUrl().replaceAll("/+$", "");
             boolean searchPath = path.startsWith("/search?");
             boolean loopbackBase = isLoopbackBaseUrl(base);
             long requestCapMs = (searchPath && !loopbackBase) ? SEARCH_HTTP_TIMEOUT_MS : 10_000L;
-            HttpRequest request = HttpRequest.newBuilder(URI.create(base + path))
-                    .timeout(Duration.ofMillis(Math.min(requestCapMs, timeLeft)))
-                    .header("Accept", "application/json").header("User-Agent", USER_AGENT).GET().build();
-            if (requestStarted != null) requestStarted.set(true);
-            if (onStarted != null) onStarted.run();
-            try {
-                HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-                long observedAt = Instant.now().getEpochSecond();
-                if (response.statusCode() != 200) {
-                    if (searchPath && isSearchUpstreamUnavailable(response.statusCode(), response.body(), loopbackBase)) {
-                        tripSearchCircuit("HTTP " + response.statusCode());
+            boolean startedMarked = false;
+            XDataProviderException lastFailure = null;
+
+            for (int attempt = 0; attempt <= MAX_INLINE_IDEMPOTENT_RETRIES; attempt++) {
+                long timeLeft = Duration.between(Instant.now(), deadline).toMillis();
+                if (timeLeft <= 0 || Thread.currentThread().isInterrupted()) {
+                    if (lastFailure != null) throw lastFailure;
+                    throw invalid("公开数据请求已超过本轮时限");
+                }
+                if (attempt > 0) {
+                    if (timeLeft < MIN_INLINE_RETRY_BUDGET_MS) {
+                        throw lastFailure;
                     }
-                    throw invalid("公开数据服务暂不可用（HTTP " + response.statusCode() + "）");
-                }
-                JsonNode json = mapper.readTree(response.body());
-                if (json == null || !json.isObject() || !json.path("code").isIntegralNumber()
-                        || json.path("code").asInt() != 200) {
-                    if (searchPath && json != null && (json.path("code").asInt() == 503 || json.path("code").asInt() == 501)) {
-                        tripSearchCircuit("code " + json.path("code").asInt());
+                    long backoffMs = loopbackBase ? 25L : Math.min(200L * attempt, Math.max(25L, timeLeft / 5L));
+                    try {
+                        Thread.sleep(backoffMs);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new XDataProviderException(503, "公开数据读取已中断");
                     }
-                    throw invalid("公开数据服务返回异常状态");
+                    timeLeft = Duration.between(Instant.now(), deadline).toMillis();
+                    if (timeLeft <= 0) throw lastFailure;
                 }
-                if (searchPath) {
-                    consecutiveSearchFailures.set(0);
-                    searchDisabledUntilEpochMs = 0L;
+
+                HttpRequest request = HttpRequest.newBuilder(URI.create(canonicalGetKey))
+                        .timeout(Duration.ofMillis(Math.min(requestCapMs, timeLeft)))
+                        .header("Accept", "application/json").header("User-Agent", USER_AGENT).GET().build();
+                if (!startedMarked) {
+                    startedMarked = true;
+                    if (requestStarted != null) requestStarted.set(true);
+                    if (onStarted != null) onStarted.run();
                 }
-                log.debug("FxTwitter {} read succeeded", path.startsWith("/profile/") ? "profile"
-                        : path.startsWith("/status/") ? "status" : path.startsWith("/thread/") ? "thread" : "search");
-                return new Fetched(json, observedAt);
-            } catch (InterruptedException ex) {
-                Thread.currentThread().interrupt();
-                throw new XDataProviderException(503, "公开数据读取已中断");
-            } catch (IOException ex) {
-                if (searchPath && !loopbackBase && consecutiveSearchFailures.incrementAndGet() >= 2) {
-                    tripSearchCircuit(ex.getClass().getSimpleName());
+                try {
+                    HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+                    long observedAt = Instant.now().getEpochSecond();
+                    int code = response.statusCode();
+                    if (code != 200) {
+                        boolean searchUnavailable = searchPath && isSearchUpstreamUnavailable(code, response.body(), loopbackBase);
+                        if (searchUnavailable) {
+                            tripSearchCircuit("HTTP " + code);
+                        }
+                        lastFailure = invalid("公开数据服务暂不可用（HTTP " + code + "）");
+                        boolean transientHttp = !searchUnavailable
+                                && (code == 429 || code == 500 || code == 502 || code == 503 || code == 504);
+                        if (transientHttp && attempt < MAX_INLINE_IDEMPOTENT_RETRIES
+                                && Duration.between(Instant.now(), deadline).toMillis() >= MIN_INLINE_RETRY_BUDGET_MS) {
+                            continue;
+                        }
+                        throw lastFailure;
+                    }
+                    JsonNode json = mapper.readTree(response.body());
+                    if (json == null || !json.isObject() || !json.path("code").isIntegralNumber()
+                            || json.path("code").asInt() != 200) {
+                        int bodyCode = json != null ? json.path("code").asInt(-1) : -1;
+                        if (searchPath && (bodyCode == 503 || bodyCode == 501)) {
+                            tripSearchCircuit("code " + bodyCode);
+                        }
+                        lastFailure = invalid("公开数据服务返回异常状态");
+                        boolean transientBodyCode = !searchPath
+                                && (bodyCode == 429 || bodyCode == 500 || bodyCode == 502 || bodyCode == 503 || bodyCode == 504);
+                        if (transientBodyCode && attempt < MAX_INLINE_IDEMPOTENT_RETRIES
+                                && Duration.between(Instant.now(), deadline).toMillis() >= MIN_INLINE_RETRY_BUDGET_MS) {
+                            continue;
+                        }
+                        throw lastFailure;
+                    }
+                    if (searchPath) {
+                        consecutiveSearchFailures.set(0);
+                        searchDisabledUntilEpochMs = 0L;
+                    }
+                    log.debug("FxTwitter {} read succeeded", path.startsWith("/profile/") ? "profile"
+                            : path.startsWith("/status/") ? "status" : path.startsWith("/thread/") ? "thread" : "search");
+                    return new Fetched(json, observedAt);
+                } catch (InterruptedException ex) {
+                    Thread.currentThread().interrupt();
+                    throw new XDataProviderException(503, "公开数据读取已中断");
+                } catch (IOException ex) {
+                    if (searchPath && !loopbackBase && consecutiveSearchFailures.incrementAndGet() >= 2) {
+                        tripSearchCircuit(ex.getClass().getSimpleName());
+                    }
+                    lastFailure = new XDataProviderException(502, "公开数据服务响应无法读取");
+                    if (attempt < MAX_INLINE_IDEMPOTENT_RETRIES
+                            && !isSearchCircuitOpen()
+                            && Duration.between(Instant.now(), deadline).toMillis() >= MIN_INLINE_RETRY_BUDGET_MS) {
+                        continue;
+                    }
+                    throw lastFailure;
                 }
-                throw new XDataProviderException(502, "公开数据服务响应无法读取");
             }
+            throw lastFailure != null ? lastFailure : invalid("公开数据服务暂不可用");
         });
+        if (onStarted == null) {
+            inFlightGets.put(canonicalGetKey, future);
+            future.whenComplete((ignored, err) -> inFlightGets.remove(canonicalGetKey, future));
+        }
         // Completing the executor future also cancels/removes its queued or running task.
         return future.orTimeout(remaining, TimeUnit.MILLISECONDS);
     }
@@ -210,6 +280,12 @@ public final class FxTwitterClient {
     boolean isSearchCircuitOpen() {
         long until = searchDisabledUntilEpochMs;
         return until > 0L && System.currentTimeMillis() < until;
+    }
+
+    /** Re-opens free /search circuit when an explicit new active sync is triggered so transient outages never lock out permanently. */
+    public void resetCircuitForActiveSync() {
+        consecutiveSearchFailures.set(0);
+        searchDisabledUntilEpochMs = 0L;
     }
 
     private void tripSearchCircuit(String reason) {
@@ -483,20 +559,33 @@ public final class FxTwitterClient {
         batch.result.whenComplete((value, error) -> {
             if (batch.result.isCancelled()) batch.active.forEach(f -> f.cancel(true));
         });
-        metricGroup(batch, 0);
+        metricGroup(batch, batch.ids, 0);
         return batch.result;
     }
 
-    private void metricGroup(Batch batch, int offset) {
+    private void metricGroup(Batch batch, List<String> workIds, int offset) {
         if (batch.result.isDone()) return;
-        if (offset >= batch.ids.size() || batch.deadline == null || !Instant.now().isBefore(batch.deadline)) {
+        if (offset >= workIds.size() || batch.deadline == null || !Instant.now().isBefore(batch.deadline)) {
+            if (!batch.retriedBatch && batch.deadline != null
+                    && Duration.between(Instant.now(), batch.deadline).toMillis() >= MIN_INLINE_RETRY_BUDGET_MS) {
+                List<String> retryableFailed = batch.ids.stream()
+                        .filter(id -> batch.attempted.contains(id)
+                                && !batch.tweets.containsKey(id)
+                                && !batch.nonRetryable.contains(id))
+                        .toList();
+                if (!retryableFailed.isEmpty()) {
+                    batch.retriedBatch = true;
+                    metricGroup(batch, retryableFailed, 0);
+                    return;
+                }
+            }
             finishMetrics(batch);
             return;
         }
-        int end = Math.min(offset + 4, batch.ids.size());
+        int end = Math.min(offset + 4, workIds.size());
         List<CompletableFuture<?>> group = new ArrayList<>();
         for (int i = offset; i < end; i++) {
-            String id = batch.ids.get(i);
+            String id = workIds.get(i);
             CompletableFuture<Fetched> request = request("/status/" + id, batch.deadline, batch.requestStarted,
                     () -> batch.attempted.add(id));
             batch.active.add(request);
@@ -507,14 +596,21 @@ public final class FxTwitterClient {
                     try {
                         batch.tweets.put(id, tweet(fetched.body().path("status"), id, fetched.observedAt()));
                     } catch (XDataProviderException ignored) {
-                        // An unverifiable status is incomplete, never evidence of deletion.
+                        // Deterministic schema/account mismatch on HTTP 200: mark non-retryable, never evidence of deletion.
+                        batch.nonRetryable.add(id);
+                    }
+                } else {
+                    Throwable cause = error.getCause() != null ? error.getCause() : error;
+                    String msg = cause.getMessage() == null ? "" : cause.getMessage();
+                    if (msg.contains("HTTP 404") || msg.contains("HTTP 400") || msg.contains("HTTP 401") || msg.contains("HTTP 403")) {
+                        batch.nonRetryable.add(id);
                     }
                 }
                 return null;
             }));
         }
         CompletableFuture.allOf(group.toArray(CompletableFuture[]::new))
-                .whenComplete((unused, error) -> metricGroup(batch, end));
+                .whenComplete((unused, error) -> metricGroup(batch, workIds, end));
     }
 
     private void finishMetrics(Batch batch) {
@@ -748,9 +844,11 @@ public final class FxTwitterClient {
         final Instant deadline;
         final AtomicBoolean requestStarted;
         final Set<String> attempted = ConcurrentHashMap.newKeySet();
+        final Set<String> nonRetryable = ConcurrentHashMap.newKeySet();
         final Map<String, ObjectNode> tweets = new ConcurrentHashMap<>();
         final Set<CompletableFuture<?>> active = ConcurrentHashMap.newKeySet();
         final CompletableFuture<JsonNode> result = new CompletableFuture<>();
+        volatile boolean retriedBatch = false;
 
         Batch(List<String> ids, Instant deadline, AtomicBoolean requestStarted) {
             this.ids = ids;

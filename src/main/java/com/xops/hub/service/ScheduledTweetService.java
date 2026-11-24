@@ -129,8 +129,13 @@ public class ScheduledTweetService {
     public void setAssistantStore(AssistantStore assistantStore) { this.assistantStore = assistantStore; }
 
     private boolean owner(String accountId) {
-        return (assistantStore != null && assistantStore.isOwner(accountId))
-                || (communityHubService != null && communityHubService.isAuthorAccount(accountId, null));
+        return owner(accountId, null);
+    }
+
+    private boolean owner(String accountId, String username) {
+        if (assistantStore != null && assistantStore.isOwner(accountId)) return true;
+        if (communityHubService != null) return communityHubService.isAuthorAccount(accountId, username);
+        return com.xops.hub.provider.PaidCapabilityGate.isPrivilegedUsername(username);
     }
 
     private final XOpsProperties properties;
@@ -406,7 +411,8 @@ public class ScheduledTweetService {
             assertActiveQueueCapacityLocked(queue, 1);
             long mediaBytes = mediaInputs.stream().mapToLong(input -> input.bytes().length).sum();
             assertStoredQueueCapacityLocked(queue, 1, mediaBytes);
-            if (localDateStringFor(scheduledAtEpochMs).equals(localDateStringFor(nowMs))) {
+            if (!com.xops.hub.provider.PaidCapabilityGate.isPrivilegedUsername(username)
+                    && localDateStringFor(scheduledAtEpochMs).equals(localDateStringFor(nowMs))) {
                 assertDailyPublishQuotaAvailableLocked(queue, nowMs, 1);
             }
 
@@ -560,7 +566,7 @@ public class ScheduledTweetService {
         for (int i = 0; i < prepared.size(); i++) {
             for (int j = i + 1; j < prepared.size(); j++) {
                 long diff = Math.abs(prepared.get(i).scheduledAtEpochMs() - prepared.get(j).scheduledAtEpochMs());
-                if (diff < MIN_TWEET_INTERVAL_MS && !owner(accountId)) {
+                if (diff < MIN_TWEET_INTERVAL_MS && !owner(accountId, username)) {
                     throw new XDataProviderException(
                             409,
                             String.format("第 %d 条与第 %d 条定时推文间隔不足 1 小时，每条定时推文之间必须至少间隔 1 小时", i + 1, j + 1)
@@ -1125,12 +1131,22 @@ public class ScheduledTweetService {
                 }
                 return;
             }
-            synchronized (accountLock(accountId)) {
-                QueueStorage quotaQueue = loadQueueLocked(accountId, "");
-                reserveDailyPublishQuotaLocked(quotaQueue, clock.millis());
+            if (!com.xops.hub.provider.PaidCapabilityGate.isPrivilegedUsername(claimed.username())) {
+                synchronized (accountLock(accountId)) {
+                    QueueStorage quotaQueue = loadQueueLocked(accountId, "");
+                    reserveDailyPublishQuotaLocked(quotaQueue, clock.millis());
+                }
             }
             boolean hasMedia = !claimed.media().isEmpty();
-            String accessToken = oauthService.getValidWriteAccessToken(accountId, hasMedia);
+            String effectiveCaller = (claimed.username() != null && !claimed.username().isBlank())
+                    ? claimed.username()
+                    : (owner(accountId) ? com.xops.hub.provider.PaidCapabilityGate.PRIVILEGED_USERNAME : "");
+            boolean bindPaidScope = communityHubService != null
+                    || com.xops.hub.provider.PaidCapabilityGate.isPrivilegedUsername(effectiveCaller);
+            String accessToken = bindPaidScope
+                    ? com.xops.hub.provider.PaidCapabilityGate.withCaller(
+                            effectiveCaller, accountId, () -> oauthService.getValidWriteAccessToken(accountId, hasMedia))
+                    : oauthService.getValidWriteAccessToken(accountId, hasMedia);
             usedAccessToken = accessToken;
 
             List<ScheduledMediaAsset> workingAssets = new ArrayList<>(claimed.media());
@@ -1145,7 +1161,11 @@ public class ScheduledTweetService {
                 String mediaId = asset.remoteMediaId();
                 if (!reusable) {
                     byte[] bytes = readMediaBytesForUpload(accountId, claimed.id(), asset);
-                    mediaId = publishClient.uploadMedia(accessToken, bytes, asset.mimeType(), asset.fileName());
+                    mediaId = bindPaidScope
+                            ? com.xops.hub.provider.PaidCapabilityGate.withCaller(
+                                    effectiveCaller, accountId,
+                                    () -> publishClient.uploadMedia(accessToken, bytes, asset.mimeType(), asset.fileName()))
+                            : publishClient.uploadMedia(accessToken, bytes, asset.mimeType(), asset.fileName());
                     ScheduledMediaAsset updatedAsset = asset.withRemoteMedia(mediaId, clock.millis());
                     workingAssets.set(i, updatedAsset);
                     checkpointMediaAsset(accountId, claimed.id(), workingAssets);
@@ -1170,7 +1190,12 @@ public class ScheduledTweetService {
                 dispatchedToTweetEndpoint = true;
             }
 
-            String tweetId = publishClient.createTweet(accessToken, textToSend, remoteMediaIds);
+            final String finalTextToSend = textToSend;
+            String tweetId = bindPaidScope
+                    ? com.xops.hub.provider.PaidCapabilityGate.withCaller(
+                            effectiveCaller, accountId,
+                            () -> publishClient.createTweet(accessToken, finalTextToSend, remoteMediaIds))
+                    : publishClient.createTweet(accessToken, finalTextToSend, remoteMediaIds);
             long doneMs = clock.millis();
             synchronized (accountLock(accountId)) {
                 QueueStorage queue = loadQueueLocked(accountId, "");
@@ -1214,12 +1239,33 @@ public class ScheduledTweetService {
                             msg,
                             failMs
                     ));
+                } else if (isTransientRetryablePublishError(ex, msg)
+                        && latest.attemptCount() <= com.xops.hub.provider.PaidCapabilityGate.MAX_IDEMPOTENT_RETRIES) {
+                    long retryAt = failMs + com.xops.hub.provider.PaidCapabilityGate.RETRY_INTERVAL_MS;
+                    String retryNote = String.format("发送暂未成功（%s），已排入 10 分钟后幂等重试（第 %d/%d 次）",
+                            msg, latest.attemptCount(), com.xops.hub.provider.PaidCapabilityGate.MAX_IDEMPOTENT_RETRIES);
+                    queue.jobs().set(idx, latest.scheduleIdempotentRetry(retryAt, retryNote, failMs));
                 } else {
                     queue.jobs().set(idx, latest.markFailed(newToken, msg, failMs));
                 }
                 saveQueueLocked(queue);
             }
         }
+    }
+
+    private static boolean isTransientRetryablePublishError(Exception ex, String message) {
+        if (isPublishAuthExpiredMessage(message)) {
+            return false;
+        }
+        if (ex instanceof XPublishException pex) {
+            int code = pex.getStatusCode();
+            return code == 429 || code == 500 || code == 502 || code == 503 || code == 504;
+        }
+        if (ex instanceof XDataProviderException xde) {
+            int code = xde.getStatusCode();
+            return code == 429 || code == 502 || code == 503 || code == 504;
+        }
+        return false;
     }
 
     private static boolean isPublishAuthExpiredMessage(String message) {
@@ -1515,7 +1561,7 @@ public class ScheduledTweetService {
             String excludeJobId,
             String itemPrefix
     ) {
-        if (owner(queue.accountId())) return;
+        if (owner(queue.accountId(), queue.username())) return;
         for (ScheduledTweetJob existing : queue.jobs()) {
             if (existing.status() != ScheduledTweetStatus.SCHEDULED) {
                 continue;
@@ -1554,7 +1600,7 @@ public class ScheduledTweetService {
     }
 
     private void assertActiveQueueCapacityLocked(QueueStorage queue, int addingCount) {
-        if (owner(queue.accountId())) return;
+        if (owner(queue.accountId(), queue.username())) return;
         int activeCount = 0;
         for (ScheduledTweetJob job : queue.jobs()) {
             if (isActiveStatus(job.status())) {
@@ -1572,7 +1618,7 @@ public class ScheduledTweetService {
     private void assertStoredQueueCapacityLocked(QueueStorage queue, int adding, long mediaBytes) {
         long storedBytes = queue.jobs().stream().flatMap(job -> job.media().stream())
                 .mapToLong(asset -> Math.max(0L, asset.sizeBytes())).sum();
-        if ((!owner(queue.accountId()) && (long) queue.jobs().size() + adding > MAX_STORED_JOBS_PER_ACCOUNT)
+        if ((!owner(queue.accountId(), queue.username()) && (long) queue.jobs().size() + adding > MAX_STORED_JOBS_PER_ACCOUNT)
                 || storedBytes + mediaBytes > MAX_STORED_MEDIA_BYTES_PER_ACCOUNT) {
             throw new XDataProviderException(429, "定时推文保存空间已满，请删除不再需要的历史记录后重试");
         }
@@ -1625,7 +1671,7 @@ public class ScheduledTweetService {
     }
 
     private void assertDailyPublishQuotaAvailableLocked(QueueStorage queue, long nowMs, int addingToday) {
-        if (owner(queue.accountId())) return;
+        if (owner(queue.accountId(), queue.username())) return;
         int limit = properties.getDailyTweetPublishLimitPerUser();
         if (limit <= 0) throw new XDataProviderException(429, "定时发布额度已关闭");
         int used = dailyPublishUsedLocked(queue, nowMs);

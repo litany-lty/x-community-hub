@@ -126,6 +126,7 @@ public class SharedApiExecutor {
         AtomicBoolean claimed = new AtomicBoolean(false);
         AtomicReference<ScheduledFuture<?>> timeout = new AtomicReference<>();
         CompletableFuture<T> future = new CompletableFuture<>();
+        PaidCapabilityGate.CallerScope capturedScope = PaidCapabilityGate.currentScope();
         FutureTask<T> task = new FutureTask<>(apiCall) {
             @Override
             public void run() {
@@ -143,7 +144,15 @@ public class SharedApiExecutor {
                     cancel(false);
                     return;
                 }
-                super.run();
+                PaidCapabilityGate.CallerScope prevScope = PaidCapabilityGate.currentScope();
+                if (capturedScope != null) {
+                    PaidCapabilityGate.bindScope(capturedScope);
+                }
+                try {
+                    super.run();
+                } finally {
+                    PaidCapabilityGate.bindScope(prevScope);
+                }
             }
             @Override
             protected void done() {

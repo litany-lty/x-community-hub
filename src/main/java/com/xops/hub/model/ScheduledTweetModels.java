@@ -182,6 +182,16 @@ public final class ScheduledTweetModels {
                     publishedAtEpochMs, publishedTweetId, publishedTweetUrl, null, assistantSource
             );
         }
+
+        public ScheduledTweetJob scheduleIdempotentRetry(long nextScheduledAtEpochMs, String errorMessage, long nowMs) {
+            return new ScheduledTweetJob(
+                    id, accountId, username, text, media, nextScheduledAtEpochMs,
+                    ScheduledTweetStatus.SCHEDULED, OverdueReason.NONE, false, false,
+                    null, clientRequestId, contentFingerprint, attemptCount,
+                    createdAtEpochMs, nowMs, 0L, 0L,
+                    publishedAtEpochMs, publishedTweetId, publishedTweetUrl, errorMessage, assistantSource
+            );
+        }
     }
 
     public record ScheduledTweetListResponse(
