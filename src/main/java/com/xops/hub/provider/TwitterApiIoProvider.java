@@ -2430,7 +2430,8 @@ public class TwitterApiIoProvider {
             AccountStore.StoredAccount metricStore, AtomicReference<XDataProviderException> capturedError) {
         var read = new ReadDiagnostic(url);
         if (useFreeSource(url)) {
-            boolean pureFree = isPureFreeEndpoint(url) || apiKey == null || apiKey.isBlank();
+            boolean pureFree = apiKey == null || apiKey.isBlank()
+                    || (isPureFreeEndpoint(url) && !PaidCapabilityGate.isCurrentCallerPrivileged());
             var started = requestStarted != null ? requestStarted : new AtomicBoolean();
             long startNanos = System.nanoTime();
             Instant freeDeadline = pureFree ? deadline : deadline.minusMillis(PAID_FALLBACK_RESERVE_MS);
@@ -2698,7 +2699,8 @@ public class TwitterApiIoProvider {
     private CompletableFuture<JsonNode> getJsonWithRetryAsync(String url, String apiKey, KeyPacer pacer, Instant deadline, SearchReplyRoots searchRoots) {
         var diagnostic = new ReadDiagnostic(url);
         if (useFreeSource(url)) {
-            boolean pureFree = isPureFreeEndpoint(url) || apiKey == null || apiKey.isBlank();
+            boolean pureFree = apiKey == null || apiKey.isBlank()
+                    || (isPureFreeEndpoint(url) && !PaidCapabilityGate.isCurrentCallerPrivileged());
             var freeStarted = new AtomicBoolean();
             long freeStartNanos = System.nanoTime();
             Instant freeDeadline = pureFree ? deadline : deadline.minusMillis(PAID_FALLBACK_RESERVE_MS);

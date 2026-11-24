@@ -176,6 +176,7 @@ public final class FxTwitterClient {
         }
         CompletableFuture<Fetched> future = executor.submitAsync(() -> {
             boolean searchPath = path.startsWith("/search?");
+            boolean statusesPath = path.startsWith("/profile/") && path.contains("/statuses");
             boolean loopbackBase = isLoopbackBaseUrl(base);
             long requestCapMs = (searchPath && !loopbackBase) ? SEARCH_HTTP_TIMEOUT_MS : 10_000L;
             boolean startedMarked = false;
@@ -220,8 +221,9 @@ public final class FxTwitterClient {
                             tripSearchCircuit("HTTP " + code);
                         }
                         lastFailure = invalid("公开数据服务暂不可用（HTTP " + code + "）");
+                        boolean transientStatuses404 = statusesPath && code == 404 && isTransientTimeline404(response.body());
                         boolean transientHttp = !searchUnavailable
-                                && (code == 429 || code == 500 || code == 502 || code == 503 || code == 504);
+                                && (code == 429 || code == 500 || code == 502 || code == 503 || code == 504 || transientStatuses404);
                         if (transientHttp && attempt < MAX_INLINE_IDEMPOTENT_RETRIES
                                 && Duration.between(Instant.now(), deadline).toMillis() >= MIN_INLINE_RETRY_BUDGET_MS) {
                             continue;
@@ -237,7 +239,8 @@ public final class FxTwitterClient {
                         }
                         lastFailure = invalid("公开数据服务返回异常状态");
                         boolean transientBodyCode = !searchPath
-                                && (bodyCode == 429 || bodyCode == 500 || bodyCode == 502 || bodyCode == 503 || bodyCode == 504);
+                                && (bodyCode == 429 || bodyCode == 500 || bodyCode == 502 || bodyCode == 503 || bodyCode == 504
+                                    || (statusesPath && bodyCode == 404 && json != null && json.has("results")));
                         if (transientBodyCode && attempt < MAX_INLINE_IDEMPOTENT_RETRIES
                                 && Duration.between(Instant.now(), deadline).toMillis() >= MIN_INLINE_RETRY_BUDGET_MS) {
                             continue;
@@ -305,6 +308,10 @@ public final class FxTwitterClient {
             return true;
         }
         return body != null && body.toLowerCase(Locale.ROOT).contains("unavailable");
+    }
+
+    private static boolean isTransientTimeline404(String body) {
+        return body != null && body.contains("\"results\"");
     }
 
     private static boolean isLoopbackBaseUrl(String base) {

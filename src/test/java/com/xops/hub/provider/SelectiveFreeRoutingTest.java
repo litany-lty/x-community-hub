@@ -347,4 +347,80 @@ class SelectiveFreeRoutingTest {
         node.set("author", freeUser(authorId, screenName, 320, 80));
         return node;
     }
+
+    @Test
+    void transientTimeline404RetriesOnFreeAndPersistentFailureFallsBackOnlyForPrivilegedOwner() throws Exception {
+        Instant now = Instant.now().truncatedTo(ChronoUnit.SECONDS);
+        AtomicInteger freeTimelineHits = new AtomicInteger();
+        AtomicInteger paidTimelineHits = new AtomicInteger();
+        AtomicBoolean alwaysFailFree = new AtomicBoolean(false);
+
+        HttpServer paidServer = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        paidServer.createContext("/twitter/user/last_tweets", ex -> {
+            paidTimelineHits.incrementAndGet();
+            ObjectNode root = MAPPER.createObjectNode().put("has_next_page", false);
+            root.putArray("tweets").add(paidPost("9502", "1001", "alice", now.minusSeconds(120)));
+            byte[] bytes = MAPPER.writeValueAsBytes(root);
+            ex.getResponseHeaders().set("Content-Type", "application/json");
+            ex.sendResponseHeaders(200, bytes.length);
+            ex.getResponseBody().write(bytes);
+            ex.close();
+        });
+        paidServer.start();
+
+        HttpServer freeServer = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        freeServer.createContext("/2/profile/alice/statuses", ex -> {
+            int hit = freeTimelineHits.incrementAndGet();
+            if (alwaysFailFree.get() || hit == 1) {
+                byte[] bogus404 = "{\"code\":404,\"results\":[],\"cursor\":{\"top\":null,\"bottom\":null}}"
+                        .getBytes(StandardCharsets.UTF_8);
+                ex.getResponseHeaders().set("Content-Type", "application/json");
+                ex.sendResponseHeaders(404, bogus404.length);
+                ex.getResponseBody().write(bogus404);
+                ex.close();
+                return;
+            }
+            ObjectNode body = MAPPER.createObjectNode().put("code", 200);
+            body.putObject("cursor").put("bottom", "");
+            body.putArray("results").add(freeStatus("9501", "1001", "alice", now.minusSeconds(90)));
+            byte[] bytes = MAPPER.writeValueAsBytes(body);
+            ex.getResponseHeaders().set("Content-Type", "application/json");
+            ex.sendResponseHeaders(200, bytes.length);
+            ex.getResponseBody().write(bytes);
+            ex.close();
+        });
+        freeServer.start();
+
+        XOpsProperties props = new XOpsProperties();
+        props.setTwitterapiIoKey("valid-test-key");
+        props.setTwitterapiIoBaseUrl("http://127.0.0.1:" + paidServer.getAddress().getPort());
+        props.setFxtwitterEnabled(true);
+        props.setFxtwitterBaseUrl("http://127.0.0.1:" + freeServer.getAddress().getPort() + "/2");
+        props.setDiskCacheDir(temp.resolve("cache-404").toString());
+
+        SharedApiExecutor pool = new SharedApiExecutor(props);
+        try {
+            TwitterApiIoProvider provider = new TwitterApiIoProvider(props, MAPPER, pool);
+
+            // 1. Transient bogus 404 recovers via inline free retry without hitting paid API
+            var recoveredPage = PaidCapabilityGate.withCaller("elidlicom", "mon-1", () ->
+                    provider.fetchTextPostsPage("alice", "1001", "", 20, Instant.now().plusSeconds(10)));
+            assertThat(recoveredPage.posts()).extracting(TwitterApiIoProvider.TextPost::id).containsExactly("9501");
+            assertThat(freeTimelineHits.get()).isEqualTo(2);
+            assertThat(paidTimelineHits.get()).isZero();
+
+            // 2. Persistent free 404 falls back to paid TwitterAPI.io for privileged owner @elidlicom
+            alwaysFailFree.set(true);
+            freeTimelineHits.set(0);
+            var fallbackPage = PaidCapabilityGate.withCaller("elidlicom", "mon-2", () ->
+                    provider.fetchTextPostsPage("alice", "1001", "", 20, Instant.now().plusSeconds(10)));
+            assertThat(fallbackPage.posts()).extracting(TwitterApiIoProvider.TextPost::id).containsExactly("9502");
+            assertThat(freeTimelineHits.get()).isEqualTo(3);
+            assertThat(paidTimelineHits.get()).isEqualTo(1);
+        } finally {
+            pool.shutdown();
+            paidServer.stop(0);
+            freeServer.stop(0);
+        }
+    }
 }
