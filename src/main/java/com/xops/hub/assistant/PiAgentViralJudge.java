@@ -2191,7 +2191,17 @@ public class PiAgentViralJudge {
         }
         if (!finished) {
             killProcessTree(proc);
-            throw new IOException("ChatGPT OAuth 判定超时（>" + timeout.toSeconds() + "s）");
+            String timeoutLabel = "ChatGPT OAuth 判定";
+            if (command != null) {
+                int provIdx = command.indexOf("--provider");
+                if (provIdx >= 0 && provIdx + 1 < command.size()) {
+                    String prov = command.get(provIdx + 1);
+                    if (prov != null && !prov.isBlank() && !"openai-codex".equalsIgnoreCase(prov)) {
+                        timeoutLabel = "PI Agent (" + prov + ") 调用";
+                    }
+                }
+            }
+            throw new IOException(timeoutLabel + "超时（>" + timeout.toSeconds() + "s）");
         }
         return new CliResult(proc.exitValue(), awaitStream(stdoutFuture), awaitStream(stderrFuture));
     }

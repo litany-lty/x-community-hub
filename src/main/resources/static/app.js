@@ -4731,7 +4731,11 @@
                 ${change.url ? ` · <a href="${safeHttpUrl(change.url)}" target="_blank" rel="noopener noreferrer">查看来源 ↗</a>` : ""}</li>`).join("")}</ul>` : ""}
             ${factChanges.length ? `<div class="assistant-fact-changes">${factChanges.map((change) => `<p><del>${escapeHtml(change.before || "")}</del><ins>${escapeHtml(change.after || "")}</ins>
                 ${Array.isArray(change.sourceIds) && change.sourceIds.length ? `<small>依据：${change.sourceIds.map((r) => escapeHtml(typeof assistantSourceRefLabel === "function" ? assistantSourceRefLabel(r) : r)).join("、")}</small>` : ""}</p>`).join("")}</div>` : ""}
-            ${fallbackMaterialId ? `<button type="button" class="x-outline-pill sm" data-assistant-research="${escapeHtml(fallbackMaterialId)}" data-regenerate="true">按最新依据重新研究</button>` : ""}
+            ${fallbackMaterialId
+                ? (draft?.id
+                    ? `<button type="button" class="x-outline-pill sm" data-assistant-research-upgrade="${escapeHtml(draft.id)}" data-material-id="${escapeHtml(fallbackMaterialId)}">按最新依据深挖出新版</button>`
+                    : `<button type="button" class="x-outline-pill sm" data-assistant-research="${escapeHtml(fallbackMaterialId)}" data-regenerate="true">按最新依据重新研究</button>`)
+                : ""}
         </div>`;
     }
 
@@ -4902,6 +4906,49 @@
             parts.push(`<span class="is-warn">正文含外链，宜移至首评规避降权</span>`);
         }
         return parts.join("");
+    }
+
+    function assistantDraftResearchStatus(draft) {
+        const res = draft?.research && typeof draft.research === "object" ? draft.research : null;
+        if (!res) {
+            return { hasDeepResearch: false, webSourceCount: 0, badgeCls: "muted", badgeLabel: "仅原帖依据" };
+        }
+        const webIds = new Set();
+        if (Array.isArray(res.evidence)) {
+            for (const item of res.evidence) {
+                const sid = String(item?.id || "").trim();
+                if (sid && !sid.startsWith("material-")) webIds.add(sid);
+            }
+        }
+        if (Array.isArray(res.sourceReads)) {
+            for (const item of res.sourceReads) {
+                if (String(item?.status || "").toUpperCase() === "READ") {
+                    const key = String(item?.id || item?.url || "").trim();
+                    if (key) webIds.add(key);
+                }
+            }
+        }
+        const webSourceCount = webIds.size;
+        const quality = String(res.quality || "").toUpperCase();
+        const isDirectOnly = quality === "MATERIAL_DIRECT" || res.fastMode === true;
+        const hasDeepResearch = webSourceCount > 0
+            || (!isDirectOnly && Boolean(res.draftable || (Array.isArray(res.claims) && res.claims.length)));
+        const badgeLabel = hasDeepResearch
+            ? (webSourceCount > 0 ? `已融合深挖 · ${webSourceCount} 源` : "已融合深挖")
+            : "仅原帖依据";
+        return {
+            hasDeepResearch,
+            webSourceCount,
+            badgeCls: hasDeepResearch ? "ok" : "muted",
+            badgeLabel
+        };
+    }
+
+    function resStatusSummaryLabel(draft) {
+        const st = assistantDraftResearchStatus(draft);
+        return st.hasDeepResearch
+            ? (st.webSourceCount > 0 ? `研究依据（已融合 ${st.webSourceCount} 个外部网页与一手原文）` : "研究依据（已融合深度研究）")
+            : "研究依据（当前仅含原帖原文，可点「联网深挖出新版」补充外部资料）";
     }
 
     function resolveAssistantDraftSourcePost(draft, materials) {
@@ -5113,12 +5160,15 @@
         const needsConfirm = topic.needsConfirmation === true || String(topic.status || "").toUpperCase() === "NEEDS_CONFIRMATION";
         const numberChangesText = assistantDraftNumberChangesText(draft?.numberChanges);
         const researchBlockHtml = draft?.research && typeof renderAssistantResearch === "function"
-            ? `<details class="assistant-collapsible assistant-evidence-collapsible"><summary>研究依据</summary>${renderAssistantResearch(draft.research)}</details>`
+            ? `<details class="assistant-collapsible assistant-evidence-collapsible"><summary>${resStatusSummaryLabel(draft)}</summary>${renderAssistantResearch(draft.research)}</details>`
             : "";
         const sourcePost = draft ? resolveAssistantDraftSourcePost(draft, materials) : null;
+        const draftResStatus = draft ? assistantDraftResearchStatus(draft) : null;
+        const upgradeMatId = draft?.materialId || primaryMaterial?.id || materials[0]?.id || "";
         const draftHtml = draft ? `<div class="assistant-draft" data-draft-id="${escapeHtml(draft.id)}" data-draft-version="${Number(draft.version || 0)}">
             <div class="assistant-pane-head"><h3 id="assistantDraftTitle">初稿 v${Number(draft.version || 0)}</h3>
                 <div class="assistant-draft-head-actions">
+                    <span class="assistant-state ${draftResStatus.badgeCls}">${escapeHtml(draftResStatus.badgeLabel)}</span>
                     ${draft.skillId ? `<span class="assistant-state ok">${escapeHtml(assistantSkillLabel(draft.skillId, dashboard))}</span>` : ""}
                     ${topicDrafts.length > 1 ? `<select id="assistantDraftSelect" class="x-select" aria-label="选择独立稿件">${topicDrafts.map((item, index) =>
                         `<option value="${escapeHtml(item.id)}"${item.id === draft.id ? " selected" : ""}>稿件 ${index + 1} · v${Number(item.version || 0)}</option>`).join("")}</select>` : ""}
@@ -5149,8 +5199,10 @@
                 <div class="assistant-draft-actions">
                     <select id="assistantOptimizeGenTargetSelect" class="x-select assistant-gen-select sm" aria-label="本次改稿生成模型" data-i18n-ignore>${renderGenerationTargetOptionsHtml(state.assistantGenerationTargetSpec)}</select>
                     <select id="assistantOptimizeEffortSelect" class="x-select assistant-effort-select sm" aria-label="本次改稿推理强度" data-i18n-ignore${!providerSupportsEffort((state.assistantGenerationTargetSpec || "chatgpt").split("|")[0]) ? " disabled" : ""}>${renderReasoningEffortOptionsHtml(state.assistantGenerationEffort, (state.assistantGenerationTargetSpec || "chatgpt").split("|")[0])}</select>
-                    <input id="assistantOptimizeInstruction" type="text" placeholder="改稿要求（留空点「改写新版本」即结合研究资料换高流量话题切口重写）…" aria-label="改稿要求" />
-                    <button type="button" class="x-outline-pill sm" data-assistant-optimize="${escapeHtml(draft.id)}">改写新版本</button>
+                    <input id="assistantOptimizeInstruction" type="text" placeholder="改稿要求（留空直接换高流量话题切口）…" aria-label="改稿要求" />
+                    ${upgradeMatId && !draftResStatus.hasDeepResearch ? `<button type="button" class="x-blue-pill sm" data-assistant-research-upgrade="${escapeHtml(draft.id)}" data-material-id="${escapeHtml(upgradeMatId)}">联网深挖出新版</button>` : ""}
+                    <button type="button" class="${draftResStatus.hasDeepResearch ? "x-blue-pill" : "x-outline-pill"} sm" data-assistant-optimize="${escapeHtml(draft.id)}">改写新版本</button>
+                    ${upgradeMatId && draftResStatus.hasDeepResearch ? `<button type="button" class="x-outline-pill sm" data-assistant-research-upgrade="${escapeHtml(draft.id)}" data-material-id="${escapeHtml(upgradeMatId)}">重跑深挖</button>` : ""}
                 </div>
             </div>
             <div class="assistant-draft-export-actions">
@@ -10602,6 +10654,7 @@
                     regenerate: researchBtn.dataset.regenerate === "true"
                 };
                 if (instruction) payload.instruction = instruction;
+                if (topicId) delete state.assistantSelectedDraftByTopic[topicId];
                 await runAssistantMutation("research", "/research", payload, 180000);
                 return;
             }
@@ -10990,15 +11043,53 @@
             const research = event.target.closest("[data-assistant-research]");
             if (research) {
                 const instruction = ($("assistantCreationAngleInput")?.value ?? state.assistantCreationAngle ?? "").trim();
+                const genTarget = parseGenerationTargetSpec(
+                    $("assistantGenTargetSelect")?.value || state.assistantGenerationTargetSpec,
+                    $("assistantGenEffortSelect") ? $("assistantGenEffortSelect").value : state.assistantGenerationEffort
+                );
                 const payload = {
                     materialId: research.dataset.assistantResearch,
                     mode: research.dataset.researchMode || "RESEARCH",
                     skillId: state.assistantSelectedSkill || "AUTO",
+                    generationProvider: genTarget.generationProvider,
+                    generationModel: genTarget.generationModel,
                     clientRequestId: newClientRequestId(),
                     regenerate: research.dataset.regenerate === "true"
                 };
                 if (instruction) payload.instruction = instruction;
+                if (state.assistantSelectedTopicId) {
+                    delete state.assistantSelectedDraftByTopic[state.assistantSelectedTopicId];
+                }
                 await runAssistantMutation("research", "/research", payload, 180000);
+                return;
+            }
+            const researchUpgrade = event.target.closest("[data-assistant-research-upgrade]");
+            if (researchUpgrade) {
+                const draftId = (researchUpgrade.dataset.assistantResearchUpgrade || "").trim();
+                const materialId = (researchUpgrade.dataset.materialId || "").trim();
+                const instruction = ($("assistantOptimizeInstruction")?.value || $("assistantCreationAngleInput")?.value || "").trim();
+                const genTarget = parseGenerationTargetSpec(
+                    $("assistantOptimizeGenTargetSelect")?.value || $("assistantGenTargetSelect")?.value || state.assistantGenerationTargetSpec,
+                    $("assistantOptimizeEffortSelect") ? $("assistantOptimizeEffortSelect").value : state.assistantGenerationEffort
+                );
+                if (!await saveAssistantDraftEditor()) return;
+                const draft = (state.assistantDashboard?.drafts || []).find((item) => item.id === draftId);
+                if (!draft) return;
+                const payload = {
+                    materialId: materialId || draft.materialId,
+                    draftId: draft.id,
+                    version: draft.version,
+                    mode: "RESEARCH",
+                    skillId: draft.skillId || state.assistantSelectedSkill || "AUTO",
+                    generationProvider: genTarget.generationProvider,
+                    generationModel: genTarget.generationModel,
+                    regenerate: true,
+                    clientRequestId: newClientRequestId()
+                };
+                if (instruction) payload.instruction = instruction;
+                state.assistantSelectedDraftByTopic[draft.topicId] = draft.id;
+                const started = await runAssistantMutation("research-upgrade", "/research", payload, 180000);
+                if (started) showToast("已启动联网深挖，完成后将直接生成当前稿件新版本…");
                 return;
             }
             const taskAction = event.target.closest("[data-assistant-task-action]");

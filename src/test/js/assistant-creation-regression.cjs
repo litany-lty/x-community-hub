@@ -112,6 +112,17 @@ const resolvedNonNumeric = metricsCtx.resolveAssistantDraftSourcePost(
 );
 assert.equal(resolvedNonNumeric, null);
 
+assert.equal(
+    metricsCtx.assistantDraftResearchStatus({ research: { quality: "MATERIAL_DIRECT", fastMode: true } }).badgeLabel,
+    "仅原帖依据"
+);
+assert.equal(
+    metricsCtx.assistantDraftResearchStatus({
+        research: { quality: "SUPPORTED", draftable: true, evidence: [{ id: "source-1" }, { id: "source-2" }] }
+    }).badgeLabel,
+    "已融合深挖 · 2 源"
+);
+
 // 2. Test renderAssistantSkillBar AUTO chip & selection switching
 const barEl = { innerHTML: "" };
 const skillCtx = createContext({
@@ -521,5 +532,7 @@ assert.ok(cssVer && cssVer === jsVer, `Expected styles.css (${cssVer}) and app.j
 assert.match(appSource, /\/research-link/);
 assert.match(appSource, /换话题切口/);
 assert.match(appSource, /补深挖增量/);
+assert.match(appSource, /联网深挖出新版/);
+assert.match(appSource, /data-assistant-research-upgrade/);
 
 console.log("assistant-creation-regression: passed");

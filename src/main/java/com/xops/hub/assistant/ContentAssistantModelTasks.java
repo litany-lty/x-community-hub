@@ -154,8 +154,7 @@ public final class ContentAssistantModelTasks {
             TextModelClient.ModelResult raw = call(binding, prompt, false, deadline);
             calls.add(metadata(raw));
             JsonNode parsed = validator.parseJson(raw);
-            List<String> exampleIds = stringArray(parsed.path("exampleSampleIds"));
-            if (!batch.sampleIds().containsAll(exampleIds)) throw new IllegalArgumentException("style examples must reference processed samples");
+            List<String> exampleIds = sanitizeStyleExampleIds(stringArray(parsed.path("exampleSampleIds")), batch.sampleIds());
             partials.add(new BatchStyle(required(parsed, "profile"), batch.sampleIds(), exampleIds));
         }
         if (partials.isEmpty()) throw new IllegalArgumentException("at least one processed style batch is required");
@@ -164,8 +163,7 @@ public final class ContentAssistantModelTasks {
         JsonNode parsed = mapper.createObjectNode().put("profile", partials.get(0).profile())
                 .set("exampleSampleIds", mapper.valueToTree(partials.get(0).exampleSampleIds()));
         List<String> processed = batches.stream().flatMap(batch -> batch.sampleIds().stream()).distinct().toList();
-        List<String> examples = stringArray(parsed.path("exampleSampleIds"));
-        if (!processed.containsAll(examples)) throw new IllegalArgumentException("combined style examples must reference processed samples");
+        List<String> examples = sanitizeStyleExampleIds(stringArray(parsed.path("exampleSampleIds")), processed);
         return new StyleProfile(required(parsed, "profile"), processed, examples, batchResults, List.copyOf(calls), List.of());
     }
 
@@ -581,9 +579,35 @@ public final class ContentAssistantModelTasks {
         calls.add(metadata(raw));
         JsonNode parsed = validator.parseJson(raw);
         List<String> allowed = group.stream().flatMap(item -> item.processedSampleIds().stream()).distinct().toList();
-        List<String> examples = stringArray(parsed.path("exampleSampleIds"));
-        if (!allowed.containsAll(examples)) throw new IllegalArgumentException("combined style examples must reference processed samples");
+        List<String> examples = sanitizeStyleExampleIds(stringArray(parsed.path("exampleSampleIds")), allowed);
         return new BatchStyle(required(parsed, "profile"), allowed, examples);
+    }
+
+    static List<String> sanitizeStyleExampleIds(List<String> rawIds, List<String> allowedIds) {
+        if (allowedIds == null || allowedIds.isEmpty()) return List.of();
+        Set<String> allowedSet = new LinkedHashSet<>(allowedIds);
+        LinkedHashSet<String> matched = new LinkedHashSet<>();
+        if (rawIds != null) {
+            for (String raw : rawIds) {
+                if (raw == null || raw.isBlank()) continue;
+                String trimmed = raw.strip();
+                if (allowedSet.contains(trimmed)) {
+                    matched.add(trimmed);
+                    continue;
+                }
+                String normalized = trimmed
+                        .replaceFirst("(?i)^(?:sample[-_:\\s]*|#)", "")
+                        .replaceFirst("[:#]\\d+(?:[-–]\\d+)?$", "")
+                        .strip();
+                if (allowedSet.contains(normalized)) {
+                    matched.add(normalized);
+                }
+            }
+        }
+        if (matched.isEmpty() && rawIds != null && !rawIds.isEmpty()) {
+            return List.copyOf(allowedIds.subList(0, Math.min(2, allowedIds.size())));
+        }
+        return List.copyOf(matched);
     }
 
     List<SourceEvidence> prepareEvidence(TopicText topic, List<SourceEvidence> sources, TextModelClient.ModelBinding binding) {

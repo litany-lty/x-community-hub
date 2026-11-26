@@ -104,7 +104,7 @@ public final class AssistantWorker {
                 }
                 long start=System.currentTimeMillis();
                 var storedInput = (ObjectNode) task.path("input");
-                long end = start + stageLeaseMillis(task.path("settings"), stage);
+                long end = start + stageLeaseMillis(task.path("settings"), storedInput, stage);
                 if ("RESEARCH_SYNTHESIS".equals(stage)) {
                     end = Math.min(end, storedInput.path("synthesisDeadline").asLong(end));
                     if (end <= start) {
@@ -132,19 +132,35 @@ public final class AssistantWorker {
     }
 
     static long stageLeaseMillis(JsonNode settings, String stage) {
-        String provider = settings.path("provider").asText("commandcode");
+        return stageLeaseMillis(settings, null, stage);
+    }
+
+    static long stageLeaseMillis(JsonNode settings, JsonNode input, String stage) {
+        ObjectNode effectiveSettings = settings != null && settings.isObject()
+                ? ((ObjectNode) settings).deepCopy()
+                : object();
+        if (input != null && input.isObject() && Set.of("DRAFT", "OPTIMIZE", "OPTIMIZE_REVISION").contains(stage)) {
+            String runtimeProv = input.path("generationProvider").asText("").strip();
+            String runtimeModel = input.path("generationModel").asText("").strip();
+            if (!runtimeProv.isBlank()) effectiveSettings.put("provider", runtimeProv);
+            if (!runtimeModel.isBlank()) {
+                effectiveSettings.put("model", runtimeModel);
+                effectiveSettings.remove("bindings");
+            }
+        }
+        String provider = effectiveSettings.path("provider").asText("commandcode");
         return switch (stage) {
             case "RESEARCH", "RESEARCH_SYNTHESIS" -> Math.max(30_000L,
-                    AssistantIntelligence.roleBinding(settings, AssistantIntelligence.Stage.RESEARCH, provider).timeout() * 1000L);
+                    AssistantIntelligence.roleBinding(effectiveSettings, AssistantIntelligence.Stage.RESEARCH, provider).timeout() * 1000L);
             case "STYLE", "COLLECT_STYLE" -> Math.max(600_000L,
-                    AssistantIntelligence.roleBinding(settings, AssistantIntelligence.Stage.STYLE, provider).timeout() * 1000L);
+                    AssistantIntelligence.roleBinding(effectiveSettings, AssistantIntelligence.Stage.STYLE, provider).timeout() * 1000L);
             case "VERIFY" -> Math.max(240_000L,
-                    AssistantIntelligence.roleBinding(settings, AssistantIntelligence.Stage.CLASSIFY, provider).timeout() * 2000L);
+                    AssistantIntelligence.roleBinding(effectiveSettings, AssistantIntelligence.Stage.CLASSIFY, provider).timeout() * 2000L);
             case "OPTIMIZE_REVISION" -> Math.max(30_000L,
-                    AssistantIntelligence.roleBinding(settings, AssistantIntelligence.Stage.OPTIMIZE, provider).timeout() * 1000L + 15_000L);
+                    AssistantIntelligence.roleBinding(effectiveSettings, AssistantIntelligence.Stage.OPTIMIZE, provider).timeout() * 1000L + 15_000L);
             default -> {
                 AssistantIntelligence.Stage role = AssistantIntelligence.Stage.valueOf(stage);
-                yield Math.max(30_000L, AssistantIntelligence.roleBinding(settings, role, provider).timeout() * 1000L + 15_000L);
+                yield Math.max(30_000L, AssistantIntelligence.roleBinding(effectiveSettings, role, provider).timeout() * 1000L + 15_000L);
             }
         };
     }

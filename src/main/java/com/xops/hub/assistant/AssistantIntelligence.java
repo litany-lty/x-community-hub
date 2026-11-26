@@ -38,6 +38,7 @@ public final class AssistantIntelligence {
     private final AssistantStore store;
     private final TextModelClient modelClient;
     private final DeepSeekTextModelClient deepSeekClient;
+    private final boolean customModelClient;
     private final TextSourceReader sourceReader;
     private final ArticleTextResolver articleResolver;
     private final ContentAssistantModelTasks tasks;
@@ -65,29 +66,31 @@ public final class AssistantIntelligence {
     public AssistantIntelligence(ObjectMapper mapper, Environment environment,
                                  @Autowired(required = false) TwitterApiIoProvider twitterProvider,
                                  @Autowired(required = false) AssistantStore store) {
-        this(mapper, environment, store, createClients(mapper, environment, store),
+        this(mapper, environment, store, createClients(mapper, environment, store), false,
                 new SafeHttpTextSourceReader(environment == null ? null : environment.getProperty(SafeHttpTextSourceReader.DOH_URL_ENV)),
                 twitterProvider == null ? null : twitterProvider::fetchArticleText);
     }
 
     AssistantIntelligence(ObjectMapper mapper, Environment environment, TextModelClient modelClient, TextSourceReader sourceReader) {
-        this(mapper, environment, null, new ClientBundle(modelClient, null), sourceReader, null);
+        this(mapper, environment, null, new ClientBundle(modelClient, null), true, sourceReader, null);
     }
 
     AssistantIntelligence(ObjectMapper mapper, Environment environment, TextModelClient modelClient,
                           TextSourceReader sourceReader, ArticleTextResolver articleResolver) {
-        this(mapper, environment, null, new ClientBundle(modelClient, null), sourceReader, articleResolver);
+        this(mapper, environment, null, new ClientBundle(modelClient, null), true, sourceReader, articleResolver);
     }
 
     private record ClientBundle(TextModelClient router, DeepSeekTextModelClient deepSeek) { }
 
     private AssistantIntelligence(ObjectMapper mapper, Environment environment, AssistantStore store,
-                                  ClientBundle clients, TextSourceReader sourceReader, ArticleTextResolver articleResolver) {
+                                  ClientBundle clients, boolean customModelClient,
+                                  TextSourceReader sourceReader, ArticleTextResolver articleResolver) {
         this.mapper = mapper;
         this.environment = environment;
         this.store = store;
         this.modelClient = clients.router();
         this.deepSeekClient = clients.deepSeek();
+        this.customModelClient = customModelClient;
         this.sourceReader = sourceReader;
         this.articleResolver = articleResolver;
         this.tasks = new ContentAssistantModelTasks(mapper, modelClient, SearchProvider.fromModelClient(modelClient));
@@ -662,8 +665,12 @@ public final class AssistantIntelligence {
         String skillId = input.path("skillId").asText("");
         String baseline = input.path("text").asText("");
         boolean revision = !input.path("draftId").asText().isEmpty();
+        boolean researchUpgrade = input.path("researchUpgrade").asBoolean(false);
         var constraints = DraftRevisionConstraints.from(revision ? instruction : "");
         instruction += constraints.prompt(baseline);
+        if (researchUpgrade && !baseline.isBlank()) {
+            instruction += "\n【基于最新深度研究重构升级】baselineDraft 是补充深挖前的旧版草稿，仅供对齐关注点，严禁照搬其浅层句式；必须充分融入本次新抓取的 deepResearchSources 外部网页证据与细节，写出信息差更厚、更有流量钩子与评论讨论度的新版本。";
+        }
         if (input.path("questions").isArray() && !input.path("questions").isEmpty())
             instruction += "\n补充研究需要落实的问题：" + input.path("questions");
         String mergedPrefs = mergePreferencesWithWinningHint(input);
@@ -850,7 +857,7 @@ public final class AssistantIntelligence {
         String baseUrl = AssistantConnection.endpoint(environment, provider);
         String credential = AssistantConnection.credentialName(provider);
         if ("chatgpt".equalsIgnoreCase(provider)) {
-            if (!AssistantConnection.isProviderConfigured(environment, store, "chatgpt")) {
+            if (!customModelClient && !AssistantConnection.isProviderConfigured(environment, store, "chatgpt")) {
                 throw new AssistantIntelligenceException(FailureKind.MISSING_CONFIG, false, null,
                         "ChatGPT 订阅授权尚未登录就绪，请执行 codex login --device-auth 完成第三方授权", null);
             }
@@ -966,8 +973,9 @@ public final class AssistantIntelligence {
             protocol = AssistantConnection.defaultProtocol(provider);
         }
         String lowerModel = model == null ? "" : model.toLowerCase(java.util.Locale.ROOT);
-        if (!settings.has("timeoutSeconds") && !override.has("timeoutSeconds")
-                && (lowerModel.contains("carbon") || lowerModel.matches(".*[\\s@:]+(high|xhigh|ultra|max)$"))) {
+        if (!override.has("timeoutSeconds") && timeout <= 120
+                && (lowerModel.contains("carbon") || lowerModel.contains("reasoner")
+                || lowerModel.matches(".*[\\s@:]+(high|xhigh|ultra|max)$"))) {
             timeout = Math.max(timeout, 240);
         }
         return new RoleBinding(model, protocol, context, timeout, maxOutput);

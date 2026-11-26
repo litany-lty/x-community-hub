@@ -16,17 +16,38 @@ import java.util.regex.Pattern;
 /** Validates structured model output before it can change assistant state. */
 public final class ContentIntelligenceEngine {
     private static final Pattern CLAIM_ID_PATTERN = Pattern.compile("^(?:claim[-_]?|c)?(\\d+)$", Pattern.CASE_INSENSITIVE);
+    private static final Pattern THINK_TAG_PATTERN = Pattern.compile("(?is)<think>.*?</think>");
     private final ObjectMapper mapper;
 
     public ContentIntelligenceEngine(ObjectMapper mapper) { this.mapper = mapper; }
 
     public JsonNode parseJson(TextModelClient.ModelResult result) {
+        String raw = result == null || result.text() == null ? "" : result.text();
+        JsonNode direct = tryParseObject(raw);
+        if (direct != null) return direct;
+
+        String cleaned = THINK_TAG_PATTERN.matcher(raw).replaceAll("").replace("\uFEFF", "").strip();
+        String extracted = ChatGptOAuthTextModelClient.extractJsonObjectString(cleaned, null);
+        if (!extracted.isBlank() && !extracted.equals(raw)) {
+            JsonNode recovered = tryParseObject(extracted);
+            if (recovered != null) return recovered;
+        }
         try {
-            JsonNode value = mapper.readTree(result.text());
+            JsonNode value = mapper.readTree(raw);
             if (value == null || !value.isObject()) throw new IllegalArgumentException("model output must be a JSON object");
             return value;
         } catch (JsonProcessingException e) {
             throw new IllegalArgumentException("model output is not valid JSON", e);
+        }
+    }
+
+    private JsonNode tryParseObject(String candidate) {
+        if (candidate == null || candidate.isBlank()) return null;
+        try {
+            JsonNode node = mapper.readTree(candidate);
+            return (node != null && node.isObject()) ? node : null;
+        } catch (JsonProcessingException ignored) {
+            return null;
         }
     }
 

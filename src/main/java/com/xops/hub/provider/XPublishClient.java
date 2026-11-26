@@ -39,6 +39,8 @@ public class XPublishClient {
             "(?is).*(only reply to or quote posts|where you are mentioned or are the author).*");
     private static final Pattern CANONICAL_STATUS_URL = Pattern.compile(
             "(?i)^https?://(?:(?:www|mobile)\\.)?(?:x|twitter)\\.com/([A-Za-z0-9_]{1,15})/status/([0-9]{2,20})(?:[/?#].*)?$");
+    private static final Pattern EMBEDDED_X_STATUS_URL = Pattern.compile(
+            "(?i)https?://(?:(?:www|mobile)\\.)?(?:x|twitter|fxtwitter|vxtwitter)\\.com/[^\\s]+/status/[0-9]{2,20}[^\\s]*");
 
     public static <T> T withQuoteTweetUrl(String quoteTweetUrl, Supplier<T> action) {
         String prev = QUOTE_URL_HINT.get();
@@ -185,6 +187,30 @@ public class XPublishClient {
                     );
                 }
                 root = parseJsonOrNull(resp.body());
+                if (status == 403) {
+                    String detail2 = extractXErrorDetail(root, status);
+                    String combinedError2 = detail2 + " " + (resp.body() == null ? "" : resp.body());
+                    if (X_MENTION_QUOTE_RESTRICTION.matcher(combinedError2).find()) {
+                        String standaloneText = buildStandaloneFallbackText(text, canonicalUrl);
+                        if (!standaloneText.isBlank()) {
+                            Map<String, Object> standalonePayload = new LinkedHashMap<>();
+                            standalonePayload.put("text", standaloneText);
+                            if (mediaIds != null && !mediaIds.isEmpty()) {
+                                standalonePayload.put("media", Map.of("media_ids", mediaIds));
+                            }
+                            resp = sendCreateTweetPayload(userAccessToken, standalonePayload);
+                            status = resp.statusCode();
+                            if (status >= 500) {
+                                throw new XPublishException(
+                                        502,
+                                        "推文发布请求响应异常（HTTP " + status + "），无法确认 X 是否已成功落库",
+                                        true
+                                );
+                            }
+                            root = parseJsonOrNull(resp.body());
+                        }
+                    }
+                }
             }
         }
         if (status >= 400) {
@@ -252,6 +278,33 @@ public class XPublishClient {
             return text;
         }
         return text.stripTrailing() + "\n\n" + canonicalUrl;
+    }
+
+    private static String buildStandaloneFallbackText(String rawText, String canonicalUrl) {
+        if (rawText == null || rawText.isBlank()) {
+            return "";
+        }
+        String stripped = EMBEDDED_X_STATUS_URL.matcher(rawText).replaceAll("")
+                .replaceAll("[ \\t]+\\n", "\n")
+                .replaceAll("\\n{3,}", "\n\n")
+                .strip();
+        if (stripped.isBlank()) {
+            return "";
+        }
+        if (canonicalUrl != null && !canonicalUrl.isBlank()) {
+            Matcher matcher = CANONICAL_STATUS_URL.matcher(canonicalUrl.strip());
+            if (matcher.matches()) {
+                String handle = matcher.group(1);
+                if (handle != null && !handle.isBlank() && !"i".equalsIgnoreCase(handle)
+                        && !stripped.toLowerCase(java.util.Locale.ROOT).contains(handle.toLowerCase(java.util.Locale.ROOT))) {
+                    String candidate = stripped + "\n\n（消息源：" + handle + "）";
+                    if (candidate.codePointCount(0, candidate.length()) <= 260) {
+                        return candidate;
+                    }
+                }
+            }
+        }
+        return stripped;
     }
 
     private String initializeMediaUpload(

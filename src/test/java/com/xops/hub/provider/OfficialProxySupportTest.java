@@ -226,6 +226,39 @@ class OfficialProxySupportTest {
             mockX.stop(0);
         }
 
+        List<String> doubleBlockedBodies = new CopyOnWriteArrayList<>();
+        HttpServer mockDoubleBlock = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        mockDoubleBlock.createContext("/2/tweets", ex -> {
+            String reqBody = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+            doubleBlockedBodies.add(reqBody);
+            if (doubleBlockedBodies.size() <= 2) {
+                writeJson(ex, 403,
+                        "{\"detail\":\"You can only reply to or quote posts where you are mentioned or are the author.\",\"status\":403,\"title\":\"Forbidden\"}");
+            } else {
+                writeJson(ex, 201, "{\"data\":{\"id\":\"standalone_published_3\"}}");
+            }
+        });
+        mockDoubleBlock.start();
+        try {
+            XOpsProperties props = baseProperties();
+            props.setOfficialBaseUrl("http://127.0.0.1:" + mockDoubleBlock.getAddress().getPort() + "/2");
+            ObjectMapper mapper = new ObjectMapper();
+            XPublishClient client = new XPublishClient(props, mapper);
+
+            String tweetId = XPublishClient.withQuoteTweetUrl(
+                    "https://x.com/_mohansolo/status/2125851902009311306",
+                    () -> client.createTweet("tok_quote", "🎉 Antigravity 正在重置所有用户的 Gemini 额度。", List.of(), "2125851902009311306")
+            );
+            assertEquals("standalone_published_3", tweetId);
+            assertEquals(3, doubleBlockedBodies.size());
+            var thirdJson = mapper.readTree(doubleBlockedBodies.get(2));
+            assertTrue(thirdJson.path("quote_tweet_id").isMissingNode());
+            assertTrue(!thirdJson.path("text").asText().contains("/status/2125851902009311306"));
+            assertTrue(thirdJson.path("text").asText().contains("（消息源：_mohansolo）"));
+        } finally {
+            mockDoubleBlock.stop(0);
+        }
+
         List<String> nonRetryBodies = new CopyOnWriteArrayList<>();
         HttpServer mockDuplicate = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         mockDuplicate.createContext("/2/tweets", ex -> {

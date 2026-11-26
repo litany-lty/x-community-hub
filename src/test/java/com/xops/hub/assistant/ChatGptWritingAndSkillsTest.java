@@ -1177,6 +1177,91 @@ class ChatGptWritingAndSkillsTest {
             JsonNode mergedFastResearch = fastRegenTask.path("input").path("research");
             assertThat(mergedFastResearch.path("evidence")).isNotEmpty();
             assertThat(mergedFastResearch.toString()).contains("尾延迟飙升 3.2 倍");
+
+            // 4. First Fast-Draft v1 -> Then one-click Deep-Research Upgrade directly into SAME draft v2 (no orphan Draft #2!)
+            store.tx(tx -> {
+                AssistantWorkflow.ingest(tx, object()
+                        .put("id", "196001")
+                        .put("authorId", "8803")
+                        .put("username", "sama")
+                        .put("authorName", "Sam Altman")
+                        .put("text", "New background coding agent sandbox launched today.")
+                        .put("textStatus", "TEXT_ONLY")
+                        .put("authorTextStatus", "FULL")
+                        .put("sourceIdentity", "ROW_ID_VERIFIED")
+                        .put("sourceUrl", "https://x.com/sama/status/196001")
+                        .put("publishedAt", Instant.now().toEpochMilli()));
+                return null;
+            });
+            String fastFirstStr = mvc.perform(post("/api/content-assistant/research").session(session)
+                            .header("X-Requested-With", "XMLHttpRequest")
+                            .contentType("application/json")
+                            .content(object()
+                                    .put("materialId", "196001")
+                                    .put("mode", "FAST")
+                                    .put("skillId", "BREAKING_FLASH")
+                                    .put("clientRequestId", "req-fast-first-196")
+                                    .toString()))
+                    .andExpect(status().isAccepted())
+                    .andReturn().getResponse().getContentAsString();
+            String fastFirstTaskId = mapper.readTree(fastFirstStr).path("id").asText();
+            worker.execute(store.tx(t -> t.put("task", fastFirstTaskId,
+                    t.get("task", fastFirstTaskId).put("attempt", AssistantWorkflow.id()).put("status", "RUNNING"))));
+            String fastDraftId = store.tx(t -> t.get("task", fastFirstTaskId)).path("draftId").asText();
+            String topic196 = store.tx(t -> AssistantTopics.topicOf(t, "196001"));
+            assertThat(store.tx(t -> t.get("draft", fastDraftId)).path("version").asInt()).isEqualTo(1);
+            assertThat(store.tx(t -> t.get("draft", fastDraftId)).at("/research/quality").asText()).isEqualTo("MATERIAL_DIRECT");
+
+            // Now trigger Deep Research directly bound to fastDraftId -> updates fastDraftId in-place to v2!
+            String upgradeStr = mvc.perform(post("/api/content-assistant/research").session(session)
+                            .header("X-Requested-With", "XMLHttpRequest")
+                            .contentType("application/json")
+                            .content(object()
+                                    .put("materialId", "196001")
+                                    .put("draftId", fastDraftId)
+                                    .put("version", 1)
+                                    .put("mode", "RESEARCH")
+                                    .put("regenerate", true)
+                                    .put("clientRequestId", "req-deep-upgrade-196")
+                                    .toString()))
+                    .andExpect(status().isAccepted())
+                    .andExpect(jsonPath("$.draftId").value(fastDraftId))
+                    .andReturn().getResponse().getContentAsString();
+            String upgradeTaskId = mapper.readTree(upgradeStr).path("id").asText();
+            for (int step = 0; step < 3; step++) {
+                worker.execute(store.tx(t -> t.put("task", upgradeTaskId,
+                        t.get("task", upgradeTaskId).put("attempt", AssistantWorkflow.id()).put("status", "RUNNING"))));
+            }
+            ObjectNode upgradedDraft = store.tx(t -> t.get("draft", fastDraftId));
+            assertThat(upgradedDraft.path("version").asInt()).isEqualTo(2);
+            assertThat(upgradedDraft.path("skillId").asText()).isEqualTo("BREAKING_FLASH");
+            assertThat(upgradedDraft.at("/research/evidence")).isNotEmpty();
+            assertThat((List<?>) store.tx(t -> t.matching("draft", "topicId", topic196, -1))).hasSize(1);
+            assertThat(draftPrompts.get(draftPrompts.size() - 1)).contains("基于最新深度研究重构升级");
+
+            // 5. Verify production log fixes: fenced/think JSON recovery, style sample ID sanitization, and carbon/xhigh 240s timeout + lease
+            ContentIntelligenceEngine ci = new ContentIntelligenceEngine(mapper);
+            JsonNode recoveredScore = ci.parseJson(new TextModelClient.ModelResult(
+                    "<think>分析选题价值</think>\n```json\n{\"title\":\"恢复成功\",\"ok\":true}\n```\n以上是评分结果。",
+                    List.of(), null, "r1", object(), Map.of()));
+            assertThat(recoveredScore.path("title").asText()).isEqualTo("恢复成功");
+
+            assertThat(ContentAssistantModelTasks.sanitizeStyleExampleIds(
+                    List.of("sample-s1:0-180", "#s2", "hallucinated-999"),
+                    List.of("s1", "s2", "s3")))
+                    .containsExactly("s1", "s2");
+
+            ObjectNode saved120Settings = object()
+                    .put("provider", "openai")
+                    .put("model", "gpt-6.2-sol")
+                    .put("protocol", "RESPONSES")
+                    .put("contextTokens", 200_000)
+                    .put("timeoutSeconds", 120);
+            ObjectNode carbonInput = object()
+                    .put("generationProvider", "google")
+                    .put("generationModel", "gemini-4-carbon");
+            assertThat(AssistantWorker.stageLeaseMillis(saved120Settings, carbonInput, "OPTIMIZE"))
+                    .isEqualTo(255_000L);
         } finally {
             worker.close();
             intelligence.closeReadPool();

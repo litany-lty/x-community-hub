@@ -464,10 +464,18 @@ public final class AssistantWorkflow {
         boolean fastMode = "FAST".equals(mode);
         var replay=replay(tx, fastMode ? "DRAFT" : "RESEARCH", body);
         if(replay!=null) return replay;
-        String mid=field(body,"materialId");
+        String targetDraftId = body.path("draftId").asText("").strip();
+        ObjectNode baseDraft = targetDraftId.isBlank() ? null : required(tx, "draft", targetDraftId);
+        if (baseDraft != null && body.has("version")) {
+            expect(baseDraft, body);
+        }
+        String mid = !body.path("materialId").asText("").strip().isBlank()
+                ? field(body, "materialId")
+                : (baseDraft != null ? field(baseDraft, "materialId") : field(body, "materialId"));
         var primaryMaterial = required(tx,"material",mid);
         if(AssistantTopics.text(primaryMaterial).isBlank()) throw new IllegalArgumentException("该素材没有可分析文字");
         String topic=AssistantTopics.topicOf(tx,mid);
+        if (topic.isBlank() && baseDraft != null) topic = baseDraft.path("topicId").asText("");
         var input=AssistantTopics.snapshot(tx,topic,mid);
         String instruction = body.path("instruction").asText("").strip();
         if (instruction.codePointCount(0, instruction.length()) > 500) {
@@ -477,13 +485,26 @@ public final class AssistantWorkflow {
         String rawSkill = body.path("skillId").asText("").strip();
         String skillId;
         if (rawSkill.isEmpty() || "AUTO".equalsIgnoreCase(rawSkill)) {
-            List<JsonNode> matList = new ArrayList<>();
-            input.path("materials").forEach(matList::add);
-            skillId = ViralWritingSkills.recommendSkill(input.path("topic"), matList);
+            String inherited = baseDraft == null ? "" : ViralWritingSkills.normalizeId(baseDraft.path("skillId").asText(""));
+            if (!inherited.isEmpty()) {
+                skillId = inherited;
+            } else {
+                List<JsonNode> matList = new ArrayList<>();
+                input.path("materials").forEach(matList::add);
+                skillId = ViralWritingSkills.recommendSkill(input.path("topic"), matList);
+            }
         } else {
             skillId = ViralWritingSkills.normalizeId(rawSkill);
         }
         if (!skillId.isEmpty()) input.put("skillId", skillId);
+        if (baseDraft != null) {
+            input.put("draftId", targetDraftId)
+                    .put("draftVersion", ver(baseDraft))
+                    .put("text", baseDraft.path("text").asText(""))
+                    .put("researchUpgrade", true);
+            String baseAngle = baseDraft.path("angleInstruction").asText("").strip();
+            if (!baseAngle.isBlank()) input.put("baseAngleInstruction", baseAngle);
+        }
         var style=tx.get("meta","style");
         if(style!=null) input.set("style",style);
         input.set("preferences",preferences(tx));
@@ -492,7 +513,7 @@ public final class AssistantWorkflow {
         applyRuntimeGenerationTarget(body, input);
         if (fastMode) {
             input.put("fastMode", true);
-            if (body.path("regenerate").asBoolean()) {
+            if (body.path("regenerate").asBoolean() || baseDraft != null) {
                 input.put("newAttempt", field(body, "clientRequestId"));
             }
             ObjectNode directResearch = buildDirectMaterialResearch(tx, input);
@@ -507,7 +528,7 @@ public final class AssistantWorkflow {
             input.set("research", directResearch);
             return enqueue(tx, "DRAFT", input, field(body, "clientRequestId"), body);
         }
-        if (body.path("regenerate").asBoolean()) {
+        if (body.path("regenerate").asBoolean() || baseDraft != null) {
             input.put("newAttempt",field(body,"clientRequestId"));
             var previous = previousResearch(tx, input);
             if (previous != null) input.set("previousResearch", previous);
