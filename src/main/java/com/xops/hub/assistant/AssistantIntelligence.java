@@ -133,17 +133,23 @@ public final class AssistantIntelligence {
                             String finalText = request.structuredJson()
                                     ? ChatGptOAuthTextModelClient.extractJsonObjectString(piRaw, piBridge)
                                     : (piRaw == null ? "" : piRaw.strip());
-                            if (!finalText.isBlank()) {
-                                String reqId = "pi-agent-" + svc + "-" + java.util.UUID.randomUUID();
-                                ObjectNode snap = mapper.createObjectNode()
-                                        .put("service", svc)
-                                        .put("executionEngine", "PI_AGENT")
-                                        .put("model", binding.modelId());
-                                return new ModelResult(finalText, List.of(), new Usage(null, null), reqId, snap, Map.of());
+                            if (finalText.isBlank()) {
+                                throw new CommandCodeTextModelClient.ModelCallException(
+                                        "PI Agent (" + svc + ") 返回内容为空", true, false, null);
                             }
+                            String reqId = "pi-agent-" + svc + "-" + java.util.UUID.randomUUID();
+                            ObjectNode snap = mapper.createObjectNode()
+                                    .put("service", svc)
+                                    .put("executionEngine", "PI_AGENT")
+                                    .put("model", binding.modelId());
+                            return new ModelResult(finalText, List.of(), new Usage(null, null), reqId, snap, Map.of());
+                        } catch (CommandCodeTextModelClient.ModelCallException ex) {
+                            throw ex;
                         } catch (RuntimeException ex) {
-                            log.warn("PI Agent execution failed for provider {} ({}), falling back to HTTP client: {}",
+                            log.warn("PI Agent execution failed for provider {} ({}), HTTP fallback disabled: {}",
                                     svc, binding.modelId(), ex.getMessage());
+                            throw new CommandCodeTextModelClient.ModelCallException(
+                                    "PI Agent (" + svc + ") 调用失败：" + ex.getMessage(), true, false, null);
                         }
                     }
                 }

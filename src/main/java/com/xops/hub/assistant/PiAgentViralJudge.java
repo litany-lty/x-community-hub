@@ -831,6 +831,40 @@ public class PiAgentViralJudge {
                 .toList();
     }
 
+    static final int PI_MAX_INLINE_ARG_BYTES = 32_768;
+
+    private static void addPiPromptFlag(
+            List<String> cmd,
+            String flag,
+            String content,
+            List<Path> tempDirs
+    ) throws IOException {
+        if (content == null || content.isBlank()) {
+            return;
+        }
+        if (content.getBytes(StandardCharsets.UTF_8).length <= PI_MAX_INLINE_ARG_BYTES) {
+            cmd.add(flag);
+            cmd.add(content);
+            return;
+        }
+        Path dir = Files.createTempDirectory("xops-pi-prompt-");
+        tempDirs.add(dir);
+        Path file = dir.resolve("prompt.txt");
+        Files.writeString(file, content, StandardCharsets.UTF_8);
+        try {
+            Files.setPosixFilePermissions(file, java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"));
+        } catch (UnsupportedOperationException | IOException ignored) { }
+        cmd.add(flag);
+        cmd.add(file.toString());
+    }
+
+    private static void cleanupTempDirs(List<Path> tempDirs) {
+        if (tempDirs == null) return;
+        for (Path dir : tempDirs) {
+            deleteQuietly(dir);
+        }
+    }
+
     String runPiProviderCompletion(
             String normalizedProvider,
             String rawModelSpec,
@@ -853,37 +887,6 @@ public class PiAgentViralJudge {
         String modelId = spec.modelId();
         boolean supportsThinking = "chatgpt".equals(norm) || "openai".equals(norm) || "google".equals(norm);
 
-        List<String> cmd = new ArrayList<>(List.of(
-                binary, "-p",
-                "--no-session", "--no-tools", "--no-extensions", "--no-mcp",
-                "--no-prompt-templates", "--no-context-files", "--no-approve",
-                "--provider", piProvider
-        ));
-        if (modelId != null && !modelId.isBlank()) {
-            cmd.add("--model");
-            cmd.add(modelId);
-        }
-        if (supportsThinking && spec.reasoningEffort() != null && !spec.reasoningEffort().isBlank()) {
-            cmd.add("--thinking");
-            cmd.add(spec.reasoningEffort());
-        }
-        if (skillFiles != null && !skillFiles.isEmpty()) {
-            for (Path skillFile : skillFiles) {
-                if (skillFile != null) {
-                    cmd.add("--skill");
-                    cmd.add(skillFile.toString());
-                }
-            }
-        } else {
-            cmd.add("--no-skills");
-        }
-        if (systemPrompt != null && !systemPrompt.isBlank()) {
-            cmd.add("--system-prompt");
-            cmd.add(systemPrompt);
-        }
-        cmd.add("--");
-        cmd.add(userPrompt == null ? "" : userPrompt);
-
         java.util.Map<String, String> envOverrides = java.util.Map.of();
         if (!"chatgpt".equals(norm)) {
             String envKey = apiKeyEnvVarForProvider(norm);
@@ -893,16 +896,54 @@ public class PiAgentViralJudge {
             envOverrides = java.util.Map.of(envKey, apiKey.strip());
         }
 
-        Duration effectiveTimeout = timeout != null ? timeout : Duration.ofSeconds(75);
-        CliResult result = executeCliWithEnv(cmd, "", effectiveTimeout, envOverrides);
-        if (result.exitCode() != 0) {
-            String err = !result.stderr().isBlank() ? result.stderr() : result.stdout();
-            throw new IllegalStateException("PI Agent (" + piProvider + ") 调用异常：" + truncate(err, 220));
+        List<Path> tempDirs = new ArrayList<>();
+        try {
+            List<String> cmd = new ArrayList<>(List.of(
+                    binary, "-p",
+                    "--no-session", "--no-tools", "--no-extensions", "--no-mcp",
+                    "--no-prompt-templates", "--no-context-files", "--no-approve",
+                    "--provider", piProvider
+            ));
+            if (modelId != null && !modelId.isBlank()) {
+                cmd.add("--model");
+                cmd.add(modelId);
+            }
+            if (supportsThinking && spec.reasoningEffort() != null && !spec.reasoningEffort().isBlank()) {
+                cmd.add("--thinking");
+                cmd.add(spec.reasoningEffort());
+            }
+            if (skillFiles != null && !skillFiles.isEmpty()) {
+                for (Path skillFile : skillFiles) {
+                    if (skillFile != null) {
+                        cmd.add("--skill");
+                        cmd.add(skillFile.toString());
+                    }
+                }
+            } else {
+                cmd.add("--no-skills");
+            }
+            addPiPromptFlag(cmd, "--system-prompt", systemPrompt, tempDirs);
+            String stdinPayload = userPrompt == null ? "" : userPrompt;
+            if (stdinPayload.isBlank()) {
+                cmd.add("--");
+                cmd.add("");
+            }
+
+            Duration effectiveTimeout = timeout != null ? timeout : Duration.ofSeconds(75);
+            CliResult result = executeCliWithEnv(cmd, stdinPayload, effectiveTimeout, envOverrides);
+            if (result.exitCode() != 0) {
+                String err = !result.stderr().isBlank() ? result.stderr() : result.stdout();
+                throw new IllegalStateException("PI Agent (" + piProvider + ") 调用异常：" + truncate(err, 220));
+            }
+            return result.stdout();
+        } catch (IOException ex) {
+            throw new IllegalStateException("PI Agent (" + piProvider + ") 准备提示词失败：" + safeMessage(ex), ex);
+        } finally {
+            cleanupTempDirs(tempDirs);
         }
-        return result.stdout();
     }
 
-    private String runApiQuoteCall(
+    String runApiQuoteCall(
             String provider,
             String modelOverride,
             String systemPrompt,
@@ -921,16 +962,13 @@ public class PiAgentViralJudge {
         if (this.httpTransport == null && canUsePiForProvider(norm, baseUrl)) {
             String apiKey = cred.apply(credRef);
             if (apiKey != null && !apiKey.isBlank()) {
-                try {
-                    List<Path> skills = structuredJson ? List.of() : resolveActiveSkillFiles();
-                    String piOut = runPiProviderCompletion(
-                            norm, modelId, systemPrompt, userPrompt, skills, Duration.ofSeconds(75), apiKey);
-                    if (piOut != null && !piOut.isBlank()) {
-                        return piOut;
-                    }
-                } catch (RuntimeException ex) {
-                    log.warn("PI Agent quote generation fallback to HTTP API for provider {}: {}", norm, truncate(safeMessage(ex), 160));
+                List<Path> skills = structuredJson ? List.of() : resolveActiveSkillFiles();
+                String piOut = runPiProviderCompletion(
+                        norm, modelId, systemPrompt, userPrompt, skills, Duration.ofSeconds(75), apiKey);
+                if (piOut == null || piOut.isBlank()) {
+                    throw new IllegalStateException("PI Agent (" + norm + ") 返回空响应");
                 }
+                return piOut;
             }
         }
 
@@ -1460,26 +1498,32 @@ public class PiAgentViralJudge {
     private String runPiBatchEvaluation(AccountBatchInput batchInput) {
         String binary = resolvePiBinary();
         String model = environment == null ? "" : environment.getProperty("X_CONTENT_ASSISTANT_PI_MODEL", "").strip();
-        List<String> cmd = new ArrayList<>(List.of(
-                binary, "-p",
-                "--no-session", "--no-tools", "--no-extensions", "--no-mcp",
-                "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-approve",
-                "--provider", DEFAULT_PI_PROVIDER,
-                "--thinking", "low",
-                "--system-prompt", BATCH_SYSTEM_PROMPT
-        ));
-        if (!model.isBlank()) {
-            cmd.add("--model");
-            cmd.add(model);
+        List<Path> tempDirs = new ArrayList<>();
+        try {
+            List<String> cmd = new ArrayList<>(List.of(
+                    binary, "-p",
+                    "--no-session", "--no-tools", "--no-extensions", "--no-mcp",
+                    "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-approve",
+                    "--provider", DEFAULT_PI_PROVIDER,
+                    "--thinking", "low"
+            ));
+            addPiPromptFlag(cmd, "--system-prompt", BATCH_SYSTEM_PROMPT, tempDirs);
+            if (!model.isBlank()) {
+                cmd.add("--model");
+                cmd.add(model);
+            }
+            String batchPrompt = buildBatchUserPrompt(batchInput);
+            CliResult result = executeCli(cmd, batchPrompt, Duration.ofSeconds(60));
+            if (result.exitCode() != 0) {
+                String err = !result.stderr().isBlank() ? result.stderr() : result.stdout();
+                throw new IllegalStateException("PI Agent (ChatGPT OAuth) 账号合并判定异常：" + truncate(err, 200));
+            }
+            return result.stdout();
+        } catch (IOException ex) {
+            throw new IllegalStateException("PI Agent (ChatGPT OAuth) 账号合并提示词准备失败：" + safeMessage(ex), ex);
+        } finally {
+            cleanupTempDirs(tempDirs);
         }
-        cmd.add("--");
-        cmd.add(buildBatchUserPrompt(batchInput));
-        CliResult result = executeCli(cmd, "", Duration.ofSeconds(60));
-        if (result.exitCode() != 0) {
-            String err = !result.stderr().isBlank() ? result.stderr() : result.stdout();
-            throw new IllegalStateException("PI Agent (ChatGPT OAuth) 账号合并判定异常：" + truncate(err, 200));
-        }
-        return result.stdout();
     }
 
     private String runCodexBatchEvaluation(AccountBatchInput batchInput) {
@@ -1644,26 +1688,32 @@ public class PiAgentViralJudge {
         boolean explicitEffort = rawModel.matches("(?i).*[\\s@:]+(minimal|low|medium|high|xhigh|ultra|max)$");
         String effort = explicitEffort ? spec.reasoningEffort() : "low";
         String model = rawModel.isBlank() ? "" : spec.modelId();
-        List<String> cmd = new ArrayList<>(List.of(
-                binary, "-p",
-                "--no-session", "--no-tools", "--no-extensions", "--no-mcp",
-                "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-approve",
-                "--provider", DEFAULT_PI_PROVIDER,
-                "--thinking", effort,
-                "--system-prompt", SYSTEM_PROMPT
-        ));
-        if (!model.isBlank()) {
-            cmd.add("--model");
-            cmd.add(model);
+        List<Path> tempDirs = new ArrayList<>();
+        try {
+            List<String> cmd = new ArrayList<>(List.of(
+                    binary, "-p",
+                    "--no-session", "--no-tools", "--no-extensions", "--no-mcp",
+                    "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-approve",
+                    "--provider", DEFAULT_PI_PROVIDER,
+                    "--thinking", effort
+            ));
+            addPiPromptFlag(cmd, "--system-prompt", SYSTEM_PROMPT, tempDirs);
+            if (!model.isBlank()) {
+                cmd.add("--model");
+                cmd.add(model);
+            }
+            String userPrompt = buildUserPrompt(input);
+            CliResult result = executeCli(cmd, userPrompt, Duration.ofSeconds(45));
+            if (result.exitCode() != 0) {
+                String err = !result.stderr().isBlank() ? result.stderr() : result.stdout();
+                throw new IllegalStateException("PI Agent (ChatGPT OAuth) 判定异常：" + truncate(err, 200));
+            }
+            return result.stdout();
+        } catch (IOException ex) {
+            throw new IllegalStateException("PI Agent (ChatGPT OAuth) 判定提示词准备失败：" + safeMessage(ex), ex);
+        } finally {
+            cleanupTempDirs(tempDirs);
         }
-        cmd.add("--");
-        cmd.add(buildUserPrompt(input));
-        CliResult result = executeCli(cmd, "", Duration.ofSeconds(45));
-        if (result.exitCode() != 0) {
-            String err = !result.stderr().isBlank() ? result.stderr() : result.stdout();
-            throw new IllegalStateException("PI Agent (ChatGPT OAuth) 判定异常：" + truncate(err, 200));
-        }
-        return result.stdout();
     }
 
     private String resolveRequestedChatGptWriterModel(EvaluationInput input) {
@@ -1683,35 +1733,40 @@ public class PiAgentViralJudge {
         boolean explicitEffort = rawModel.matches("(?i).*[\\s@:]+(minimal|low|medium|high|xhigh|ultra|max)$");
         String effort = explicitEffort ? spec.reasoningEffort() : "medium";
         String model = rawModel.isBlank() ? "" : spec.modelId();
-        List<String> cmd = new ArrayList<>(List.of(
-                binary, "-p",
-                "--no-session", "--no-tools", "--no-extensions", "--no-mcp",
-                "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-approve",
-                "--provider", DEFAULT_PI_PROVIDER,
-                "--thinking", effort,
-                "--system-prompt", QUOTE_WRITER_SYSTEM_PROMPT
-        ));
-        for (Path skillFile : resolveActiveSkillFiles()) {
-            cmd.add("--skill");
-            cmd.add(skillFile.toString());
+        List<Path> tempDirs = new ArrayList<>();
+        try {
+            List<String> cmd = new ArrayList<>(List.of(
+                    binary, "-p",
+                    "--no-session", "--no-tools", "--no-extensions", "--no-mcp",
+                    "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-approve",
+                    "--provider", DEFAULT_PI_PROVIDER,
+                    "--thinking", effort
+            ));
+            addPiPromptFlag(cmd, "--system-prompt", QUOTE_WRITER_SYSTEM_PROMPT, tempDirs);
+            for (Path skillFile : resolveActiveSkillFiles()) {
+                cmd.add("--skill");
+                cmd.add(skillFile.toString());
+            }
+            String skillGuidance = loadQuoteVoiceSkillGuidance();
+            if (!skillGuidance.isBlank()) {
+                addPiPromptFlag(cmd, "--append-system-prompt", skillGuidance, tempDirs);
+            }
+            if (!model.isBlank()) {
+                cmd.add("--model");
+                cmd.add(model);
+            }
+            String writerPrompt = buildPureQuoteWriterPrompt(input);
+            CliResult result = executeCli(cmd, writerPrompt, Duration.ofSeconds(60));
+            if (result.exitCode() != 0) {
+                String err = !result.stderr().isBlank() ? result.stderr() : result.stdout();
+                throw new IllegalStateException("PI Agent (ChatGPT OAuth) 转发语生成异常：" + truncate(err, 200));
+            }
+            return result.stdout();
+        } catch (IOException ex) {
+            throw new IllegalStateException("PI Agent (ChatGPT OAuth) 转发语提示词准备失败：" + safeMessage(ex), ex);
+        } finally {
+            cleanupTempDirs(tempDirs);
         }
-        String skillGuidance = loadQuoteVoiceSkillGuidance();
-        if (!skillGuidance.isBlank()) {
-            cmd.add("--append-system-prompt");
-            cmd.add(skillGuidance);
-        }
-        if (!model.isBlank()) {
-            cmd.add("--model");
-            cmd.add(model);
-        }
-        cmd.add("--");
-        cmd.add(buildPureQuoteWriterPrompt(input));
-        CliResult result = executeCli(cmd, "", Duration.ofSeconds(60));
-        if (result.exitCode() != 0) {
-            String err = !result.stderr().isBlank() ? result.stderr() : result.stdout();
-            throw new IllegalStateException("PI Agent (ChatGPT OAuth) 转发语生成异常：" + truncate(err, 200));
-        }
-        return result.stdout();
     }
 
     private String runCodexEvaluation(EvaluationInput input) {
@@ -1815,30 +1870,36 @@ public class PiAgentViralJudge {
         boolean explicitEffort = rawModel.matches("(?i).*[\\s@:]+(minimal|low|medium|high|xhigh|ultra|max)$");
         String effort = explicitEffort ? spec.reasoningEffort() : "medium";
         String model = rawModel.isBlank() ? "" : spec.modelId();
-        List<String> cmd = new ArrayList<>(List.of(
-                binary, "-p",
-                "--no-session", "--no-tools", "--no-extensions", "--no-mcp",
-                "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-approve",
-                "--provider", DEFAULT_PI_PROVIDER,
-                "--thinking", effort,
-                "--system-prompt", QUOTE_POLISHER_SYSTEM_PROMPT
-        ));
-        for (Path skillFile : resolveActiveSkillFiles()) {
-            cmd.add("--skill");
-            cmd.add(skillFile.toString());
+        List<Path> tempDirs = new ArrayList<>();
+        try {
+            List<String> cmd = new ArrayList<>(List.of(
+                    binary, "-p",
+                    "--no-session", "--no-tools", "--no-extensions", "--no-mcp",
+                    "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-approve",
+                    "--provider", DEFAULT_PI_PROVIDER,
+                    "--thinking", effort
+            ));
+            addPiPromptFlag(cmd, "--system-prompt", QUOTE_POLISHER_SYSTEM_PROMPT, tempDirs);
+            for (Path skillFile : resolveActiveSkillFiles()) {
+                cmd.add("--skill");
+                cmd.add(skillFile.toString());
+            }
+            if (!model.isBlank()) {
+                cmd.add("--model");
+                cmd.add(model);
+            }
+            String polishUserPrompt = buildQuotePolishUserPrompt(input, firstDraft, polishPrompt);
+            CliResult result = executeCli(cmd, polishUserPrompt, Duration.ofSeconds(60));
+            if (result.exitCode() != 0) {
+                String err = !result.stderr().isBlank() ? result.stderr() : result.stdout();
+                throw new IllegalStateException("PI Agent (ChatGPT OAuth) 二次改写异常：" + truncate(err, 200));
+            }
+            return result.stdout();
+        } catch (IOException ex) {
+            throw new IllegalStateException("PI Agent (ChatGPT OAuth) 二次改写提示词准备失败：" + safeMessage(ex), ex);
+        } finally {
+            cleanupTempDirs(tempDirs);
         }
-        if (!model.isBlank()) {
-            cmd.add("--model");
-            cmd.add(model);
-        }
-        cmd.add("--");
-        cmd.add(buildQuotePolishUserPrompt(input, firstDraft, polishPrompt));
-        CliResult result = executeCli(cmd, "", Duration.ofSeconds(60));
-        if (result.exitCode() != 0) {
-            String err = !result.stderr().isBlank() ? result.stderr() : result.stdout();
-            throw new IllegalStateException("PI Agent (ChatGPT OAuth) 二次改写异常：" + truncate(err, 200));
-        }
-        return result.stdout();
     }
 
     private String runCodexQuotePolisher(EvaluationInput input, String firstDraft, String polishPrompt) {
@@ -2113,13 +2174,13 @@ public class PiAgentViralJudge {
         }
 
         Process proc = pb.start();
+        var stdoutFuture = CompletableFuture.supplyAsync(() -> readBounded(proc.getInputStream()));
+        var stderrFuture = CompletableFuture.supplyAsync(() -> readBounded(proc.getErrorStream()));
         try (var out = proc.getOutputStream()) {
             if (stdin != null && !stdin.isEmpty()) {
                 out.write(stdin.getBytes(StandardCharsets.UTF_8));
             }
         }
-        var stdoutFuture = CompletableFuture.supplyAsync(() -> readBounded(proc.getInputStream()));
-        var stderrFuture = CompletableFuture.supplyAsync(() -> readBounded(proc.getErrorStream()));
         final boolean finished;
         try {
             finished = proc.waitFor(Math.max(1L, timeout.toMillis()), TimeUnit.MILLISECONDS);

@@ -1641,4 +1641,59 @@ class AutoRepostAndTierTest {
         verifyNoInteractions(mockJudge);
         verifyNoInteractions(mockPublish);
     }
+
+    @Test
+    void piAgentPassesOversizedDistillationPromptViaStdinAndTempFileWithoutHttpFallback() throws Exception {
+        Path fakePi = Files.createFile(tempDir.resolve("fake-pi-large"),
+                PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rwxr-xr-x")));
+        MockEnvironment piEnv = new MockEnvironment()
+                .withProperty(PiAgentViralJudge.PI_CLI_PATH_ENV, fakePi.toString())
+                .withProperty("OPENAI_API_KEY", "sk-test-no-http-fallback");
+
+        String hugeUserPrompt = "样本内容：今天测试降智 AI 与重置卡，完全不值。\n".repeat(4000);
+        String hugeSystemPrompt = "风格蒸馏规则：保持短句直给。\n".repeat(1200);
+        assertThat(hugeUserPrompt.getBytes(java.nio.charset.StandardCharsets.UTF_8).length).isGreaterThan(200_000);
+        assertThat(hugeSystemPrompt.getBytes(java.nio.charset.StandardCharsets.UTF_8).length).isGreaterThan(40_000);
+
+        List<String> capturedStdin = new java.util.concurrent.CopyOnWriteArrayList<>();
+        List<Path> capturedTempFiles = new java.util.concurrent.CopyOnWriteArrayList<>();
+        java.util.concurrent.atomic.AtomicBoolean failNextCall = new java.util.concurrent.atomic.AtomicBoolean(false);
+
+        PiAgentViralJudge judge = new PiAgentViralJudge(new ObjectMapper(), piEnv, (cmd, stdin, timeout) -> {
+            if (failNextCall.get()) {
+                return new PiAgentViralJudge.CliResult(1, "", "simulated pi failure");
+            }
+            for (String arg : cmd) {
+                assertThat(arg.getBytes(java.nio.charset.StandardCharsets.UTF_8).length).isLessThanOrEqualTo(4096);
+            }
+            int sysIdx = cmd.indexOf("--system-prompt");
+            assertThat(sysIdx).isGreaterThanOrEqualTo(0);
+            Path sysFile = Path.of(cmd.get(sysIdx + 1));
+            assertThat(Files.isRegularFile(sysFile)).isTrue();
+            assertThat(Files.readString(sysFile)).isEqualTo(hugeSystemPrompt);
+            capturedTempFiles.add(sysFile);
+            capturedStdin.add(stdin);
+            return new PiAgentViralJudge.CliResult(0, "{\"status\":\"ok\"}", "");
+        });
+
+        String out = judge.runPiProviderCompletion(
+                "openai",
+                "gpt-6-luna xhigh",
+                hugeSystemPrompt,
+                hugeUserPrompt,
+                List.of(),
+                java.time.Duration.ofSeconds(120),
+                "sk-test-no-http-fallback");
+        assertThat(out).isEqualTo("{\"status\":\"ok\"}");
+        assertThat(capturedStdin).containsExactly(hugeUserPrompt);
+        assertThat(capturedTempFiles).hasSize(1);
+        assertThat(Files.exists(capturedTempFiles.get(0))).isFalse();
+
+        // When PI Agent fails for a supported official provider, HTTP fallback must NOT run.
+        failNextCall.set(true);
+        assertThatThrownBy(() -> judge.runApiQuoteCall("openai", "gpt-6-luna xhigh", "sys", "usr", false))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("PI Agent")
+                .hasMessageContaining("simulated pi failure");
+    }
 }
