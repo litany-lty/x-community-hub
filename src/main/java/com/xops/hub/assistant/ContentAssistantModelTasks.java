@@ -141,9 +141,12 @@ public final class ContentAssistantModelTasks {
         List<ModelCallMetadata> calls = new ArrayList<>();
         for (StyleBatchPlanner.Batch batch : batches) {
             check(deadline);
-            String prompt = "Describe tone, sentence length, openings, paragraph rhythm, argument order, transitions, endings, punctuation, emoji, and language usage. " +
+            String prompt = "Distill the author's real personal voice and recurring domain stances from their authentic posts and quote-tweets: " +
+                    "analyze tone, sentence length, openings, paragraph rhythm, argument order, transitions, punctuation/pause habits (like '……'), " +
+                    "emotional switching (when blunt/skeptical vs. when relaxed with emojis), and genuine recurring viewpoints on AI labs/models/coding tools " +
+                    "(strictly grounded in the provided samples, never invent stances). " +
                     "Each segment has a source sample ID and Unicode code-point range. Return exactly " +
-                    "{\"profile\":\"one Chinese string describing the style\",\"exampleSampleIds\":[\"exact supplied sample ID\"]}. " +
+                    "{\"profile\":\"one comprehensive Chinese string capturing writing voice + authentic recurring AI/tool stances\",\"exampleSampleIds\":[\"exact supplied sample ID\"]}. " +
                     "Do not return an object or array as profile.\n" + json(mapper.valueToTree(batch.segments()));
             TextModelClient.ModelResult raw = call(binding, prompt, false, deadline);
             calls.add(metadata(raw));

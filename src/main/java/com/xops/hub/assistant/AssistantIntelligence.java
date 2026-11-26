@@ -27,6 +27,7 @@ import java.util.concurrent.TimeoutException;
 
 @Service
 public final class AssistantIntelligence {
+    private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(AssistantIntelligence.class);
     public static final String BASE_URL_ENV = "X_CONTENT_ASSISTANT_COMMANDCODE_BASE_URL";
     public static final String API_KEY_ENV = "X_CONTENT_ASSISTANT_COMMANDCODE_API_KEY";
     private static final int MAX_SEARCH_ROUNDS = 4;
@@ -34,7 +35,9 @@ public final class AssistantIntelligence {
     static final List<Stage> VERIFY_ROLES = List.of(Stage.CLASSIFY,Stage.SCORE,Stage.STYLE,Stage.RESEARCH,Stage.DRAFT,Stage.OPTIMIZE);
     private final ObjectMapper mapper;
     private final Environment environment;
+    private final AssistantStore store;
     private final TextModelClient modelClient;
+    private final DeepSeekTextModelClient deepSeekClient;
     private final TextSourceReader sourceReader;
     private final ArticleTextResolver articleResolver;
     private final ContentAssistantModelTasks tasks;
@@ -51,26 +54,40 @@ public final class AssistantIntelligence {
     }
 
     public AssistantIntelligence(ObjectMapper mapper, Environment environment) {
-        this(mapper, environment, (TwitterApiIoProvider) null);
+        this(mapper, environment, (TwitterApiIoProvider) null, (AssistantStore) null);
+    }
+
+    public AssistantIntelligence(ObjectMapper mapper, Environment environment, TwitterApiIoProvider twitterProvider) {
+        this(mapper, environment, twitterProvider, null);
     }
 
     @Autowired
     public AssistantIntelligence(ObjectMapper mapper, Environment environment,
-                                 @Autowired(required = false) TwitterApiIoProvider twitterProvider) {
-        this(mapper, environment, createClient(mapper, environment),
-                new SafeHttpTextSourceReader(environment.getProperty(SafeHttpTextSourceReader.DOH_URL_ENV)),
+                                 @Autowired(required = false) TwitterApiIoProvider twitterProvider,
+                                 @Autowired(required = false) AssistantStore store) {
+        this(mapper, environment, store, createClients(mapper, environment, store),
+                new SafeHttpTextSourceReader(environment == null ? null : environment.getProperty(SafeHttpTextSourceReader.DOH_URL_ENV)),
                 twitterProvider == null ? null : twitterProvider::fetchArticleText);
     }
 
     AssistantIntelligence(ObjectMapper mapper, Environment environment, TextModelClient modelClient, TextSourceReader sourceReader) {
-        this(mapper, environment, modelClient, sourceReader, null);
+        this(mapper, environment, null, new ClientBundle(modelClient, null), sourceReader, null);
     }
 
     AssistantIntelligence(ObjectMapper mapper, Environment environment, TextModelClient modelClient,
                           TextSourceReader sourceReader, ArticleTextResolver articleResolver) {
+        this(mapper, environment, null, new ClientBundle(modelClient, null), sourceReader, articleResolver);
+    }
+
+    private record ClientBundle(TextModelClient router, DeepSeekTextModelClient deepSeek) { }
+
+    private AssistantIntelligence(ObjectMapper mapper, Environment environment, AssistantStore store,
+                                  ClientBundle clients, TextSourceReader sourceReader, ArticleTextResolver articleResolver) {
         this.mapper = mapper;
         this.environment = environment;
-        this.modelClient = modelClient;
+        this.store = store;
+        this.modelClient = clients.router();
+        this.deepSeekClient = clients.deepSeek();
         this.sourceReader = sourceReader;
         this.articleResolver = articleResolver;
         this.tasks = new ContentAssistantModelTasks(mapper, modelClient, SearchProvider.fromModelClient(modelClient));
@@ -82,35 +99,78 @@ public final class AssistantIntelligence {
         sourceReadPool.shutdownNow();
     }
 
-    private static TextModelClient createClient(ObjectMapper mapper, Environment environment) {
+    private static ClientBundle createClients(ObjectMapper mapper, Environment environment, AssistantStore store) {
         var transport = new JavaNetModelTransport(mapper);
-        java.util.function.Function<String, String> credential = environment::getProperty;
+        java.util.function.Function<String, String> credential =
+                ref -> AssistantConnection.resolveSecret(store, environment, ref);
         var miniMax = new MiniMaxTextModelClient(mapper, transport, credential);
+        var deepSeek = new DeepSeekTextModelClient(mapper, transport, credential);
+        var gemini = new GeminiTextModelClient(mapper, transport, credential);
+        var openAi = new OpenAiTextModelClient(mapper, transport, credential);
         var commandCode = new CommandCodeTextModelClient(mapper, transport, credential::apply);
-        var chatGpt = new ChatGptOAuthTextModelClient(mapper, environment);
-        return new TextModelClient() {
+        var piBridge = new PiAgentViralJudge(mapper, environment);
+        var chatGpt = new ChatGptOAuthTextModelClient(mapper, piBridge);
+        TextModelClient router = new TextModelClient() {
             @Override
             public ModelResult complete(ModelBinding binding, TextRequest request) {
-                String svc = binding.connection().serviceName();
-                if ("chatgpt".equalsIgnoreCase(svc)) {
-                    return chatGpt.complete(binding, request);
+                String svc = binding.connection().serviceName().toLowerCase(java.util.Locale.ROOT);
+                if (!request.webSearch()
+                        && !"chatgpt".equals(svc)
+                        && !"commandcode".equals(svc)
+                        && piBridge.canUsePiForProvider(svc, binding.connection().baseUri().toString())) {
+                    String apiKey = credential.apply(binding.connection().credentialRef());
+                    if (apiKey != null && !apiKey.isBlank()) {
+                        try {
+                            String piRaw = piBridge.runPiProviderCompletion(
+                                    svc,
+                                    binding.modelId(),
+                                    request.systemText(),
+                                    request.userText(),
+                                    piBridge.resolveHumanizerSkillFiles(),
+                                    binding.timeout(),
+                                    apiKey
+                            );
+                            String finalText = request.structuredJson()
+                                    ? ChatGptOAuthTextModelClient.extractJsonObjectString(piRaw, piBridge)
+                                    : (piRaw == null ? "" : piRaw.strip());
+                            if (!finalText.isBlank()) {
+                                String reqId = "pi-agent-" + svc + "-" + java.util.UUID.randomUUID();
+                                ObjectNode snap = mapper.createObjectNode()
+                                        .put("service", svc)
+                                        .put("executionEngine", "PI_AGENT")
+                                        .put("model", binding.modelId());
+                                return new ModelResult(finalText, List.of(), new Usage(null, null), reqId, snap, Map.of());
+                            }
+                        } catch (RuntimeException ex) {
+                            log.warn("PI Agent execution failed for provider {} ({}), falling back to HTTP client: {}",
+                                    svc, binding.modelId(), ex.getMessage());
+                        }
+                    }
                 }
-                return "minimax".equalsIgnoreCase(svc)
-                        ? miniMax.complete(binding, request)
-                        : commandCode.complete(binding, request);
+                return switch (svc) {
+                    case "chatgpt" -> chatGpt.complete(binding, request);
+                    case "openai" -> openAi.complete(binding, request);
+                    case "google" -> gemini.complete(binding, request);
+                    case "deepseek" -> deepSeek.complete(binding, request);
+                    case "minimax" -> miniMax.complete(binding, request);
+                    default -> commandCode.complete(binding, request);
+                };
             }
 
             @Override
             public boolean requiresExplicitSearchQuery(ModelBinding binding) {
-                String svc = binding.connection().serviceName();
-                if ("chatgpt".equalsIgnoreCase(svc)) {
-                    return chatGpt.requiresExplicitSearchQuery(binding);
-                }
-                return "minimax".equalsIgnoreCase(svc)
-                        ? miniMax.requiresExplicitSearchQuery(binding)
-                        : commandCode.requiresExplicitSearchQuery(binding);
+                String svc = binding.connection().serviceName().toLowerCase(java.util.Locale.ROOT);
+                return switch (svc) {
+                    case "chatgpt" -> chatGpt.requiresExplicitSearchQuery(binding);
+                    case "openai" -> openAi.requiresExplicitSearchQuery(binding);
+                    case "google" -> gemini.requiresExplicitSearchQuery(binding);
+                    case "deepseek" -> deepSeek.requiresExplicitSearchQuery(binding);
+                    case "minimax" -> miniMax.requiresExplicitSearchQuery(binding);
+                    default -> commandCode.requiresExplicitSearchQuery(binding);
+                };
             }
         };
+        return new ClientBundle(router, deepSeek);
     }
 
     /** Runs one persisted task stage. Call this only from the assistant worker, outside database transactions. */
@@ -122,13 +182,13 @@ public final class AssistantIntelligence {
                 case OPTIMIZE_REVISION -> Stage.OPTIMIZE;
                 default -> stage;
             };
-            TextModelClient.ModelBinding binding = binding(settings, bindingRole);
+            TextModelClient.ModelBinding binding = binding(settings, bindingRole, input);
             return switch (stage) {
                 case CLASSIFY -> classify(binding, input);
                 case SCORE -> score(binding, settings, input);
                 case RESEARCH -> research(binding, input);
                 case RESEARCH_SYNTHESIS -> synthesizeResearch(binding, input);
-                case DRAFT -> draft(binding, input);
+                case DRAFT -> draft(binding, settings, input);
                 case OPTIMIZE, OPTIMIZE_REVISION -> optimize(binding, input, stage == Stage.OPTIMIZE_REVISION);
                 case STYLE -> style(binding, input);
                 case VERIFY -> verify(settings);
@@ -182,7 +242,21 @@ public final class AssistantIntelligence {
             if (!key.isBlank()) seedTargets.putIfAbsent(key, new TextModelClient.SearchResult(
                     "", URI.create(url), read.path("title").asText(), "", read.path("publishedAt").asText()));
         }
+        Set<String> preReadUserLinkUrls = new LinkedHashSet<>();
         for (JsonNode material : workingInput.path("materials")) {
+            if ("USER_LINK".equals(material.path("sourceIdentity").asText())) {
+                String primaryKey = AssistantEvidence.normalizedUrl(material.path("sourceUrl").asText(""));
+                if (!primaryKey.isBlank()) preReadUserLinkUrls.add(primaryKey);
+                for (String link : AssistantTopics.links(material)) {
+                    if (seedTargets.size() == 6) break;
+                    String key = AssistantEvidence.normalizedUrl(link);
+                    if (!key.isBlank() && !key.equals(primaryKey)) {
+                        seedTargets.putIfAbsent(key, new TextModelClient.SearchResult(
+                                "", URI.create(key), material.path("authorName").asText(""), "", ""));
+                    }
+                }
+                continue;
+            }
             if (seedTargets.size() == 6) break;
             if (!"ARTICLE_PREVIEW".equals(material.path("textStatus").asText())
                     && !"PREVIEW".equals(material.path("articleTextStatus").asText())) continue;
@@ -201,7 +275,7 @@ public final class AssistantIntelligence {
         Map<String, String> finalSources = new LinkedHashMap<>();
         Map<String, List<URI>> linksBySourceId = new LinkedHashMap<>();
         var relations = mapper.createArrayNode();
-        Set<String> attemptedUrls = new LinkedHashSet<>();
+        Set<String> attemptedUrls = new LinkedHashSet<>(preReadUserLinkUrls);
         List<String> unreadableUrls = new ArrayList<>();
         List<TextModelClient.SearchResult> allSearchResults = new ArrayList<>();
         Map<String, JsonNode> allSearchEvents = new LinkedHashMap<>();
@@ -400,12 +474,45 @@ public final class AssistantIntelligence {
         return backfilled;
     }
 
+    public TextSourceReader.ReadResult readPublicUrl(URI uri) {
+        if (uri == null || !("http".equalsIgnoreCase(uri.getScheme()) || "https".equalsIgnoreCase(uri.getScheme()))
+                || uri.getRawUserInfo() != null || uri.getHost() == null || uri.getHost().isBlank()) {
+            throw new IllegalArgumentException("请输入有效的公开 http/https 链接");
+        }
+        if (sourceReader instanceof SafeHttpTextSourceReader) {
+            try {
+                SafeHttpTextSourceReader.validatePublicUri(uri);
+            } catch (java.io.IOException e) {
+                throw new com.xops.hub.provider.XDataProviderException(422, "无法解析该链接域名：" + uri.getHost());
+            }
+        }
+        return readOneWithDeepSeekFallback(uri);
+    }
+
+    private TextSourceReader.ReadResult readOneWithDeepSeekFallback(URI uri) {
+        TextSourceReader.ReadResult primary = sourceReader.read(uri);
+        if (primary.status() == TextSourceReader.Status.READ && !primary.text().isBlank()) {
+            return primary;
+        }
+        if (deepSeekClient != null) {
+            DeepSeekTextModelClient.CachedWebContent ds = deepSeekClient.readCachedOrFetch(uri, Duration.ofSeconds(18));
+            if (ds != null && ds.content() != null && !ds.content().isBlank()) {
+                return new TextSourceReader.ReadResult(
+                        uri, uri, "text/markdown", ds.title() == null ? "" : ds.title(),
+                        ds.content(), "deepseek-fetch",
+                        Instant.now(), TextSourceReader.Status.READ, "via DeepSeek search/fetch"
+                );
+            }
+        }
+        return primary;
+    }
+
     private List<TextSourceReader.ReadResult> readWave(List<TextModelClient.SearchResult> wave, long deadline) {
         if (wave.size() <= 1) {
-            return wave.isEmpty() ? List.of() : List.of(sourceReader.read(wave.get(0).url()));
+            return wave.isEmpty() ? List.of() : List.of(readOneWithDeepSeekFallback(wave.get(0).url()));
         }
         List<CompletableFuture<TextSourceReader.ReadResult>> futures = wave.stream()
-                .map(item -> CompletableFuture.supplyAsync(() -> sourceReader.read(item.url()), sourceReadPool))
+                .map(item -> CompletableFuture.supplyAsync(() -> readOneWithDeepSeekFallback(item.url()), sourceReadPool))
                 .toList();
         List<TextSourceReader.ReadResult> results = new ArrayList<>(wave.size());
         for (int i = 0; i < wave.size(); i++) {
@@ -475,6 +582,30 @@ public final class AssistantIntelligence {
         String selected = input.path("selectedMaterialId").asText();
         for (JsonNode material : input.path("materials")) {
             if (!selected.equals(material.path("id").asText())) continue;
+            if ("USER_LINK".equals(material.path("sourceIdentity").asText())) {
+                String linkUrl = AssistantEvidence.normalizedUrl(material.path("sourceUrl").asText(""));
+                String body = !material.path("articleText").asText("").isBlank()
+                        ? material.path("articleText").asText("")
+                        : material.path("text").asText("");
+                if (!linkUrl.isBlank() && !body.isBlank()) {
+                    String title = material.path("authorName").asText(material.path("text").asText("链接原文"));
+                    String host = safeHost(linkUrl);
+                    long acquired = material.path("updatedAt").asLong(material.path("collectedAt").asLong(0L));
+                    String acquiredAt = acquired > 0 ? Instant.ofEpochMilli(acquired).toString() : "";
+                    evidence.add(new ContentAssistantModelTasks.SourceEvidence(
+                            "material-" + selected + "-link",
+                            linkUrl,
+                            title,
+                            host.isBlank() ? linkUrl : host,
+                            "",
+                            acquiredAt,
+                            body,
+                            "用户提交链接原文 · 素材版本 " + material.path("version").asText("1"),
+                            "MATERIAL_FULL"
+                    ));
+                }
+                break;
+            }
             String author = material.path("username").asText();
             String quoteAuthor = material.path("quotedUsername").asText();
             String quoteId = material.path("quotedId").asText();
@@ -517,7 +648,7 @@ public final class AssistantIntelligence {
 
     private static boolean isMaterialSource(String id) { return id.startsWith("material-"); }
 
-    private ObjectNode draft(TextModelClient.ModelBinding binding, ObjectNode input) {
+    private ObjectNode draft(TextModelClient.ModelBinding binding, ObjectNode settings, ObjectNode input) {
         var research = draftResearch(input.path("research"));
         var style = input.path("style").isObject() ? draftStyle(input.path("style")) : null;
         String instruction = input.path("instruction").asText("");
@@ -528,11 +659,37 @@ public final class AssistantIntelligence {
         instruction += constraints.prompt(baseline);
         if (input.path("questions").isArray() && !input.path("questions").isEmpty())
             instruction += "\n补充研究需要落实的问题：" + input.path("questions");
-        var value = tasks.draft(binding, research, style, mergePreferencesWithWinningHint(input),
+        String mergedPrefs = mergePreferencesWithWinningHint(input);
+        var value = tasks.draft(binding, research, style, mergedPrefs,
                 instruction, baseline, skillId);
-        ObjectNode out = writingResult(value.value(), constraints, baseline);
+        ContentIntelligenceEngine.Draft finalDraft = value.value();
+        var finalRaw = value;
+        if (settings != null && settings.has("postPolishPrompt")
+                && settings.path("postPolishEnabled").asBoolean(true)) {
+            String polishPrompt = settings.path("postPolishPrompt").asText("").strip();
+            if (!polishPrompt.isBlank() && !finalDraft.text().isBlank()) {
+                try {
+                    String secondPassInstruction = "【二次改写提示词（在保持事实与证据锚点不变的前提下，严格按以下我的要求对初稿重写一遍）】\n"
+                            + polishPrompt;
+                    ObjectNode polishInput = input == null ? null : input.deepCopy();
+                    if (polishInput != null && polishInput.has("generationModel")) {
+                        String gm = polishInput.path("generationModel").asText("").strip();
+                        if (gm.matches("(?i).*[\\s@:]+(medium|high|xhigh|ultra|max)$")) {
+                            polishInput.put("generationModel", gm.replaceFirst("(?i)[\\s@:]+(medium|high|xhigh|ultra|max)$", " low"));
+                        }
+                    }
+                    var polished = tasks.optimize(binding(settings, Stage.OPTIMIZE, polishInput), finalDraft.text(),
+                            research, style, mergedPrefs, secondPassInstruction, null, skillId);
+                    if (polished.value() != null && !polished.value().text().isBlank()) {
+                        finalDraft = polished.value();
+                        finalRaw = polished;
+                    }
+                } catch (ContentAssistantModelTasks.AdditionalResearchRequiredException ignored) { }
+            }
+        }
+        ObjectNode out = writingResult(finalDraft, constraints, baseline);
         if (!ViralWritingSkills.normalizeId(skillId).isEmpty()) out.put("skillId", ViralWritingSkills.normalizeId(skillId));
-        return result(out, value.raw());
+        return result(out, finalRaw.raw());
     }
 
     private ObjectNode optimize(TextModelClient.ModelBinding binding, ObjectNode input, boolean correcting) {
@@ -606,7 +763,7 @@ public final class AssistantIntelligence {
         var examples = output.putArray("examples");
         var samplesById = new java.util.HashMap<String, String>();
         samples.forEach(sample -> samplesById.put(sample.id(), sample.text()));
-        for (String id : profile.exampleSampleIds().stream().distinct().limit(3).toList()) {
+        for (String id : profile.exampleSampleIds().stream().distinct().limit(8).toList()) {
             String text = samplesById.get(id);
             int end = text.offsetByCodePoints(0, Math.min(220, text.codePointCount(0, text.length())));
             examples.addObject().put("sampleId", id).put("text", text.substring(0, end));
@@ -620,31 +777,121 @@ public final class AssistantIntelligence {
         return result(output, null);
     }
 
+    public static String moduleForStage(Stage role) {
+        return switch (role) {
+            case CLASSIFY, SCORE -> "collection";
+            case RESEARCH, RESEARCH_SYNTHESIS -> "search";
+            case DRAFT, OPTIMIZE, OPTIMIZE_REVISION, STYLE, VERIFY -> "generation";
+        };
+    }
+
+    static String resolveStageProvider(JsonNode settings, Stage role, JsonNode input, Environment environment, AssistantStore store) {
+        String module = moduleForStage(role);
+        if ("generation".equals(module) && input != null && input.isObject()) {
+            String runtimeProv = input.path("generationProvider").asText("").strip();
+            if (AssistantConnection.isSupportedProvider(runtimeProv)) {
+                return AssistantConnection.normalizeProvider(runtimeProv);
+            }
+        }
+        if (settings != null && settings.path("moduleConfigs").path(module).isObject()) {
+            String modProv = settings.path("moduleConfigs").path(module).path("provider").asText("").strip();
+            if (AssistantConnection.isSupportedProvider(modProv)) {
+                return AssistantConnection.normalizeProvider(modProv);
+            }
+        }
+        boolean hasLegacyRoleOverride = settings != null && settings.path("bindings").path(role.name()).isObject();
+        boolean manuallyPinnedSingleProvider = settings != null && settings.path("providerManuallySelected").asBoolean(false);
+        if (!hasLegacyRoleOverride && !manuallyPinnedSingleProvider) {
+            if ("collection".equals(module) && AssistantConnection.isProviderConfigured(environment, store, "minimax")) {
+                return "minimax";
+            }
+            if ("search".equals(module) && AssistantConnection.isProviderConfigured(environment, store, "deepseek")) {
+                return "deepseek";
+            }
+            if ("generation".equals(module)) {
+                if (AssistantConnection.isProviderConfigured(environment, store, "chatgpt")) return "chatgpt";
+                if (AssistantConnection.isProviderConfigured(environment, store, "openai")) return "openai";
+                if (AssistantConnection.isProviderConfigured(environment, store, "google")) return "google";
+            }
+        }
+        return AssistantConnection.selectedProvider(settings instanceof ObjectNode obj ? obj : null, environment);
+    }
+
     private TextModelClient.ModelBinding binding(ObjectNode settings, Stage role) {
-        String provider = AssistantConnection.selectedProvider(settings, environment);
+        return binding(settings, role, null);
+    }
+
+    TextModelClient.ModelBinding binding(ObjectNode settings, Stage role, ObjectNode input) {
+        String provider = resolveStageProvider(settings, role, input, environment, store);
         String baseUrl = AssistantConnection.endpoint(environment, provider);
         String credential = AssistantConnection.credentialName(provider);
         if ("chatgpt".equalsIgnoreCase(provider)) {
-            if (!AssistantConnection.isProviderConfigured(environment, "chatgpt")) {
+            if (!AssistantConnection.isProviderConfigured(environment, store, "chatgpt")) {
                 throw new AssistantIntelligenceException(FailureKind.MISSING_CONFIG, false, null,
-                        "ChatGPT OAuth 尚未登录就绪，请执行 codex login --device-auth 完成第三方授权", null);
+                        "ChatGPT 订阅授权尚未登录就绪，请执行 codex login --device-auth 完成第三方授权", null);
             }
-        } else if (baseUrl == null || baseUrl.isBlank() || environment.getProperty(credential, "").isBlank()) {
-            throw new AssistantIntelligenceException(FailureKind.MISSING_CONFIG, false, null, "内容助手模型服务未在服务器配置", null);
+        } else if (baseUrl == null || baseUrl.isBlank()
+                || AssistantConnection.resolveSecret(store, environment, credential).isBlank()) {
+            String label = switch (provider) {
+                case "openai" -> "OpenAI API Key（OPENAI_API_KEY）";
+                case "google" -> "Google Gemini API Key（GEMINI_API_KEY）";
+                case "deepseek" -> "DeepSeek API Key（DEEPSEEK_API_KEY）";
+                case "minimax" -> "MiniMax API Key（MINIMAX_API_KEY）";
+                default -> "内容助手模型服务密钥";
+            };
+            throw new AssistantIntelligenceException(FailureKind.MISSING_CONFIG, false, null,
+                    "未配置 " + label + "，请在运行设置填入密钥或配置环境变量", null);
         }
-        ObjectNode effectiveSettings = settings;
-        if ("chatgpt".equalsIgnoreCase(provider)) {
-            effectiveSettings = settings.deepCopy();
-            if (effectiveSettings.path("model").asText("").isBlank()) {
+
+        ObjectNode effectiveSettings = settings == null ? mapper.createObjectNode() : settings.deepCopy();
+        String baseProvider = AssistantConnection.selectedProvider(settings, environment);
+        boolean switchedFromBase = !provider.equalsIgnoreCase(baseProvider);
+        if (switchedFromBase || effectiveSettings.path("model").asText("").isBlank()) {
+            if (switchedFromBase) {
+                effectiveSettings.put("model", AssistantConnection.defaultModelForProvider(provider));
+                effectiveSettings.put("protocol", AssistantConnection.defaultProtocol(provider));
+                effectiveSettings.put("contextTokens", AssistantConnection.defaultContextTokens(provider));
+                effectiveSettings.put("researchModel", AssistantConnection.defaultModelForProvider(provider));
+                effectiveSettings.put("researchProtocol", AssistantConnection.defaultProtocol(provider));
+                effectiveSettings.put("researchContextTokens", AssistantConnection.defaultContextTokens(provider));
+            } else if ("chatgpt".equalsIgnoreCase(provider)) {
                 effectiveSettings.put("model", ChatGptOAuthTextModelClient.DEFAULT_MODEL_ALIAS);
-            }
-            if (effectiveSettings.path("protocol").asText("").isBlank()) {
-                effectiveSettings.put("protocol", "RESPONSES");
-            }
-            if (effectiveSettings.path("contextTokens").asInt(0) <= 0) {
-                effectiveSettings.put("contextTokens", 200_000);
+                if (effectiveSettings.path("protocol").asText("").isBlank()) effectiveSettings.put("protocol", "RESPONSES");
+                if (effectiveSettings.path("contextTokens").asInt(0) <= 0) effectiveSettings.put("contextTokens", 200_000);
+            } else {
+                effectiveSettings.put("model", AssistantConnection.defaultModelForProvider(provider));
+                if (effectiveSettings.path("protocol").asText("").isBlank()) {
+                    effectiveSettings.put("protocol", AssistantConnection.defaultProtocol(provider));
+                }
+                if (effectiveSettings.path("contextTokens").asInt(0) <= 0) {
+                    effectiveSettings.put("contextTokens", AssistantConnection.defaultContextTokens(provider));
+                }
             }
         }
+
+        String module = moduleForStage(role);
+        JsonNode modNode = effectiveSettings.path("moduleConfigs").path(module);
+        if (modNode.isObject()) {
+            String modModel = modNode.path("model").asText("").strip();
+            if (!modModel.isBlank()) {
+                if (role == Stage.RESEARCH || role == Stage.RESEARCH_SYNTHESIS) {
+                    effectiveSettings.put("researchModel", modModel);
+                } else {
+                    effectiveSettings.put("model", modModel);
+                }
+            }
+        }
+        if ("generation".equals(module) && input != null && input.isObject()) {
+            String runtimeModel = input.path("generationModel").asText("").strip();
+            if (!runtimeModel.isBlank()) {
+                effectiveSettings.put("model", runtimeModel);
+                effectiveSettings.remove("bindings");
+            } else if (!input.path("generationProvider").asText("").isBlank()) {
+                effectiveSettings.put("model", AssistantConnection.defaultModelForProvider(provider));
+                effectiveSettings.remove("bindings");
+            }
+        }
+
         required(effectiveSettings, "model");
         required(effectiveSettings, "protocol");
         var config = roleBinding(effectiveSettings, role, provider);
@@ -654,9 +901,9 @@ public final class AssistantIntelligence {
                     "当前模型服务不支持 " + config.protocol() + " 协议，请切换兼容协议", null);
         if (config.context() < 1024 || config.maxOutput() > config.context() - 512)
             throw new AssistantIntelligenceException(FailureKind.MISSING_CONFIG, false, null,
-                    role.name()+" 的上下文必须至少保留 512 token 输入空间", null);
-        String version = required(effectiveSettings, "version") + ":" + role.name() + ":" + Integer.toUnsignedString(
-                java.util.Objects.hash(config.model(),config.protocol(),config.context(),config.timeout(),config.maxOutput()));
+                    role.name() + " 的上下文必须至少保留 512 token 输入空间", null);
+        String version = effectiveSettings.path("version").asInt(0) + ":" + provider + ":" + role.name() + ":" + Integer.toUnsignedString(
+                java.util.Objects.hash(provider, config.model(), config.protocol(), config.context(), config.timeout(), config.maxOutput()));
         return new TextModelClient.ModelBinding(
                 new TextModelClient.ServiceConnection(provider, URI.create(baseUrl), credential,
                         effectiveSettings.path("connectionVersion").asLong()),
@@ -693,6 +940,11 @@ public final class AssistantIntelligence {
         }
         if (!AssistantConnection.supportsProtocol(provider, protocol) && !override.hasNonNull("protocol")) {
             protocol = AssistantConnection.defaultProtocol(provider);
+        }
+        String lowerModel = model == null ? "" : model.toLowerCase(java.util.Locale.ROOT);
+        if (!settings.has("timeoutSeconds") && !override.has("timeoutSeconds")
+                && (lowerModel.contains("carbon") || lowerModel.matches(".*[\\s@:]+(high|xhigh|ultra|max)$"))) {
+            timeout = Math.max(timeout, 240);
         }
         return new RoleBinding(model, protocol, context, timeout, maxOutput);
     }
@@ -833,9 +1085,10 @@ public final class AssistantIntelligence {
     }
 
     public enum Stage { CLASSIFY, SCORE, RESEARCH, RESEARCH_SYNTHESIS, DRAFT, OPTIMIZE, OPTIMIZE_REVISION, STYLE, VERIFY }
-    private record BindingKey(String model,TextModelClient.Protocol protocol,int context,long timeoutMillis,int maxOutput) {
+    private record BindingKey(String service, String model, TextModelClient.Protocol protocol, int context, long timeoutMillis, int maxOutput) {
         static BindingKey of(TextModelClient.ModelBinding binding) {
-            return new BindingKey(binding.modelId(),binding.protocol(),binding.contextTokens(),binding.timeout().toMillis(),binding.maxOutputTokens());
+            return new BindingKey(binding.connection().serviceName(), binding.modelId(), binding.protocol(),
+                    binding.contextTokens(), binding.timeout().toMillis(), binding.maxOutputTokens());
         }
     }
 }

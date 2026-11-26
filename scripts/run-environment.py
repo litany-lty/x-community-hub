@@ -207,11 +207,17 @@ def main():
     }
     if args.mode != "production":
         options.update({
-            "xops.scheduler-enabled": "false", "xops.top50-auto-sync-enabled": "false",
+            "xops.scheduler-enabled": "false", "xops.auto-repost-enabled": "false",
+            "xops.top50-auto-sync-enabled": "false",
             "server.forward-headers-strategy": "none",
             "server.servlet.session.store-dir": str(cwd / ".sessions"),
             "xops.disk-cache-dir": str(cwd / ".cache/snapshots"),
             "xops.algo-profile-path": str(cwd / ".cache/x-algorithm-profile.json"),
+        })
+    else:
+        options.update({
+            "xops.scheduler-enabled": "true",
+            "xops.auto-repost-enabled": "true",
         })
     if args.mode == "preview":
         options.update({

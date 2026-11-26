@@ -74,6 +74,10 @@ public final class FxTwitterClient {
                 case "/twitter/user/last_tweets" -> validProfileSelector(route.query().get("userName"))
                         && (route.query().getOrDefault("cursor", "").isEmpty()
                             || route.query().get("cursor").startsWith(CURSOR_PREFIX));
+                case "/twitter/user/mentions" -> !isSearchCircuitOpen()
+                        && HANDLE.matcher(route.query().getOrDefault("userName", "")).matches()
+                        && (route.query().getOrDefault("cursor", "").isEmpty()
+                            || route.query().get("cursor").startsWith(CURSOR_PREFIX));
                 case "/twitter/tweet/advanced_search" -> !isSearchCircuitOpen()
                         && "Latest".equalsIgnoreCase(route.query().get("queryType"))
                         && route.query().getOrDefault("query", "").length() > 0
@@ -122,6 +126,18 @@ public final class FxTwitterClient {
                     return statuses(fetched, selector, includeReplies, cursor, searchRoots, deadline);
                 });
             }
+            case "/twitter/user/mentions" -> {
+                String handle = route.query().get("userName");
+                String cursor = route.query().getOrDefault("cursor", "");
+                if (cursor.equals(CURSOR_PREFIX)) yield CompletableFuture.failedFuture(invalid("公开数据分页游标无效"));
+                String query = "(to:" + handle + " OR @" + handle + ") -from:" + handle;
+                String path = "/search?q=" + encode(query) + "&feed=latest&count=30"
+                        + (cursor.isEmpty() ? "" : "&cursor=" + encode(cursor.substring(CURSOR_PREFIX.length())));
+                yield TwitterApiIoProvider.handleComposeCancellable(request(path, deadline, requestStarted, null), (fetched, error) -> {
+                    if (error != null) return CompletableFuture.failedFuture(error);
+                    return search(fetched, query, cursor, searchRoots, deadline, false);
+                });
+            }
             case "/twitter/tweet/advanced_search" -> {
                 String query = route.query().get("query");
                 String cursor = route.query().getOrDefault("cursor", "");
@@ -130,7 +146,7 @@ public final class FxTwitterClient {
                         + (cursor.isEmpty() ? "" : "&cursor=" + encode(cursor.substring(CURSOR_PREFIX.length())));
                 yield TwitterApiIoProvider.handleComposeCancellable(request(path, deadline, requestStarted, null), (fetched, error) -> {
                     if (error != null) return CompletableFuture.failedFuture(error);
-                    return search(fetched, query, cursor, searchRoots, deadline);
+                    return search(fetched, query, cursor, searchRoots, deadline, true);
                 });
             }
             case "/twitter/tweets" -> metrics(tweetIds(route.query().get("tweet_ids")), deadline, requestStarted);
@@ -434,6 +450,12 @@ public final class FxTwitterClient {
 
     private CompletableFuture<JsonNode> search(Fetched fetched, String query, String requestedCursor,
                                                SearchReplyRoots roots, Instant deadline) {
+        return search(fetched, query, requestedCursor, roots, deadline, true);
+    }
+
+    private CompletableFuture<JsonNode> search(Fetched fetched, String query, String requestedCursor,
+                                               SearchReplyRoots roots, Instant deadline,
+                                               boolean resolveConversationRoots) {
         JsonNode rows = fetched.body().get("results");
         JsonNode cursors = fetched.body().get("cursor");
         if (rows == null || !rows.isArray() || cursors == null || !cursors.isObject()
@@ -476,7 +498,7 @@ public final class FxTwitterClient {
         }
         out.put("has_next_page", !bottom.isEmpty());
         out.put("next_cursor", bottom.isEmpty() ? "" : CURSOR_PREFIX + bottom);
-        if (!hasReplies) return CompletableFuture.completedFuture(out);
+        if (!resolveConversationRoots || !hasReplies) return CompletableFuture.completedFuture(out);
         Set<String> missing = page.fill(tweets);
         if (missing.isEmpty()) return CompletableFuture.completedFuture(out);
         Set<String> fetchParents = new LinkedHashSet<>();

@@ -158,7 +158,7 @@ public final class AssistantWorker {
         if(samples.path("coverage").path("running").asBoolean()) return;
         var cleaned=object(); var rows=cleaned.putArray("samples");
         samples.path("samples").forEach(s->rows.add(object().put("id",s.path("id").asText()).put("text",s.path("text").asText())));
-        String hash=digest(rows);
+        String hash=digest(rows) + "|distill-v2";
         store.tx(tx->{
             var waiting=tx.matching("task","status","WAITING_SAMPLES",-1);
             var waitingStyle=tx.matching("task","status","WAITING_STYLE",-1);

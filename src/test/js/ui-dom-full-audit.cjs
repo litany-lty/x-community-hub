@@ -38,7 +38,9 @@ function slice(startMarker, endMarker) {
         "assistantDraftVersionPreview",
         "assistantDraftVersionText",
         "assistantDraftVersionTitle",
-        "assistantOptimizeInstruction"
+        "assistantOptimizeInstruction",
+        "assistantOptimizeGenTargetSelect",
+        "assistantOptimizeEffortSelect"
     ]);
 
     const referencedIds = new Set([

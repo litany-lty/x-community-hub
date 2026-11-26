@@ -13,6 +13,161 @@ import static com.xops.hub.assistant.AssistantTopics.required;
 
 public final class AssistantWorkflow {
     private static final int FINGERPRINT_RULES = 2;
+    private static final int MAX_WEB_LINK_CODE_POINTS = 40_000;
+    private static final java.util.regex.Pattern EMBEDDED_HTTP_URL = java.util.regex.Pattern.compile("https?://[^\\s<>\"'“”‘’]+");
+    private static final java.util.regex.Pattern X_STATUS_URL = java.util.regex.Pattern.compile(
+            "(?i)^https?://(?:(?:www|mobile)\\.)?(?:x|twitter|fxtwitter|vxtwitter)\\.com/(?:[A-Za-z0-9_]{1,15}|i(?:/web)?)/status/([0-9]{2,20})(?:[/?#].*)?$");
+
+    record ParsedLinkInput(String normalizedUrl, java.net.URI uri, String xTweetId) { }
+
+    static ParsedLinkInput parseLinkInput(String rawInput) {
+        if (rawInput == null || rawInput.isBlank()) {
+            throw new IllegalArgumentException("请粘贴需要调研的链接");
+        }
+        var matcher = EMBEDDED_HTTP_URL.matcher(rawInput.strip());
+        if (!matcher.find()) {
+            throw new IllegalArgumentException("请输入以 http:// 或 https:// 开头的有效链接");
+        }
+        String candidate = matcher.group();
+        while (!candidate.isEmpty()) {
+            char tail = candidate.charAt(candidate.length() - 1);
+            if (".,;!?，。！？；：、】》」』".indexOf(tail) >= 0
+                    || (tail == ')' && countChar(candidate, '(') < countChar(candidate, ')'))
+                    || (tail == '）' && countChar(candidate, '（') < countChar(candidate, '）'))) {
+                candidate = candidate.substring(0, candidate.length() - 1);
+            } else {
+                break;
+            }
+        }
+        String normalized = AssistantEvidence.normalizedUrl(candidate);
+        if (normalized.isBlank()) {
+            throw new IllegalArgumentException("链接格式无效，请提供公开可访问的 http/https 链接");
+        }
+        var xMatcher = X_STATUS_URL.matcher(normalized);
+        String tweetId = xMatcher.matches() ? xMatcher.group(1) : null;
+        return new ParsedLinkInput(normalized, java.net.URI.create(normalized), tweetId);
+    }
+
+    private static int countChar(String s, char ch) {
+        int n = 0;
+        for (int i = 0; i < s.length(); i++) if (s.charAt(i) == ch) n++;
+        return n;
+    }
+
+    static ObjectNode buildWebLinkMaterial(String normalizedUrl, TextSourceReader.ReadResult read, long nowMs) {
+        String finalUrl = read.finalUri() != null
+                ? AssistantEvidence.normalizedUrl(read.finalUri().toString())
+                : normalizedUrl;
+        if (finalUrl.isBlank()) finalUrl = normalizedUrl;
+        String canonicalIdKey = AssistantEvidence.normalizedUrl(normalizedUrl);
+        String materialId = "link-" + digest(TextNode.valueOf(canonicalIdKey)).substring(0, 20);
+        String host = "";
+        try {
+            String h = java.net.URI.create(finalUrl).getHost();
+            if (h != null) host = h.replaceFirst("(?i)^www\\.", "");
+        } catch (IllegalArgumentException ignored) { }
+        if (host.isBlank()) host = "web";
+
+        String rawTitle = read.title() == null ? "" : read.title().replaceAll("\\s+", " ").strip();
+        String rawBody = read.text() == null ? "" : read.text().strip();
+        String cappedBody = limitCodePoints(rawBody, MAX_WEB_LINK_CODE_POINTS);
+        String headline = !rawTitle.isBlank()
+                ? limitCodePoints(rawTitle, 180)
+                : firstParagraphPreview(cappedBody, 120);
+        if (headline.isBlank()) headline = finalUrl;
+
+        return object()
+                .put("id", materialId)
+                .put("authorId", "web:" + host.toLowerCase(Locale.ROOT))
+                .put("username", host)
+                .put("authorName", !rawTitle.isBlank() ? limitCodePoints(rawTitle, 80) : host)
+                .put("authorAvatarUrl", "")
+                .put("authorVerified", false)
+                .put("text", headline)
+                .put("quotedText", "")
+                .put("articleText", cappedBody)
+                .put("articleRole", "AUTHOR")
+                .put("articleUrl", finalUrl)
+                .put("sourceUrl", finalUrl)
+                .put("textStatus", "ARTICLE_FULL")
+                .put("authorTextStatus", "FULL")
+                .put("quotedTextStatus", "NOT_PRESENT")
+                .put("articleTextStatus", "FULL")
+                .put("sourceIdentity", "USER_LINK")
+                .put("kind", "POST")
+                .put("publishedAt", nowMs)
+                .put("collectedAt", nowMs);
+    }
+
+    static String ingestDirectLinkMaterial(AssistantStore.Tx tx, ObjectNode source) {
+        String materialId = field(source, "id");
+        ObjectNode previous = tx.get("material", materialId);
+        ObjectNode content = object();
+        for (String key : List.of("authorId", "username", "text", "quotedText", "articleText", "sourceUrl", "textStatus",
+                "authorTextStatus", "quotedTextStatus", "articleTextStatus", "articleRole", "publishedAt",
+                "quotedId", "quotedAuthorId", "quotedUsername", "articleId", "articleUrl")) {
+            if (source.has(key)) content.set(key, source.get(key));
+        }
+        String fingerprint = digest(content);
+        long now = System.currentTimeMillis();
+        long firstCollectedAt = previous != null && previous.path("collectedAt").asLong(0) > 0
+                ? previous.path("collectedAt").asLong()
+                : source.path("collectedAt").asLong(now);
+        ObjectNode saved = (previous != null && fingerprint.equals(previous.path("contentFingerprint").asText("")))
+                ? previous
+                : tx.put("material", materialId, source.deepCopy()
+                        .put("contentFingerprint", fingerprint)
+                        .put("collectedAt", firstCollectedAt)
+                        .put("lastCollectedAt", now));
+        if (AssistantTopics.text(saved).isBlank() || "NO_ANALYZABLE_TEXT".equals(saved.path("textStatus").asText(""))) {
+            throw new IllegalArgumentException("该链接不含可分析的正文内容");
+        }
+
+        String topicId = AssistantTopics.topicOf(tx, materialId);
+        if (topicId.isBlank()) {
+            topicId = id();
+            tx.put("membership", materialId, object().put("topicId", topicId).put("actor", "OWNER_LINK"));
+            ObjectNode topic = AssistantTopics.fresh(topicId, saved);
+            String titleCandidate = !saved.path("authorName").asText("").isBlank()
+                    && "USER_LINK".equals(saved.path("sourceIdentity").asText(""))
+                    ? saved.path("authorName").asText("")
+                    : saved.path("text").asText("");
+            if (!titleCandidate.isBlank()) {
+                topic.put("title", limitCodePoints(titleCandidate.replaceAll("\\s+", " ").strip(), 100));
+            }
+            String summaryCandidate = !saved.path("articleText").asText("").isBlank()
+                    ? firstParagraphPreview(saved.path("articleText").asText(""), 140)
+                    : firstParagraphPreview(saved.path("text").asText(""), 140);
+            topic.put("summary", summaryCandidate)
+                    .put("status", "SCORED")
+                    .put("score", 85)
+                    .put("valueScore", 85.0)
+                    .put("reachScore", 85.0)
+                    .put("reason", "用户指定链接调研选题");
+            topic.set("decision", object()
+                    .put("kind", "NEW_TOPIC")
+                    .put("confidence", "HIGH")
+                    .put("reason", "来自用户复制提交的链接素材"));
+            AssistantTopics.persist(tx, topicId, topic);
+        } else {
+            ObjectNode existingTopic = required(tx, "topic", topicId);
+            if ("USER_LINK".equals(saved.path("sourceIdentity").asText(""))) {
+                String summaryCandidate = firstParagraphPreview(saved.path("articleText").asText(""), 140);
+                if (!summaryCandidate.isBlank() && existingTopic.path("summary").asText("").isBlank()) {
+                    existingTopic.put("summary", summaryCandidate);
+                    AssistantTopics.persist(tx, topicId, existingTopic);
+                }
+            }
+        }
+        return topicId;
+    }
+
+    private static String limitCodePoints(String text, int maxCodePoints) {
+        if (text == null || text.isEmpty()) return "";
+        int count = text.codePointCount(0, text.length());
+        if (count <= maxCodePoints) return text;
+        return text.substring(0, text.offsetByCodePoints(0, maxCodePoints));
+    }
 
     private AssistantWorkflow() {}
 
@@ -46,6 +201,18 @@ public final class AssistantWorkflow {
                 .put("researchModel","").put("researchProtocol","RESPONSES").put("researchContextTokens",0);
     }
 
+    public static boolean isPostPolishEnabled(JsonNode settings) {
+        return settings == null || !settings.has("postPolishEnabled")
+                || settings.path("postPolishEnabled").asBoolean(true);
+    }
+
+    public static String resolvePostPolishPrompt(JsonNode settings) {
+        if (settings != null && settings.has("postPolishPrompt")) {
+            return OwnerQuoteStyleDistiller.normalizePolishPrompt(settings.path("postPolishPrompt").asText(""));
+        }
+        return OwnerQuoteStyleDistiller.DEFAULT_POST_POLISH_PROMPT;
+    }
+
     static ObjectNode preferences(AssistantStore.Tx tx) {
         var value=tx.get("meta","preferences");
         return value==null?object().put("version",0).put("text",""):value;
@@ -76,11 +243,14 @@ public final class AssistantWorkflow {
             boolean needAuthorBackfill = (!source.path("authorAvatarUrl").asText("").isBlank()
                     && previous.path("authorAvatarUrl").asText("").isBlank())
                     || (!source.path("authorName").asText("").isBlank()
-                    && previous.path("authorName").asText("").isBlank());
+                    && previous.path("authorName").asText("").isBlank())
+                    || (!source.path("authorBio").asText("").isBlank()
+                    && previous.path("authorBio").asText("").isBlank());
             if (needAuthorBackfill) {
                 tx.put("material", materialId, previous.deepCopy()
                         .put("authorName", source.path("authorName").asText(previous.path("authorName").asText("")))
                         .put("authorAvatarUrl", source.path("authorAvatarUrl").asText(previous.path("authorAvatarUrl").asText("")))
+                        .put("authorBio", source.path("authorBio").asText(previous.path("authorBio").asText("")))
                         .put("authorVerified", source.path("authorVerified").asBoolean(previous.path("authorVerified").asBoolean(false))));
             }
             return;
@@ -214,6 +384,9 @@ public final class AssistantWorkflow {
     private static ObjectNode effectiveBindings(JsonNode settings, List<Stage> stages) {
         String provider = settings.path("provider").asText("commandcode");
         var effective = object().put("provider",provider).put("connectionVersion",settings.path("connectionVersion").asLong());
+        if (settings.has("moduleConfigs")) {
+            effective.set("moduleConfigs", settings.path("moduleConfigs").deepCopy());
+        }
         var bindings = effective.putObject("bindings");
         for (Stage role : stages) bindings.set(role.name(), modelConfig(settings,role,provider));
         return effective;
@@ -314,6 +487,7 @@ public final class AssistantWorkflow {
         input.set("preferences",preferences(tx));
         String winningHint = buildWinningObservationHint(tx);
         if (!winningHint.isEmpty()) input.put("winningHint", winningHint);
+        applyRuntimeGenerationTarget(body, input);
         if (fastMode) {
             input.put("fastMode", true);
             if (body.path("regenerate").asBoolean()) {
@@ -468,7 +642,25 @@ public final class AssistantWorkflow {
         input.set("style",tx.get("meta","style"));
         String winningHint = buildWinningObservationHint(tx);
         if (!winningHint.isEmpty()) input.put("winningHint", winningHint);
+        applyRuntimeGenerationTarget(body, input);
         return enqueue(tx,"OPTIMIZE",input,field(request,"clientRequestId"),request);
+    }
+
+    private static void applyRuntimeGenerationTarget(JsonNode body, ObjectNode input) {
+        if (body == null || !body.isObject()) return;
+        String rawProv = body.path("generationProvider").asText("").strip();
+        String rawModel = body.path("generationModel").asText("").strip();
+        if (!rawProv.isEmpty()) {
+            String normalized = AssistantConnection.normalizeProvider(rawProv);
+            if (!Set.of("chatgpt", "openai", "google", "minimax", "deepseek").contains(normalized)) {
+                throw new IllegalArgumentException("不支持的内容生成渠道: " + rawProv);
+            }
+            input.put("generationProvider", normalized);
+        }
+        if (!rawModel.isEmpty()) {
+            if (rawModel.length() > 160) throw new IllegalArgumentException("生成模型名称过长");
+            input.put("generationModel", rawModel);
+        }
     }
 
     static String buildWinningObservationHint(AssistantStore.Tx tx) {
@@ -556,6 +748,7 @@ public final class AssistantWorkflow {
         if(existing!=null) return existing;
         // A new verification or refresh is an explicit request to check the current upstream state.
         input.put("refreshId",field(body,"clientRequestId"));
+        applyRuntimeGenerationTarget(body, input);
         return enqueue(tx,kind,input,field(body,"clientRequestId"),body);
     }
 

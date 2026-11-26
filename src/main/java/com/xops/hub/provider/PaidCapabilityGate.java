@@ -309,6 +309,33 @@ public class PaidCapabilityGate {
         }
     }
 
+    public boolean isExhausted(String idempotencyKey) {
+        if (idempotencyKey == null || idempotencyKey.isBlank()) return false;
+        RetryTaskEntry entry = retryLedger.get(idempotencyKey.trim());
+        if (entry == null) return false;
+        synchronized (entry) {
+            return entry.state == RetryState.EXHAUSTED;
+        }
+    }
+
+    public int resetByPrefix(String keyPrefix) {
+        if (keyPrefix == null || keyPrefix.isBlank()) return 0;
+        String prefix = keyPrefix.trim();
+        int cleared = 0;
+        for (String key : new ArrayList<>(retryLedger.keySet())) {
+            if (!key.startsWith(prefix)) continue;
+            RetryTaskEntry entry = retryLedger.get(key);
+            if (entry == null) continue;
+            synchronized (entry) {
+                if (entry.running) continue;
+            }
+            if (retryLedger.remove(key, entry)) {
+                cleared++;
+            }
+        }
+        return cleared;
+    }
+
     public RetrySnapshot getRetrySnapshot(String idempotencyKey) {
         if (idempotencyKey == null) return null;
         RetryTaskEntry entry = retryLedger.get(idempotencyKey.trim());

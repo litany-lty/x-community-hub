@@ -257,6 +257,38 @@ class ScheduledRequestStabilityTest {
         verify(publisher, times(1)).createTweet(anyString(), anyString(), anyList());
     }
 
+    @Test
+    void explicitAndLegacyTrailingUrlQuoteTweetsDispatchWithQuoteTweetId() throws Exception {
+        when(publisher.createTweet(anyString(), anyString(), anyList(), anyString())).thenReturn("quoted-pub-id");
+        MockMvc mvc = mvc(service);
+        long t1 = clock.millis() + 60_000L;
+        long t2 = t1 + 3_600_000L;
+
+        mvc.perform(post("/api/scheduled-tweets")
+                        .session(session())
+                        .contentType("application/json")
+                        .content(mapper.writeValueAsString(Map.of(
+                                "text", "我的引用点评",
+                                "scheduledAtEpochMs", t1,
+                                "clientRequestId", "quote-explicit-1",
+                                "quoteTweetId", "1920001",
+                                "quoteTweetUrl", "https://x.com/sama/status/1920001"
+                        ))))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.quoteTweetId").value("1920001"));
+
+        service.createScheduledTweet("1001", "alice",
+                "旧格式带链接附文\nhttps://x.com/sama/status/1920002", t2, "quote-legacy-2", List.of());
+
+        clock.advance(65_000L);
+        service.processDueJobsForAccount("1001");
+        verify(publisher, times(1)).createTweet("synthetic-access-token", "我的引用点评", List.of(), "1920001");
+
+        clock.advance(3_600_000L);
+        service.processDueJobsForAccount("1001");
+        verify(publisher, times(1)).createTweet("synthetic-access-token", "旧格式带链接附文", List.of(), "1920002");
+    }
+
     private Path exhaustDailyAllowance() throws Exception {
         Path budget = tempDir.resolve("users/by-id/1001/scheduled_publish_budget_v1.json");
         mapper.writeValue(budget.toFile(), Map.of("accountId", "1001", "localDate", "2026-11-16", "count", 1));

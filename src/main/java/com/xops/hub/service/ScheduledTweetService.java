@@ -80,6 +80,9 @@ public class ScheduledTweetService {
     public static final long MEDIA_REUSE_TTL_MS = 20L * 3600_000L;
     private static final int MAX_CLIENT_REQUEST_CACHE = 200;
     private static final Pattern SAFE_ID_PATTERN = Pattern.compile("^[A-Za-z0-9_-]{1,64}$");
+    private static final Pattern QUOTE_TWEET_ID_PATTERN = Pattern.compile("^[0-9]{2,20}$");
+    private static final Pattern TRAILING_STATUS_URL_PATTERN = Pattern.compile(
+            "(?is)^(.+?)(?:\\r?\\n)+https?://(?:(?:www|mobile)\\.)?(?:x|twitter)\\.com/[A-Za-z0-9_]{1,15}/status/([0-9]{2,20})/?\\s*$");
     private static final DateTimeFormatter CONFLICT_TIME_FMT = DateTimeFormatter.ofPattern("MM-dd HH:mm");
 
     public record MediaUploadInput(String fileName, byte[] bytes) {
@@ -89,10 +92,16 @@ public class ScheduledTweetService {
             String text,
             long scheduledAtEpochMs,
             String clientRequestId,
-            List<MediaUploadInput> uploads, AssistantSource assistantSource
+            List<MediaUploadInput> uploads, AssistantSource assistantSource,
+            String quoteTweetId, String quoteTweetUrl
     ) {
+        public BatchTweetDraftInput(String text, long scheduledAtEpochMs, String clientRequestId,
+                                    List<MediaUploadInput> uploads, AssistantSource assistantSource) {
+            this(text, scheduledAtEpochMs, clientRequestId, uploads, assistantSource, null, null);
+        }
+
         public BatchTweetDraftInput(String text,long time,String key,List<MediaUploadInput> uploads) {
-            this(text,time,key,uploads,null);
+            this(text,time,key,uploads,null,null,null);
         }
     }
 
@@ -151,6 +160,8 @@ public class ScheduledTweetService {
     private final AtomicBoolean bootRecovered = new AtomicBoolean(false);
     private final Object mediaSpaceLock = new Object();
     private long reservedMediaBytes;
+    @Autowired(required = false)
+    private org.springframework.core.env.Environment environment;
 
     @Autowired
     public ScheduledTweetService(
@@ -205,9 +216,14 @@ public class ScheduledTweetService {
                 }, new ThreadPoolExecutor.AbortPolicy());
     }
 
+    public boolean isScheduledPublishRuntimeEnabled() {
+        return properties.isScheduledPublishActive(environment);
+    }
+
     @EventListener(ApplicationReadyEvent.class)
     public void onApplicationReady() {
-        if (!properties.isSchedulerEnabled()) {
+        if (!isScheduledPublishRuntimeEnabled()) {
+            log.info("Local/non-production runtime detected; scheduled tweet background publishing is disabled.");
             return;
         }
         if (bootRecovered.compareAndSet(false, true)) {
@@ -217,7 +233,7 @@ public class ScheduledTweetService {
 
     @Scheduled(fixedDelayString = "${xops.scheduler-poll-ms:15000}")
     public void runScheduledTick() {
-        if (!properties.isSchedulerEnabled()) {
+        if (!isScheduledPublishRuntimeEnabled()) {
             return;
         }
         if (bootRecovered.compareAndSet(false, true)) {
@@ -281,6 +297,28 @@ public class ScheduledTweetService {
                 log.warn("Scheduled queue recovery stopped for account {}: {}", accountId, ex.getMessage());
             }
         }
+    }
+
+    public long latestAccountPublishEpochMs(String accountId, String username) {
+        if (accountId == null || accountId.isBlank() || !SAFE_ID_PATTERN.matcher(accountId).matches()) {
+            return 0L;
+        }
+        long latest = 0L;
+        synchronized (accountLock(accountId)) {
+            QueueStorage queue = loadQueueLocked(accountId, username);
+            for (ScheduledTweetJob job : queue.jobs()) {
+                if (job.status() == ScheduledTweetStatus.PUBLISHED && job.publishedAtEpochMs() > 0L) {
+                    latest = Math.max(latest, job.publishedAtEpochMs());
+                } else if (job.status() == ScheduledTweetStatus.SENDING && job.updatedAtEpochMs() > 0L) {
+                    latest = Math.max(latest, job.updatedAtEpochMs());
+                } else if (job.status() == ScheduledTweetStatus.OVERDUE_CONFIRM_REQUIRED
+                        && job.overdueReason() == OverdueReason.UNCERTAIN_DELIVERY
+                        && job.updatedAtEpochMs() > 0L) {
+                    latest = Math.max(latest, job.updatedAtEpochMs());
+                }
+            }
+        }
+        return latest;
     }
 
     public ScheduledTweetListResponse listJobs(String accountId, String username) {
@@ -352,6 +390,18 @@ public class ScheduledTweetService {
             String clientRequestId,
             List<MediaUploadInput> uploads, AssistantSource source
     ) {
+        return createScheduledTweet(accountId, username, text, scheduledAtEpochMs, clientRequestId, uploads, source, null, null);
+    }
+
+    public ScheduledTweetJob createScheduledTweet(
+            String accountId,
+            String username,
+            String text,
+            long scheduledAtEpochMs,
+            String clientRequestId,
+            List<MediaUploadInput> uploads, AssistantSource source,
+            String quoteTweetId, String quoteTweetUrl
+    ) {
         validateSafeId(accountId, "accountId");
         if (username == null || username.isBlank()) {
             throw new XDataProviderException(401, "缺少当前登录用户名，请重新登录");
@@ -366,6 +416,9 @@ public class ScheduledTweetService {
         if (trimmedText.isEmpty() && mediaInputs.isEmpty()) {
             throw new IllegalArgumentException("请输入推文内容或至少添加 1 张图片");
         }
+        String effectiveQuoteId = normalizeQuoteTweetId(
+                (quoteTweetId != null && !quoteTweetId.isBlank()) ? quoteTweetId : (source != null ? source.quoteTweetId() : null));
+        String effectiveQuoteUrl = normalizeQuoteTweetUrl(quoteTweetUrl, effectiveQuoteId);
 
         List<DetectedImageFormat> detectedFormats = validateMediaUploads(mediaInputs);
         XOAuthService.TokenCapability cap = oauthService.getTokenCapability(accountId);
@@ -382,7 +435,7 @@ public class ScheduledTweetService {
         for (MediaUploadInput input : mediaInputs) {
             mediaShaList.add(sha256Hex(input.bytes()));
         }
-        String fingerprint = computeContentFingerprint(trimmedText, mediaShaList);
+        String fingerprint = computeContentFingerprint(trimmedText, mediaShaList, effectiveQuoteId);
 
         synchronized (accountLock(accountId)) {
             QueueStorage queue = loadQueueLocked(accountId, username);
@@ -470,7 +523,7 @@ public class ScheduledTweetService {
                         0L,
                         null,
                         null,
-                        null, source
+                        null, source, effectiveQuoteId, effectiveQuoteUrl
                 );
                 queue.jobs().add(job);
                 if (!normalizedReqId.isEmpty()) {
@@ -498,7 +551,9 @@ public class ScheduledTweetService {
             List<MediaUploadInput> mediaInputs,
             List<DetectedImageFormat> detectedFormats,
             List<String> mediaShaList,
-            String fingerprint
+            String fingerprint,
+            String quoteTweetId,
+            String quoteTweetUrl
     ) {
     }
 
@@ -549,7 +604,12 @@ public class ScheduledTweetService {
             for (MediaUploadInput input : mediaInputs) {
                 mediaShaList.add(sha256Hex(input.bytes()));
             }
-            String fingerprint = computeContentFingerprint(trimmedText, mediaShaList);
+            String effectiveQuoteId = normalizeQuoteTweetId(
+                    (d.quoteTweetId() != null && !d.quoteTweetId().isBlank())
+                            ? d.quoteTweetId()
+                            : (d.assistantSource() != null ? d.assistantSource().quoteTweetId() : null));
+            String effectiveQuoteUrl = normalizeQuoteTweetUrl(d.quoteTweetUrl(), effectiveQuoteId);
+            String fingerprint = computeContentFingerprint(trimmedText, mediaShaList, effectiveQuoteId);
             prepared.add(new PreparedDraftItem(
                     rawText,
                     trimmedText,
@@ -558,7 +618,9 @@ public class ScheduledTweetService {
                     mediaInputs,
                     detectedFormats,
                     mediaShaList,
-                    fingerprint
+                    fingerprint,
+                    effectiveQuoteId,
+                    effectiveQuoteUrl
             ));
         }
 
@@ -701,7 +763,9 @@ public class ScheduledTweetService {
                             0L,
                             null,
                             null,
-                            null, drafts.get(idx).assistantSource()
+                            null, drafts.get(idx).assistantSource(),
+                            item.quoteTweetId(),
+                            item.quoteTweetUrl()
                     );
                     createdJobs.add(job);
                 }
@@ -912,7 +976,7 @@ public class ScheduledTweetService {
             }
 
             List<String> shaList = current.media().stream().map(ScheduledMediaAsset::sha256).toList();
-            String nextFingerprint = computeContentFingerprint(nextText.trim(), shaList);
+            String nextFingerprint = computeContentFingerprint(nextText.trim(), shaList, current.quoteTweetId());
             for (ScheduledTweetJob other : queue.jobs()) {
                 if (!other.id().equals(jobId)
                         && isActiveStatus(other.status())
@@ -1051,6 +1115,10 @@ public class ScheduledTweetService {
     }
 
     private void triggerAsyncDispatch(String accountId) {
+        if (environment != null && !isScheduledPublishRuntimeEnabled()) {
+            log.info("Blocked scheduled tweet background dispatch in local/non-production runtime for account {}", accountId);
+            return;
+        }
         if (!dispatchingAccounts.add(accountId)) return;
         try {
             dispatchExecutor.execute(() -> {
@@ -1174,6 +1242,8 @@ public class ScheduledTweetService {
             }
 
             String textToSend;
+            String latestQuoteTweetId;
+            String latestQuoteTweetUrl;
             synchronized (accountLock(accountId)) {
                 QueueStorage queue = loadQueueLocked(accountId, "");
                 int idx = findJobIndex(queue, claimed.id());
@@ -1185,17 +1255,26 @@ public class ScheduledTweetService {
                     return;
                 }
                 textToSend = latest.text();
+                latestQuoteTweetId = latest.quoteTweetId();
+                latestQuoteTweetUrl = latest.quoteTweetUrl();
                 queue.jobs().set(idx, latest.withPostRequestDispatched(clock.millis()));
                 saveQueueLocked(queue);
                 dispatchedToTweetEndpoint = true;
             }
 
-            final String finalTextToSend = textToSend;
+            ResolvedQuoteSend resolvedSend = resolveEffectiveQuoteSend(textToSend, latestQuoteTweetId);
+            String effectiveQuoteUrl = resolveEffectiveQuoteUrl(textToSend, resolvedSend.quoteTweetId(), latestQuoteTweetUrl);
             String tweetId = bindPaidScope
                     ? com.xops.hub.provider.PaidCapabilityGate.withCaller(
                             effectiveCaller, accountId,
-                            () -> publishClient.createTweet(accessToken, finalTextToSend, remoteMediaIds))
-                    : publishClient.createTweet(accessToken, finalTextToSend, remoteMediaIds);
+                            () -> resolvedSend.quoteTweetId() != null
+                                    ? XPublishClient.withQuoteTweetUrl(effectiveQuoteUrl,
+                                            () -> publishClient.createTweet(accessToken, resolvedSend.textToSend(), remoteMediaIds, resolvedSend.quoteTweetId()))
+                                    : publishClient.createTweet(accessToken, resolvedSend.textToSend(), remoteMediaIds))
+                    : (resolvedSend.quoteTweetId() != null
+                            ? XPublishClient.withQuoteTweetUrl(effectiveQuoteUrl,
+                                    () -> publishClient.createTweet(accessToken, resolvedSend.textToSend(), remoteMediaIds, resolvedSend.quoteTweetId()))
+                            : publishClient.createTweet(accessToken, resolvedSend.textToSend(), remoteMediaIds));
             long doneMs = clock.millis();
             synchronized (accountLock(accountId)) {
                 QueueStorage queue = loadQueueLocked(accountId, "");
@@ -1713,8 +1792,78 @@ public class ScheduledTweetService {
     }
 
     private static String computeContentFingerprint(String normalizedText, List<String> mediaSha256List) {
-        String joined = normalizedText + "|" + String.join(",", mediaSha256List);
+        return computeContentFingerprint(normalizedText, mediaSha256List, null);
+    }
+
+    private static String computeContentFingerprint(String normalizedText, List<String> mediaSha256List, String quoteTweetId) {
+        String joined = normalizedText + "|" + String.join(",", mediaSha256List)
+                + (quoteTweetId != null && !quoteTweetId.isBlank() ? ("|quote:" + quoteTweetId.trim()) : "");
         return sha256Hex(joined.getBytes(StandardCharsets.UTF_8));
+    }
+
+    static String normalizeQuoteTweetId(String rawQuoteTweetId) {
+        if (rawQuoteTweetId == null) {
+            return null;
+        }
+        String trimmed = rawQuoteTweetId.trim();
+        if (trimmed.isEmpty()) {
+            return null;
+        }
+        if (!QUOTE_TWEET_ID_PATTERN.matcher(trimmed).matches()) {
+            throw new IllegalArgumentException("被引用推文 ID 格式无效");
+        }
+        return trimmed;
+    }
+
+    static String normalizeQuoteTweetUrl(String rawQuoteTweetUrl, String normalizedQuoteTweetId) {
+        if (rawQuoteTweetUrl != null) {
+            String trimmed = rawQuoteTweetUrl.trim();
+            if (trimmed.matches("(?i)^https?://.+") && trimmed.length() <= 512) {
+                return trimmed;
+            }
+        }
+        return normalizedQuoteTweetId != null ? ("https://x.com/i/status/" + normalizedQuoteTweetId) : null;
+    }
+
+    record ResolvedQuoteSend(String textToSend, String quoteTweetId) { }
+
+    static ResolvedQuoteSend resolveEffectiveQuoteSend(String text, String explicitQuoteTweetId) {
+        String rawText = text == null ? "" : text;
+        String normalizedId = normalizeQuoteTweetId(explicitQuoteTweetId);
+        if (normalizedId != null) {
+            Pattern sameIdTrailing = Pattern.compile(
+                    "(?is)^(.*?)(?:\\r?\\n)+https?://(?:(?:www|mobile)\\.)?(?:x|twitter)\\.com/[A-Za-z0-9_]{1,15}/status/"
+                            + Pattern.quote(normalizedId) + "/?\\s*$");
+            var matcher = sameIdTrailing.matcher(rawText);
+            if (matcher.matches() && !matcher.group(1).strip().isEmpty()) {
+                return new ResolvedQuoteSend(matcher.group(1).stripTrailing(), normalizedId);
+            }
+            return new ResolvedQuoteSend(rawText, normalizedId);
+        }
+        var matcher = TRAILING_STATUS_URL_PATTERN.matcher(rawText);
+        if (matcher.matches() && !matcher.group(1).strip().isEmpty()) {
+            return new ResolvedQuoteSend(matcher.group(1).stripTrailing(), matcher.group(2));
+        }
+        return new ResolvedQuoteSend(rawText, null);
+    }
+
+    private static String resolveEffectiveQuoteUrl(String rawText, String quoteTweetId, String explicitQuoteTweetUrl) {
+        if (quoteTweetId == null || quoteTweetId.isBlank()) {
+            return null;
+        }
+        if (rawText != null) {
+            Pattern p = Pattern.compile(
+                    "(?i)(https?://(?:(?:www|mobile)\\.)?(?:x|twitter)\\.com/[A-Za-z0-9_]{1,15}/status/"
+                            + Pattern.quote(quoteTweetId) + ")");
+            var m = p.matcher(rawText);
+            if (m.find()) {
+                return m.group(1);
+            }
+        }
+        if (explicitQuoteTweetUrl != null && !explicitQuoteTweetUrl.isBlank()) {
+            return explicitQuoteTweetUrl.strip();
+        }
+        return "https://x.com/i/status/" + quoteTweetId;
     }
 
     private static String sha256Hex(byte[] bytes) {

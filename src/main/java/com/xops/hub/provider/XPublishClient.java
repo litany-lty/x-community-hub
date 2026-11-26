@@ -20,6 +20,9 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.function.Supplier;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * X 官方 API v2 图文发布客户端：
@@ -31,6 +34,29 @@ public class XPublishClient {
 
     private static final int MEDIA_CHUNK_BYTES = 4 * 1024 * 1024;
     private static final long STATUS_POLL_MAX_MS = 25_000L;
+    private static final ThreadLocal<String> QUOTE_URL_HINT = new ThreadLocal<>();
+    private static final Pattern X_MENTION_QUOTE_RESTRICTION = Pattern.compile(
+            "(?is).*(only reply to or quote posts|where you are mentioned or are the author).*");
+    private static final Pattern CANONICAL_STATUS_URL = Pattern.compile(
+            "(?i)^https?://(?:(?:www|mobile)\\.)?(?:x|twitter)\\.com/([A-Za-z0-9_]{1,15})/status/([0-9]{2,20})(?:[/?#].*)?$");
+
+    public static <T> T withQuoteTweetUrl(String quoteTweetUrl, Supplier<T> action) {
+        String prev = QUOTE_URL_HINT.get();
+        if (quoteTweetUrl == null || quoteTweetUrl.isBlank()) {
+            QUOTE_URL_HINT.remove();
+        } else {
+            QUOTE_URL_HINT.set(quoteTweetUrl.strip());
+        }
+        try {
+            return action.get();
+        } finally {
+            if (prev == null) {
+                QUOTE_URL_HINT.remove();
+            } else {
+                QUOTE_URL_HINT.set(prev);
+            }
+        }
+    }
 
     public static class XPublishException extends XDataProviderException {
         private final boolean deliveryUncertain;
@@ -96,13 +122,24 @@ public class XPublishClient {
     }
 
     public String createTweet(String userAccessToken, String text, List<String> mediaIds) {
-        return createTweet(userAccessToken, text, mediaIds, null);
+        return createTweet(userAccessToken, text, mediaIds, null, null);
     }
 
     public String createTweet(String userAccessToken, String text, List<String> mediaIds, String quoteTweetId) {
+        return createTweet(userAccessToken, text, mediaIds, quoteTweetId, QUOTE_URL_HINT.get());
+    }
+
+    public String createTweet(
+            String userAccessToken,
+            String text,
+            List<String> mediaIds,
+            String quoteTweetId,
+            String quoteTweetUrl
+    ) {
         if (userAccessToken == null || userAccessToken.isBlank()) {
             throw new XPublishException(401, "缺少有效访问令牌，无法发布推文", false);
         }
+        String cleanQuoteId = (quoteTweetId == null || quoteTweetId.isBlank()) ? null : quoteTweetId.trim();
         Map<String, Object> payload = new LinkedHashMap<>();
         if (text != null && !text.isBlank()) {
             payload.put("text", text);
@@ -110,13 +147,58 @@ public class XPublishClient {
         if (mediaIds != null && !mediaIds.isEmpty()) {
             payload.put("media", Map.of("media_ids", mediaIds));
         }
-        if (quoteTweetId != null && !quoteTweetId.isBlank()) {
-            payload.put("quote_tweet_id", quoteTweetId.trim());
+        if (cleanQuoteId != null) {
+            payload.put("quote_tweet_id", cleanQuoteId);
         }
         if (payload.isEmpty()) {
             throw new XPublishException(400, "推文正文与媒体不可同时为空", false);
         }
 
+        HttpResponse<String> resp = sendCreateTweetPayload(userAccessToken, payload);
+        int status = resp.statusCode();
+        if (status >= 500) {
+            throw new XPublishException(
+                    502,
+                    "推文发布请求响应异常（HTTP " + status + "），无法确认 X 是否已成功落库",
+                    true
+            );
+        }
+        JsonNode root = parseJsonOrNull(resp.body());
+        if (status == 403 && cleanQuoteId != null) {
+            String detail = extractXErrorDetail(root, status);
+            String combinedError = detail + " " + (resp.body() == null ? "" : resp.body());
+            if (X_MENTION_QUOTE_RESTRICTION.matcher(combinedError).find()) {
+                String canonicalUrl = resolveCanonicalQuoteUrl(cleanQuoteId, quoteTweetUrl);
+                String fallbackText = appendQuoteUrlIfMissing(text, cleanQuoteId, canonicalUrl);
+                Map<String, Object> fallbackPayload = new LinkedHashMap<>();
+                fallbackPayload.put("text", fallbackText);
+                if (mediaIds != null && !mediaIds.isEmpty()) {
+                    fallbackPayload.put("media", Map.of("media_ids", mediaIds));
+                }
+                resp = sendCreateTweetPayload(userAccessToken, fallbackPayload);
+                status = resp.statusCode();
+                if (status >= 500) {
+                    throw new XPublishException(
+                            502,
+                            "推文发布请求响应异常（HTTP " + status + "），无法确认 X 是否已成功落库",
+                            true
+                    );
+                }
+                root = parseJsonOrNull(resp.body());
+            }
+        }
+        if (status >= 400) {
+            String detail = extractXErrorDetail(root, status);
+            throw new XPublishException(status, "X 官方接口拒绝发布：" + detail, false);
+        }
+        String tweetId = root == null ? "" : root.path("data").path("id").asText("");
+        if (tweetId.isBlank()) {
+            throw new XPublishException(502, "推文发布成功响应缺少推文 ID，无法确认 X 是否已成功落库", true);
+        }
+        return tweetId;
+    }
+
+    private HttpResponse<String> sendCreateTweetPayload(String userAccessToken, Map<String, Object> payload) {
         final String jsonBody;
         try {
             jsonBody = objectMapper.writeValueAsString(payload);
@@ -133,7 +215,7 @@ public class XPublishClient {
                 .POST(HttpRequest.BodyPublishers.ofString(jsonBody, StandardCharsets.UTF_8))
                 .build();
 
-        HttpResponse<String> resp = sharedExecutor.execute(() -> {
+        return sharedExecutor.execute(() -> {
             try {
                 budgetGuard.acquirePermit(req.uri(), "x_tweet_create");
             } catch (XDataProviderException ex) {
@@ -150,25 +232,26 @@ public class XPublishClient {
                 throw new XPublishException(502, "推文发布请求被中断，无法确认 X 是否已成功落库", ex, true);
             }
         });
+    }
 
-        int status = resp.statusCode();
-        if (status >= 500) {
-            throw new XPublishException(
-                    502,
-                    "推文发布请求响应异常（HTTP " + status + "），无法确认 X 是否已成功落库",
-                    true
-            );
+    private static String resolveCanonicalQuoteUrl(String cleanQuoteId, String quoteTweetUrl) {
+        if (quoteTweetUrl != null && !quoteTweetUrl.isBlank()) {
+            Matcher matcher = CANONICAL_STATUS_URL.matcher(quoteTweetUrl.strip());
+            if (matcher.matches() && cleanQuoteId.equals(matcher.group(2))) {
+                return "https://x.com/" + matcher.group(1) + "/status/" + cleanQuoteId;
+            }
         }
-        JsonNode root = parseJsonOrNull(resp.body());
-        if (status >= 400) {
-            String detail = extractXErrorDetail(root, status);
-            throw new XPublishException(status, "X 官方接口拒绝发布：" + detail, false);
+        return "https://x.com/i/status/" + cleanQuoteId;
+    }
+
+    private static String appendQuoteUrlIfMissing(String text, String cleanQuoteId, String canonicalUrl) {
+        if (text == null || text.isBlank()) {
+            return canonicalUrl;
         }
-        String tweetId = root == null ? "" : root.path("data").path("id").asText("");
-        if (tweetId.isBlank()) {
-            throw new XPublishException(502, "推文发布成功响应缺少推文 ID，无法确认 X 是否已成功落库", true);
+        if (text.contains("/status/" + cleanQuoteId)) {
+            return text;
         }
-        return tweetId;
+        return text.stripTrailing() + "\n\n" + canonicalUrl;
     }
 
     private String initializeMediaUpload(

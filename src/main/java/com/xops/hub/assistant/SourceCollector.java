@@ -35,8 +35,9 @@ import java.util.regex.Pattern;
 @Service
 public class SourceCollector {
     public static final Set<Integer> SUPPORTED_TIERS = Set.of(1, 5, 30);
+    public static final int DEFAULT_AUTO_REPOST_MIN_SCORE = 70;
     private static final Pattern HANDLE = Pattern.compile("^[A-Za-z0-9_]{1,15}$");
-    private static final int STYLE_SAMPLE_LIMIT = 100;
+    private static final int STYLE_SAMPLE_LIMIT = 300;
     private static final int STYLE_PAGE_BATCH = 20;
     private static final int MAX_SOURCES_PER_TICK = 5;
     private static final int MAX_GAP_ENTRIES = 20;
@@ -84,10 +85,24 @@ public class SourceCollector {
         void onMaterialIngested(ObjectNode source, ObjectNode material);
     }
 
+    @FunctionalInterface
+    interface BatchIngestHook {
+        void onAuthorMaterialsIngested(ObjectNode source, List<ObjectNode> materials);
+    }
+
     private volatile IngestHook ingestHook;
+    private volatile BatchIngestHook batchIngestHook;
 
     void setIngestHook(IngestHook ingestHook) {
         this.ingestHook = ingestHook;
+    }
+
+    void setBatchIngestHook(BatchIngestHook batchIngestHook) {
+        this.batchIngestHook = batchIngestHook;
+    }
+
+    void setPaidCapabilityGate(PaidCapabilityGate paidCapabilityGate) {
+        this.paidCapabilityGate = paidCapabilityGate;
     }
 
     static int validateTierMinutes(int minutes) {
@@ -102,6 +117,15 @@ public class SourceCollector {
         if (SUPPORTED_TIERS.contains(raw)) return raw;
         if (SUPPORTED_TIERS.contains(fallbackMinutes)) return fallbackMinutes;
         return fallbackMinutes <= 1 ? 1 : (fallbackMinutes >= 30 ? 30 : 5);
+    }
+
+    public static int resolveAutoRepostMinScore(ObjectNode source) {
+        if (source == null || !source.has("autoRepostMinScore")) return DEFAULT_AUTO_REPOST_MIN_SCORE;
+        int raw = source.path("autoRepostMinScore").asInt(DEFAULT_AUTO_REPOST_MIN_SCORE);
+        if (!source.path("autoRepostMinScoreCustomized").asBoolean(false) && raw == 82) {
+            return DEFAULT_AUTO_REPOST_MIN_SCORE;
+        }
+        return Math.max(50, Math.min(99, raw));
     }
 
     public List<ObjectNode> list() {
@@ -119,11 +143,13 @@ public class SourceCollector {
                         copy.put("intervalMinutes", tierMinutes)
                                 .put("displayName", copy.path("displayName").asText(copy.path("username").asText("")))
                                 .put("avatarUrl", copy.path("avatarUrl").asText(""))
+                                .put("bio", copy.path("bio").asText(""))
                                 .put("verified", copy.path("verified").asBoolean(false))
+                                .put("followersCount", copy.path("followersCount").asLong(0))
                                 .put("autoRepostEnabled", copy.path("autoRepostEnabled").asBoolean(false))
                                 .put("autoRepostTextMode", copy.path("autoRepostTextMode").asText("AI"))
                                 .put("autoRepostTemplate", copy.path("autoRepostTemplate").asText(""))
-                                .put("autoRepostMinScore", copy.path("autoRepostMinScore").asInt(82))
+                                .put("autoRepostMinScore", resolveAutoRepostMinScore(copy))
                                 .put("autoRepostRuleHint", copy.path("autoRepostRuleHint").asText(""));
                         if ("ACTIVE".equals(copy.path("status").asText())) {
                             long anchor = copy.path("lastCompleteAt").asLong(0) > 0
@@ -143,6 +169,137 @@ public class SourceCollector {
         return add(input, 5);
     }
 
+    /**
+     * Fetches a single public X post by tweet ID and converts it into a content-assistant material node.
+     */
+    public ObjectNode fetchTweetMaterialById(String tweetId) {
+        if (provider == null) {
+            throw new XDataProviderException(503, "X 数据读取服务未启用");
+        }
+        String cleanId = tweetId == null ? "" : tweetId.strip();
+        if (!cleanId.matches("[0-9]{2,20}")) {
+            throw new IllegalArgumentException("无效的 X 推文 ID");
+        }
+        ObjectNode owner = store.tx(tx -> tx.get("meta", "owner"));
+        String ownerAccountId = owner == null ? "" : owner.path("accountId").asText("");
+        TwitterApiIoProvider.FetchedSinglePost fetched = PaidCapabilityGate.withCaller(
+                PaidCapabilityGate.PRIVILEGED_USERNAME,
+                ownerAccountId,
+                () -> provider.fetchSingleTextPost(cleanId, clock.instant().plusSeconds(25))
+        );
+        return toMaterial(fetched.post(), fetched.author(), false);
+    }
+
+    /**
+     * Fetches up to a handful of recent public posts on-demand when a monitored source has no
+     * local materials yet, so avatar-click repost preview works immediately after adding a source.
+     */
+    List<ObjectNode> fetchOnDemandPreviewMaterials(ObjectNode source) {
+        if (source == null || provider == null) return List.of();
+        String authorId = source.path("authorId").asText(source.path("id").asText("")).strip();
+        String username = source.path("username").asText("").replaceFirst("^@+", "").strip();
+        if (username.isBlank() || authorId.isBlank()) return List.of();
+        ObjectNode owner = store.tx(tx -> tx.get("meta", "owner"));
+        String ownerAccountId = owner == null ? "" : owner.path("accountId").asText("");
+        TextPostPage page = com.xops.hub.provider.PaidCapabilityGate.withCaller(
+                com.xops.hub.provider.PaidCapabilityGate.PRIVILEGED_USERNAME,
+                ownerAccountId,
+                () -> provider.fetchTextPostsPage(username, authorId, "", 10, clock.instant().plusSeconds(20))
+        );
+        if (page == null || page.posts() == null || page.posts().isEmpty()) return List.of();
+        XUserSummary pageAuthor = page.author();
+        return page.posts().stream()
+                .limit(5)
+                .map(post -> toMaterial(post, pageAuthor, false))
+                .toList();
+    }
+
+    /**
+     * Checks the latest non-reply tweet publish timestamp (epoch ms) on X for the given account
+     * (used by the 30-minute @elidlicom idle quote-repost patrol).
+     */
+    long fetchLatestAccountPostEpochMs(String username, String accountId) {
+        if (provider == null) return -1L;
+        String cleanUsername = (username == null || username.isBlank())
+                ? PaidCapabilityGate.PRIVILEGED_USERNAME
+                : username.replaceFirst("^@+", "").strip();
+        String safeAccountId = accountId == null ? "" : accountId.strip();
+        TextPostPage page = PaidCapabilityGate.withCaller(
+                PaidCapabilityGate.PRIVILEGED_USERNAME,
+                safeAccountId,
+                () -> provider.fetchTextPostsPage(cleanUsername, safeAccountId, "", 20, clock.instant().plusSeconds(25))
+        );
+        if (page == null || page.posts() == null || page.posts().isEmpty()) {
+            return 0L;
+        }
+        long nowMs = clock.millis();
+        long latest = 0L;
+        for (TextPost post : page.posts()) {
+            if (post == null || post.publishedAt() == null || post.selfThreadReply()) continue;
+            long ts = post.publishedAt().toEpochMilli();
+            if (ts > 0L && ts <= nowMs) {
+                latest = Math.max(latest, ts);
+            }
+        }
+        return latest;
+    }
+
+    /**
+     * Refreshes recent public posts into local material storage for a configured quote-repost source
+     * when its local snapshot is older than 5 minutes, and returns up to 8 recent materials.
+     */
+    List<ObjectNode> syncSourceMaterialsForPatrol(ObjectNode source, long freshnessWindowMs) {
+        if (source == null) return List.of();
+        String authorId = source.path("authorId").asText(source.path("id").asText("")).strip();
+        String username = source.path("username").asText("").replaceFirst("^@+", "").strip();
+        if (username.isBlank() && authorId.isBlank()) return List.of();
+        long nowMs = clock.millis();
+        long lastSuccessAt = source.path("lastSuccessAt").asLong(0L);
+        if (provider != null && !username.isBlank() && !authorId.isBlank() && (nowMs - lastSuccessAt >= 5L * 60_000L)) {
+            try {
+                ObjectNode owner = store.tx(tx -> tx.get("meta", "owner"));
+                String ownerAccountId = owner == null ? "" : owner.path("accountId").asText("");
+                TextPostPage page = PaidCapabilityGate.withCaller(
+                        PaidCapabilityGate.PRIVILEGED_USERNAME,
+                        ownerAccountId,
+                        () -> provider.fetchTextPostsPage(username, authorId, "", 20, clock.instant().plusSeconds(25))
+                );
+                if (page != null && page.posts() != null && !page.posts().isEmpty()) {
+                    long completedAt = clock.millis();
+                    long commitCutoff = AssistantRetention.cutoffMillis(completedAt);
+                    XUserSummary pageAuthor = page.author();
+                    store.tx(tx -> {
+                        for (TextPost post : page.posts()) {
+                            if (post.publishedAt().toEpochMilli() < commitCutoff) continue;
+                            AssistantWorkflow.ingest(tx, toMaterial(post, pageAuthor, false));
+                        }
+                        ObjectNode live = tx.get("source", authorId);
+                        if (live != null && "ACTIVE".equals(live.path("status").asText(""))) {
+                            tx.put("source", authorId, live.deepCopy().put("lastSuccessAt", completedAt).put("error", ""));
+                        }
+                        return null;
+                    });
+                }
+            } catch (Exception ignored) {
+                // Fall back to existing local materials if upstream refresh fails transiently
+            }
+        }
+        long maxAge = freshnessWindowMs > 0L ? freshnessWindowMs : 24L * 60L * 60_000L;
+        return store.tx(tx -> {
+            List<ObjectNode> matches = new ArrayList<>();
+            for (ObjectNode m : tx.all("material")) {
+                boolean same = (!authorId.isBlank() && authorId.equals(m.path("authorId").asText("")))
+                        || (!username.isBlank() && username.equalsIgnoreCase(m.path("username").asText("").replaceFirst("^@+", "")));
+                if (!same) continue;
+                long pubAt = m.path("publishedAt").asLong(0L);
+                if (pubAt <= 0L || nowMs - pubAt > maxAge) continue;
+                matches.add(m.deepCopy());
+            }
+            matches.sort(Comparator.comparingLong((ObjectNode m) -> m.path("publishedAt").asLong(0L)).reversed());
+            return matches.stream().limit(8).toList();
+        });
+    }
+
     public ObjectNode add(String input, int intervalMinutes) {
         int tierMinutes = validateTierMinutes(intervalMinutes);
         XUserSummary author = provider.resolvePublicAuthor(parseUsername(input));
@@ -153,11 +310,14 @@ public class SourceCollector {
             boolean readded = existing != null && "REMOVED".equals(existing.path("status").asText());
             if (existing != null && !readded) {
                 if (existing.path("intervalMinutes").asInt(5) != tierMinutes
-                        || existing.path("avatarUrl").asText("").isBlank()) {
+                        || existing.path("avatarUrl").asText("").isBlank()
+                        || (!value(author.bio()).isBlank() && existing.path("bio").asText("").isBlank())) {
                     ObjectNode updated = existing.deepCopy()
                             .put("displayName", value(author.displayName()))
                             .put("avatarUrl", value(author.avatarUrl()))
+                            .put("bio", value(author.bio()).isBlank() ? existing.path("bio").asText("") : value(author.bio()))
                             .put("verified", author.verified())
+                            .put("followersCount", author.followersCount())
                             .put("intervalMinutes", tierMinutes);
                     return tx.put("source", author.id(), updated);
                 }
@@ -167,7 +327,9 @@ public class SourceCollector {
             source.put("authorId", author.id()).put("username", author.username())
                     .put("displayName", value(author.displayName()))
                     .put("avatarUrl", value(author.avatarUrl()))
+                    .put("bio", value(author.bio()))
                     .put("verified", author.verified())
+                    .put("followersCount", author.followersCount())
                     .put("intervalMinutes", tierMinutes)
                     .put("status", "ACTIVE")
                     .put("instanceId", UUID.randomUUID().toString()).put("enabledAt", now)
@@ -179,7 +341,7 @@ public class SourceCollector {
             if (!source.has("autoRepostEnabled")) source.put("autoRepostEnabled", false);
             if (!source.has("autoRepostTextMode")) source.put("autoRepostTextMode", "AI");
             if (!source.has("autoRepostTemplate")) source.put("autoRepostTemplate", "");
-            if (!source.has("autoRepostMinScore")) source.put("autoRepostMinScore", 82);
+            if (!source.has("autoRepostMinScore")) source.put("autoRepostMinScore", DEFAULT_AUTO_REPOST_MIN_SCORE);
             if (!source.has("autoRepostRuleHint")) source.put("autoRepostRuleHint", "");
             source.remove("anchorSince");
             return tx.put("source", author.id(), source);
@@ -228,10 +390,11 @@ public class SourceCollector {
             }
             if (body.has("autoRepostMinScore")) {
                 int minScore = body.path("autoRepostMinScore").asInt(-1);
-                if (!body.path("autoRepostMinScore").isIntegralNumber() || minScore < 60 || minScore > 99) {
-                    throw new IllegalArgumentException("热度阈值范围为 60–99");
+                if (!body.path("autoRepostMinScore").isIntegralNumber() || minScore < 50 || minScore > 99) {
+                    throw new IllegalArgumentException("走热阈值范围为 50–99");
                 }
-                next.put("autoRepostMinScore", minScore);
+                next.put("autoRepostMinScore", minScore)
+                        .put("autoRepostMinScoreCustomized", true);
             }
             if (body.has("autoRepostRuleHint")) {
                 String hint = body.path("autoRepostRuleHint").asText("").strip();
@@ -278,9 +441,7 @@ public class SourceCollector {
 
     public ObjectNode styleSamples() {
         return store.tx(tx -> {
-            List<ObjectNode> samples = tx.matching("style_sample", "textRole", "AUTHOR", -1).stream()
-                    .sorted(Comparator.comparingLong((ObjectNode n) -> n.path("publishedAt").asLong()).reversed())
-                    .limit(STYLE_SAMPLE_LIMIT).toList();
+            List<ObjectNode> samples = OwnerQuoteStyleDistiller.collectOwnerAuthoredSamples(tx, STYLE_SAMPLE_LIMIT);
             ObjectNode status = tx.get("meta", "style_status");
             ObjectNode result = mapper.createObjectNode();
             ArrayNode rows = result.putArray("samples");
@@ -324,8 +485,10 @@ public class SourceCollector {
                     .sorted(Comparator.comparingInt(n -> n.path("rank").asInt(Integer.MAX_VALUE)))
                     .toList();
             ownerSources.forEach(sources::add);
-            result.put("materials", tx.count("history_material"));
-            result.put("interactions", tx.count("history_interaction"));
+            long matTotal = ownerSources.stream().mapToLong(n -> n.path("timelineSavedCount").asLong(0)).sum();
+            long inTotal = ownerSources.stream().mapToLong(n -> n.path("inboundSavedCount").asLong(0)).sum();
+            result.put("materials", matTotal > 0 ? matTotal : (ownerSources.isEmpty() ? 0 : tx.count("history_material")));
+            result.put("interactions", inTotal > 0 ? inTotal : (ownerSources.isEmpty() ? 0 : tx.count("history_interaction")));
             List<ObjectNode> eligible = ownerSources.stream()
                     .filter(n -> n.path("eligible").asBoolean(true)).toList();
             result.put("complete", !eligible.isEmpty()
@@ -335,6 +498,29 @@ public class SourceCollector {
                             && n.path("inboundError").asText("").isBlank()));
             return result;
         });
+    }
+
+    public ObjectNode retryHistoryNow() {
+        store.tx(tx -> {
+            for (ObjectNode source : tx.all("history_source")) {
+                ObjectNode next = source.deepCopy()
+                        .put("timelineRetryExhausted", false)
+                        .put("inboundRetryExhausted", false)
+                        .put("timelineRetryCount", 0)
+                        .put("inboundRetryCount", 0)
+                        .put("timelineError", "")
+                        .put("inboundError", "")
+                        .put("error", "");
+                tx.put("history_source", source.path("id").asText(), next);
+            }
+            return null;
+        });
+        provider.resetFreeCircuitForActiveSync();
+        if (paidCapabilityGate != null) {
+            paidCapabilityGate.resetByPrefix("history-source:");
+        }
+        scheduledTick();
+        return history();
     }
 
     @Scheduled(fixedDelayString = "${xops.content-assistant-source-tick-ms:15000}")
@@ -633,28 +819,66 @@ public class SourceCollector {
     }
 
     private void collectOneHistoryPage() {
-        long now = System.currentTimeMillis();
+        long now = clock.millis();
+        boolean freeMode = provider.isFreeInboundConfigured();
         boolean allowFreeTimeline = provider.canReadTimelineForFree("");
+        boolean allowFreeInbound = provider.canReadInboundForFree("");
         boolean allowPaidBackground = !provider.isBackgroundPaidBudgetExhausted();
+        boolean canRunTimeline = freeMode ? allowFreeTimeline : (allowFreeTimeline || allowPaidBackground);
+        boolean canRunInbound = freeMode ? allowFreeInbound : allowPaidBackground;
         ObjectNode due = store.tx(tx -> tx.all("history_source").stream()
                 .filter(s -> s.path("eligible").asBoolean(false)
-                        && (((allowFreeTimeline || allowPaidBackground) && historyDimensionDue(s, "timeline", now, allowFreeTimeline))
-                            || (allowPaidBackground && historyDimensionDue(s, "inbound", now, false))))
+                        && ((canRunTimeline && historyDimensionEligibleForTick(s, "timeline", now, allowFreeTimeline))
+                            || (canRunInbound && historyDimensionEligibleForTick(s, "inbound", now, allowFreeInbound))))
                 .min(Comparator.comparingLong(s -> s.path("lastAttemptAt").asLong(0)))
                 .map(ObjectNode::deepCopy).orElse(null));
         if (due == null) return;
+        boolean timelineDue = canRunTimeline && historyDimensionEligibleForTick(due, "timeline", now, allowFreeTimeline);
+        boolean inboundDue = canRunInbound && historyDimensionEligibleForTick(due, "inbound", now, allowFreeInbound);
+        boolean timeline = timelineDue && (!inboundDue || "TIMELINE".equals(due.path("nextDimension").asText("TIMELINE")));
+        executeHistoryDimension(due, timeline, now, false);
+    }
+
+    private boolean historyDimensionEligibleForTick(ObjectNode source, String prefix, long now, boolean freeAvailable) {
+        if (paidCapabilityGate != null && source.path(prefix + "RetryCount").asInt(0) > 0) {
+            return false;
+        }
+        return historyDimensionDue(source, prefix, now, freeAvailable);
+    }
+
+    private void retryHistoryDimensionOnce(String sourceId, boolean timeline) {
+        String prefix = timeline ? "timeline" : "inbound";
+        ObjectNode source = store.tx(tx -> {
+            ObjectNode node = tx.get("history_source", sourceId);
+            return node == null ? null : node.deepCopy();
+        });
+        if (source == null || !source.path("eligible").asBoolean(false)
+                || source.path(prefix + "RetryExhausted").asBoolean(false)) {
+            return;
+        }
+        ObjectNode ownerNode = store.tx(tx -> tx.get("meta", "owner"));
+        String ownerAccountId = ownerNode == null ? sourceId : ownerNode.path("accountId").asText(sourceId);
+        PaidCapabilityGate.runWithCaller(PaidCapabilityGate.PRIVILEGED_USERNAME, ownerAccountId,
+                () -> executeHistoryDimension(source, timeline, clock.millis(), true));
+    }
+
+    private void executeHistoryDimension(ObjectNode due, boolean timeline, long now, boolean fromScheduledRetry) {
+        boolean freeMode = provider.isFreeInboundConfigured();
+        if (fromScheduledRetry && freeMode) {
+            provider.resetFreeCircuitForActiveSync();
+        }
         String id = due.path("id").asText();
         long attemptAt = now;
-        boolean timelineDue = (allowFreeTimeline || allowPaidBackground) && historyDimensionDue(due, "timeline", now, allowFreeTimeline);
-        boolean inboundDue = allowPaidBackground && historyDimensionDue(due, "inbound", now, false);
-        boolean timeline = timelineDue && (!inboundDue || "TIMELINE".equals(due.path("nextDimension").asText("TIMELINE")));
         HistoryScan scan = null;
         try {
             if (timeline) {
                 scan = prepareHistoryScan(id, "timeline", TIMELINE_ENDPOINT, due, attemptAt);
                 long minPublished = scan.since();
-                TextPostPage page = provider.fetchHistoryPostsPage(due.path("username").asText(), id,
-                        scan.cursor(), 100, Instant.now().plusSeconds(30));
+                TextPostPage page = freeMode
+                        ? provider.fetchHistoryPostsPage(due.path("username").asText(), id,
+                                scan.cursor(), 100, Instant.now().plusSeconds(30), true)
+                        : provider.fetchHistoryPostsPage(due.path("username").asText(), id,
+                                scan.cursor(), 100, Instant.now().plusSeconds(30));
                 List<TextPost> accepted = scan.backfill() ? page.posts() : page.posts().stream()
                         .filter(post -> post.publishedAt().toEpochMilli() >= minPublished).toList();
                 boolean crossed = !scan.backfill() && crossedListenerBoundary(page.posts(), minPublished);
@@ -665,8 +889,11 @@ public class SourceCollector {
             } else {
                 scan = prepareHistoryScan(id, "inbound", INBOUND_ENDPOINT, due, attemptAt);
                 long minPublished = scan.since();
-                TextInteractionPage page = provider.fetchInboundTextPage(due.path("username").asText(), id,
-                        scan.cursor(), 100, Instant.now().plusSeconds(30));
+                TextInteractionPage page = freeMode
+                        ? provider.fetchInboundTextPage(due.path("username").asText(), id,
+                                scan.cursor(), 100, Instant.now().plusSeconds(30), true)
+                        : provider.fetchInboundTextPage(due.path("username").asText(), id,
+                                scan.cursor(), 100, Instant.now().plusSeconds(30));
                 List<TextInteraction> accepted = scan.backfill() ? page.interactions() : page.interactions().stream()
                         .filter(interaction -> interaction.publishedAt().toEpochMilli() >= minPublished).toList();
                 boolean crossed = !scan.backfill() && page.interactions().stream()
@@ -679,24 +906,39 @@ public class SourceCollector {
         } catch (Exception ex) {
             String dimension = timeline ? "timeline" : "inbound";
             HistoryScan failedScan = scan;
+            String retryCursor = failedScan == null ? "" : failedScan.cursor();
+            String retryKey = "history-source:" + id + ":" + dimension + ":" + retryCursor;
+            PaidCapabilityGate.RetrySnapshot snap = null;
             if (paidCapabilityGate != null) {
-                String retryCursor = failedScan == null ? "" : failedScan.cursor();
-                paidCapabilityGate.scheduleIdempotentRetry(
-                        "history-source:" + id + ":" + dimension + ":" + retryCursor,
-                        "twitterapi_io_read",
+                String capability = freeMode ? "fxtwitter_free_source" : "twitterapi_io_read";
+                snap = paidCapabilityGate.scheduleIdempotentRetry(
+                        retryKey,
+                        capability,
                         PaidCapabilityGate.PRIVILEGED_USERNAME,
                         id,
                         safeError(ex),
-                        this::tick
+                        () -> retryHistoryDimensionOnce(id, timeline)
                 );
             }
+            PaidCapabilityGate.RetrySnapshot finalSnap = snap;
+            boolean transientFreeFailure = freeMode && isTransientFreeFailure(ex);
             store.tx(tx -> {
                 ObjectNode source = tx.get("history_source", id);
                 if (source != null) {
+                    int failCount = source.path(dimension + "RetryCount").asInt(0) + 1;
+                    boolean exhausted = paidCapabilityGate != null
+                            ? (paidCapabilityGate.isExhausted(retryKey)
+                                || (finalSnap != null && (finalSnap.state() == PaidCapabilityGate.RetryState.EXHAUSTED
+                                    || (fromScheduledRetry && finalSnap.retryCount() >= PaidCapabilityGate.MAX_IDEMPOTENT_RETRIES)))
+                                || failCount > PaidCapabilityGate.MAX_IDEMPOTENT_RETRIES)
+                            : failCount > PaidCapabilityGate.MAX_IDEMPOTENT_RETRIES;
                     ObjectNode next = source.deepCopy()
-                            .put(dimension + "Error", safeError(ex))
+                            .put(dimension + "RetryCount", failCount)
+                            .put(dimension + "RetryExhausted", exhausted)
+                            .put(dimension + "Error", exhausted ? "免费接口连续重试 3 次未成功，等待手动触发重试" : safeError(ex))
                             .put("nextDimension", timeline ? "INBOUND" : "TIMELINE");
-                    if (failedScan != null && !failedScan.cursor().isBlank() && !UpstreamBudgetGuard.isBudgetReached(ex)) {
+                    if (!exhausted && !transientFreeFailure
+                            && failedScan != null && !failedScan.cursor().isBlank() && !UpstreamBudgetGuard.isBudgetReached(ex)) {
                         int failures = next.path(dimension + "CursorFailures").asInt(0) + 1;
                         if (shouldResetExpiredCursor(ex, failures)) {
                             appendCoverageGap(next, failedScan.since(), failedScan.startedAt(), dimension + ":" + safeError(ex));
@@ -712,6 +954,15 @@ public class SourceCollector {
         }
     }
 
+    private static boolean isTransientFreeFailure(Exception ex) {
+        if (ex instanceof XDataProviderException xpe) {
+            int code = xpe.getStatusCode();
+            return code == 429 || code == 502 || code == 503 || code == 504 || code >= 500;
+        }
+        String msg = ex.getMessage() == null ? "" : ex.getMessage().toLowerCase(Locale.ROOT);
+        return msg.contains("超时") || msg.contains("暂不可用") || msg.contains("503") || msg.contains("timeout");
+    }
+
     private record HistoryScan(String cursor, long startedAt, long since, boolean backfill) {}
 
     static boolean historyDimensionDue(ObjectNode source, String prefix, long now) {
@@ -719,6 +970,9 @@ public class SourceCollector {
     }
 
     static boolean historyDimensionDue(ObjectNode source, String prefix, long now, boolean freeAvailable) {
+        if (source.path(prefix + "RetryExhausted").asBoolean(false)) {
+            return false;
+        }
         String dimError = source.path(prefix + "Error").asText("");
         if (!dimError.isBlank()) {
             boolean budgetError = dimError.contains("外部调用预算已达保护上限") || dimError.contains("预算记录暂不可用");
@@ -731,15 +985,21 @@ public class SourceCollector {
         }
         if (!source.path(prefix + "BackfillComplete").asBoolean(false)) return true;
         if (!source.path(prefix + "Cursor").asText("").isBlank()) return true;
+        long incrementalMs = (freeAvailable && "timeline".equals(prefix)) ? 90_000L : HISTORY_INCREMENTAL_INTERVAL_MS;
         return now - source.path("last" + Character.toUpperCase(prefix.charAt(0)) + prefix.substring(1)
-                + "CheckAt").asLong(0) >= HISTORY_INCREMENTAL_INTERVAL_MS;
+                + "CheckAt").asLong(0) >= incrementalMs;
     }
 
     private HistoryScan prepareHistoryScan(String sourceId, String prefix, String endpoint, ObjectNode source, long attemptAt) {
         String rawCursor = boundCursor(source, prefix + "Cursor", TIMELINE_PROVIDER, endpoint);
-        String cursor = ("timeline".equals(prefix) && !rawCursor.isBlank() && !rawCursor.startsWith("fx:")
-                && provider.isPageReadBudgetExhausted() && provider.canReadTimelineForFree(""))
-                ? "" : rawCursor;
+        boolean resetLegacyTimelineCursor = "timeline".equals(prefix)
+                && !rawCursor.isBlank() && !rawCursor.startsWith("fx:")
+                && (provider.isFreeInboundConfigured()
+                    || (provider.isPageReadBudgetExhausted() && provider.canReadTimelineForFree("")));
+        boolean resetLegacyInboundCursor = "inbound".equals(prefix)
+                && !rawCursor.isBlank() && !rawCursor.startsWith("fx:")
+                && provider.isFreeInboundConfigured();
+        String cursor = (resetLegacyTimelineCursor || resetLegacyInboundCursor) ? "" : rawCursor;
         boolean backfill = !source.path(prefix + "BackfillComplete").asBoolean(false);
         long startedAt = cursor.isBlank() ? attemptAt : source.path(prefix + "ScanStartedAt").asLong(attemptAt);
         long since = backfill ? 0 : (cursor.isBlank()
@@ -773,6 +1033,8 @@ public class SourceCollector {
             ObjectNode current = tx.get("history_source", sourceId);
             if (current != null) {
                 ObjectNode next = current.deepCopy().put("lastSuccessAt", completedAt).put("timelineError", "")
+                        .put("timelineRetryCount", 0)
+                        .put("timelineRetryExhausted", false)
                         .put("timelineCursor", scanComplete ? "" : page.nextCursor())
                         .put("timelineCursorProvider", TIMELINE_PROVIDER)
                         .put("timelineCursorEndpoint", TIMELINE_ENDPOINT)
@@ -811,6 +1073,8 @@ public class SourceCollector {
             ObjectNode current = tx.get("history_source", sourceId);
             if (current != null) {
                 ObjectNode next = current.deepCopy().put("lastSuccessAt", completedAt).put("inboundError", "")
+                        .put("inboundRetryCount", 0)
+                        .put("inboundRetryExhausted", false)
                         .put("inboundCursor", scanComplete ? "" : page.nextCursor())
                         .put("inboundCursorProvider", TIMELINE_PROVIDER)
                         .put("inboundCursorEndpoint", INBOUND_ENDPOINT)
@@ -879,6 +1143,7 @@ public class SourceCollector {
                 if (!value(pageAuthor.username()).isBlank()) next.put("username", pageAuthor.username());
                 if (!value(pageAuthor.displayName()).isBlank()) next.put("displayName", pageAuthor.displayName());
                 if (!value(pageAuthor.avatarUrl()).isBlank()) next.put("avatarUrl", pageAuthor.avatarUrl());
+                if (!value(pageAuthor.bio()).isBlank()) next.put("bio", pageAuthor.bio());
                 next.put("verified", pageAuthor.verified());
             }
             if (scanComplete) {
@@ -887,12 +1152,17 @@ public class SourceCollector {
             }
             return tx.put(sourceKind, sourceId, next);
         });
+        BatchIngestHook batchHook = this.batchIngestHook;
         IngestHook hook = this.ingestHook;
-        if (hook != null && latestSourceSnapshot != null
+        if (latestSourceSnapshot != null
                 && latestSourceSnapshot.path("autoRepostEnabled").asBoolean(false)
                 && !newlyIngested.isEmpty()) {
-            for (ObjectNode item : newlyIngested) {
-                hook.onMaterialIngested(latestSourceSnapshot, item);
+            if (batchHook != null) {
+                batchHook.onAuthorMaterialsIngested(latestSourceSnapshot, List.copyOf(newlyIngested));
+            } else if (hook != null) {
+                for (ObjectNode item : newlyIngested) {
+                    hook.onMaterialIngested(latestSourceSnapshot, item);
+                }
             }
         }
     }
@@ -906,7 +1176,9 @@ public class SourceCollector {
                 .put("id", post.id()).put("authorId", post.authorId()).put("username", post.username())
                 .put("authorName", author != null && !value(author.displayName()).isBlank() ? author.displayName() : value(post.username()))
                 .put("authorAvatarUrl", author != null ? value(author.avatarUrl()) : "")
+                .put("authorBio", author != null ? value(author.bio()) : "")
                 .put("authorVerified", author != null && author.verified())
+                .put("authorFollowersCount", author != null ? author.followersCount() : 0L)
                 .put("text", value(post.text())).put("quotedText", value(post.quotedText()))
                 .put("articleText", value(post.articleText())).put("articleRole", post.articleRole())
                 .put("publishedAt", post.publishedAt().toEpochMilli())
@@ -956,9 +1228,17 @@ public class SourceCollector {
                 boolean continueBatch = store.tx(tx -> {
                     for (TextPost post : page.posts()) {
                         if (post.styleText().isBlank()) continue;
-                        tx.put("style_sample", post.id(), mapper.createObjectNode()
-                                .put("textRole", "AUTHOR").put("text", post.styleText())
-                                .put("publishedAt", post.publishedAt().toEpochMilli()));
+                        boolean isQuote = post.kind() == com.xops.hub.model.RawSnapshotModels.TweetKind.QUOTE;
+                        ObjectNode sampleNode = mapper.createObjectNode()
+                                .put("textRole", "AUTHOR")
+                                .put("kind", post.kind().name())
+                                .put("isQuote", isQuote)
+                                .put("text", post.styleText())
+                                .put("publishedAt", post.publishedAt().toEpochMilli());
+                        if (isQuote && !value(post.quotedText()).isBlank()) {
+                            sampleNode.put("quotedText", value(post.quotedText()));
+                        }
+                        tx.put("style_sample", post.id(), sampleNode);
                     }
                     boolean needsMore = !page.exhausted() && countStyleSamples(tx) < STYLE_SAMPLE_LIMIT;
                     ObjectNode current = tx.get("meta", "style_status");

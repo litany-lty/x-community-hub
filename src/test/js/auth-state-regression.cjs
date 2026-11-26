@@ -172,15 +172,31 @@ function response(username = 'alice', id = '1001') {
         return controls.get(id);
     };
     monitor.document.createTextNode = text => text;
+    monitor.escapeHtml = s => String(s);
     monitor.assistantKeyValueRows = () => '';
     monitor.renderAssistantHistory = () => '';
-    vm.runInContext(section('    function renderAssistantMonitor(', '    function renderContentAssistant('), monitor);
+    vm.runInContext(
+        section('    const repostPreviewState = {', '    function syncPolishPromptControls(')
+        + '\n'
+        + section('    function renderAssistantMonitor(', '    function renderContentAssistant('),
+        monitor
+    );
     const priorSettings = {settings: {model: 'stored', version: 1}};
     monitor.renderAssistantMonitor(priorSettings);
     monitor.$('assistantModel').value = 'edited before blur';
     monitor.$('assistantSettingsForm').dataset.editRevision = '1';
     monitor.renderAssistantMonitor(priorSettings);
     assert.equal(monitor.$('assistantModel').value, 'edited before blur', 'sync after blur preserves unsaved settings');
+    delete monitor.$('assistantSettingsForm').dataset.editRevision;
+    monitor.renderAssistantMonitor({settings: {version: 2, moduleConfigs: {generation: {provider: 'openai', model: 'gpt-6.2-sol high'}}}});
+    assert.equal(monitor.$('assistantGenerationProvider').value, 'openai');
+    assert.equal(monitor.$('assistantGenerationModelSelect').value, 'gpt-6.2-sol');
+    assert.equal(monitor.$('assistantGenTargetSelect').value, 'openai|gpt-6.2-sol');
+    assert.equal(monitor.state.assistantGenerationEffort, 'high');
+    monitor.state.assistantGenerationTargetPinned = true;
+    monitor.renderAssistantMonitor({settings: {version: 3, moduleConfigs: {generation: {provider: 'google', model: 'gemini-4-neon'}}}});
+    assert.equal(monitor.$('assistantGenTargetSelect').value, 'openai|gpt-6.2-sol', 'pinned creation model survives background sync');
+    monitor.state.assistantGenerationTargetPinned = false;
 
     const progress = context();
     const liveEditor = {value: 'text mid-edit', closest: () => ({dataset: {draftId: 'draft'}})};
@@ -190,7 +206,13 @@ function response(username = 'alice', id = '1001') {
     progress.state.assistantSelectedTopicId = 'topic';
     progress.state.assistantSelectedDraftByTopic = {};
     progress.renderAssistantTask = task => task.stage;
-    vm.runInContext(section('    function assistantDraftLengthText(', '    function assistantKeyValueRows('), progress);
+    progress.escapeHtml = String;
+    vm.runInContext(
+        section('    const repostPreviewState = {', '    function syncPolishPromptControls(')
+        + '\n'
+        + section('    function assistantDraftLengthText(', '    function assistantKeyValueRows('),
+        progress
+    );
     progress.renderAssistantTopicDetail({
         topics: [{id: 'topic'}], drafts: [{id: 'draft', topicId: 'topic'}],
         tasks: [{id: 'job', topicId: 'topic', stage: 'DRAFT'}]

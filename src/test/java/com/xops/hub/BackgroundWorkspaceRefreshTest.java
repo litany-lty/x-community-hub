@@ -270,4 +270,62 @@ class BackgroundWorkspaceRefreshTest {
             pool.shutdown();
         }
     }
+
+    @Test
+    void privilegedOwnerSilentReloadAfterBackgroundRefreshReusesFreshBundleWithoutReBlockingForeground() throws Exception {
+        ObjectMapper mapper = new ObjectMapper().findAndRegisterModules();
+        XOpsProperties properties = new XOpsProperties();
+        properties.setDiskCacheDir(temp.resolve("elidlicom-swr").toString());
+        properties.setTwitterapiIoKey("fixture-key");
+        properties.setDefaultProvider("TWITTERAPI_IO");
+        SharedApiExecutor pool = new SharedApiExecutor(properties);
+        java.util.concurrent.atomic.AtomicInteger syncCalls = new java.util.concurrent.atomic.AtomicInteger();
+        TwitterApiIoProvider provider = new TwitterApiIoProvider(properties, mapper, pool) {
+            @Override
+            public SyncOutcome syncStoreByHours(String username, AccountStore.StoredAccount existing,
+                    int hours, boolean head, boolean daily, String key, String expectedId) {
+                syncCalls.incrementAndGet();
+                Instant doneAt = Instant.now();
+                long from = doneAt.minusSeconds(24 * 3600L).getEpochSecond();
+                long to = doneAt.getEpochSecond();
+                AccountStore.StoredAccount refreshed = AccountStore.merge(
+                        existing, existing.profile(), doneAt, List.of(), List.of(),
+                        List.of(new long[]{from, to}), List.of(new long[]{from, to}), null);
+                refreshed = AccountStore.withDailyRefreshState(refreshed, to, 0);
+                return new SyncOutcome(refreshed, true, true, true, 1);
+            }
+        };
+        Instant now = Instant.now();
+        XUserSummary profile = new XUserSummary("9000", "elidlicom", "Litany", "", "", true, 1200, 300, 100, "");
+        AccountStore.StoredAccount stored = AccountStore.merge(null, profile, now.minusSeconds(3600), List.of(), List.of(),
+                List.of(), List.of(), new AccountStore.GraphUpdate(
+                        List.of(), List.of(), Set.of(), true, false, false, false));
+        AccountStore.write(temp.resolve("elidlicom-swr/users/by-id/9000/store_v" + AccountStore.VERSION + ".json.gz"), stored, mapper);
+        CommunityHubService service = new CommunityHubService(
+                properties, new DemoXDataProvider(), provider, null, mapper);
+        try {
+            var immediate = service.analyzeWorkspaceBundle(
+                    "elidlicom", ReportPeriod.HOURS_24, "TWITTERAPI_IO", false, "127.0.0.1", "9000", false, true);
+            assertThat(immediate.hours24().fromCache()).isTrue();
+            assertThat(immediate.backgroundRefreshStatus().state()).isEqualTo("RUNNING");
+
+            long waitDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+            while (!"SUCCEEDED".equals(service.workspaceRefreshStatus("elidlicom", "TWITTERAPI_IO", "9000").state())
+                    && System.nanoTime() < waitDeadline) {
+                Thread.sleep(10);
+            }
+            assertThat(service.workspaceRefreshStatus("elidlicom", "TWITTERAPI_IO", "9000").state()).isEqualTo("SUCCEEDED");
+            assertThat(syncCalls.get()).isEqualTo(1);
+
+            // Simulate browser poll firing >5s later: reloadFromServer (forceRefresh=false) must STILL serve in-memory bundle without a 2nd upstream sync!
+            Thread.sleep(5_200L);
+            var afterReload = service.analyzeWorkspaceBundle(
+                    "elidlicom", ReportPeriod.HOURS_24, "TWITTERAPI_IO", false, "127.0.0.1", "9000", false, false);
+            assertThat(afterReload.hours24().fromCache()).isTrue();
+            assertThat(syncCalls.get()).isEqualTo(1);
+        } finally {
+            service.stopBackgroundRefreshes();
+            pool.shutdown();
+        }
+    }
 }

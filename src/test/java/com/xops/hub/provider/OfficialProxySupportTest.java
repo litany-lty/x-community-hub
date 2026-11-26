@@ -183,6 +183,71 @@ class OfficialProxySupportTest {
         assertEquals(502, oauthEx.getStatusCode());
     }
 
+    @Test
+    void quoteTweetFallsBackToAppendingCanonicalStatusUrlWhenXRejectsWithMentionRestriction403() throws Exception {
+        List<String> requestBodies = new CopyOnWriteArrayList<>();
+        HttpServer mockX = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        mockX.createContext("/2/tweets", ex -> {
+            String reqBody = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+            requestBodies.add(reqBody);
+            if (requestBodies.size() == 1) {
+                writeJson(ex, 403,
+                        "{\"detail\":\"You can only reply to or quote posts where you are mentioned or are the author.\",\"status\":403,\"title\":\"Forbidden\"}");
+            } else {
+                writeJson(ex, 201, "{\"data\":{\"id\":\"fallback_published_1\"}}");
+            }
+        });
+        mockX.start();
+        try {
+            XOpsProperties props = baseProperties();
+            props.setOfficialBaseUrl("http://127.0.0.1:" + mockX.getAddress().getPort() + "/2");
+            ObjectMapper mapper = new ObjectMapper();
+            XPublishClient client = new XPublishClient(props, mapper);
+
+            String tweetId = XPublishClient.withQuoteTweetUrl(
+                    "https://x.com/thsottiaux/status/2125853628250599730?s=20",
+                    () -> client.createTweet("tok_quote", "🎉 Tibo 说，Banked reset 已经上线。", List.of(), "2125853628250599730")
+            );
+            assertEquals("fallback_published_1", tweetId);
+            assertEquals(2, requestBodies.size());
+
+            var firstJson = mapper.readTree(requestBodies.get(0));
+            assertEquals("2125853628250599730", firstJson.path("quote_tweet_id").asText());
+            assertEquals("🎉 Tibo 说，Banked reset 已经上线。", firstJson.path("text").asText());
+
+            var secondJson = mapper.readTree(requestBodies.get(1));
+            assertTrue(secondJson.path("quote_tweet_id").isMissingNode(),
+                    "Fallback request must omit quote_tweet_id");
+            assertEquals(
+                    "🎉 Tibo 说，Banked reset 已经上线。\n\nhttps://x.com/thsottiaux/status/2125853628250599730",
+                    secondJson.path("text").asText()
+            );
+        } finally {
+            mockX.stop(0);
+        }
+
+        List<String> nonRetryBodies = new CopyOnWriteArrayList<>();
+        HttpServer mockDuplicate = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        mockDuplicate.createContext("/2/tweets", ex -> {
+            nonRetryBodies.add(new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+            writeJson(ex, 403, "{\"detail\":\"You are not allowed to create a Tweet with duplicate content.\",\"status\":403,\"title\":\"Forbidden\"}");
+        });
+        mockDuplicate.start();
+        try {
+            XOpsProperties props = baseProperties();
+            props.setOfficialBaseUrl("http://127.0.0.1:" + mockDuplicate.getAddress().getPort() + "/2");
+            XPublishClient client = new XPublishClient(props, new ObjectMapper());
+            XPublishClient.XPublishException ex = assertThrows(
+                    XPublishClient.XPublishException.class,
+                    () -> client.createTweet("tok_dup", "duplicate test", List.of(), "2125853628250599730")
+            );
+            assertEquals(403, ex.getStatusCode());
+            assertEquals(1, nonRetryBodies.size());
+        } finally {
+            mockDuplicate.stop(0);
+        }
+    }
+
     private static void handleConnectAttempt(Socket client, List<String> connectLines) {
         try (Socket sock = client) {
             sock.setSoTimeout(3000);

@@ -101,9 +101,13 @@ xops:
   disk-cache-dir: ${X_DISK_CACHE_DIR:./.cache/snapshots}
   timezone: ${X_TIMEZONE:Asia/Shanghai}
 
-  # 定时发推与加密令牌存储配置
+  # 定时发推、自动引用转发与加密令牌存储配置（仅生产 HTTPS 域名且非 local/preview 时启用自动转发与定时内容推送）
   token-encryption-secret: "${X_TOKEN_ENCRYPTION_SECRET:}"
   scheduler-enabled: ${X_SCHEDULER_ENABLED:true}
+  auto-repost-enabled: ${X_AUTO_REPOST_ENABLED:}
+  # 自动引用转发静默时段（Asia/Shanghai 24小时制 [start, end)，默认 12:00-24:00 不做任何自动推送）
+  auto-repost-quiet-start-hour: ${X_AUTO_REPOST_QUIET_START_HOUR:12}
+  auto-repost-quiet-end-hour: ${X_AUTO_REPOST_QUIET_END_HOUR:24}
   scheduler-poll-ms: ${X_SCHEDULER_POLL_MS:15000}
   schedule-grace-window-seconds: ${X_SCHEDULE_GRACE_WINDOW_SECONDS:300}
 
@@ -113,6 +117,9 @@ xops:
   # @elidlicom 本人及互动排名前 10 账号后台低优静默历史缓存（前台有请求时自动让路）
   top10-silent-history-enabled: ${X_TOP10_SILENT_HISTORY_ENABLED:true}
   top10-silent-history-poll-ms: ${X_TOP10_SILENT_HISTORY_POLL_MS:45000}
+  # @elidlicom 最近发推巡检间隔（默认 30 分钟一次；超 1小时+N[1-20]分钟未发新推时从自动引用转发配置账号择优发布）
+  auto-repost-patrol-ms: ${X_AUTO_REPOST_PATROL_MS:1800000}
+  auto-repost-patrol-initial-delay-ms: ${X_AUTO_REPOST_PATROL_INITIAL_DELAY_MS:60000}
 
   # 可热更新的 X 推荐算法规则覆盖文件路径（不存在时使用内置默认基线）
   algo-profile-path: "${X_ALGO_PROFILE_PATH:./.cache/x-algorithm-profile.json}"

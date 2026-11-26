@@ -43,37 +43,61 @@ public final class AssistantPublishing {
     }
 
     public AssistantSource prepare(String accountId,String draftId,Integer version,String intentId,String text,long time,List<MediaUploadInput> files) {
+        return prepare(accountId, draftId, version, intentId, text, time, files, false, null);
+    }
+
+    public AssistantSource prepare(String accountId,String draftId,Integer version,String intentId,String text,long time,List<MediaUploadInput> files,boolean quoteSource,String explicitQuoteTweetId) {
         if(draftId==null && version==null) return null;
         if(!store.isOwner(accountId)) throw new XDataProviderException(403,"作者身份校验失败");
         if(draftId==null || version==null || version<1 || intentId==null || intentId.isBlank() || intentId.length()>128)
             throw new IllegalArgumentException("排期需要稿件、已保存版本和请求标识");
+        String cleanExplicitQuoteId = (explicitQuoteTweetId == null || explicitQuoteTweetId.isBlank())
+                ? null : explicitQuoteTweetId.strip();
+        if (cleanExplicitQuoteId != null && !cleanExplicitQuoteId.matches("[0-9]{2,20}")) {
+            throw new IllegalArgumentException("被引用推文 ID 格式无效");
+        }
         var request=object().put("draftId",draftId).put("draftVersion",version).put("text",text==null?"":text).put("scheduledAtEpochMs",time);
         var hashes=request.putArray("mediaDigests");
         try { for(var file:files) hashes.add(HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(file.bytes()))); }
         catch(NoSuchAlgorithmException e) { throw new IllegalStateException(e); }
-        String fingerprint=AssistantWorkflow.digest(request);
         var prior=store.tx(t->t.get("publication",intentId));
         if(prior!=null && prior.hasNonNull("jobId") && queue.assistantJobs(accountId).stream().noneMatch(e->e.job().id().equals(prior.path("jobId").asText())))
             throw new XDataProviderException(409,"原发布任务暂无法对账，已保留意图及回执");
         return store.tx(t->{
             var saved=t.version("draft",draftId,version);
             if(saved==null) throw new XDataProviderException(404,"稿件版本不存在");
+            String quoteTweetId = cleanExplicitQuoteId != null
+                    ? cleanExplicitQuoteId
+                    : (quoteSource ? resolveQuoteTweetId(t, saved) : null);
+            if (quoteSource && quoteTweetId == null) {
+                throw new IllegalArgumentException("该素材不含有效推文 ID，不支持引用原帖发布");
+            }
+            ObjectNode digestNode = request.deepCopy();
+            if (quoteTweetId != null) {
+                digestNode.put("quoteTweetId", quoteTweetId);
+            }
+            String fingerprint=AssistantWorkflow.digest(digestNode);
             var old=t.get("publication",intentId);
             if(old==null) {
                 var intent=request.deepCopy().put("status","PENDING").put("requestDigest",fingerprint)
                         .put("topicId",saved.path("topicId").asText()).put("topicVersion",saved.path("topicVersion").asInt())
                         .put("researchId",saved.path("researchId").asText());
+                if (quoteTweetId != null) intent.put("quoteTweetId", quoteTweetId);
                 String skillId = ViralWritingSkills.normalizeId(saved.path("skillId").asText(""));
                 if (!skillId.isEmpty()) intent.put("skillId", skillId);
                 t.put("publication",intentId,intent);
             } else if(!fingerprint.equals(old.path("requestDigest").asText())) throw new XDataProviderException(409,"同一发布意图已绑定其他内容");
-            return source(saved,intentId,fingerprint,null);
+            return source(saved,intentId,fingerprint,null,quoteTweetId);
         });
     }
 
     private AssistantSource source(ObjectNode draft,String intent,String digest,String op) {
+        return source(draft, intent, digest, op, null);
+    }
+
+    private AssistantSource source(ObjectNode draft,String intent,String digest,String op,String quoteTweetId) {
         return new AssistantSource(intent,draft.path("id").asText(),draft.path("version").asInt(),draft.path("topicId").asText(),
-                draft.path("topicVersion").asInt(),draft.path("researchId").asText(),digest,op);
+                draft.path("topicVersion").asInt(),draft.path("researchId").asText(),digest,op,quoteTweetId);
     }
 
     public void record(ScheduledTweetJob job) { record(job,false); }
@@ -92,6 +116,11 @@ public final class AssistantPublishing {
                     .put("jobId",job.id()).put("text",job.text()).put("status",job.status().name())
                     .put("scheduledAtEpochMs",job.scheduledAtEpochMs()).put("queueUpdatedAt",job.updatedAtEpochMs())
                     .put("publishedTweetId",job.publishedTweetId()).put("publishedAt",job.publishedAtEpochMs());
+            String effectiveQuoteId = (job.quoteTweetId() != null && !job.quoteTweetId().isBlank())
+                    ? job.quoteTweetId() : src.quoteTweetId();
+            if (effectiveQuoteId != null && !effectiveQuoteId.isBlank()) {
+                p.put("quoteTweetId", effectiveQuoteId);
+            }
             if (p.path("skillId").asText("").isBlank() && src.draftId() != null && !src.draftId().isBlank()) {
                 ObjectNode d = t.version("draft", src.draftId(), src.draftVersion());
                 if (d == null) d = t.get("draft", src.draftId());
@@ -116,8 +145,9 @@ public final class AssistantPublishing {
         AssistantWorkflow.expect(draft,body);
         var pub=store.tx(t->AssistantTopics.required(t,"publication",intent));
         if(!draftId.equals(pub.path("draftId").asText())) throw new XDataProviderException(409,"稿件与排期来源不一致");
+        String pubQuoteId = pub.path("quoteTweetId").asText("").strip();
         var updated=queue.updateAssistantJob(account,username,pub.path("jobId").asText(),body.path("expectedUpdatedAt").asLong(-1),
-                draft.path("text").asText(),source(draft,intent,pub.path("requestDigest").asText(),operation));
+                draft.path("text").asText(),source(draft,intent,pub.path("requestDigest").asText(),operation,pubQuoteId.isEmpty() ? null : pubQuoteId));
         record(updated);
         return store.tx(t->t.get("publication",intent));
     }
@@ -141,7 +171,8 @@ public final class AssistantPublishing {
                 String researchId,
                 String skillId,
                 String text,
-                String quoteTweetId
+                String quoteTweetId,
+                String quoteTweetUrl
         ) { }
 
         PreparedDirectPublish prepared = store.tx(tx -> {
@@ -150,6 +181,7 @@ public final class AssistantPublishing {
             if (quoteSource && quoteTweetId == null) {
                 throw new IllegalArgumentException("该素材不含有效推文 ID，不支持引用原帖发布");
             }
+            String quoteTweetUrl = resolveQuoteTweetUrl(tx, draft, quoteTweetId);
             int requestedVersion = body.path("version").asInt(-1);
             ObjectNode digestPayload = object()
                     .put("draftId", draftId)
@@ -164,7 +196,7 @@ public final class AssistantPublishing {
                 }
                 String existingStatus = existing.path("status").asText("");
                 if ("PUBLISHED".equals(existingStatus)) {
-                    return new PreparedDirectPublish(existing, requestDigest, requestedVersion, "", 0, "", "", "", quoteTweetId);
+                    return new PreparedDirectPublish(existing, requestDigest, requestedVersion, "", 0, "", "", "", quoteTweetId, quoteTweetUrl);
                 }
                 if ("SENDING".equals(existingStatus) || "UNCERTAIN".equals(existingStatus)) {
                     throw new XDataProviderException(409, "该发布请求正在处理或回执待确认，请勿重复提交");
@@ -182,7 +214,8 @@ public final class AssistantPublishing {
                     draft.path("researchId").asText(""),
                     ViralWritingSkills.normalizeId(draft.path("skillId").asText("")),
                     text,
-                    quoteTweetId
+                    quoteTweetId,
+                    quoteTweetUrl
             );
         });
 
@@ -216,7 +249,9 @@ public final class AssistantPublishing {
         try {
             publishedTweetId = com.xops.hub.provider.PaidCapabilityGate.withCaller(
                     com.xops.hub.provider.PaidCapabilityGate.PRIVILEGED_USERNAME, accountId,
-                    () -> publishClient.createTweet(accessToken, prepared.text(), List.of(), prepared.quoteTweetId()));
+                    () -> XPublishClient.withQuoteTweetUrl(
+                            prepared.quoteTweetUrl(),
+                            () -> publishClient.createTweet(accessToken, prepared.text(), List.of(), prepared.quoteTweetId())));
         } catch (XPublishException ex) {
             store.tx(tx -> {
                 ObjectNode rec = tx.get("publication", pubKey);
@@ -260,15 +295,81 @@ public final class AssistantPublishing {
 
     private static String resolveQuoteTweetId(AssistantStore.Tx tx, ObjectNode draft) {
         String materialId = draft.path("materialId").asText("").strip();
-        if (materialId.matches("[0-9]+")) return materialId;
-        if (!materialId.isBlank()) {
-            ObjectNode mat = tx.get("material", materialId);
-            if (mat != null) {
-                String matId = mat.path("id").asText("").strip();
-                if (matId.matches("[0-9]+")) return matId;
-                Matcher m = STATUS_ID_URL.matcher(mat.path("sourceUrl").asText(""));
-                if (m.find()) return m.group(1);
+        String direct = extractMaterialQuoteId(tx, materialId);
+        if (direct != null) return direct;
+
+        String topicId = draft.path("topicId").asText("").strip();
+        if (!topicId.isBlank()) {
+            ObjectNode topic = tx.get("topic", topicId);
+            if (topic != null) {
+                for (var member : topic.path("materialIds")) {
+                    String found = extractMaterialQuoteId(tx, member.asText("").strip());
+                    if (found != null) return found;
+                }
             }
+        }
+        for (var snapMat : draft.path("research").path("snapshot").path("materials")) {
+            String sid = snapMat.path("id").asText("").strip();
+            if (sid.matches("[0-9]{2,20}")) return sid;
+            Matcher m = STATUS_ID_URL.matcher(snapMat.path("sourceUrl").asText(""));
+            if (m.find()) return m.group(1);
+        }
+        return null;
+    }
+
+    private static String extractMaterialQuoteId(AssistantStore.Tx tx, String materialId) {
+        if (materialId == null || materialId.isBlank()) return null;
+        if (materialId.matches("[0-9]{2,20}")) return materialId;
+        ObjectNode mat = tx.get("material", materialId);
+        if (mat != null) {
+            String matId = mat.path("id").asText("").strip();
+            if (matId.matches("[0-9]{2,20}")) return matId;
+            Matcher m = STATUS_ID_URL.matcher(mat.path("sourceUrl").asText(""));
+            if (m.find()) return m.group(1);
+        }
+        return null;
+    }
+
+    private static String resolveQuoteTweetUrl(AssistantStore.Tx tx, ObjectNode draft, String quoteTweetId) {
+        if (quoteTweetId == null || quoteTweetId.isBlank()) return null;
+        String materialId = draft.path("materialId").asText("").strip();
+        String url = extractMaterialQuoteUrl(tx, materialId, quoteTweetId);
+        if (url != null) return url;
+
+        String topicId = draft.path("topicId").asText("").strip();
+        if (!topicId.isBlank()) {
+            ObjectNode topic = tx.get("topic", topicId);
+            if (topic != null) {
+                for (var member : topic.path("materialIds")) {
+                    String found = extractMaterialQuoteUrl(tx, member.asText("").strip(), quoteTweetId);
+                    if (found != null) return found;
+                }
+            }
+        }
+        for (var snapMat : draft.path("research").path("snapshot").path("materials")) {
+            String sUrl = snapMat.path("sourceUrl").asText("").strip();
+            if (sUrl.contains("/status/" + quoteTweetId)) {
+                return sUrl;
+            }
+            String sUser = snapMat.path("username").asText("").replaceFirst("^@+", "").strip();
+            if (!sUser.isBlank() && quoteTweetId.equals(snapMat.path("id").asText("").strip())) {
+                return "https://x.com/" + sUser + "/status/" + quoteTweetId;
+            }
+        }
+        return "https://x.com/i/status/" + quoteTweetId;
+    }
+
+    private static String extractMaterialQuoteUrl(AssistantStore.Tx tx, String materialId, String quoteTweetId) {
+        if (materialId == null || materialId.isBlank()) return null;
+        ObjectNode mat = tx.get("material", materialId);
+        if (mat == null) return null;
+        String srcUrl = mat.path("sourceUrl").asText("").strip();
+        if (srcUrl.contains("/status/" + quoteTweetId)) {
+            return srcUrl;
+        }
+        String uname = mat.path("username").asText("").replaceFirst("^@+", "").strip();
+        if (!uname.isBlank() && quoteTweetId.equals(mat.path("id").asText("").strip())) {
+            return "https://x.com/" + uname + "/status/" + quoteTweetId;
         }
         return null;
     }

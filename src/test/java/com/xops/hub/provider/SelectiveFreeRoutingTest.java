@@ -228,6 +228,15 @@ class SelectiveFreeRoutingTest {
             ex.getResponseBody().write(bytes);
             ex.close();
         });
+        paidServer.createContext("/twitter/user/mentions", ex -> {
+            ObjectNode root = MAPPER.createObjectNode().put("has_next_page", false);
+            root.putArray("tweets");
+            byte[] bytes = MAPPER.writeValueAsBytes(root);
+            ex.getResponseHeaders().set("Content-Type", "application/json");
+            ex.sendResponseHeaders(200, bytes.length);
+            ex.getResponseBody().write(bytes);
+            ex.close();
+        });
         paidServer.start();
 
         HttpServer freeServer = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
@@ -417,6 +426,190 @@ class SelectiveFreeRoutingTest {
             assertThat(fallbackPage.posts()).extracting(TwitterApiIoProvider.TextPost::id).containsExactly("9502");
             assertThat(freeTimelineHits.get()).isEqualTo(3);
             assertThat(paidTimelineHits.get()).isEqualTo(1);
+        } finally {
+            pool.shutdown();
+            paidServer.stop(0);
+            freeServer.stop(0);
+        }
+    }
+
+    @Test
+    void pureFreeInboundUsesFxTwitterSearchAndNeverSpendsPaidQuotaEvenForPrivilegedCaller() throws Exception {
+        Instant now = Instant.now().truncatedTo(ChronoUnit.SECONDS);
+        AtomicInteger paidHits = new AtomicInteger();
+        AtomicInteger freeSearchHits = new AtomicInteger();
+        AtomicBoolean failSearch503 = new AtomicBoolean(false);
+
+        HttpServer paidServer = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        paidServer.createContext("/twitter/user/mentions", ex -> {
+            paidHits.incrementAndGet();
+            ex.sendResponseHeaders(500, -1);
+            ex.close();
+        });
+        paidServer.start();
+
+        HttpServer freeServer = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        freeServer.createContext("/2/profile/alice", ex -> {
+            ObjectNode body = MAPPER.createObjectNode().put("code", 200);
+            body.set("user", freeUser("1001", "alice", 320, 80));
+            byte[] bytes = MAPPER.writeValueAsBytes(body);
+            ex.getResponseHeaders().set("Content-Type", "application/json");
+            ex.sendResponseHeaders(200, bytes.length);
+            ex.getResponseBody().write(bytes);
+            ex.close();
+        });
+        freeServer.createContext("/2/search", ex -> {
+            freeSearchHits.incrementAndGet();
+            if (failSearch503.get()) {
+                byte[] err = "{\"code\":503,\"message\":\"search unavailable\"}".getBytes(StandardCharsets.UTF_8);
+                ex.getResponseHeaders().set("Content-Type", "application/json");
+                ex.sendResponseHeaders(503, err.length);
+                ex.getResponseBody().write(err);
+                ex.close();
+                return;
+            }
+            String rawQuery = ex.getRequestURI().getRawQuery();
+            boolean page2 = rawQuery != null && rawQuery.contains("cursor=c2");
+            ObjectNode body = MAPPER.createObjectNode().put("code", 200);
+            body.putObject("cursor").put("bottom", page2 ? "" : "c2");
+            ArrayNode results = body.putArray("results");
+            ObjectNode reply = freeStatus(page2 ? "9802" : "9801", "2002", "bob",
+                    page2 ? now.minusSeconds(300) : now.minusSeconds(60));
+            reply.putObject("replying_to").put("status", "9001").put("screen_name", "alice");
+            results.add(reply);
+            byte[] bytes = MAPPER.writeValueAsBytes(body);
+            ex.getResponseHeaders().set("Content-Type", "application/json");
+            ex.sendResponseHeaders(200, bytes.length);
+            ex.getResponseBody().write(bytes);
+            ex.close();
+        });
+        freeServer.start();
+
+        XOpsProperties props = new XOpsProperties();
+        props.setTwitterapiIoKey("valid-test-key");
+        props.setTwitterapiIoBaseUrl("http://127.0.0.1:" + paidServer.getAddress().getPort());
+        props.setFxtwitterEnabled(true);
+        props.setFxtwitterBaseUrl("http://127.0.0.1:" + freeServer.getAddress().getPort() + "/2");
+        props.setDiskCacheDir(temp.resolve("cache-free-inbound").toString());
+
+        SharedApiExecutor pool = new SharedApiExecutor(props);
+        try {
+            TwitterApiIoProvider provider = new TwitterApiIoProvider(props, MAPPER, pool);
+            assertThat(provider.isFreeInboundConfigured()).isTrue();
+            assertThat(provider.canReadInboundForFree("")).isTrue();
+
+            // 1. Page 1 + Page 2 paginate via fx: cursor with 0 paid hits even under privileged caller
+            var page1 = PaidCapabilityGate.withCaller("elidlicom", "hist-1", () ->
+                    provider.fetchInboundTextPage("alice", "1001", "", 20, Instant.now().plusSeconds(10), true));
+            assertThat(page1.exhausted()).isFalse();
+            assertThat(page1.nextCursor()).isEqualTo("fx:c2");
+            assertThat(page1.interactions()).extracting(TwitterApiIoProvider.TextInteraction::id).containsExactly("9801");
+
+            var page2 = PaidCapabilityGate.withCaller("elidlicom", "hist-2", () ->
+                    provider.fetchInboundTextPage("alice", "1001", page1.nextCursor(), 20, Instant.now().plusSeconds(10), true));
+            assertThat(page2.exhausted()).isTrue();
+            assertThat(page2.interactions()).extracting(TwitterApiIoProvider.TextInteraction::id).containsExactly("9802");
+            assertThat(paidHits.get()).isZero();
+
+            // 2. When free search trips 503 circuit, pureFree throws cleanly and NEVER falls back to paid API
+            failSearch503.set(true);
+            org.assertj.core.api.Assertions.assertThatThrownBy(() ->
+                    PaidCapabilityGate.withCaller("elidlicom", "hist-3", () ->
+                            provider.fetchInboundTextPage("alice", "1001", "", 20, Instant.now().plusSeconds(10), true)))
+                    .isInstanceOf(XDataProviderException.class);
+            assertThat(paidHits.get()).isZero();
+            assertThat(provider.canReadInboundForFree("")).isFalse();
+        } finally {
+            pool.shutdown();
+            paidServer.stop(0);
+            freeServer.stop(0);
+        }
+    }
+
+    @Test
+    void elidlicomPureFreeHistoryTimelineInboundAndSilentStepNeverSpendPaidQuota() throws Exception {
+        Instant now = Instant.now().truncatedTo(ChronoUnit.SECONDS);
+        AtomicInteger paidHits = new AtomicInteger();
+        AtomicInteger freeHits = new AtomicInteger();
+        AtomicBoolean failFree503 = new AtomicBoolean(false);
+
+        HttpServer paidServer = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        paidServer.createContext("/", ex -> {
+            paidHits.incrementAndGet();
+            ex.sendResponseHeaders(500, -1);
+            ex.close();
+        });
+        paidServer.start();
+
+        HttpServer freeServer = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        freeServer.createContext("/", ex -> {
+            freeHits.incrementAndGet();
+            if (failFree503.get()) {
+                byte[] err = "{\"code\":503,\"message\":\"upstream busy\"}".getBytes(StandardCharsets.UTF_8);
+                ex.getResponseHeaders().set("Content-Type", "application/json");
+                ex.sendResponseHeaders(503, err.length);
+                ex.getResponseBody().write(err);
+                ex.close();
+                return;
+            }
+            String path = ex.getRequestURI().getPath();
+            ObjectNode body = MAPPER.createObjectNode().put("code", 200);
+            if (path.equals("/2/profile/elidlicom")) {
+                body.set("user", freeUser("2095392916734976000", "elidlicom", 650, 450));
+            } else if (path.equals("/2/profile/elidlicom/statuses")) {
+                body.putObject("cursor").put("bottom", "");
+                body.putArray("results").add(freeStatus("9901", "2095392916734976000", "elidlicom", now.minusSeconds(120)));
+            } else if (path.equals("/2/search")) {
+                body.putObject("cursor").put("bottom", "");
+                ArrayNode results = body.putArray("results");
+                ObjectNode reply = freeStatus("9902", "2002", "bob", now.minusSeconds(90));
+                reply.putObject("replying_to").put("status", "9901").put("screen_name", "elidlicom");
+                results.add(reply);
+            }
+            byte[] bytes = MAPPER.writeValueAsBytes(body);
+            ex.getResponseHeaders().set("Content-Type", "application/json");
+            ex.sendResponseHeaders(200, bytes.length);
+            ex.getResponseBody().write(bytes);
+            ex.close();
+        });
+        freeServer.start();
+
+        XOpsProperties props = new XOpsProperties();
+        props.setTwitterapiIoKey("valid-test-key");
+        props.setTwitterapiIoBaseUrl("http://127.0.0.1:" + paidServer.getAddress().getPort());
+        props.setFxtwitterEnabled(true);
+        props.setFxtwitterBaseUrl("http://127.0.0.1:" + freeServer.getAddress().getPort() + "/2");
+        props.setDiskCacheDir(temp.resolve("cache-elidlicom-free").toString());
+
+        SharedApiExecutor pool = new SharedApiExecutor(props);
+        try {
+            TwitterApiIoProvider provider = new TwitterApiIoProvider(props, MAPPER, pool);
+
+            var tl = PaidCapabilityGate.withCaller("elidlicom", "2095392916734976000", () ->
+                    provider.fetchHistoryPostsPage("elidlicom", "2095392916734976000", "", 20, Instant.now().plusSeconds(10), true));
+            assertThat(tl.posts()).extracting(TwitterApiIoProvider.TextPost::id).containsExactly("9901");
+
+            var in = PaidCapabilityGate.withCaller("elidlicom", "2095392916734976000", () ->
+                    provider.fetchInboundTextPage("elidlicom", "2095392916734976000", "", 20, Instant.now().plusSeconds(10), true));
+            assertThat(in.interactions()).extracting(TwitterApiIoProvider.TextInteraction::id).containsExactly("9902");
+
+            var silentOk = PaidCapabilityGate.withCaller("elidlicom", "2095392916734976000", () ->
+                    provider.syncStoreSilentHistoryStep("elidlicom", null, 2, "2095392916734976000", true));
+            assertThat(silentOk.progressed()).isTrue();
+            assertThat(paidHits.get()).isZero();
+            assertThat(freeHits.get()).isGreaterThan(0);
+
+            // When free endpoints fail with 503, pureFree never falls back to paid TwitterAPI.io
+            failFree503.set(true);
+            org.assertj.core.api.Assertions.assertThatThrownBy(() ->
+                    PaidCapabilityGate.withCaller("elidlicom", "2095392916734976000", () ->
+                            provider.fetchHistoryPostsPage("elidlicom", "2095392916734976000", "", 20, Instant.now().plusSeconds(10), true)))
+                    .isInstanceOf(XDataProviderException.class);
+            var silentFail = PaidCapabilityGate.withCaller("elidlicom", "2095392916734976000", () ->
+                    provider.syncStoreSilentHistoryStep("elidlicom", null, 2, "2095392916734976000", true));
+            assertThat(silentFail.degraded()).isTrue();
+            assertThat(silentFail.progressed()).isFalse();
+            assertThat(paidHits.get()).isZero();
         } finally {
             pool.shutdown();
             paidServer.stop(0);

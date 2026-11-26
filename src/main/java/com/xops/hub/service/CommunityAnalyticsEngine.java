@@ -748,11 +748,15 @@ public class CommunityAnalyticsEngine {
         // 第一步：基于全量 30 天快照构建「我方主帖归属索引」与「外部主帖帖主索引」，确保跨时间窗评论也能 100% 识别帖主
         Set<String> myOwnedRootPostIds = new HashSet<>();
         Set<String> myOutboundCommentTweetIds = new HashSet<>();
+        Map<String, String> myTweetConvById = new HashMap<>();
         for (RawTweet t : allTimeline) {
             if (t == null) continue;
             String tid = normId(t.id());
             String cid = normId(t.conversationId());
             String rid = normId(t.inReplyToId());
+            if (!tid.isEmpty() && !cid.isEmpty()) {
+                myTweetConvById.put(tid, cid);
+            }
             if ((t.kind() == TweetKind.POST && !t.selfThreadReply()) || t.kind() == TweetKind.QUOTE) {
                 if (!tid.isEmpty()) myOwnedRootPostIds.add(tid);
                 if (!cid.isEmpty()) myOwnedRootPostIds.add(cid);
@@ -880,6 +884,13 @@ public class CommunityAnalyticsEngine {
                     String cid = normId(inbound.conversationId());
                     String rid = normId(inbound.inReplyToId());
                     String tid = normId(inbound.tweetId());
+                    if (cid.isEmpty() && !rid.isEmpty()) {
+                        if (myOwnedRootPostIds.contains(rid)) {
+                            cid = rid;
+                        } else {
+                            cid = myTweetConvById.getOrDefault(rid, "");
+                        }
+                    }
 
                     boolean replyToMyOutboundComment = !rid.isEmpty() && myOutboundCommentTweetIds.contains(rid);
                     if (!cid.isEmpty()) {

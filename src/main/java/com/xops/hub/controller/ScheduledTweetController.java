@@ -99,7 +99,11 @@ public class ScheduledTweetController {
         } catch (NumberFormatException ex) {
             throw new IllegalArgumentException("稿件版本格式无效");
         }
-        return createScheduledTweetInternal(user, text, scheduledAtEpochMs, clientRequestId, uploads, draftId, version);
+        String quoteTweetId = request.getParameter("quoteTweetId");
+        String quoteTweetUrl = request.getParameter("quoteTweetUrl");
+        boolean quoteSource = "true".equalsIgnoreCase(request.getParameter("quoteSource"));
+        return createScheduledTweetInternal(user, text, scheduledAtEpochMs, clientRequestId, uploads,
+                draftId, version, quoteTweetId, quoteTweetUrl, quoteSource);
     }
 
     @PostMapping(consumes = MediaType.APPLICATION_JSON_VALUE)
@@ -121,7 +125,10 @@ public class ScheduledTweetController {
                 body.clientRequestId() != null ? body.clientRequestId() : "",
                 List.of(),
                 body.assistantDraftId(),
-                body.assistantDraftVersion()
+                body.assistantDraftVersion(),
+                body.quoteTweetId(),
+                body.quoteTweetUrl(),
+                body.quoteTweetId() != null && !body.quoteTweetId().isBlank()
         );
     }
 
@@ -132,15 +139,24 @@ public class ScheduledTweetController {
             String clientRequestId,
             List<MediaUploadInput> uploads,
             String draftId,
-            Integer version
+            Integer version,
+            String quoteTweetId,
+            String quoteTweetUrl,
+            boolean quoteSource
     ) {
         if (draftId == null && version == null) {
             return scheduledTweetService.createScheduledTweet(
-                    user.id(), user.username(), text, scheduledAtEpochMs, clientRequestId, uploads);
+                    user.id(), user.username(), text, scheduledAtEpochMs, clientRequestId, uploads,
+                    null, quoteTweetId, quoteTweetUrl);
         }
-        var source = publishing.prepare(user.id(), draftId, version, clientRequestId, text, scheduledAtEpochMs, uploads);
+        var source = publishing.prepare(user.id(), draftId, version, clientRequestId, text,
+                scheduledAtEpochMs, uploads, quoteSource, quoteTweetId);
+        String resolvedQuoteId = (source != null && source.quoteTweetId() != null && !source.quoteTweetId().isBlank())
+                ? source.quoteTweetId()
+                : quoteTweetId;
         var job = scheduledTweetService.createScheduledTweet(
-                user.id(), user.username(), text, scheduledAtEpochMs, clientRequestId, uploads, source);
+                user.id(), user.username(), text, scheduledAtEpochMs, clientRequestId, uploads,
+                source, resolvedQuoteId, quoteTweetUrl);
         publishing.record(job);
         return job;
     }
@@ -203,14 +219,19 @@ public class ScheduledTweetController {
                     }
                 }
             }
+            boolean metaQuoteSource = meta.quoteTweetId() != null && !meta.quoteTweetId().isBlank();
             var source = meta.assistantDraftId() == null && meta.assistantDraftVersion() == null ? null
                     : publishing.prepare(user.id(), meta.assistantDraftId(), meta.assistantDraftVersion(),
-                            meta.clientRequestId(), meta.text(), meta.scheduledAtEpochMs(), uploads);
+                            meta.clientRequestId(), meta.text(), meta.scheduledAtEpochMs(), uploads,
+                            metaQuoteSource, meta.quoteTweetId());
+            String resolvedQuoteId = (source != null && source.quoteTweetId() != null && !source.quoteTweetId().isBlank())
+                    ? source.quoteTweetId()
+                    : meta.quoteTweetId();
             drafts.add(new BatchTweetDraftInput(
                     meta.text(),
                     meta.scheduledAtEpochMs(),
                     meta.clientRequestId(),
-                    uploads, source
+                    uploads, source, resolvedQuoteId, meta.quoteTweetUrl()
             ));
         }
 

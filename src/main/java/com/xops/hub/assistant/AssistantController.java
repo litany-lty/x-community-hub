@@ -36,6 +36,12 @@ public final class AssistantController {
     private PiAgentViralJudge piJudge;
     @Autowired(required = false)
     private AutoRepostService autoRepostService;
+    @Autowired(required = false)
+    private AssistantIntelligence intelligence;
+
+    void setIntelligence(AssistantIntelligence intelligence) {
+        this.intelligence = intelligence;
+    }
 
     public AssistantController(AssistantStore store,SourceCollector sources,AssistantWorker worker,AssistantPublishing publishing,ObjectMapper mapper) {
         this(store, sources, worker, publishing, mapper, null, null);
@@ -99,29 +105,64 @@ public final class AssistantController {
              .put("needsConfirmationCount",counts.needsConfirmation())
              .put("draftedTopicCount",counts.drafted());
             String provider = AssistantConnection.selectedProvider(config, environment);
+            config = config.deepCopy()
+                    .put("postPolishEnabled", AssistantWorkflow.isPostPolishEnabled(config))
+                    .put("postPolishPrompt", AssistantWorkflow.resolvePostPolishPrompt(config));
             if (environment != null) {
-                config = config.deepCopy()
-                        .put("provider", provider)
-                        .put("credentialConfigured", AssistantConnection.isProviderConfigured(environment, provider));
-                d.set("settings", config);
-                d.set("capabilities", capabilities(tx, config));
+                config.put("provider", provider)
+                        .put("credentialConfigured", AssistantConnection.isProviderConfigured(environment, tx, provider));
             }
+            d.set("settings", config);
+            d.set("capabilities", capabilities(tx, config));
             var configuredProviders = object()
-                    .put("chatgpt", environment != null && AssistantConnection.isProviderConfigured(environment, "chatgpt"))
-                    .put("minimax", environment != null && AssistantConnection.isProviderConfigured(environment, "minimax"))
-                    .put("commandcode", environment != null && AssistantConnection.isProviderConfigured(environment, "commandcode"));
-            String recModel = "chatgpt".equals(provider)
-                    ? ChatGptOAuthTextModelClient.DEFAULT_MODEL_SPEC
-                    : ("minimax".equals(provider) ? "MiniMax-M2.7" : "gpt-5.4");
-            String recProto = "minimax".equals(provider) ? "MESSAGES" : "RESPONSES";
-            int recCtx = ("chatgpt".equals(provider) || "minimax".equals(provider)) ? 200_000 : 128_000;
-            d.set("providerDefaults", object()
+                    .put("chatgpt", AssistantConnection.isProviderConfigured(environment, tx, "chatgpt"))
+                    .put("openai", AssistantConnection.isProviderConfigured(environment, tx, "openai"))
+                    .put("google", AssistantConnection.isProviderConfigured(environment, tx, "google"))
+                    .put("deepseek", AssistantConnection.isProviderConfigured(environment, tx, "deepseek"))
+                    .put("minimax", AssistantConnection.isProviderConfigured(environment, tx, "minimax"))
+                    .put("commandcode", AssistantConnection.isProviderConfigured(environment, tx, "commandcode"));
+            var maskedKeys = object()
+                    .put("openai", AssistantConnection.maskSecret(AssistantConnection.resolveSecretFromTx(tx, environment, AssistantConnection.OPENAI_KEY_ENV)))
+                    .put("google", AssistantConnection.maskSecret(AssistantConnection.resolveSecretFromTx(tx, environment, AssistantConnection.GOOGLE_KEY_ENV)))
+                    .put("deepseek", AssistantConnection.maskSecret(AssistantConnection.resolveSecretFromTx(tx, environment, AssistantConnection.DEEPSEEK_KEY_ENV)))
+                    .put("minimax", AssistantConnection.maskSecret(AssistantConnection.resolveSecretFromTx(tx, environment, AssistantConnection.MINIMAX_KEY_ENV)));
+            var stageRouting = object();
+            stageRouting.putObject("collection")
+                    .put("provider", resolveConfiguredStageProvider(config, "collection", "minimax"))
+                    .put("model", resolveConfiguredStageModel(config, "collection", AssistantConnection.DEFAULT_COLLECTION_MODEL));
+            stageRouting.putObject("search")
+                    .put("provider", resolveConfiguredStageProvider(config, "search", "deepseek"))
+                    .put("model", resolveConfiguredStageModel(config, "search", AssistantConnection.DEFAULT_SEARCH_MODEL));
+            stageRouting.putObject("repost")
+                    .put("provider", resolveConfiguredStageProvider(config, "repost", AssistantConnection.DEFAULT_REPOST_PROVIDER))
+                    .put("model", resolveConfiguredStageModel(config, "repost", AssistantConnection.DEFAULT_REPOST_MODEL));
+            stageRouting.putObject("generation")
+                    .put("mode", "ON_DEMAND_SELECT")
+                    .put("defaultProvider", resolveConfiguredStageProvider(config, "generation", "chatgpt"))
+                    .put("defaultModel", resolveConfiguredStageModel(config, "generation", AssistantConnection.DEFAULT_GENERATION_MODEL));
+
+            String recModel = switch (provider) {
+                case "chatgpt" -> ChatGptOAuthTextModelClient.DEFAULT_MODEL_SPEC;
+                case "openai" -> OpenAiTextModelClient.DEFAULT_MODEL;
+                case "google" -> GeminiTextModelClient.DEFAULT_MODEL;
+                case "deepseek" -> DeepSeekTextModelClient.DEFAULT_MODEL;
+                case "minimax" -> "MiniMax-M2.7";
+                default -> "gpt-5.4";
+            };
+            String recProto = ("minimax".equals(provider) || "deepseek".equals(provider))
+                    ? ("minimax".equals(provider) ? "MESSAGES" : "CHAT_COMPLETIONS")
+                    : "RESPONSES";
+            int recCtx = AssistantConnection.defaultContextTokens(provider);
+            ObjectNode pd = object()
                     .put("provider", provider)
                     .put("defaultProtocol", AssistantConnection.defaultProtocol(provider))
                     .put("recommendedModel", recModel)
                     .put("recommendedProtocol", recProto)
-                    .put("recommendedContextTokens", recCtx)
-                    .set("configuredProviders", configuredProviders));
+                    .put("recommendedContextTokens", recCtx);
+            pd.set("configuredProviders", configuredProviders);
+            pd.set("maskedApiKeys", maskedKeys);
+            pd.set("stageRouting", stageRouting);
+            d.set("providerDefaults", pd);
             d.put("materialCount",tx.count("material"));
             d.put("topicHasNext",topics.size()>size);
             d.set("topics",mapper.valueToTree(topics.subList(0,Math.min(size,topics.size()))));
@@ -163,9 +204,16 @@ public final class AssistantController {
                 AssistantConnection.switchProvider(tx,config,body.path("provider").asText(""),environment);
                 config.put("providerManuallySelected", true);
             }
-            for(String key:List.of("enabled","collectionEnabled","modelEnabled")) if(body.has(key)) {
+            for(String key:List.of("enabled","collectionEnabled","modelEnabled","postPolishEnabled")) if(body.has(key)) {
                 if(!body.path(key).isBoolean()) throw new IllegalArgumentException(key+" 必须是布尔值");
                 config.put(key,body.get(key).asBoolean());
+            }
+            if (body.has("postPolishPrompt")) {
+                String polishPrompt = body.path("postPolishPrompt").asText("").strip();
+                if (polishPrompt.codePointCount(0, polishPrompt.length()) > 3000) {
+                    throw new IllegalArgumentException("二次改写提示词过长（最多 3000 字）");
+                }
+                config.put("postPolishPrompt", polishPrompt);
             }
             for(String key:List.of("model","researchModel")) if(body.has(key)) {
                 String value=body.path(key).asText("").strip();
@@ -181,14 +229,126 @@ public final class AssistantController {
             bounded(config,body,"contextTokens",0,10_000_000); bounded(config,body,"researchContextTokens",0,10_000_000);
             bounded(config,body,"timeoutSeconds",1,600); bounded(config,body,"maxOutputTokens",1,100_000);
             bounded(config,body,"researchTimeoutSeconds",1,600); bounded(config,body,"researchMaxOutputTokens",1,100_000);
+            if (body.has("apiKeys") && body.path("apiKeys").isObject()) {
+                ObjectNode existingSecrets = Optional.ofNullable(tx.get("secret", "api_keys"))
+                        .map(ObjectNode::deepCopy)
+                        .orElseGet(AssistantStore::object);
+                JsonNode incomingKeys = body.path("apiKeys");
+                boolean secretChanged = false;
+                for (var entry : List.of(
+                        Map.entry("openai", "openaiApiKey"),
+                        Map.entry("google", "googleApiKey"),
+                        Map.entry("deepseek", "deepseekApiKey"),
+                        Map.entry("minimax", "minimaxApiKey"),
+                        Map.entry("commandcode", "commandcodeApiKey")
+                )) {
+                    if (incomingKeys.has(entry.getKey())) {
+                        String val = incomingKeys.path(entry.getKey()).asText("").strip();
+                        if (val.length() > 512) throw new IllegalArgumentException(entry.getKey() + " API Key 过长");
+                        if ("__CLEAR__".equals(val)) {
+                            existingSecrets.remove(entry.getValue());
+                            secretChanged = true;
+                        } else if (!val.isBlank() && !val.contains("••••")) {
+                            existingSecrets.put(entry.getValue(), val);
+                            secretChanged = true;
+                        }
+                    }
+                }
+                if (secretChanged) {
+                    tx.put("secret", "api_keys", existingSecrets);
+                    int nextConnVer = AssistantConnection.recordServerConnectionChange(tx, environment);
+                    config.put("connectionVersion", nextConnVer);
+                }
+            }
+            if (body.has("moduleConfigs") && body.path("moduleConfigs").isObject()) {
+                config.set("moduleConfigs", validatedModuleConfigs(body.path("moduleConfigs")));
+            }
             if(body.has("bindings")) config.set("bindings",validatedBindings(body.path("bindings")));
             if (body.has("scoreWeights")) {
                 var weights = ContentIntelligenceEngine.scoreWeights(body.path("scoreWeights"));
                 config.set("scoreWeights", mapper.valueToTree(weights));
             }
-            return tx.put("meta","settings",config);
+            ObjectNode saved = tx.put("meta","settings",config);
+            if (autoRepostService != null
+                    && (body.has("postPolishEnabled") || body.has("postPolishPrompt")
+                        || body.has("moduleConfigs") || body.has("apiKeys"))) {
+                autoRepostService.clearPreviewCache();
+            }
+            return saved.deepCopy()
+                    .put("postPolishEnabled", AssistantWorkflow.isPostPolishEnabled(saved))
+                    .put("postPolishPrompt", AssistantWorkflow.resolvePostPolishPrompt(saved));
         });
     }
+
+    @PostMapping("/polish-prompt")
+    public ObjectNode savePolishPrompt(@RequestBody(required = false) ObjectNode body) {
+        ObjectNode req = body == null ? object() : body;
+        boolean resetDefault = req.path("resetDefault").asBoolean(false);
+        ObjectNode updated = store.tx(tx -> {
+            ObjectNode config = settings(tx).deepCopy();
+            if (req.has("postPolishEnabled")) {
+                if (!req.path("postPolishEnabled").isBoolean()) {
+                    throw new IllegalArgumentException("postPolishEnabled 必须是布尔值");
+                }
+                config.put("postPolishEnabled", req.get("postPolishEnabled").asBoolean());
+            } else if (!config.has("postPolishEnabled")) {
+                config.put("postPolishEnabled", true);
+            }
+            if (resetDefault) {
+                config.put("postPolishPrompt", OwnerQuoteStyleDistiller.DEFAULT_POST_POLISH_PROMPT);
+            } else if (req.has("postPolishPrompt")) {
+                String prompt = req.path("postPolishPrompt").asText("").strip();
+                if (prompt.codePointCount(0, prompt.length()) > 3000) {
+                    throw new IllegalArgumentException("二次改写提示词过长（最多 3000 字）");
+                }
+                config.put("postPolishPrompt", prompt);
+            } else if (!config.has("postPolishPrompt")) {
+                config.put("postPolishPrompt", OwnerQuoteStyleDistiller.DEFAULT_POST_POLISH_PROMPT);
+            }
+            return tx.put("meta", "settings", config);
+        });
+        if (autoRepostService != null) {
+            autoRepostService.clearPreviewCache();
+        }
+        return object()
+                .put("postPolishEnabled", AssistantWorkflow.isPostPolishEnabled(updated))
+                .put("postPolishPrompt", AssistantWorkflow.resolvePostPolishPrompt(updated))
+                .put("settingsVersion", updated.path("version").asInt(0));
+    }
+    private static String resolveConfiguredStageProvider(JsonNode config, String module, String fallback) {
+        String p = config == null ? "" : config.path("moduleConfigs").path(module).path("provider").asText("").strip();
+        return AssistantConnection.isSupportedProvider(p) ? AssistantConnection.normalizeProvider(p) : fallback;
+    }
+
+    private static String resolveConfiguredStageModel(JsonNode config, String module, String fallback) {
+        String m = config == null ? "" : config.path("moduleConfigs").path(module).path("model").asText("").strip();
+        return m.isBlank() ? fallback : m;
+    }
+
+    private static ObjectNode validatedModuleConfigs(JsonNode value) {
+        if (!value.isObject()) throw new IllegalArgumentException("moduleConfigs 必须是对象");
+        Set<String> modules = Set.of("collection", "search", "generation", "repost");
+        var out = object();
+        value.fields().forEachRemaining(entry -> {
+            String mod = entry.getKey().toLowerCase(Locale.ROOT);
+            if (!modules.contains(mod) || !entry.getValue().isObject()) {
+                throw new IllegalArgumentException("无效的模块配置: " + entry.getKey());
+            }
+            JsonNode node = entry.getValue();
+            var clean = object();
+            if (node.has("provider") && !node.path("provider").asText("").isBlank()) {
+                clean.put("provider", AssistantConnection.normalizeProvider(node.path("provider").asText("")));
+            }
+            if (node.has("model")) {
+                String m = node.path("model").asText("").strip();
+                if (m.length() > 200) throw new IllegalArgumentException(mod + " 模型名称过长");
+                if (!m.isBlank()) clean.put("model", m);
+            }
+            out.set(mod, clean);
+        });
+        return out;
+    }
+
     private static void bounded(ObjectNode config,ObjectNode body,String key,int min,int max) {
         if(!body.has(key)) return;
         var n=body.get(key);
@@ -303,10 +463,128 @@ public final class AssistantController {
     public Object updateSourceConfig(@PathVariable String id, @RequestBody ObjectNode body) {
         return sources.updateConfig(id, body);
     }
+
+    @PostMapping("/sources/{sourceKey}/timeline")
+    public ObjectNode previewSourceTimeline(@PathVariable String sourceKey, @RequestBody(required = false) ObjectNode body) {
+        if (autoRepostService == null) {
+            throw new XDataProviderException(503, "自动引用转发预览服务未启用");
+        }
+        return autoRepostService.authorTimeline(sourceKey, body == null ? object() : body);
+    }
+
+    @PostMapping("/sources/{sourceKey}/evaluate-once")
+    public ObjectNode evaluateSourceOnce(@PathVariable String sourceKey, @RequestBody(required = false) ObjectNode body) {
+        if (autoRepostService == null) {
+            throw new XDataProviderException(503, "自动引用转发预览服务未启用");
+        }
+        return autoRepostService.evaluateAuthorOnce(sourceKey, body == null ? object() : body);
+    }
+
+    @PostMapping("/sources/{sourceKey}/repost-preview")
+    public ObjectNode previewSourceRepost(@PathVariable String sourceKey, @RequestBody(required = false) ObjectNode body) {
+        if (autoRepostService == null) {
+            throw new XDataProviderException(503, "自动引用转发预览服务未启用");
+        }
+        return autoRepostService.previewRepost(sourceKey, body == null ? object() : body);
+    }
+
+    @PostMapping("/sources/{sourceKey}/publish-quote")
+    public ObjectNode publishManualQuote(
+            @PathVariable String sourceKey,
+            @RequestBody(required = false) ObjectNode body,
+            HttpServletRequest request
+    ) {
+        if (autoRepostService == null) {
+            throw new XDataProviderException(503, "自动引用转发服务未启用");
+        }
+        var owner = (AuthenticatedXUser) request.getAttribute("assistantOwner");
+        return autoRepostService.publishManualQuote(owner.id(), owner.username(), sourceKey, body == null ? object() : body);
+    }
     @PostMapping("/sources/{id}/{action}") public Object change(@PathVariable String id,@PathVariable String action) { return sources.change(id,action); }
 
     @PostMapping("/research") @ResponseStatus(HttpStatus.ACCEPTED)
-    public ObjectNode researchTask(@RequestBody ObjectNode b) { return publicTask(store.tx(tx->research(tx,b))); }
+    public ObjectNode researchTask(@RequestBody ObjectNode b) {
+        if (b != null && b.path("materialId").asText("").isBlank()
+                && (!b.path("url").asText("").isBlank() || !b.path("link").asText("").isBlank())) {
+            return (ObjectNode) researchLink(b).path("task");
+        }
+        return publicTask(store.tx(tx->research(tx,b)));
+    }
+
+    @PostMapping("/research-link")
+    @ResponseStatus(HttpStatus.ACCEPTED)
+    public ObjectNode researchLink(@RequestBody ObjectNode body) {
+        if (body == null) throw new IllegalArgumentException("请求内容不能为空");
+        String rawUrl = !body.path("url").asText("").isBlank()
+                ? body.path("url").asText("")
+                : body.path("link").asText("");
+        ParsedLinkInput parsed = parseLinkInput(rawUrl);
+        String mode = body.path("mode").asText("RESEARCH").strip().toUpperCase(Locale.ROOT);
+        boolean fastMode = "FAST".equals(mode);
+        boolean regenerate = body.path("regenerate").asBoolean(false);
+        String replayKind = fastMode ? "LINK_DRAFT" : "LINK_RESEARCH";
+
+        ObjectNode replayed = store.tx(tx -> replay(tx, replayKind, body));
+        if (replayed != null) {
+            ObjectNode pub = publicTask(replayed);
+            return object()
+                    .put("topicId", pub.path("topicId").asText(""))
+                    .put("materialId", pub.path("materialId").asText(""))
+                    .put("sourceUrl", parsed.normalizedUrl())
+                    .set("task", pub);
+        }
+
+        ObjectNode resolvedMaterial;
+        if (parsed.xTweetId() != null) {
+            String tweetId = parsed.xTweetId();
+            ObjectNode existingMat = regenerate ? null : store.tx(tx -> tx.get("material", tweetId));
+            if (existingMat != null && !AssistantTopics.text(existingMat).isBlank()) {
+                resolvedMaterial = existingMat;
+            } else {
+                resolvedMaterial = sources.fetchTweetMaterialById(tweetId);
+            }
+        } else {
+            TextSourceReader.ReadResult read;
+            if (intelligence != null) {
+                read = intelligence.readPublicUrl(parsed.uri());
+            } else {
+                SafeHttpTextSourceReader fallbackReader = new SafeHttpTextSourceReader(
+                        environment == null ? null : environment.getProperty(SafeHttpTextSourceReader.DOH_URL_ENV));
+                try {
+                    SafeHttpTextSourceReader.validatePublicUri(parsed.uri());
+                } catch (java.io.IOException e) {
+                    throw new XDataProviderException(422, "无法解析该链接域名：" + parsed.uri().getHost());
+                }
+                read = fallbackReader.read(parsed.uri());
+            }
+            if (read.status() != TextSourceReader.Status.READ || read.text().isBlank()) {
+                String detail = read.detail() == null || read.detail().isBlank() ? read.status().name() : read.detail();
+                throw new XDataProviderException(422, "无法读取该链接的公开正文内容（" + detail + "），请确认链接无需登录且包含可读文字");
+            }
+            resolvedMaterial = buildWebLinkMaterial(parsed.normalizedUrl(), read, System.currentTimeMillis());
+        }
+
+        String bodyDigest = digest(body);
+        String reqKey = field(body, "clientRequestId");
+        return store.tx(tx -> {
+            String topicId = ingestDirectLinkMaterial(tx, resolvedMaterial);
+            String materialId = resolvedMaterial.path("id").asText("");
+            ObjectNode researchReq = body.deepCopy().put("materialId", materialId);
+            researchReq.remove(List.of("url", "link"));
+            ObjectNode task = research(tx, researchReq);
+            tx.put("accept", replayKind + "/" + reqKey, object()
+                    .put("digest", bodyDigest)
+                    .put("taskId", task.path("id").asText("")));
+            ObjectNode pubTask = publicTask(task);
+            ObjectNode topic = tx.get("topic", topicId);
+            return object()
+                    .put("topicId", topicId)
+                    .put("materialId", materialId)
+                    .put("sourceUrl", resolvedMaterial.path("sourceUrl").asText(parsed.normalizedUrl()))
+                    .put("title", topic != null ? topic.path("title").asText("") : resolvedMaterial.path("text").asText(""))
+                    .set("task", pubTask);
+        });
+    }
 
     @PostMapping("/pi-agent/verify")
     public ObjectNode verifyPiAgent() {
@@ -329,6 +607,9 @@ public final class AssistantController {
 
     @PostMapping("/style/refresh") @ResponseStatus(HttpStatus.ACCEPTED)
     public ObjectNode refreshStyle(@RequestBody ObjectNode b) { return publicTask(store.tx(tx->requestTask(tx,"COLLECT_STYLE",b,object()))); }
+
+    @PostMapping("/history/retry")
+    public ObjectNode retryHistory() { return sources.retryHistoryNow(); }
 
     @GetMapping("/tasks/{id}") public ObjectNode task(@PathVariable String id) {return publicTask(store.tx(t->AssistantTopics.required(t,"task",id)));}
     @PostMapping("/tasks/{id}/{action}") public ObjectNode transitionTask(@PathVariable String id,@PathVariable String action) {

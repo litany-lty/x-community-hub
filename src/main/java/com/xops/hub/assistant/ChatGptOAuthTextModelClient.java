@@ -102,7 +102,7 @@ public final class ChatGptOAuthTextModelClient implements TextModelClient {
 
         Duration timeout = binding.timeout() != null ? binding.timeout() : Duration.ofSeconds(120);
         ModelSpec modelSpec = parseModelSpec(binding.modelId());
-        snapshot.put("resolvedModel", modelSpec.modelId().isBlank() ? DEFAULT_MODEL_ALIAS : modelSpec.modelId())
+        snapshot.put("resolvedModel", effectiveCodexModelId(modelSpec))
                 .put("reasoningEffort", modelSpec.reasoningEffort());
         long deadlineMs = System.currentTimeMillis() + timeout.toMillis();
 
@@ -162,14 +162,11 @@ public final class ChatGptOAuthTextModelClient implements TextModelClient {
                     "--json",
                     "-s", "read-only",
                     "-c", "model_reasoning_effort=\"" + modelSpec.reasoningEffort() + "\"",
+                    "-m", effectiveCodexModelId(modelSpec),
                     "-C", workDir.toString(),
-                    "-o", outFile.toString()
+                    "-o", outFile.toString(),
+                    "-"
             ));
-            if (!modelSpec.modelId().isBlank()) {
-                cmd.add("-m");
-                cmd.add(modelSpec.modelId());
-            }
-            cmd.add("-");
 
             String searchInstruction = request.systemText() + "\n"
                     + "You MUST invoke the native web_search tool to find authoritative public web pages, and do NOT execute any shell commands.\n"
@@ -327,14 +324,11 @@ public final class ChatGptOAuthTextModelClient implements TextModelClient {
                     "--color", "never",
                     "-s", "read-only",
                     "-c", "model_reasoning_effort=\"" + modelSpec.reasoningEffort() + "\"",
+                    "-m", effectiveCodexModelId(modelSpec),
                     "-C", workDir.toString(),
-                    "-o", outFile.toString()
+                    "-o", outFile.toString(),
+                    "-"
             ));
-            if (!modelSpec.modelId().isBlank()) {
-                cmd.add("-m");
-                cmd.add(modelSpec.modelId());
-            }
-            cmd.add("-");
 
             String fullPrompt = (request.systemText().isBlank() ? "" : request.systemText() + "\n")
                     + "Do NOT run any shell commands or local tools. Respond directly with the requested output only.\n\n"
@@ -434,16 +428,29 @@ public final class ChatGptOAuthTextModelClient implements TextModelClient {
         return new ModelSpec(resolvedModel, effort);
     }
 
+    public static String effectiveCodexModelId(ModelSpec spec) {
+        if (spec == null || spec.modelId() == null || spec.modelId().isBlank()) {
+            return ASTRA_6_2_MODEL;
+        }
+        return spec.modelId();
+    }
+
     static String resolveExplicitModel(String modelId) {
         return parseModelSpec(modelId).modelId();
     }
 
     String extractJsonObjectString(String raw) {
+        return extractJsonObjectString(raw, oauthBridge);
+    }
+
+    static String extractJsonObjectString(String raw, PiAgentViralJudge bridge) {
         if (raw == null || raw.isBlank()) return "";
         String cleaned = stripBomAndCodeFence(raw);
-        JsonNode parsed = oauthBridge.parseFirstJsonObject(cleaned);
-        if (parsed != null && parsed.isObject()) {
-            return parsed.toString();
+        if (bridge != null) {
+            JsonNode parsed = bridge.parseFirstJsonObject(cleaned);
+            if (parsed != null && parsed.isObject()) {
+                return parsed.toString();
+            }
         }
         return cleaned;
     }

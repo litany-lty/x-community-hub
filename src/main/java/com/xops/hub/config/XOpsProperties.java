@@ -32,6 +32,9 @@ public class XOpsProperties {
     private String timezone = "Asia/Shanghai";
     private String tokenEncryptionSecret = "";
     private boolean schedulerEnabled = true;
+    private Boolean autoRepostEnabled;
+    private int autoRepostQuietStartHour = 12;
+    private int autoRepostQuietEndHour = 24;
     private long schedulerPollMs = 15000L;
     private long scheduleGraceWindowSeconds = 300L;
     private boolean top50AutoSyncEnabled = true;
@@ -434,5 +437,128 @@ public class XOpsProperties {
 
     public boolean hasOAuthClient() {
         return oauthClientId != null && !oauthClientId.isBlank();
+    }
+
+    public Boolean getAutoRepostEnabled() {
+        return autoRepostEnabled;
+    }
+
+    public void setAutoRepostEnabled(Boolean autoRepostEnabled) {
+        this.autoRepostEnabled = autoRepostEnabled;
+    }
+
+    public int getAutoRepostQuietStartHour() {
+        return autoRepostQuietStartHour;
+    }
+
+    public void setAutoRepostQuietStartHour(int autoRepostQuietStartHour) {
+        this.autoRepostQuietStartHour = autoRepostQuietStartHour;
+    }
+
+    public int getAutoRepostQuietEndHour() {
+        return autoRepostQuietEndHour;
+    }
+
+    public void setAutoRepostQuietEndHour(int autoRepostQuietEndHour) {
+        this.autoRepostQuietEndHour = autoRepostQuietEndHour;
+    }
+
+    public boolean isAutoRepostQuietHour(long epochMs, java.time.ZoneId zone) {
+        return isQuietHour(epochMs, zone, autoRepostQuietStartHour, autoRepostQuietEndHour);
+    }
+
+    /**
+     * Checks whether {@code epochMs} falls inside the 24-hour quiet window {@code [startHour, endHour)}.
+     */
+    public static boolean isQuietHour(long epochMs, java.time.ZoneId zone, int startHour, int endHour) {
+        int s = Math.max(0, Math.min(24, startHour));
+        int e = Math.max(0, Math.min(24, endHour));
+        if (s == e) {
+            return false;
+        }
+        java.time.ZoneId effectiveZone = zone != null ? zone : java.time.ZoneId.of("Asia/Shanghai");
+        int hour = java.time.Instant.ofEpochMilli(epochMs).atZone(effectiveZone).getHour();
+        if (s < e) {
+            return hour >= s && hour < e;
+        }
+        return hour >= s || hour < e;
+    }
+
+    /**
+     * Computes the next wakeup timestamp (with a 5s buffer) right after the quiet window ends.
+     */
+    public static long nextQuietWindowEndEpochMs(long epochMs, java.time.ZoneId zone, int startHour, int endHour) {
+        int s = Math.max(0, Math.min(24, startHour));
+        int e = Math.max(0, Math.min(24, endHour));
+        if (!isQuietHour(epochMs, zone, s, e)) {
+            return epochMs;
+        }
+        java.time.ZoneId effectiveZone = zone != null ? zone : java.time.ZoneId.of("Asia/Shanghai");
+        java.time.ZonedDateTime now = java.time.Instant.ofEpochMilli(epochMs).atZone(effectiveZone);
+        java.time.LocalDate targetDate = now.toLocalDate();
+        int targetHour = e;
+        if (e >= 24) {
+            targetDate = targetDate.plusDays(1);
+            targetHour = 0;
+        } else if (s > e && now.getHour() >= s) {
+            targetDate = targetDate.plusDays(1);
+        }
+        return targetDate.atTime(targetHour, 0, 5).atZone(effectiveZone).toInstant().toEpochMilli();
+    }
+
+    public boolean isProductionOrigin() {
+        if (oauthRedirectUri == null || oauthRedirectUri.isBlank()) {
+            return false;
+        }
+        try {
+            java.net.URI uri = java.net.URI.create(oauthRedirectUri.trim());
+            String scheme = uri.getScheme();
+            String host = uri.getHost();
+            if (scheme == null || !"https".equalsIgnoreCase(scheme) || host == null || host.isBlank()) {
+                return false;
+            }
+            String lowerHost = host.toLowerCase(java.util.Locale.ROOT);
+            return !("localhost".equals(lowerHost)
+                    || "127.0.0.1".equals(lowerHost)
+                    || "0.0.0.0".equals(lowerHost)
+                    || "::1".equals(lowerHost)
+                    || "[::1]".equals(lowerHost));
+        } catch (Exception ex) {
+            return false;
+        }
+    }
+
+    private static boolean isNonProductionProfile(org.springframework.core.env.Environment env) {
+        if (env == null) {
+            return false;
+        }
+        for (String profile : env.getActiveProfiles()) {
+            if (profile == null) continue;
+            String normalized = profile.strip().toLowerCase(java.util.Locale.ROOT);
+            if ("local".equals(normalized) || "preview".equals(normalized) || "test".equals(normalized)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public boolean isAutoRepostActive(org.springframework.core.env.Environment env) {
+        if (autoRepostEnabled != null) {
+            return autoRepostEnabled;
+        }
+        if (isNonProductionProfile(env)) {
+            return false;
+        }
+        return isProductionOrigin();
+    }
+
+    public boolean isScheduledPublishActive(org.springframework.core.env.Environment env) {
+        if (!schedulerEnabled) {
+            return false;
+        }
+        if (isNonProductionProfile(env)) {
+            return false;
+        }
+        return isProductionOrigin();
     }
 }

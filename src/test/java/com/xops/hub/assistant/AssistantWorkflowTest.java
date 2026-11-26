@@ -1,5 +1,6 @@
 package com.xops.hub.assistant;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.xops.hub.controller.ApiExceptionHandler;
@@ -606,6 +607,203 @@ class AssistantWorkflowTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.text").value(""))
                 .andExpect(jsonPath("$.version").value(2));
+    }
+
+    @Test void pastedWebLinkAndXTweetLinkRunResearchAndGenerateTweetDrafts() throws Exception {
+        store.tx(tx -> {
+            tx.put("meta", "owner", object().put("accountId", "A").put("username", "elidlicom"));
+            tx.put("meta", "settings", AssistantWorkflow.settings(tx)
+                    .put("enabled", true)
+                    .put("modelEnabled", true)
+                    .put("provider", "openai")
+                    .put("model", "gpt-5.4")
+                    .put("protocol", "RESPONSES")
+                    .put("contextTokens", 128_000));
+            tx.put("meta", "style", object().put("profile", "直接给结论与关键数字，不讲套话"));
+            return null;
+        });
+
+        TextSourceReader linkReader = uri -> {
+            if ("https://openai.com/index/gpt-6-release".equals(uri.toString())) {
+                return new TextSourceReader.ReadResult(
+                        uri,
+                        uri,
+                        "text/html",
+                        "Introducing GPT-6 Developer Platform",
+                        "GPT-6 reduces coding agent tool-call latency by 45% and supports 1M token context windows with native repo indexing.",
+                        "网页正文段落",
+                        Instant.parse("2026-11-26T08:00:00Z"),
+                        TextSourceReader.Status.READ,
+                        ""
+                );
+            }
+            return new TextSourceReader.ReadResult(
+                    uri,
+                    uri,
+                    "text/html",
+                    "Independent Benchmark Report",
+                    "Third-party evaluation confirms GPT-6 achieves 45% faster tool-call execution on repository tasks.",
+                    "网页正文段落",
+                    Instant.parse("2026-11-26T08:05:00Z"),
+                    TextSourceReader.Status.READ,
+                    ""
+            );
+        };
+        TextModelClient linkModelClient = (binding, request) -> {
+            if (request.webSearch()) {
+                return new TextModelClient.ModelResult(
+                        "{\"summary\":\"Found benchmark verification\"}",
+                        List.of(new TextModelClient.SearchResult(
+                                "GPT-6 latency benchmark",
+                                java.net.URI.create("https://bench.example.org/gpt-6-eval"),
+                                "Independent Benchmark Report",
+                                "45% faster tool calls",
+                                "2026-11-26"
+                        )),
+                        new TextModelClient.Usage(80L, 40L),
+                        "req-search-1",
+                        null,
+                        Map.of("search", mapper.createObjectNode().put("count", 1))
+                );
+            }
+            String userText = request.userText();
+            if (userText.contains("Build a research result")) {
+                JsonNode sourcesArr;
+                try {
+                    sourcesArr = mapper.readTree(userText.substring(userText.indexOf("{\"topic\":"))).path("sources");
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+                String linkSrcId = "";
+                String linkExcId = "";
+                String webSrcId = "";
+                String webExcId = "";
+                for (JsonNode s : sourcesArr) {
+                    String sid = s.path("id").asText("");
+                    String eid = s.path("excerpts").path(0).path("id").asText("");
+                    if (sid.startsWith("material-")) {
+                        linkSrcId = sid;
+                        linkExcId = eid;
+                    } else if (webSrcId.isEmpty()) {
+                        webSrcId = sid;
+                        webExcId = eid;
+                    }
+                }
+                assertThat(linkSrcId).startsWith("material-link-").endsWith("-link");
+                assertThat(webSrcId).isNotBlank();
+                String body = """
+                        {
+                          "summary": "GPT-6 开发者平台将工具调用延迟降低 45%% 并支持 1M 上下文",
+                          "claims": [
+                            {
+                              "claim": "GPT-6 工具调用延迟降低 45%%，并支持 1M 上下文窗口",
+                              "relation": "SUPPORTS",
+                              "sourceIds": ["%s", "%s"],
+                              "excerptIds": ["%s", "%s"]
+                            }
+                          ],
+                          "angles": ["从 Agent 仓库级编码效率切入"],
+                          "unverified": []
+                        }
+                        """.formatted(linkSrcId, webSrcId, linkExcId, webExcId);
+                return new TextModelClient.ModelResult(body, List.of(), new TextModelClient.Usage(100L, 60L), "req-synth-1", null, Map.of());
+            }
+            return new TextModelClient.ModelResult(
+                    "{\"draft\":\"GPT-6 开发者平台上线：工具调用延迟降低 45%，原生支持 1M 上下文窗口，跑仓库级 Agent 终于轻快了。\",\"usedClaimIds\":[\"claim-1\"],\"caveats\":[],\"factChanges\":[]}",
+                    List.of(),
+                    new TextModelClient.Usage(120L, 80L),
+                    "req-draft-1",
+                    null,
+                    Map.of()
+            );
+        };
+
+        MockEnvironment env = new MockEnvironment()
+                .withProperty(AssistantConnection.OPENAI_KEY_ENV, "sk-test-link-key");
+        AssistantIntelligence realIntelligence = new AssistantIntelligence(mapper, env, linkModelClient, linkReader);
+        AssistantWorker realWorker = new AssistantWorker(store, realIntelligence, sources);
+        try {
+            AssistantController controller = new AssistantController(store, sources, realWorker, mock(AssistantPublishing.class), mapper, null, env);
+            controller.setIntelligence(realIntelligence);
+            var mvc = MockMvcBuilders.standaloneSetup(controller).setControllerAdvice(new ApiExceptionHandler()).build();
+            var owner = session("A", "elidlicom");
+
+            // 1) Paste copied text containing an external article URL -> RESEARCH + synthesis + DRAFT
+            String linkRespStr = mvc.perform(post("/api/content-assistant/research-link")
+                            .session(owner)
+                            .header("X-Requested-With", "XMLHttpRequest")
+                            .contentType("application/json")
+                            .content(object()
+                                    .put("url", "来看看这篇官方发布：https://openai.com/index/gpt-6-release。")
+                                    .put("mode", "RESEARCH")
+                                    .put("instruction", "突出延迟下降对编码 Agent 的意义")
+                                    .put("clientRequestId", "link-req-web-1")
+                                    .toString()))
+                    .andExpect(status().isAccepted())
+                    .andExpect(jsonPath("$.topicId").isNotEmpty())
+                    .andExpect(jsonPath("$.materialId").isNotEmpty())
+                    .andExpect(jsonPath("$.sourceUrl").value("https://openai.com/index/gpt-6-release"))
+                    .andExpect(jsonPath("$.task.kind").value("RESEARCH"))
+                    .andReturn().getResponse().getContentAsString();
+
+            ObjectNode linkResp = (ObjectNode) mapper.readTree(linkRespStr);
+            String webTaskId = linkResp.path("task").path("id").asText();
+            String webTopicId = linkResp.path("topicId").asText();
+
+            // Execute RESEARCH -> RESEARCH_SYNTHESIS -> DRAFT stages deterministically
+            for (int step = 0; step < 3; step++) {
+                ObjectNode running = claim(webTaskId);
+                realWorker.execute(running);
+            }
+
+            ObjectNode finishedWebTask = store.tx(tx -> tx.get("task", webTaskId));
+            assertThat(finishedWebTask.path("status").asText())
+                    .as(() -> "task=" + finishedWebTask)
+                    .isEqualTo("READY");
+            String webDraftId = finishedWebTask.path("draftId").asText();
+            assertThat(webDraftId).isNotBlank();
+            ObjectNode webDraft = store.tx(tx -> tx.get("draft", webDraftId));
+            assertThat(webDraft.path("topicId").asText()).isEqualTo(webTopicId);
+            assertThat(webDraft.path("text").asText()).contains("45%").contains("1M");
+
+            // 2) Paste an X status URL -> resolves single tweet via SourceCollector & generates draft in FAST mode
+            when(sources.fetchTweetMaterialById("1987654321098765432")).thenReturn(object()
+                    .put("id", "1987654321098765432")
+                    .put("authorId", "9001")
+                    .put("username", "karpathy")
+                    .put("authorName", "Andrej Karpathy")
+                    .put("text", "New minimal C CUDA training loop hits 45% faster step time on single GPU.")
+                    .put("textStatus", "TEXT_ONLY")
+                    .put("authorTextStatus", "FULL")
+                    .put("sourceIdentity", "ROW_ID_VERIFIED")
+                    .put("kind", "POST")
+                    .put("publishedAt", 1_732_600_000_000L)
+                    .put("sourceUrl", "https://x.com/karpathy/status/1987654321098765432"));
+
+            String xLinkRespStr = mvc.perform(post("/api/content-assistant/research-link")
+                            .session(owner)
+                            .header("X-Requested-With", "XMLHttpRequest")
+                            .contentType("application/json")
+                            .content(object()
+                                    .put("url", "https://x.com/karpathy/status/1987654321098765432?s=20")
+                                    .put("mode", "FAST")
+                                    .put("clientRequestId", "link-req-x-1")
+                                    .toString()))
+                    .andExpect(status().isAccepted())
+                    .andExpect(jsonPath("$.materialId").value("1987654321098765432"))
+                    .andExpect(jsonPath("$.task.kind").value("DRAFT"))
+                    .andReturn().getResponse().getContentAsString();
+
+            ObjectNode xLinkResp = (ObjectNode) mapper.readTree(xLinkRespStr);
+            String xTaskId = xLinkResp.path("task").path("id").asText();
+            realWorker.execute(claim(xTaskId));
+            ObjectNode finishedXTask = store.tx(tx -> tx.get("task", xTaskId));
+            assertThat(finishedXTask.path("status").asText()).isEqualTo("READY");
+            assertThat(finishedXTask.path("draftId").asText()).isNotBlank();
+        } finally {
+            realWorker.close();
+            realIntelligence.closeReadPool();
+        }
     }
 
     private ObjectNode claim(String id) {

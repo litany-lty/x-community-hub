@@ -326,4 +326,149 @@ class SourceCollectorBoundaryTest {
                 "https://x.com/author/status/" + id, id, false, pinned, "ROW_ID_VERIFIED",
                 null, null, null, null, null);
     }
+
+    @Test
+    void historyAndSilentStepRetryThreeTimesViaPaidCapabilityGateThenPauseUntilManualTrigger() throws Exception {
+        ZoneId utc = ZoneId.of("UTC");
+        AtomicReference<Instant> nowRef = new AtomicReference<>(Instant.parse("2026-11-25T08:00:00Z"));
+        Clock mutableClock = new Clock() {
+            @Override public ZoneId getZone() { return utc; }
+            @Override public Clock withZone(ZoneId zone) { return this; }
+            @Override public Instant instant() { return nowRef.get(); }
+        };
+
+        ObjectMapper mapper = new ObjectMapper().findAndRegisterModules();
+        com.xops.hub.provider.PaidCapabilityGate gate = new com.xops.hub.provider.PaidCapabilityGate(mutableClock);
+        AssistantStore store = new AssistantStore(tempDir.resolve("retry-pause-test"), mapper);
+        TwitterApiIoProvider provider = mock(TwitterApiIoProvider.class);
+        CommunityHubService community = mock(CommunityHubService.class);
+
+        XUserSummary owner = new XUserSummary("2095392916734976000", "elidlicom", "Litany", "", "", true, 650, 450, 7000, "");
+        when(community.isSilentHistoryEnabled()).thenReturn(true);
+        when(community.hasActiveForegroundWork()).thenReturn(false);
+        when(community.longHistoryCandidates()).thenReturn(List.of(
+                new CommunityHubService.LongHistoryCandidate(owner, 0, true, 30, false, nowRef.get().toEpochMilli())));
+
+        when(provider.isFreeInboundConfigured()).thenReturn(true);
+        when(provider.canReadTimelineForFree(anyString())).thenReturn(true);
+        when(provider.canReadInboundForFree(anyString())).thenReturn(true);
+        when(provider.isPageReadBudgetExhausted()).thenReturn(false);
+        when(provider.isBackgroundPaidBudgetExhausted()).thenReturn(false);
+
+        when(provider.fetchInboundTextPage(eq("elidlicom"), eq("2095392916734976000"), anyString(), eq(100), any(), eq(true)))
+                .thenReturn(new TwitterApiIoProvider.TextInteractionPage(owner, List.of(), "", true));
+        java.util.concurrent.atomic.AtomicBoolean timelineFails = new java.util.concurrent.atomic.AtomicBoolean(true);
+        when(provider.fetchHistoryPostsPage(eq("elidlicom"), eq("2095392916734976000"), anyString(), eq(100), any(), eq(true)))
+                .thenAnswer(inv -> {
+                    if (timelineFails.get()) {
+                        throw new XDataProviderException(503, "免费公开动态暂不可用，已保留当前进度");
+                    }
+                    return new TextPostPage(owner, List.of(post("p-revived", "恢复采集成功", nowRef.get().toEpochMilli(), false)), "", true);
+                });
+
+        SourceCollector collector = new SourceCollector(store, provider, community, mapper, mutableClock);
+        collector.setPaidCapabilityGate(gate);
+        try {
+            store.tx(tx -> {
+                tx.put("meta", "owner", mapper.createObjectNode().put("accountId", "2095392916734976000").put("username", "elidlicom"));
+                tx.put("meta", "settings", AssistantWorkflow.settings(tx).put("enabled", true).put("collectionEnabled", true));
+                return null;
+            });
+
+            // Initial tick -> inbound hasn't run yet, timeline goes first and fails (retryCount=1, not exhausted)
+            collector.tick();
+            String tlRetryKey = "history-source:2095392916734976000:timeline:";
+            verify(provider, times(1)).fetchHistoryPostsPage(eq("elidlicom"), eq("2095392916734976000"), eq(""), eq(100), any(), eq(true));
+            verify(provider, never()).fetchHistoryPostsPage(anyString(), anyString(), anyString(), anyInt(), any());
+            var afterInit = record(store, "history_source", "2095392916734976000");
+            assertThat(afterInit.path("timelineRetryCount").asInt()).isEqualTo(1);
+            assertThat(afterInit.path("timelineRetryExhausted").asBoolean()).isFalse();
+            assertThat(gate.isExhausted(tlRetryKey)).isFalse();
+
+            // Second normal tick runs inbound (succeeds) and must NOT re-trigger timeline while retryCount > 0
+            collector.tick();
+            collector.tick();
+            verify(provider, times(1)).fetchHistoryPostsPage(eq("elidlicom"), eq("2095392916734976000"), eq(""), eq(100), any(), eq(true));
+
+            // 3 scheduled 10-minute retries via PaidCapabilityGate
+            for (int attempt = 1; attempt <= 3; attempt++) {
+                nowRef.set(nowRef.get().plusSeconds(601));
+                gate.runDueRetries();
+            }
+            verify(provider, times(4)).fetchHistoryPostsPage(eq("elidlicom"), eq("2095392916734976000"), eq(""), eq(100), any(), eq(true));
+            verify(provider, times(3)).resetFreeCircuitForActiveSync();
+
+            var afterExhausted = record(store, "history_source", "2095392916734976000");
+            assertThat(afterExhausted.path("timelineRetryExhausted").asBoolean()).isTrue();
+            assertThat(afterExhausted.path("timelineRetryCount").asInt()).isEqualTo(4);
+            assertThat(afterExhausted.path("timelineError").asText()).contains("等待手动触发重试");
+            assertThat(gate.isExhausted(tlRetryKey)).isTrue();
+            assertThat(SourceCollector.historyDimensionDue(afterExhausted, "timeline", nowRef.get().plusSeconds(3600).toEpochMilli(), true)).isFalse();
+
+            // Subsequent ticks and runDueRetries make 0 upstream calls
+            nowRef.set(nowRef.get().plusSeconds(1200));
+            gate.runDueRetries();
+            collector.tick();
+            verify(provider, times(4)).fetchHistoryPostsPage(eq("elidlicom"), eq("2095392916734976000"), eq(""), eq(100), any(), eq(true));
+
+            // Manual trigger revives history collection
+            timelineFails.set(false);
+            collector.retryHistoryNow();
+            assertThat(gate.isExhausted(tlRetryKey)).isFalse();
+            verify(provider, timeout(2000).times(5))
+                    .fetchHistoryPostsPage(eq("elidlicom"), eq("2095392916734976000"), eq(""), eq(100), any(), eq(true));
+            // Wait briefly for commitHistoryTimeline on worker thread
+            long deadline = System.currentTimeMillis() + 2000;
+            while (System.currentTimeMillis() < deadline
+                    && !record(store, "history_source", "2095392916734976000").path("timelineBackfillComplete").asBoolean(false)) {
+                Thread.sleep(20);
+            }
+            var afterRevive = record(store, "history_source", "2095392916734976000");
+            assertThat(afterRevive.path("timelineBackfillComplete").asBoolean()).isTrue();
+            assertThat(afterRevive.path("timelineRetryExhausted").asBoolean()).isFalse();
+            assertThat(afterRevive.path("timelineRetryCount").asInt()).isZero();
+            assertThat(record(store, "history_material", "p-revived")).isNotNull();
+        } finally {
+            collector.stop();
+        }
+
+        // Also verify CommunityHubService.runOneSilentTop10HistoryStepNow() pauses @elidlicom after 3 failed retries
+        com.xops.hub.config.XOpsProperties props = new com.xops.hub.config.XOpsProperties();
+        props.setDiskCacheDir(tempDir.resolve("silent-pause-cache").toString());
+        props.setTwitterapiIoKey("valid-test-key");
+        props.setFxtwitterEnabled(true);
+        TwitterApiIoProvider silentProvider = mock(TwitterApiIoProvider.class);
+        when(silentProvider.isFreeInboundConfigured()).thenReturn(true);
+        when(silentProvider.canReadTimelineForFree(anyString())).thenReturn(true);
+        when(silentProvider.isBackgroundPaidBudgetExhausted()).thenReturn(false);
+        when(silentProvider.syncStoreSilentHistoryStep(eq("elidlicom"), any(), eq(3), eq("2095392916734976000"), eq(true)))
+                .thenReturn(new TwitterApiIoProvider.SyncOutcome(null, false, true, true, 0));
+
+        CommunityHubService hub = new CommunityHubService(props, new com.xops.hub.provider.DemoXDataProvider(), silentProvider, null, mapper);
+        hub.setPaidCapabilityGate(gate);
+        // Seed author store with stale syncedAt so longHistoryCandidates() returns @elidlicom and needsSilent30DayBackfill() is true
+        var staleStore = new com.xops.hub.store.AccountStore.StoredAccount(
+                com.xops.hub.store.AccountStore.VERSION, owner,
+                Instant.now().minusSeconds(7200).getEpochSecond(),
+                java.util.Map.of(), List.of(), List.of(), List.of(), List.of(),
+                List.of(), List.of(), List.of(), 0L, false);
+        com.xops.hub.store.AccountStore.write(
+                tempDir.resolve("silent-pause-cache").resolve("users").resolve("by-id").resolve("2095392916734976000").resolve("store_v1.json.gz"),
+                staleStore, mapper);
+
+        assertThat(hub.runOneSilentTop10HistoryStepNow()).isFalse();
+        verify(silentProvider, times(1)).syncStoreSilentHistoryStep(eq("elidlicom"), any(), eq(3), eq("2095392916734976000"), eq(true));
+        for (int attempt = 1; attempt <= 3; attempt++) {
+            nowRef.set(nowRef.get().plusSeconds(601));
+            gate.runDueRetries();
+        }
+        verify(silentProvider, times(4)).syncStoreSilentHistoryStep(eq("elidlicom"), any(), eq(3), eq("2095392916734976000"), eq(true));
+        assertThat(gate.isExhausted("silent-history:elidlicom")).isTrue();
+
+        // Further silent steps must make 0 calls while exhausted
+        nowRef.set(nowRef.get().plusSeconds(1200));
+        gate.runDueRetries();
+        assertThat(hub.runOneSilentTop10HistoryStepNow()).isFalse();
+        verify(silentProvider, times(4)).syncStoreSilentHistoryStep(eq("elidlicom"), any(), eq(3), eq("2095392916734976000"), eq(true));
+    }
 }

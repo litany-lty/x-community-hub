@@ -58,9 +58,11 @@
         pendingExpandCheck: false,
         pendingRelationshipChecks: 0,
         isFetching: false,
+        isSilentRefreshing: false,
         isLoggingOut: false,
         reportRequestGeneration: 0,
         reportAbortController: null,
+        silentReportAbortController: null,
         authStatusGeneration: 0,
         userScopeGeneration: 0,
         cacheExpiresEpochMs: 0,
@@ -85,6 +87,7 @@
         assistantAccess: null,
         assistantDashboard: null,
         assistantView: "assistant",
+        assistantGenerationTargetPinned: false,
         assistantSelectedTopicId: "",
         assistantTopicSearch: "",
         assistantTopicStatus: "",
@@ -219,6 +222,9 @@
         state.pendingExpandCheck = false;
         state.cacheExpiresEpochMs = 0;
         state.isFetching = false;
+        if (state.silentReportAbortController) state.silentReportAbortController.abort();
+        state.silentReportAbortController = null;
+        state.isSilentRefreshing = false;
         state.selectedPeerUsername = null;
         state.peerRelFilter = "MUTUAL";
         state.peerFilterTouched = false;
@@ -268,9 +274,11 @@
         state.assistantSelectedDraftByTopic = {};
         state.assistantCreationAngle = "";
         if ($("assistantCreationAngleInput")) $("assistantCreationAngleInput").value = "";
+        if ($("assistantLinkResearchInput")) $("assistantLinkResearchInput").value = "";
         state.assistantOrganizeMode = false;
         state.assistantLoading = false;
         state.assistantMutation = "";
+        state.assistantGenerationTargetPinned = false;
         clearTimeout(state.assistantDraftSaveTimerId);
         state.assistantDraftSaveTimerId = null;
         state.assistantDraftSave = null;
@@ -1330,8 +1338,8 @@
                         state.backgroundRefreshTimerId = setTimeout(pollOnce, 2000);
                         return;
                     }
-                    if (body.state === "SUCCEEDED" && !state.isFetching) {
-                        void loadSelfReport({ reloadFromServer: true });
+                    if (body.state === "SUCCEEDED" && !state.isFetching && !state.isSilentRefreshing) {
+                        void loadSelfReport({ reloadFromServer: true, silent: true });
                     }
                 }
             } catch (_) {
@@ -1689,6 +1697,8 @@
         const continueRelations = !state.storedMode && options?.continueRelations === true;
         const reloadFromServer = !state.storedMode && options?.reloadFromServer === true;
         const forceRefresh = !state.storedMode && !continueRelations && (options === true || options?.forceRefresh === true);
+        const silent = !state.storedMode && !forceRefresh && !continueRelations &&
+            (options?.silent === true || (reloadFromServer && Boolean(state.report)));
         if (state.isLoggingOut) return;
         if (!isLoggedIn()) {
             syncAuthGateAndWorkspaceUI();
@@ -1720,8 +1730,16 @@
         }
 
         if (state.isFetching) {
-            if (!continueRelations) state.pendingExpandCheck = true;
+            if (!continueRelations && !silent) state.pendingExpandCheck = true;
             return;
+        }
+        if (silent && state.isSilentRefreshing) {
+            return;
+        }
+        if (!silent && state.isSilentRefreshing && state.silentReportAbortController) {
+            state.silentReportAbortController.abort();
+            state.silentReportAbortController = null;
+            state.isSilentRefreshing = false;
         }
         const requestGeneration = ++state.reportRequestGeneration;
         const selectedPeriod = state.period;
@@ -1729,127 +1747,124 @@
         const requestIsCurrent = () => requestGeneration === state.reportRequestGeneration &&
             !state.isLoggingOut && isLoggedIn() &&
             stableUserId(state.authStatus.user) === authUserId;
-        state.isFetching = true;
-        state.pendingExpandCheck = false;
-        updateRefreshButtonState();
+        if (silent) {
+            state.isSilentRefreshing = true;
+        } else {
+            state.isFetching = true;
+            state.pendingExpandCheck = false;
+            updateRefreshButtonState();
 
-        hideError();
-        const retryCardStart = document.getElementById("workspaceRetryCard");
-        if (retryCardStart) retryCardStart.hidden = true;
-        $("loadingBar").hidden = false;
-        if (!state.report) showLoadingSkeleton(true);
+            hideError();
+            const retryCardStart = document.getElementById("workspaceRetryCard");
+            if (retryCardStart) retryCardStart.hidden = true;
+            $("loadingBar").hidden = false;
+            if (!state.report) showLoadingSkeleton(true);
+        }
         const slowHintEl = $("loadingSlowHint");
-        const selfHandle = authUname ? `@${authUname}` : "本人账号";
         const startedMs = Date.now();
         let elapsedTimer = null;
 
         const updateLoadingProgressText = () => {
-            if (!slowHintEl || !requestIsCurrent()) return;
+            if (silent || !slowHintEl || !requestIsCurrent()) return;
             const sec = Math.max(1, Math.floor((Date.now() - startedMs) / 1000));
             slowHintEl.textContent = state.storedMode ? `读取已入库报表（${sec}s）…` : `同步中（${sec}s）…`;
             slowHintEl.hidden = false;
         };
 
-        const slowTimer = setTimeout(() => {
+        const slowTimer = silent ? null : setTimeout(() => {
             updateLoadingProgressText();
             elapsedTimer = setInterval(updateLoadingProgressText, 1000);
         }, 2500);
 
         try {
-            let batchLimit = 1;
-            let previousStatus = null;
-            let cycleStartedAt = null;
-            for (let batch = 0; batch < batchLimit; batch++) {
-                // 续批只采最近24小时，显示维度保持用户选择，不付费扩展历史。
-                const reqDays = batch === 0 ? selectedDays || 1 : 1;
-                const reqPeriod = batch === 0 ? selectedPeriod || "HOURS_24" : "HOURS_24";
-                const sendRefresh = forceRefresh && batch === 0;
-                const sendPreferStored = batch === 0 && !forceRefresh && !continueRelations && !reloadFromServer && !state.storedMode;
-                if (!requestIsCurrent()) return;
-                const abortCtrl = new AbortController();
+            // 首屏只加载最近 24 小时（或当前请求单批）让界面立即可流畅使用；剩余指标与历史窗口统一交由后台静默补齐。
+            const reqDays = selectedDays || 1;
+            const reqPeriod = selectedPeriod || "HOURS_24";
+            const sendRefresh = forceRefresh;
+            const sendPreferStored = !forceRefresh && !continueRelations && !reloadFromServer && !state.storedMode;
+            if (!requestIsCurrent()) return;
+            const abortCtrl = new AbortController();
+            if (silent) {
+                state.silentReportAbortController = abortCtrl;
+            } else {
                 state.reportAbortController = abortCtrl;
-                const fetchTimeout = setTimeout(() => abortCtrl.abort(), 55000);
-                let resp;
-                let bundleBody;
-                try {
-                    resp = await fetch(
-                        `/api/analyze/bundle?period=${encodeURIComponent(reqPeriod)}&targetDays=${encodeURIComponent(reqDays)}${state.storedMode ? "&stored=true" : continueRelations ? "&continueRelations=true" : ""}${sendRefresh ? "&refresh=true" : ""}${sendPreferStored ? "&preferStored=true" : ""}`,
-                        {
-                            cache: "no-store",
-                            signal: abortCtrl.signal
-                        }
-                    );
-                    bundleBody = await safeParseJson(resp);
-                    if (bundleBody && bundleBody.backgroundRefreshStatus) {
-                        state.backgroundRefreshStatus = bundleBody.backgroundRefreshStatus;
+            }
+            const fetchTimeout = setTimeout(() => abortCtrl.abort(), 55000);
+            let resp;
+            let bundleBody;
+            try {
+                resp = await fetch(
+                    `/api/analyze/bundle?period=${encodeURIComponent(reqPeriod)}&targetDays=${encodeURIComponent(reqDays)}${state.storedMode ? "&stored=true" : continueRelations ? "&continueRelations=true" : ""}${sendRefresh ? "&refresh=true" : ""}${sendPreferStored ? "&preferStored=true" : ""}`,
+                    {
+                        cache: "no-store",
+                        signal: abortCtrl.signal
                     }
-                } finally {
-                    clearTimeout(fetchTimeout);
+                );
+                bundleBody = await safeParseJson(resp);
+                if (bundleBody && bundleBody.backgroundRefreshStatus) {
+                    state.backgroundRefreshStatus = bundleBody.backgroundRefreshStatus;
                 }
+            } finally {
+                clearTimeout(fetchTimeout);
+            }
 
-                if (!requestIsCurrent()) return;
-                if (resp.status === 401) {
-                    state.isFetching = false;
-                    await fetchServerAndAuthStatus();
-                    if (requestGeneration !== state.reportRequestGeneration && isLoggedIn()) return;
-                    showError(bundleBody.message || "登录会话已失效，请重新使用 X 账号授权登录");
+            if (!requestIsCurrent()) return;
+            if (resp.status === 401) {
+                if (silent) {
+                    state.isSilentRefreshing = false;
                     return;
                 }
-                const nonNullReports = [
-                    bundleBody.hours24,
-                    bundleBody.day,
-                    bundleBody.week,
-                    bundleBody.month
-                ].filter(Boolean);
-                if (!resp.ok || nonNullReports.length === 0) {
-                    throw new Error(bundleBody.message || `查询失败（HTTP ${resp.status}）`);
-                }
+                state.isFetching = false;
+                await fetchServerAndAuthStatus();
+                if (requestGeneration !== state.reportRequestGeneration && isLoggedIn()) return;
+                showError(bundleBody.message || "登录会话已失效，请重新使用 X 账号授权登录");
+                return;
+            }
+            const nonNullReports = [
+                bundleBody.hours24,
+                bundleBody.day,
+                bundleBody.week,
+                bundleBody.month
+            ].filter(Boolean);
+            if (!resp.ok || nonNullReports.length === 0) {
+                throw new Error(bundleBody.message || `查询失败（HTTP ${resp.status}）`);
+            }
 
-                if (nonNullReports.some((report) => stableUserId(report?.profile) !== authUserId)) {
-                    throw new Error("报表账号与当前登录账号不匹配，请重新加载");
-                }
-                state.bundle = {
-                    HOURS_24: bundleBody.hours24 || null,
-                    HOURS_48: bundleBody.day || null,
-                    WEEK: bundleBody.week || null,
-                    MONTH: bundleBody.month || null
-                };
-                state.accessPolicy = bundleBody.accessPolicy || null;
-                state.dailyCacheStatus = bundleBody.dailyCacheStatus || null;
-                state.coveredWindowDays = Number(bundleBody.coveredWindowDays ?? 0);
-                state.pendingRelationshipChecks = state.storedMode ? 0 : Math.max(0, Number(bundleBody.pendingRelationshipChecks || 0));
+            if (nonNullReports.some((report) => stableUserId(report?.profile) !== authUserId)) {
+                throw new Error("报表账号与当前登录账号不匹配，请重新加载");
+            }
+            state.bundle = {
+                HOURS_24: bundleBody.hours24 || null,
+                HOURS_48: bundleBody.day || null,
+                WEEK: bundleBody.week || null,
+                MONTH: bundleBody.month || null
+            };
+            state.accessPolicy = bundleBody.accessPolicy || null;
+            state.dailyCacheStatus = bundleBody.dailyCacheStatus || null;
+            state.coveredWindowDays = Number(bundleBody.coveredWindowDays ?? 0);
+            state.pendingRelationshipChecks = state.storedMode ? 0 : Math.max(0, Number(bundleBody.pendingRelationshipChecks || 0));
 
-                const targetReport = state.bundle[state.period] || state.bundle.HOURS_24 || nonNullReports[0];
-                startCacheCooldownTicker(targetReport.cacheRemainingSeconds);
-                applyLoadedPeriodReport(targetReport);
-                if (!state.storedMode && state.backgroundRefreshStatus?.state === "RUNNING") {
-                    scheduleWorkspaceRefreshPoll(authUname, selectedPeriod || "HOURS_24", selectedDays || 1);
-                    break;
-                }
-                const status = state.dailyCacheStatus;
-                if (reloadFromServer || state.storedMode || continueRelations || !status?.canContinue || status.lastAttemptDegraded ||
-                    state.pendingExpandCheck || state.period !== selectedPeriod || state.days !== selectedDays ||
-                    !status.cycleStartedAt) break;
-                if (batch === 0) cycleStartedAt = status.cycleStartedAt;
-                if (status.cycleStartedAt !== cycleStartedAt) break;
-
-                // 首响应给出明确未试队列后允许一批确认；之后只在实存数据/覆盖/可尝试数推进时继续。
-                const movedEarlier = (next, prev) => Boolean(next && (!prev || Date.parse(next) < Date.parse(prev)));
-                const progressed = !previousStatus ||
-                    status.unattemptedMetricPosts < previousStatus.unattemptedMetricPosts ||
-                    (!previousStatus.timelineCovered && status.timelineCovered) ||
-                    (!previousStatus.inboundCovered && status.inboundCovered) ||
-                    status.recentPosts > previousStatus.recentPosts || status.recentInbound > previousStatus.recentInbound ||
-                    movedEarlier(status.timelineCoveredFrom, previousStatus.timelineCoveredFrom) ||
-                    movedEarlier(status.inboundCoveredFrom, previousStatus.inboundCoveredFrom);
-                if (!progressed) break;
-                previousStatus = status;
-                // 指标接口每批至多50帖；每个未覆盖流预留3批，已知队列变长可扩展，但一次动作最多20批。
-                const streamBatches = (Number(!status.timelineCovered) + Number(!status.inboundCovered)) * 3;
-                batchLimit = Math.min(20, Math.max(batchLimit, batch + 1 + Math.ceil(status.unattemptedMetricPosts / 50) + streamBatches));
+            const targetReport = state.bundle[state.period] || state.bundle.HOURS_24 || nonNullReports[0];
+            startCacheCooldownTicker(targetReport.cacheRemainingSeconds);
+            applyLoadedPeriodReport(targetReport);
+            if (!state.storedMode && state.backgroundRefreshStatus?.state === "RUNNING") {
+                scheduleWorkspaceRefreshPoll(authUname, selectedPeriod || "HOURS_24", selectedDays || 1);
+            } else if (
+                !silent &&
+                !reloadFromServer &&
+                !state.storedMode &&
+                !continueRelations &&
+                state.dailyCacheStatus?.canContinue &&
+                !state.dailyCacheStatus.lastAttemptDegraded &&
+                state.backgroundRefreshStatus?.state !== "SUCCEEDED"
+            ) {
+                void startColdWorkspaceRefresh(selectedPeriod || "HOURS_24", 1)
+                    .then(() => scheduleWorkspaceRefreshPoll(authUname, selectedPeriod || "HOURS_24", 1))
+                    .catch(() => {});
             }
         } catch (err) {
             if (!requestIsCurrent()) return;
+            if (silent && state.report) return;
             const rawErrMsg = String(err?.message || "");
             const isBrowserFetchFailure =
                 /^(?:Failed to fetch|Load failed|NetworkError when attempting to fetch resource\.?|fetch failed)$/i.test(rawErrMsg.trim()) ||
@@ -1874,18 +1889,26 @@
                 if (retryCard) retryCard.hidden = false;
             }
         } finally {
-            clearTimeout(slowTimer);
+            if (slowTimer !== null) clearTimeout(slowTimer);
             clearInterval(elapsedTimer);
-            if (!requestIsCurrent()) return;
-            state.reportAbortController = null;
-            state.isFetching = false;
-            updateRefreshButtonState();
-            if (slowHintEl) slowHintEl.hidden = true;
-            $("loadingBar").hidden = true;
-            $("authenticatedWorkspace").classList.remove("is-loading");
-            if (state.pendingExpandCheck && state.bundle?.[state.period]) {
-                state.pendingExpandCheck = false;
-                applyLoadedPeriodReport(state.bundle[state.period]);
+            if (!requestIsCurrent()) {
+                if (silent) state.isSilentRefreshing = false;
+                return;
+            }
+            if (silent) {
+                state.silentReportAbortController = null;
+                state.isSilentRefreshing = false;
+            } else {
+                state.reportAbortController = null;
+                state.isFetching = false;
+                updateRefreshButtonState();
+                if (slowHintEl) slowHintEl.hidden = true;
+                $("loadingBar").hidden = true;
+                $("authenticatedWorkspace").classList.remove("is-loading");
+                if (state.pendingExpandCheck && state.bundle?.[state.period]) {
+                    state.pendingExpandCheck = false;
+                    applyLoadedPeriodReport(state.bundle[state.period]);
+                }
             }
         }
     }
@@ -1933,7 +1956,7 @@
     }
 
     function syncBodyModalLock() {
-        const ids = ["authorPromptModal", "unlockGuideModal", "confirmResendModal"];
+        const ids = ["authorPromptModal", "unlockGuideModal", "confirmResendModal", "repostPreviewModal"];
         const anyOpen = ids.some((id) => {
             const el = document.getElementById(id);
             return Boolean(el && !el.hidden);
@@ -2039,6 +2062,7 @@
         if (top.id === "authorPromptModal") closeAuthorPromptModal(true);
         else if (top.id === "unlockGuideModal") closeUnlockGuideModal(true);
         else if (top.id === "confirmResendModal") closeConfirmResendModal(true);
+        else if (top.id === "repostPreviewModal" && typeof closeRepostPreviewModal === "function") closeRepostPreviewModal(true);
         return true;
     }
 
@@ -2379,8 +2403,9 @@
 
         const noticeStrip = $("bannerNoticeStrip");
         const rawNotice = (report.bannerNotice || "").trim();
-        noticeStrip.textContent = rawNotice;
-        noticeStrip.hidden = !rawNotice;
+        const isSilentSwrNotice = rawNotice === "已返回最近一次完整入库快照；后台刷新已受理。";
+        noticeStrip.textContent = isSilentSwrNotice ? "" : rawNotice;
+        noticeStrip.hidden = !rawNotice || isSilentSwrNotice;
 
         const syncSummary = document.getElementById("syncStatusSummary");
         if (syncSummary) {
@@ -3276,6 +3301,1094 @@
         el.hidden = !message;
     }
 
+    const repostPreviewState = {
+        requestToken: 0,
+        sourceKey: "",
+        focusedMaterialId: "",
+        filterMode: "ALL",
+        polishDrawerOpen: false,
+        evaluatingAccountOnce: false,
+        cooldown: null,
+        owner: null,
+        source: null,
+        items: [],
+        overrides: {},
+        evaluatingIds: new Set(),
+        publishingIds: new Set(),
+        expandedIds: new Set(),
+        editedComments: new Map()
+    };
+
+    const DEFAULT_GENERATION_TARGET_SPEC = "chatgpt|gpt-6.2-astra";
+    const DEFAULT_GENERATION_EFFORT = "medium";
+    const KNOWN_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max"]);
+    const REASONING_EFFORT_OPTIONS = [
+        { value: "", label: "默认强度" },
+        { value: "minimal", label: "极速 minimal" },
+        { value: "low", label: "低强度 low" },
+        { value: "medium", label: "中强度 medium" },
+        { value: "high", label: "高强度 high" },
+        { value: "xhigh", label: "极高强度 xhigh" },
+        { value: "none", label: "关闭推理 none" }
+    ];
+    const PROVIDER_MODEL_CATALOG = {
+        chatgpt: ["gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.1-terra", "gpt-6-luna", "gpt-5.4"],
+        openai: ["gpt-6.2-sol", "gpt-6.2-astra", "gpt-6.1-terra", "gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini"],
+        google: ["gemini-4-neon", "gemini-4-carbon", "gemini-4-argon", "gemini-4-hydrogen"],
+        minimax: ["MiniMax-M2.7"],
+        deepseek: ["deepseek-chat", "deepseek-reasoner"]
+    };
+    const DEFAULT_MODEL_BY_PROVIDER = {
+        chatgpt: "gpt-6.2-astra",
+        openai: "gpt-6.2-sol",
+        google: "gemini-4-neon",
+        minimax: "MiniMax-M2.7",
+        deepseek: "deepseek-chat"
+    };
+    const DEFAULT_EFFORT_BY_PROVIDER = {
+        chatgpt: "medium",
+        openai: "",
+        google: "",
+        minimax: "",
+        deepseek: ""
+    };
+    const GENERATION_TARGET_OPTIONS = [
+        { group: "ChatGPT 订阅额度（PI Agent）", value: "chatgpt|gpt-6.2-astra", label: "ChatGPT 订阅 · gpt-6.2-astra" },
+        { group: "ChatGPT 订阅额度（PI Agent）", value: "chatgpt|gpt-6.2-sol", label: "ChatGPT 订阅 · gpt-6.2-sol" },
+        { group: "ChatGPT 订阅额度（PI Agent）", value: "chatgpt|gpt-6.1-terra", label: "ChatGPT 订阅 · gpt-6.1-terra" },
+        { group: "ChatGPT 订阅额度（PI Agent）", value: "chatgpt|gpt-6-luna", label: "ChatGPT 订阅 · gpt-6-luna" },
+        { group: "OpenAI API（官方）", value: "openai|gpt-6.2-sol", label: "OpenAI API · gpt-6.2-sol" },
+        { group: "OpenAI API（官方）", value: "openai|gpt-6.2-astra", label: "OpenAI API · gpt-6.2-astra" },
+        { group: "OpenAI API（官方）", value: "openai|gpt-6.1-terra", label: "OpenAI API · gpt-6.1-terra" },
+        { group: "OpenAI API（官方）", value: "openai|gpt-6.1-sol", label: "OpenAI API · gpt-6.1-sol" },
+        { group: "OpenAI API（官方）", value: "openai|gpt-6-luna", label: "OpenAI API · gpt-6-luna" },
+        { group: "OpenAI API（官方）", value: "openai|gpt-5.4", label: "OpenAI API · gpt-5.4" },
+        { group: "Google Gemini API", value: "google|gemini-4-neon", label: "Gemini API · gemini-4-neon" },
+        { group: "Google Gemini API", value: "google|gemini-4-carbon", label: "Gemini API · gemini-4-carbon" },
+        { group: "Google Gemini API", value: "google|gemini-4-argon", label: "Gemini API · gemini-4-argon" },
+        { group: "Google Gemini API", value: "google|gemini-4-hydrogen", label: "Gemini API · gemini-4-hydrogen" },
+        { group: "MiniMax / DeepSeek API", value: "minimax|MiniMax-M2.7", label: "MiniMax API · MiniMax-M2.7" },
+        { group: "MiniMax / DeepSeek API", value: "deepseek|deepseek-chat", label: "DeepSeek API · deepseek-chat" },
+        { group: "MiniMax / DeepSeek API", value: "deepseek|deepseek-reasoner", label: "DeepSeek API · deepseek-reasoner" }
+    ];
+
+    function providerSupportsEffort(provider) {
+        return ["chatgpt", "openai", "google"].includes(String(provider || "").toLowerCase());
+    }
+
+    function splitModelAndEffort(rawModel) {
+        const trimmed = String(rawModel || "").trim();
+        if (!trimmed) return { modelId: "", effort: "" };
+        const parts = trimmed.split(/[\s@:]+/);
+        if (parts.length >= 2) {
+            const tail = parts[parts.length - 1].toLowerCase();
+            if (KNOWN_REASONING_EFFORTS.has(tail)) {
+                return { modelId: parts.slice(0, -1).join("-").trim(), effort: tail };
+            }
+        }
+        return { modelId: trimmed, effort: "" };
+    }
+
+    function composeModelWithEffort(provider, baseModel, effort) {
+        const prov = String(provider || "chatgpt").toLowerCase();
+        const split = splitModelAndEffort(baseModel);
+        const cleanModel = split.modelId || DEFAULT_MODEL_BY_PROVIDER[prov] || "gpt-6.2-astra";
+        const cleanEffort = effort !== undefined
+            ? String(effort || "").trim().toLowerCase()
+            : split.effort;
+        if (providerSupportsEffort(prov) && cleanEffort && KNOWN_REASONING_EFFORTS.has(cleanEffort)) {
+            return `${cleanModel} ${cleanEffort}`;
+        }
+        return cleanModel;
+    }
+
+    function parseGenerationTargetSpec(rawSpec, explicitEffort) {
+        const spec = String(rawSpec || state.assistantGenerationTargetSpec || DEFAULT_GENERATION_TARGET_SPEC).trim();
+        const sep = spec.indexOf("|");
+        if (sep < 0) {
+            const eff = explicitEffort !== undefined ? explicitEffort : (state.assistantGenerationEffort ?? DEFAULT_GENERATION_EFFORT);
+            return {
+                generationProvider: "chatgpt",
+                generationModel: composeModelWithEffort("chatgpt", "gpt-6.2-astra", eff)
+            };
+        }
+        const rawProv = spec.slice(0, sep).trim().toLowerCase();
+        const provider = ["chatgpt", "openai", "google", "minimax", "deepseek"].includes(rawProv) ? rawProv : "chatgpt";
+        const rawModelPart = spec.slice(sep + 1).trim();
+        const split = splitModelAndEffort(rawModelPart);
+        const baseModel = split.modelId || DEFAULT_MODEL_BY_PROVIDER[provider] || "gpt-6.2-astra";
+        const resolvedEffort = explicitEffort !== undefined ? String(explicitEffort || "").trim().toLowerCase() : split.effort;
+        return {
+            generationProvider: provider,
+            generationModel: composeModelWithEffort(provider, baseModel, resolvedEffort)
+        };
+    }
+
+    function renderGenerationTargetOptionsHtml(selectedSpec) {
+        const rawActive = String(selectedSpec || state.assistantGenerationTargetSpec || DEFAULT_GENERATION_TARGET_SPEC).trim();
+        const sep = rawActive.indexOf("|");
+        const activeProv = sep >= 0 ? rawActive.slice(0, sep).trim().toLowerCase() : "chatgpt";
+        const activeBaseModel = sep >= 0 ? (splitModelAndEffort(rawActive.slice(sep + 1)).modelId || DEFAULT_MODEL_BY_PROVIDER[activeProv]) : "gpt-6.2-astra";
+        const active = `${activeProv}|${activeBaseModel}`;
+        const groups = new Map();
+        for (const opt of GENERATION_TARGET_OPTIONS) {
+            if (!groups.has(opt.group)) groups.set(opt.group, []);
+            groups.get(opt.group).push(opt);
+        }
+        let html = "";
+        for (const [grpLabel, items] of groups.entries()) {
+            html += `<optgroup label="${escapeHtml(grpLabel)}">${items.map((it) =>
+                `<option value="${escapeHtml(it.value)}"${it.value === active ? " selected" : ""}>${escapeHtml(it.label)}</option>`
+            ).join("")}</optgroup>`;
+        }
+        return html;
+    }
+
+    function renderReasoningEffortOptionsHtml(selectedEffort, provider = "chatgpt") {
+        const active = providerSupportsEffort(provider) ? String(selectedEffort ?? state.assistantGenerationEffort ?? "").trim().toLowerCase() : "";
+        return REASONING_EFFORT_OPTIONS.map((opt) =>
+            `<option value="${escapeHtml(opt.value)}"${opt.value === active ? " selected" : ""}>${escapeHtml(opt.label)}</option>`
+        ).join("");
+    }
+
+    function syncEffortSelectAvailability(effortEl, provider, nextEffort) {
+        if (!effortEl) return;
+        const supported = providerSupportsEffort(provider);
+        effortEl.disabled = !supported;
+        const targetVal = supported ? String(nextEffort ?? "").trim().toLowerCase() : "";
+        if (!effortEl.options || [...effortEl.options].some((o) => o.value === targetVal)) {
+            effortEl.value = targetVal;
+        } else {
+            effortEl.value = "";
+        }
+    }
+
+    function syncGenerationTargetSelects(nextSpec, nextEffort) {
+        const raw = String(nextSpec || state.assistantGenerationTargetSpec || DEFAULT_GENERATION_TARGET_SPEC).trim();
+        const sep = raw.indexOf("|");
+        const prov = sep >= 0 ? raw.slice(0, sep).trim().toLowerCase() : "chatgpt";
+        const split = sep >= 0 ? splitModelAndEffort(raw.slice(sep + 1)) : { modelId: "gpt-6.2-astra", effort: "" };
+        const baseSpec = `${prov}|${split.modelId || DEFAULT_MODEL_BY_PROVIDER[prov] || "gpt-6.2-astra"}`;
+        const prevProv = (state.assistantGenerationTargetSpec || "").split("|")[0] || "chatgpt";
+        let effort = nextEffort !== undefined
+            ? String(nextEffort || "").trim().toLowerCase()
+            : (split.effort || (prov !== prevProv ? (DEFAULT_EFFORT_BY_PROVIDER[prov] ?? "") : (state.assistantGenerationEffort ?? "")));
+        if (!providerSupportsEffort(prov)) effort = "";
+        state.assistantGenerationTargetSpec = baseSpec;
+        state.assistantGenerationEffort = effort;
+        for (const id of ["assistantGenTargetSelect", "assistantOptimizeGenTargetSelect"]) {
+            const el = $(id);
+            if (el && (!el.options || [...el.options].some((o) => o.value === baseSpec)) && el.value !== baseSpec) {
+                el.value = baseSpec;
+            }
+        }
+        for (const id of ["assistantGenEffortSelect", "assistantOptimizeEffortSelect"]) {
+            syncEffortSelectAvailability($(id), prov, effort);
+        }
+    }
+
+    const STAGE_MODEL_CONTROL_IDS = {
+        repost: {
+            provider: "assistantRepostProvider",
+            model: "assistantRepostModelSelect",
+            effort: "assistantRepostEffortSelect",
+            custom: "assistantRepostModel"
+        },
+        generation: {
+            provider: "assistantGenerationProvider",
+            model: "assistantGenerationModelSelect",
+            effort: "assistantGenerationEffortSelect",
+            custom: "assistantGenerationModel"
+        }
+    };
+
+    function syncStageModelControls(stage, provider, rawModelSpec) {
+        const ids = STAGE_MODEL_CONTROL_IDS[stage];
+        if (!ids) return;
+        const safeProv = ["chatgpt", "openai", "google", "minimax", "deepseek"].includes(String(provider || "").toLowerCase())
+            ? String(provider).toLowerCase() : "chatgpt";
+        const split = splitModelAndEffort(rawModelSpec);
+        const baseModel = split.modelId || DEFAULT_MODEL_BY_PROVIDER[safeProv] || "gpt-6.2-astra";
+        const effort = providerSupportsEffort(safeProv)
+            ? (split.effort || (rawModelSpec ? "" : (DEFAULT_EFFORT_BY_PROVIDER[safeProv] ?? "")))
+            : "";
+        if ($(ids.provider)) {
+            $(ids.provider).value = safeProv;
+        }
+        const modelSel = $(ids.model);
+        const customInput = $(ids.custom);
+        const catalog = PROVIDER_MODEL_CATALOG[safeProv] || ["gpt-6.2-astra"];
+        const inCatalog = catalog.includes(baseModel);
+        if (modelSel) {
+            modelSel.innerHTML = catalog.map((m) =>
+                `<option value="${escapeHtml(m)}"${m === baseModel ? " selected" : ""}>${escapeHtml(m)}</option>`
+            ).join("") + `<option value="__custom__"${!inCatalog ? " selected" : ""}>自定义模型…</option>`;
+            modelSel.value = inCatalog ? baseModel : "__custom__";
+        }
+        syncEffortSelectAvailability($(ids.effort), safeProv, effort);
+        const composed = composeModelWithEffort(safeProv, baseModel, effort);
+        if (customInput) {
+            customInput.hidden = inCatalog;
+            customInput.value = inCatalog ? composed : baseModel;
+        }
+    }
+
+    function readStageModelControls(stage) {
+        const ids = STAGE_MODEL_CONTROL_IDS[stage];
+        if (!ids) return { provider: "chatgpt", model: "gpt-6.2-astra medium" };
+        const provRaw = ($(ids.provider)?.value || "chatgpt").trim().toLowerCase();
+        const prov = ["chatgpt", "openai", "google", "minimax", "deepseek"].includes(provRaw) ? provRaw : "chatgpt";
+        const selVal = $(ids.model)?.value || "";
+        const rawBase = selVal === "__custom__"
+            ? ($(ids.custom)?.value || "").trim()
+            : (selVal || ($(ids.custom)?.value || "").trim());
+        const effort = $(ids.effort)?.value ?? "";
+        const composed = composeModelWithEffort(prov, rawBase || DEFAULT_MODEL_BY_PROVIDER[prov], effort);
+        if ($(ids.custom) && selVal !== "__custom__") {
+            $(ids.custom).value = composed;
+        }
+        return { provider: prov, model: composed };
+    }
+
+    function syncRepostSettingsModelControls(provider, rawModelSpec) {
+        return syncStageModelControls("repost", provider, rawModelSpec);
+    }
+
+    function readRepostSettingsComposedModel() {
+        return readStageModelControls("repost");
+    }
+
+    function applySavedGenerationDefault(dashboard) {
+        if (state.assistantGenerationTargetPinned) return;
+        const mod = dashboard?.settings?.moduleConfigs?.generation || {};
+        const routing = dashboard?.providerDefaults?.stageRouting?.generation || {};
+        const prov = String(mod.provider || routing.defaultProvider || "").toLowerCase();
+        const model = String(mod.model || routing.defaultModel || "").trim();
+        if (!prov || !model) return;
+        const split = splitModelAndEffort(model);
+        syncGenerationTargetSelects(`${prov}|${split.modelId}`, split.effort);
+    }
+
+    function syncPolishPromptControls(sourceOrSettings = {}) {
+        const enabled = sourceOrSettings.postPolishEnabled !== false;
+        const prompt = typeof sourceOrSettings.postPolishPrompt === "string"
+            ? sourceOrSettings.postPolishPrompt
+            : "";
+        const modalChk = $("repostPolishEnabledCheck");
+        const modalInput = $("repostPolishPromptInput");
+        if (modalChk && (typeof document === "undefined" || document.activeElement !== modalChk)) {
+            modalChk.checked = enabled;
+        }
+        if (modalInput && (typeof document === "undefined" || document.activeElement !== modalInput)) {
+            modalInput.value = prompt;
+        }
+        const toggleBtn = $("repostPolishPromptToggleBtn");
+        if (toggleBtn) {
+            toggleBtn.textContent = "二次改写";
+            toggleBtn.classList?.toggle?.("is-on", enabled);
+            if (typeof toggleBtn.setAttribute === "function") {
+                toggleBtn.setAttribute("aria-expanded", repostPreviewState.polishDrawerOpen ? "true" : "false");
+            }
+        }
+        const drawer = $("repostPolishPromptDrawer");
+        if (drawer) {
+            drawer.hidden = !repostPreviewState.polishDrawerOpen;
+        }
+        const settingsChk = $("assistantPostPolishEnabled");
+        const settingsInput = $("assistantPostPolishPrompt");
+        if (settingsChk && (typeof document === "undefined" || document.activeElement !== settingsChk)) {
+            settingsChk.checked = enabled;
+        }
+        if (settingsInput && !settingsInput.dataset?.editRevision
+            && (typeof document === "undefined" || document.activeElement !== settingsInput)) {
+            settingsInput.value = prompt;
+        }
+    }
+
+    async function persistOwnerPolishPrompt(enabled, promptText, resetDefault = false) {
+        const body = resetDefault
+            ? { resetDefault: true, postPolishEnabled: true }
+            : { postPolishEnabled: Boolean(enabled), postPolishPrompt: String(promptText || "").trim() };
+        const saved = await contentAssistantRequest("/polish-prompt", body, 20000);
+        if (!saved) return null;
+        if (state.assistantDashboard?.settings) {
+            state.assistantDashboard.settings.postPolishEnabled = saved.postPolishEnabled;
+            state.assistantDashboard.settings.postPolishPrompt = saved.postPolishPrompt;
+            if (Number.isInteger(saved.settingsVersion)) {
+                state.assistantDashboard.settings.version = saved.settingsVersion;
+                const form = $("assistantSettingsForm");
+                if (form) form.dataset.version = String(saved.settingsVersion);
+            }
+        }
+        if (repostPreviewState.source) {
+            repostPreviewState.source.postPolishEnabled = saved.postPolishEnabled;
+            repostPreviewState.source.postPolishPrompt = saved.postPolishPrompt;
+        }
+        const settingsInput = $("assistantPostPolishPrompt");
+        if (settingsInput?.dataset) delete settingsInput.dataset.editRevision;
+        syncPolishPromptControls(saved);
+        return saved;
+    }
+
+    function collectSourceAutoRepostOverrides(row, sourceId) {
+        if (!row || !sourceId) return {};
+        const escSel = typeof CSS !== "undefined" && typeof CSS.escape === "function"
+            ? CSS.escape(sourceId)
+            : String(sourceId).replace(/(["\\])/g, "\\$1");
+        const toggle = row.querySelector(`[data-source-autorepost-toggle="${escSel}"]`);
+        const modeEl = row.querySelector(`[data-source-autorepost-mode="${escSel}"]`);
+        const scoreEl = row.querySelector(`[data-source-autorepost-score="${escSel}"]`);
+        const tplEl = row.querySelector(`[data-source-autorepost-template="${escSel}"]`);
+        const hintEl = row.querySelector(`[data-source-autorepost-hint="${escSel}"]`);
+        const payload = {};
+        if (toggle) payload.autoRepostEnabled = Boolean(toggle.checked);
+        if (modeEl) payload.autoRepostTextMode = modeEl.value;
+        if (scoreEl && scoreEl.value !== "") payload.autoRepostMinScore = Number(scoreEl.value);
+        if (tplEl) payload.autoRepostTemplate = tplEl.value.trim();
+        if (hintEl) payload.autoRepostRuleHint = hintEl.value.trim();
+        return payload;
+    }
+
+    function resolveRepostMaterialUrl(material = {}) {
+        const handle = String(material.username || repostPreviewState.source?.username || "").replace(/^@+/, "");
+        const id = String(material.id || "").trim();
+        const fallback = /^[0-9]+$/.test(id)
+            ? (handle ? `https://x.com/${encodeURIComponent(handle)}/status/${id}` : `https://x.com/i/status/${id}`)
+            : "";
+        const raw = String(material.sourceUrl || fallback).trim();
+        return raw && typeof safeHttpUrl === "function" ? safeHttpUrl(raw, "") : raw;
+    }
+
+    function resolveRepostQuoteTweetId(material = {}) {
+        const id = String(material?.id || "").trim();
+        if (/^[0-9]{2,20}$/.test(id)) return id;
+        const match = String(material?.sourceUrl || "").match(/\/status\/([0-9]{2,20})(?:[/?#]|$)/i);
+        return match ? match[1] : "";
+    }
+
+    function getRepostItemCommentText(materialId) {
+        const id = String(materialId || "");
+        if (repostPreviewState.editedComments.has(id)) {
+            return String(repostPreviewState.editedComments.get(id) || "");
+        }
+        const found = repostPreviewState.items.find((it) => String(it.material?.id || "") === id);
+        return String(found?.decision?.commentText || "");
+    }
+
+    function buildRepostItemComposedText(materialId) {
+        const id = String(materialId || "");
+        const found = repostPreviewState.items.find((it) => String(it.material?.id || "") === id);
+        const comment = getRepostItemCommentText(id).trim();
+        const url = found ? resolveRepostMaterialUrl(found.material) : "";
+        return [comment, url].filter(Boolean).join("\n");
+    }
+
+    function buildRepostIntentHref(composedText) {
+        const text = String(composedText || "").trim();
+        return text
+            ? `https://x.com/intent/tweet?text=${encodeURIComponent(text)}`
+            : "https://x.com/intent/tweet";
+    }
+
+    function resolveRepostOwnerIdentity(owner = {}) {
+        const authUser = state.authStatus?.user || {};
+        const prof = state.report?.profile || {};
+        const username = String(authUser.username || prof.username || owner?.username || "elidlicom").replace(/^@+/, "");
+        const displayName = String(prof.displayName || authUser.displayName || authUser.name || owner?.displayName || username).trim();
+        const avatarUrl = String(prof.avatarUrl || authUser.avatarUrl || owner?.avatarUrl || "/author-avatar.webp").trim();
+        return { username, displayName, avatarUrl };
+    }
+
+    const REPOST_SAME_AUTHOR_COOLDOWN_MS = 16 * 60 * 60 * 1000;
+    const REPOST_DIRECT_PASS_CATEGORIES = new Set(["MODEL_RELEASE", "FEATURE_UPDATE", "QUOTA_RESET"]);
+
+    function isDirectPassRepostCategory(category) {
+        return REPOST_DIRECT_PASS_CATEGORIES.has(String(category || "").trim().toUpperCase());
+    }
+
+    function repostCategoryLabel(category) {
+        const raw = String(category || "").trim().toUpperCase();
+        switch (raw) {
+            case "MODEL_RELEASE":
+                return "模型发布 · 直通";
+            case "FEATURE_UPDATE":
+                return "功能更新 · 直通";
+            case "QUOTA_RESET":
+                return "额度重置 · 直通";
+            case "MAJOR_LAUNCH":
+                return "模型发布";
+            case "BREAKING_NEWS":
+            case "KEY_PERSONNEL":
+            case "INDUSTRY_SHIFT":
+                return "重大新闻";
+            case "UPDATE_NOTICE":
+                return "更新通知";
+            default:
+                return "";
+        }
+    }
+
+    function repostDecisionBadgeMeta(decision, isEvaluating = false) {
+        if (isEvaluating) return { cls: "running", label: "判定中…" };
+        const code = String(decision?.decisionCode || "PENDING_EVAL").toUpperCase();
+        switch (code) {
+            case "PUBLISHED": return { cls: "ok", label: "已转发" };
+            case "WOULD_REPOST": return { cls: "ok", label: "会转发" };
+            case "SKIP_AUTHOR_COOLDOWN": return { cls: "running", label: "账号 CD" };
+            case "SKIP_NOT_FIT": return { cls: "running", label: "不契合" };
+            case "SKIP_LOW_HEAT": return { cls: "muted", label: "热度不足" };
+            case "SKIP_DUPLICATE": return { cls: "muted", label: "同事件已转" };
+            case "SKIP_LIMIT": return { cls: "muted", label: "达日上限" };
+            case "SKIP_COOLDOWN": return { cls: "running", label: "全局 CD" };
+            case "EVAL_FALLBACK": return { cls: "muted", label: "未完成" };
+            case "PENDING_EVAL": return { cls: "muted", label: "待判定" };
+            default: return { cls: "muted", label: "不转发" };
+        }
+    }
+
+    function repostDualScoreText(decision, source) {
+        if (!decision || !decision.evaluated) return "";
+        const minScore = Number(decision.minScore || source?.minScore || 70);
+        const vScore = Number(decision.viralScore || 0);
+        const fScore = Number(decision.fitScore || 0);
+        if (vScore <= 0 && fScore <= 0) return "";
+        const isDirect = Boolean(decision.directPass || (isDirectPassRepostCategory(decision.category) && decision.contentPass));
+        const vPart = (decision.viralPass || isDirect) ? `潜力 ${vScore}` : `潜力 ${vScore}/${minScore}`;
+        const fPart = fScore > 0 ? `契合 ${fScore}` : "";
+        return [vPart, fPart].filter(Boolean).join(" · ");
+    }
+
+    function repostScoreBreakdownText(decision) {
+        if (!decision || !decision.evaluated) return "";
+        const fact = Number(decision.factScore || 0);
+        const trend = Number(decision.trendScore || 0);
+        const attn = Number(decision.attentionScore || 0);
+        return (fact > 0 || trend > 0 || attn > 0) ? `事实 ${fact} · 热门 ${trend} · 关注 ${attn}` : "";
+    }
+
+    function resolveDualCdView(sourceInfo = {}) {
+        const cd = sourceInfo?.cooldown || repostPreviewState.cooldown || {};
+        const gNode = cd.globalCd || {};
+        const aNode = cd.authorCd || {};
+        const globalActive = gNode.active !== undefined
+            ? Boolean(gNode.active)
+            : Boolean(sourceInfo?.ownerInTweetCooldown);
+        const globalJitter = Number(gNode.jitterMinutes || sourceInfo?.ownerTweetJitterMinutes || 5);
+        const globalRemMin = globalActive
+            ? Math.max(1, Number(gNode.remainingMinutes || sourceInfo?.ownerCooldownRemainingMinutes || 1))
+            : 0;
+        const authorActive = aNode.active !== undefined
+            ? Boolean(aNode.active)
+            : Boolean(sourceInfo?.authorInCooldown);
+        const authorRemMin = authorActive
+            ? Math.max(1, Number(aNode.remainingMinutes || sourceInfo?.authorCooldownRemainingMinutes || 60))
+            : 0;
+        const authorRemHrs = authorActive ? Math.max(1, Math.ceil(authorRemMin / 60)) : 0;
+        const anyActive = globalActive || authorActive;
+        let reasonText = "";
+        if (globalActive && authorActive) {
+            reasonText = `全局 CD（1小时+${globalJitter}分钟，余约 ${globalRemMin} 分钟）与账号 16h CD（余约 ${authorRemHrs} 小时）均未解除，待 CD 解除后再做判断`;
+        } else if (globalActive) {
+            reasonText = `全局 CD 冷却中（距上一条推文不足 1小时+${globalJitter}分钟，还差约 ${globalRemMin} 分钟），待 CD 解除后再做判断`;
+        } else if (authorActive) {
+            reasonText = `账号 CD 冷却中（16 小时内已转载该作者，还差约 ${authorRemHrs} 小时），待 CD 解除后再做判断`;
+        }
+        return { globalActive, globalJitter, globalRemMin, authorActive, authorRemMin, authorRemHrs, anyActive, reasonText };
+    }
+
+    function renderRepostDualCdBar(sourceInfo = {}) {
+        const barEl = $("repostDualCdBar");
+        if (!barEl) return;
+        const cd = resolveDualCdView(sourceInfo);
+        const globalText = cd.globalActive ? `全局 CD · 余 ${cd.globalRemMin}m` : "全局 CD · 就绪";
+        const globalTitle = `距上一条推文需间隔 1h+${cd.globalJitter}m`;
+        const globalPill = `<span class="assistant-state ${cd.globalActive ? "running" : "ok"}" title="${escapeHtml(globalTitle)}">${escapeHtml(globalText)}</span>`;
+        const authorText = cd.authorActive ? `账号 CD · 余 ${cd.authorRemHrs}h` : "账号 CD · 就绪";
+        const authorPill = `<span class="assistant-state ${cd.authorActive ? "running" : "ok"}" title="${escapeHtml("同一作者 16h 内只转 1 条")}">${escapeHtml(authorText)}</span>`;
+        barEl.innerHTML = `<div class="repost-dual-cd-pills">${globalPill}${authorPill}</div>`;
+        barEl.hidden = false;
+    }
+
+    function recomputeTimeline16hWindow() {
+        const items = repostPreviewState.items || [];
+        const dualCd = resolveDualCdView(repostPreviewState.source || {});
+        if (dualCd.globalActive) {
+            for (const it of items) {
+                if (!it) continue;
+                const dec = (it.decision ||= {});
+                if (dec.persistedStatus === "PUBLISHED") continue;
+                const alreadyEvaluated = Boolean(dec.evaluated);
+                const exemptAuthorCd = isDirectPassRepostCategory(dec.category);
+                const contentPass = dec.contentPass !== undefined
+                    ? Boolean(dec.contentPass)
+                    : Boolean((dec.viralPass || exemptAuthorCd) && dec.accountFit);
+                const rawBase = String(dec.baseReason !== undefined ? dec.baseReason : (dec.reason || "")).trim();
+                if (rawBase && !rawBase.includes("全局 CD") && !rawBase.includes("上一条推文")) {
+                    dec.baseReason = rawBase;
+                }
+                const savedBase = String(dec.baseReason || "").trim();
+                dec.wouldAutoRepost = false;
+                dec.cdShortCircuited = !alreadyEvaluated;
+                dec.authorCooldownBlocked = dualCd.authorActive;
+                dec.ownerCooldownBlocked = true;
+                if (!alreadyEvaluated) {
+                    dec.decisionCode = "SKIP_COOLDOWN";
+                    dec.reason = dualCd.reasonText;
+                } else if (contentPass) {
+                    dec.decisionCode = "SKIP_COOLDOWN";
+                    dec.reason = savedBase
+                        ? `内容达标（${savedBase}），但${dualCd.reasonText}`
+                        : dualCd.reasonText;
+                } else {
+                    if (!dec.decisionCode || dec.decisionCode === "WOULD_REPOST" || dec.decisionCode === "PENDING_EVAL") {
+                        dec.decisionCode = "SKIP_COOLDOWN";
+                    }
+                    dec.reason = savedBase || dualCd.reasonText;
+                }
+            }
+            return;
+        }
+        const occupied = [];
+        for (const it of items) {
+            const dec = it?.decision;
+            if (dec?.persistedStatus === "PUBLISHED") {
+                const ts = Number(it.material?.publishedAt || 0);
+                if (ts > 0) occupied.push(ts);
+            }
+        }
+        for (let i = items.length - 1; i >= 0; i--) {
+            const it = items[i];
+            const dec = it?.decision;
+            if (!dec || !dec.evaluated || dec.persistedStatus === "PUBLISHED") continue;
+            const exemptAuthorCd = isDirectPassRepostCategory(dec.category);
+            const persisted = String(dec.persistedStatus || "");
+            const guardPersisted = ["SKIPPED_DUPLICATE", "SKIPPED_LIMIT", "SKIPPED_COOLDOWN"]
+                .includes(persisted) || (!exemptAuthorCd && persisted === "SKIPPED_AUTHOR_COOLDOWN");
+            if (guardPersisted) continue;
+            const contentPass = dec.contentPass !== undefined
+                ? Boolean(dec.contentPass)
+                : Boolean((dec.viralPass || exemptAuthorCd) && dec.accountFit);
+            if (!contentPass) {
+                if (dualCd.authorActive && !exemptAuthorCd) {
+                    dec.wouldAutoRepost = false;
+                    dec.authorCooldownBlocked = true;
+                    dec.decisionCode = "SKIP_AUTHOR_COOLDOWN";
+                    dec.reason = dualCd.reasonText;
+                }
+                continue;
+            }
+            const baseReason = String(dec.baseReason !== undefined ? dec.baseReason : (dec.reason || "")).trim();
+            dec.baseReason = baseReason;
+            const ts = Number(it.material?.publishedAt || 0);
+            const blockedBySlot = dualCd.authorActive
+                || (ts > 0 && occupied.some((prev) => Math.abs(ts - prev) < REPOST_SAME_AUTHOR_COOLDOWN_MS));
+            if (blockedBySlot && !exemptAuthorCd) {
+                dec.wouldAutoRepost = false;
+                dec.authorCooldownBlocked = true;
+                dec.ownerCooldownBlocked = false;
+                dec.decisionCode = "SKIP_AUTHOR_COOLDOWN";
+                dec.reason = baseReason && !baseReason.includes("16 小时")
+                    ? `内容达标，但同账号 16 小时 CD 内仅转 1 条（${baseReason}）`
+                    : (baseReason || "16 小时内不连续转发同一作者");
+            } else {
+                dec.wouldAutoRepost = true;
+                dec.authorCooldownBlocked = false;
+                dec.ownerCooldownBlocked = false;
+                if (blockedBySlot && exemptAuthorCd) dec.authorCooldownExempt = true;
+                dec.decisionCode = "WOULD_REPOST";
+                dec.reason = baseReason;
+                if (ts > 0) occupied.push(ts);
+            }
+        }
+    }
+
+    function renderRepostPreviewHeader(sourceInfo = {}) {
+        const srcHandle = String(sourceInfo.username || sourceInfo.handle || repostPreviewState.sourceKey || "").replace(/^@+/, "");
+        const srcName = String(sourceInfo.displayName || srcHandle || "监听作者").trim();
+        const srcVerified = Boolean(sourceInfo.verified);
+        const avatarEl = $("repostPreviewSourceAvatar");
+        if (avatarEl && typeof avatarHtml === "function") {
+            avatarEl.innerHTML = avatarHtml({
+                username: srcHandle || srcName,
+                displayName: srcName,
+                avatarUrl: sourceInfo.avatarUrl || ""
+            }, "md");
+        }
+        const titleEl = $("repostPreviewTitle");
+        if (titleEl) titleEl.textContent = srcName;
+        const verEl = $("repostPreviewSourceVerified");
+        if (verEl && typeof verifiedSvgHtml === "function") {
+            verEl.innerHTML = verifiedSvgHtml(srcVerified);
+        }
+        const handleEl = $("repostPreviewSourceHandle");
+        if (handleEl) handleEl.textContent = srcHandle ? `@${srcHandle}` : "";
+        renderRepostDualCdBar(sourceInfo);
+        const ruleEl = $("repostPreviewRuleBadge");
+        if (ruleEl) {
+            const minScore = Number(sourceInfo.minScore || sourceInfo.autoRepostMinScore || 70);
+            const isTpl = String(sourceInfo.textMode || sourceInfo.autoRepostTextMode || "AI").toUpperCase() === "TEMPLATE";
+            const autoOn = Boolean(sourceInfo.autoRepostEnabled);
+            ruleEl.className = `assistant-state ${autoOn ? "ok" : "muted"}`;
+            ruleEl.textContent = `${autoOn ? "自动转推" : "仅预览"} · 潜力≥${minScore}${isTpl ? " · 固定文案" : ""}`;
+            ruleEl.hidden = false;
+        }
+        const profLink = $("repostPreviewProfileLink");
+        if (profLink) {
+            if (srcHandle) {
+                const rawUrl = `https://x.com/${encodeURIComponent(srcHandle)}`;
+                profLink.href = typeof safeHttpUrl === "function" ? safeHttpUrl(rawUrl, rawUrl) : rawUrl;
+                profLink.hidden = false;
+            } else {
+                profLink.hidden = true;
+            }
+        }
+        if (sourceInfo && (sourceInfo.postPolishPrompt !== undefined || state.assistantDashboard?.settings)) {
+            syncPolishPromptControls({
+                ...(state.assistantDashboard?.settings || {}),
+                ...sourceInfo
+            });
+        }
+    }
+
+    function renderRepostPreviewSubbar() {
+        const items = repostPreviewState.items || [];
+        let repostCount = 0;
+        let skipCount = 0;
+        let pendingCount = 0;
+        for (const it of items) {
+            const dec = it.decision || {};
+            if (dec.evaluated || dec.cdShortCircuited) {
+                if (dec.wouldAutoRepost) repostCount++;
+                else skipCount++;
+            } else {
+                pendingCount++;
+            }
+        }
+        const filterEl = $("repostPreviewFilterBar");
+        if (filterEl) {
+            const filters = [
+                { id: "ALL", label: `全部推文 ${items.length}` },
+                { id: "REPOST", label: `会转发 ${repostCount}` },
+                { id: "SKIP", label: `不转发 ${skipCount}` }
+            ];
+            filterEl.innerHTML = filters.map((f) => {
+                const active = repostPreviewState.filterMode === f.id;
+                return `<button type="button" class="pill-chip sm${active ? " active" : ""}" data-repost-filter="${f.id}" aria-pressed="${active ? "true" : "false"}">${escapeHtml(f.label)}</button>`;
+            }).join("");
+        }
+        const evalRestBtn = $("repostPreviewEvalRestBtn");
+        if (evalRestBtn) {
+            const unevaluated = items.filter((it) => !it.decision?.evaluated).length;
+            const inFlight = repostPreviewState.evaluatingIds.size;
+            if (repostPreviewState.evaluatingAccountOnce || inFlight > 0) {
+                evalRestBtn.hidden = false;
+                evalRestBtn.disabled = true;
+                evalRestBtn.textContent = repostPreviewState.evaluatingAccountOnce
+                    ? "判定中…"
+                    : `生成中 ${inFlight}`;
+            } else if (items.length > 0) {
+                evalRestBtn.hidden = false;
+                evalRestBtn.disabled = false;
+                evalRestBtn.textContent = unevaluated > 0 ? "合并判定" : "重新判定";
+            } else {
+                evalRestBtn.hidden = true;
+            }
+        }
+    }
+
+    function renderRepostTimelineItemHtml(item) {
+        const mat = item?.material || {};
+        const dec = item?.decision || {};
+        const id = String(mat.id || "");
+        const isEvaluating = repostPreviewState.evaluatingIds.has(id);
+        const isPublishing = Boolean(repostPreviewState.publishingIds?.has(id));
+        const willRepost = Boolean(dec.evaluated && dec.wouldAutoRepost);
+        const isFocused = Boolean(id && id === repostPreviewState.focusedMaterialId);
+        const isExpanded = willRepost || isFocused || repostPreviewState.expandedIds.has(id);
+        const badge = repostDecisionBadgeMeta(dec, isEvaluating);
+        const dualScore = repostDualScoreText(dec, repostPreviewState.source);
+        const scoreBreakdown = repostScoreBreakdownText(dec);
+
+        const srcHandle = String(mat.username || repostPreviewState.source?.username || "").replace(/^@+/, "");
+        const srcName = String(mat.authorName || repostPreviewState.source?.displayName || srcHandle || "--").trim();
+        const srcAvatar = typeof avatarHtml === "function"
+            ? avatarHtml({ username: srcHandle || srcName, displayName: srcName, avatarUrl: mat.authorAvatarUrl || repostPreviewState.source?.avatarUrl || "" }, "sm")
+            : "";
+        const srcVer = typeof verifiedSvgHtml === "function"
+            ? verifiedSvgHtml(Boolean(mat.authorVerified ?? repostPreviewState.source?.verified))
+            : "";
+        const pubTime = Number(mat.publishedAt) > 0 && typeof formatAssistantDateTime === "function"
+            ? formatAssistantDateTime(Number(mat.publishedAt))
+            : "";
+        const sourceUrl = resolveRepostMaterialUrl(mat);
+        const pubTweetUrl = dec.publishedTweetUrl && typeof safeHttpUrl === "function"
+            ? safeHttpUrl(dec.publishedTweetUrl, "")
+            : String(dec.publishedTweetUrl || "");
+
+        const formatMetric = (n) => typeof fmtNum === "function" ? fmtNum(n) : String(n);
+        const metricParts = [];
+        if (Number(mat.views) > 0) metricParts.push(`浏览 ${formatMetric(Number(mat.views))}`);
+        if (Number(mat.reposts) > 0) metricParts.push(`转 ${formatMetric(Number(mat.reposts))}`);
+        if (Number(mat.replies) > 0) metricParts.push(`评 ${formatMetric(Number(mat.replies))}`);
+        if (Number(mat.likes) > 0) metricParts.push(`赞 ${formatMetric(Number(mat.likes))}`);
+
+        const mainText = String(mat.text || (!mat.quotedText && mat.articleText ? mat.articleText : "") || "（纯媒体或链接推文）");
+        const quotedSubHtml = mat.quotedText
+            ? `<div class="author-timeline-quoted-sub">${escapeHtml(mat.quotedText)}</div>`
+            : "";
+
+        const code = String(dec.decisionCode || "");
+        const isCdCode = code === "SKIP_COOLDOWN" || code === "SKIP_AUTHOR_COOLDOWN";
+        const cdBase = String(dec.baseReason || "").trim();
+        const cdBaseIsCdText = /CD|上一条推文|16 小时/.test(cdBase);
+        const reasonText = (isCdCode ? (dec.evaluated && !cdBaseIsCdText ? cdBase : "") : String(dec.reason || "")).trim();
+        const reasonCls = willRepost ? " is-pass" : ((code === "SKIP_NOT_FIT" || code === "SKIP_LOW_HEAT") ? " is-mismatch" : "");
+        const reasonHtml = reasonText
+            ? `<div class="author-timeline-reason${reasonCls}">${escapeHtml(reasonText)}</div>`
+            : "";
+
+        const owner = resolveRepostOwnerIdentity(repostPreviewState.owner);
+        const ownerAvatar = typeof avatarHtml === "function"
+            ? avatarHtml({ username: owner.username, displayName: owner.displayName, avatarUrl: owner.avatarUrl }, "sm")
+            : "";
+        const commentVal = getRepostItemCommentText(id);
+        const composedHref = buildRepostIntentHref([commentVal.trim(), sourceUrl].filter(Boolean).join("\n"));
+
+        let quoteSectionHtml = "";
+        if (isEvaluating && !commentVal) {
+            quoteSectionHtml = `<div class="timeline-owner-quote-box">
+                <div class="repost-owner-row">
+                    <div class="repost-owner-identity">${ownerAvatar}<strong>${escapeHtml(owner.displayName)}</strong><span>@${escapeHtml(owner.username)}</span></div>
+                </div>
+                <textarea class="repost-preview-comment is-loading" rows="2" readonly>生成中…</textarea>
+            </div>`;
+        } else if (dec.fallbackUsed && !dec.evaluated && !commentVal) {
+            quoteSectionHtml = `<button type="button" class="timeline-skip-quote-toggle" data-repost-write-item="${escapeHtml(id)}">
+                <span class="timeline-skip-quote-snippet">重新生成</span>
+                <span>↻</span>
+            </button>`;
+        } else if (commentVal) {
+            if (isExpanded) {
+                quoteSectionHtml = `<div class="timeline-owner-quote-box">
+                    <div class="repost-owner-row">
+                        <div class="repost-owner-identity">${ownerAvatar}<strong>${escapeHtml(owner.displayName)}</strong><span>@${escapeHtml(owner.username)}</span></div>
+                        ${pubTweetUrl ? `<a class="link-inline-btn" href="${pubTweetUrl}" target="_blank" rel="noopener noreferrer">查看已发推文 ↗</a>` : ""}
+                    </div>
+                    <textarea class="repost-preview-comment${isEvaluating ? " is-loading" : ""}" rows="6" maxlength="400" data-repost-comment-input="${escapeHtml(id)}" aria-label="转发附文预览"${isEvaluating ? " readonly" : ""}>${escapeHtml(commentVal)}</textarea>
+                    <div class="repost-preview-actions">
+                        <button type="button" class="x-outline-pill sm" data-repost-regen-item="${escapeHtml(id)}"${isEvaluating || isPublishing ? " disabled" : ""}>${isEvaluating ? "生成中…" : "换一句"}</button>
+                        <div class="repost-preview-actions-right">
+                            <button type="button" class="x-outline-pill sm" data-repost-copy-item="${escapeHtml(id)}"${isEvaluating || isPublishing ? " disabled" : ""}>复制附文</button>
+                            <a class="x-outline-pill sm" data-repost-intent-link="${escapeHtml(id)}" href="${composedHref}" target="_blank" rel="noopener noreferrer">去 X 转发 ↗</a>
+                            <button type="button" class="x-outline-pill sm" data-repost-schedule-item="${escapeHtml(id)}"${isEvaluating || isPublishing ? " disabled" : ""}>转入定时</button>
+                            <button type="button" class="x-blue-pill sm" data-repost-publish-item="${escapeHtml(id)}"${isEvaluating || isPublishing ? " disabled" : ""}>${isPublishing ? "发布中…" : "立即引用"}</button>
+                        </div>
+                    </div>
+                </div>`;
+            } else {
+                quoteSectionHtml = `<button type="button" class="timeline-skip-quote-toggle" data-repost-expand-item="${escapeHtml(id)}">
+                    <span class="timeline-skip-quote-snippet">${escapeHtml(commentVal)}</span>
+                    <span>▾</span>
+                </button>`;
+            }
+        } else {
+            quoteSectionHtml = `<button type="button" class="timeline-skip-quote-toggle" data-repost-write-item="${escapeHtml(id)}"${isEvaluating ? " disabled" : ""}>
+                <span class="timeline-skip-quote-snippet">${isEvaluating ? "试写中…" : "试写转发语"}</span>
+                <span>${isEvaluating ? "" : "▸"}</span>
+            </button>`;
+        }
+
+        const categoryTag = dec.evaluated ? repostCategoryLabel(dec.category) : "";
+        const evalTriggerBtn = !dec.evaluated && !isEvaluating
+            ? `<button type="button" class="link-inline-btn" data-repost-eval-item="${escapeHtml(id)}">判定</button>`
+            : "";
+
+        return `<article class="author-timeline-item${willRepost ? " is-will-repost" : ""}${isFocused ? " is-focused" : ""}" data-timeline-material="${escapeHtml(id)}">
+            <div class="author-timeline-head">
+                <div class="author-timeline-who">
+                    ${srcAvatar}
+                    <strong>${escapeHtml(srcName)}</strong>
+                    ${srcVer}
+                    <span>@${escapeHtml(srcHandle)}</span>
+                    ${pubTime ? `<span>· ${escapeHtml(pubTime)}</span>` : ""}
+                </div>
+                <div class="author-timeline-decision">
+                    ${categoryTag ? `<span class="mini-tag blue">${escapeHtml(categoryTag)}</span>` : ""}
+                    <span class="assistant-state ${badge.cls}">${escapeHtml(badge.label)}</span>
+                    ${dualScore ? `<span class="timeline-dual-score"${scoreBreakdown ? ` title="${escapeHtml(scoreBreakdown)}"` : ""}>${escapeHtml(dualScore)}</span>` : ""}
+                    ${evalTriggerBtn}
+                    ${sourceUrl ? `<a class="link-inline-btn" href="${sourceUrl}" target="_blank" rel="noopener noreferrer">原帖 ↗</a>` : ""}
+                </div>
+            </div>
+            <div class="author-timeline-text">${escapeHtml(mainText)}</div>
+            ${quotedSubHtml}
+            ${metricParts.length ? `<div class="author-timeline-meta-row"><span>${escapeHtml(metricParts.join(" · "))}</span></div>` : ""}
+            ${reasonHtml}
+            ${quoteSectionHtml}
+        </article>`;
+    }
+
+    function itemMatchesRepostFilter(item) {
+        const mode = repostPreviewState.filterMode;
+        const settled = Boolean(item.decision?.evaluated || item.decision?.cdShortCircuited);
+        if (mode === "REPOST") return Boolean(settled && item.decision?.wouldAutoRepost);
+        if (mode === "SKIP") return Boolean(settled && !item.decision?.wouldAutoRepost);
+        return true;
+    }
+
+    function renderRepostPreviewTimeline(singleMaterialId = "") {
+        recomputeTimeline16hWindow();
+        if (repostPreviewState.source) {
+            renderRepostPreviewHeader(repostPreviewState.source);
+        }
+        renderRepostPreviewSubbar();
+        const listEl = $("repostPreviewTimelineList");
+        if (!listEl) return;
+
+        if (singleMaterialId && repostPreviewState.filterMode === "ALL" && typeof listEl.querySelector === "function") {
+            const escSel = typeof CSS !== "undefined" && typeof CSS.escape === "function"
+                ? CSS.escape(singleMaterialId)
+                : String(singleMaterialId).replace(/(["\\])/g, "\\$1");
+            const existingRow = listEl.querySelector(`[data-timeline-material="${escSel}"]`);
+            const activeInput = typeof document !== "undefined" ? document.activeElement : null;
+            const activeEditingOther = activeInput && activeInput.dataset?.repostCommentInput
+                && activeInput.dataset.repostCommentInput !== singleMaterialId;
+            if (existingRow && activeEditingOther) {
+                const targetItem = repostPreviewState.items.find((it) => String(it.material?.id || "") === singleMaterialId);
+                if (targetItem) {
+                    existingRow.outerHTML = renderRepostTimelineItemHtml(targetItem);
+                    return;
+                }
+            }
+        }
+
+        const visibleItems = (repostPreviewState.items || []).filter(itemMatchesRepostFilter);
+        if (!visibleItems.length) {
+            const emptyMsg = repostPreviewState.items.length
+                ? (repostPreviewState.filterMode === "REPOST" ? "当前已评估推文中暂无满足「会火且适合当前账号」的条目。" : "当前筛选下暂无推文。")
+                : "该监听作者暂无可预览的近期推文。";
+            listEl.innerHTML = `<div class="assistant-empty compact" style="margin:16px;">${escapeHtml(emptyMsg)}</div>`;
+            return;
+        }
+        listEl.innerHTML = visibleItems.map(renderRepostTimelineItemHtml).join("");
+    }
+
+    async function evaluateSingleTimelineItem(materialId, forceRegenerate, token, expandOnFinish = false, forceWriteComment = false) {
+        const id = String(materialId || "").trim();
+        if (!id || token !== repostPreviewState.requestToken) return;
+        if (repostPreviewState.evaluatingIds.has(id) && !forceRegenerate && !forceWriteComment) return;
+        repostPreviewState.evaluatingIds.add(id);
+        if (forceRegenerate || forceWriteComment) repostPreviewState.editedComments.delete(id);
+        if (expandOnFinish) repostPreviewState.expandedIds.add(id);
+        renderRepostPreviewTimeline(id);
+        try {
+            const reqBody = {
+                ...(repostPreviewState.overrides || {}),
+                materialId: id
+            };
+            const modalChk = $("repostPolishEnabledCheck");
+            const modalPromptEl = $("repostPolishPromptInput");
+            if (modalChk && typeof modalChk.checked === "boolean") {
+                reqBody.postPolishEnabled = Boolean(modalChk.checked);
+            }
+            if (modalPromptEl && typeof modalPromptEl.value === "string" && modalPromptEl.value.trim()) {
+                reqBody.postPolishPrompt = modalPromptEl.value.trim();
+            }
+            const repostGenSel = $("repostGenTargetSelect");
+            const repostEffSel = $("repostGenEffortSelect");
+            const genTarget = parseGenerationTargetSpec(
+                repostGenSel?.value || state.assistantGenerationTargetSpec,
+                repostEffSel ? repostEffSel.value : state.assistantGenerationEffort
+            );
+            reqBody.generationProvider = genTarget.generationProvider;
+            reqBody.generationModel = genTarget.generationModel;
+            if (forceRegenerate) reqBody.forceRegenerate = true;
+            if (forceWriteComment || forceRegenerate || id === repostPreviewState.focusedMaterialId) {
+                reqBody.forceWriteComment = true;
+            }
+            const res = await contentAssistantRequest(
+                `/sources/${encodeURIComponent(repostPreviewState.sourceKey)}/repost-preview`,
+                reqBody,
+                95000
+            );
+            if (token !== repostPreviewState.requestToken) return;
+            const target = repostPreviewState.items.find((it) => String(it.material?.id || "") === id);
+            if (target && res?.preview) {
+                target.decision = res.preview;
+                if (res.material) target.material = res.material;
+            }
+        } catch (err) {
+            if (token !== repostPreviewState.requestToken) return;
+            const target = repostPreviewState.items.find((it) => String(it.material?.id || "") === id);
+            if (target) {
+                target.decision = {
+                    ...(target.decision || {}),
+                    evaluated: false,
+                    fallbackUsed: true,
+                    decisionCode: "EVAL_FALLBACK",
+                    reason: formatLocalizedFetchError(err, "判定未完成，请稍后重试")
+                };
+            }
+        } finally {
+            if (token === repostPreviewState.requestToken) {
+                repostPreviewState.evaluatingIds.delete(id);
+                renderRepostPreviewTimeline(id);
+            }
+        }
+    }
+
+    async function evaluateAuthorAccountOnceInModal(token, forceRegenerate = false) {
+        if (!repostPreviewState.sourceKey || token !== repostPreviewState.requestToken) return;
+        const dualCd = resolveDualCdView(repostPreviewState.source || {});
+        if (dualCd.globalActive && !forceRegenerate) {
+            renderRepostPreviewTimeline();
+            return;
+        }
+        if (repostPreviewState.evaluatingAccountOnce && !forceRegenerate) return;
+        repostPreviewState.evaluatingAccountOnce = true;
+        if (forceRegenerate) repostPreviewState.editedComments.clear();
+        renderRepostPreviewSubbar();
+        try {
+            const reqBody = { ...(repostPreviewState.overrides || {}) };
+            const modalChk = $("repostPolishEnabledCheck");
+            const modalPromptEl = $("repostPolishPromptInput");
+            if (modalChk && typeof modalChk.checked === "boolean") {
+                reqBody.postPolishEnabled = Boolean(modalChk.checked);
+            }
+            if (modalPromptEl && typeof modalPromptEl.value === "string" && modalPromptEl.value.trim()) {
+                reqBody.postPolishPrompt = modalPromptEl.value.trim();
+            }
+            const repostGenSel = $("repostGenTargetSelect");
+            const repostEffSel = $("repostGenEffortSelect");
+            const genTarget = parseGenerationTargetSpec(
+                repostGenSel?.value || state.assistantGenerationTargetSpec,
+                repostEffSel ? repostEffSel.value : state.assistantGenerationEffort
+            );
+            reqBody.generationProvider = genTarget.generationProvider;
+            reqBody.generationModel = genTarget.generationModel;
+            if (forceRegenerate) reqBody.forceRegenerate = true;
+            const data = await contentAssistantRequest(
+                `/sources/${encodeURIComponent(repostPreviewState.sourceKey)}/evaluate-once`,
+                reqBody,
+                110000
+            );
+            if (token !== repostPreviewState.requestToken) return;
+            if (data?.owner) repostPreviewState.owner = data.owner;
+            if (data?.source) repostPreviewState.source = data.source;
+            if (data?.cooldown) repostPreviewState.cooldown = data.cooldown;
+            if (Array.isArray(data?.items)) repostPreviewState.items = data.items;
+        } catch (err) {
+            if (token === repostPreviewState.requestToken && typeof showToast === "function") {
+                showToast(formatLocalizedFetchError(err, "本账号合并判定未完成，请稍后重试"));
+            }
+        } finally {
+            if (token === repostPreviewState.requestToken) {
+                repostPreviewState.evaluatingAccountOnce = false;
+                renderRepostPreviewTimeline();
+            }
+        }
+    }
+
+    async function loadAuthorTimelinePreview(sourceKey, options = {}) {
+        const key = String(sourceKey || "").trim();
+        if (!key) return;
+        const token = ++repostPreviewState.requestToken;
+        repostPreviewState.sourceKey = key;
+        repostPreviewState.evaluatingAccountOnce = false;
+        repostPreviewState.cooldown = null;
+        repostPreviewState.evaluatingIds.clear();
+        repostPreviewState.publishingIds.clear();
+        repostPreviewState.expandedIds.clear();
+        repostPreviewState.editedComments.clear();
+        repostPreviewState.items = [];
+        repostPreviewState.filterMode = "ALL";
+        if (repostPreviewState.focusedMaterialId) {
+            repostPreviewState.expandedIds.add(repostPreviewState.focusedMaterialId);
+        }
+
+        const listEl = $("repostPreviewTimelineList");
+        if (listEl) {
+            listEl.innerHTML = `<div class="assistant-empty compact" style="margin:18px;">加载中…</div>`;
+        }
+        renderRepostPreviewSubbar();
+
+        try {
+            const data = await contentAssistantRequest(
+                `/sources/${encodeURIComponent(key)}/timeline`,
+                { ...(repostPreviewState.overrides || {}) },
+                35000
+            );
+            if (token !== repostPreviewState.requestToken) return;
+            repostPreviewState.owner = data?.owner || null;
+            repostPreviewState.source = data?.source || repostPreviewState.source;
+            repostPreviewState.cooldown = data?.cooldown || data?.source?.cooldown || null;
+            repostPreviewState.items = Array.isArray(data?.items) ? data.items : [];
+            renderRepostPreviewTimeline();
+
+            if (repostPreviewState.focusedMaterialId && listEl?.querySelector) {
+                const escSel = typeof CSS !== "undefined" && typeof CSS.escape === "function"
+                    ? CSS.escape(repostPreviewState.focusedMaterialId)
+                    : repostPreviewState.focusedMaterialId;
+                const focusedRow = listEl.querySelector(`[data-timeline-material="${escSel}"]`);
+                if (focusedRow && typeof focusedRow.scrollIntoView === "function") {
+                    try { focusedRow.scrollIntoView({ block: "nearest" }); } catch (_) {}
+                }
+            }
+
+            // Priority 0: If Global CD (1h+N min) is active, short-circuit immediately (0 LLM calls).
+            const dualCd = resolveDualCdView(repostPreviewState.source || {});
+            if (dualCd.globalActive) {
+                return;
+            }
+
+            // Same account evaluated ONLY ONCE across its top candidate window!
+            const hasPendingTopWindow = repostPreviewState.items
+                .slice(0, 8)
+                .some((it) => !it.decision?.evaluated);
+            if (hasPendingTopWindow) {
+                void evaluateAuthorAccountOnceInModal(token, false);
+            }
+        } catch (err) {
+            if (token !== repostPreviewState.requestToken) return;
+            if (listEl) {
+                listEl.innerHTML = `<div class="assistant-empty compact" style="margin:18px;">${escapeHtml(formatLocalizedFetchError(err, "加载监听作者推文失败，请稍后重试"))}</div>`;
+            }
+        }
+    }
+
+    function openRepostPreviewModal(sourceKey, options = {}) {
+        const key = String(sourceKey || "").trim();
+        if (!key) return;
+        const modal = document.getElementById("repostPreviewModal");
+        if (!modal) return;
+        const normHandle = key.replace(/^@+/, "").toLowerCase();
+        const knownSource = (state.assistantDashboard?.sources || []).find((s) =>
+            s.id === key
+            || s.authorId === key
+            || String(s.username || "").replace(/^@+/, "").toLowerCase() === normHandle
+        ) || {};
+        repostPreviewState.overrides = options.overrides && typeof options.overrides === "object"
+            ? { ...options.overrides }
+            : {};
+        repostPreviewState.focusedMaterialId = options.materialId ? String(options.materialId) : "";
+        repostPreviewState.source = { ...knownSource, ...repostPreviewState.overrides };
+        renderRepostPreviewHeader(repostPreviewState.source);
+        modal.hidden = false;
+        syncBodyModalLock();
+        onModalOpened("repostPreviewModal", modal);
+        void loadAuthorTimelinePreview(key, options);
+    }
+
+    function closeRepostPreviewModal(fromPopstate = false) {
+        repostPreviewState.requestToken++;
+        repostPreviewState.evaluatingIds.clear();
+        repostPreviewState.publishingIds.clear();
+        const modal = document.getElementById("repostPreviewModal");
+        if (modal) modal.hidden = true;
+        syncBodyModalLock();
+        onModalClosed("repostPreviewModal", fromPopstate);
+    }
+
     function assistantStatusLabel(status) {
         const raw = String(status || "").trim();
         if (!raw) return "待定";
@@ -3452,12 +4565,21 @@
         const avatarUrl = String(author.avatarUrl || author.authorAvatarUrl || "").trim();
         const verified = Boolean(author.verified || author.authorVerified);
         const avatar = avatarHtml({ username: username || displayName, displayName, avatarUrl }, "sm");
+        const previewKey = String(author.sourceId || author.authorId || author.id || username || "").trim();
+        const previewMatAttr = options.materialId && /^[0-9]+$/.test(String(options.materialId))
+            ? ` data-repost-preview-material-id="${escapeHtml(String(options.materialId))}"`
+            : "";
+        const isWebLinkAuthor = String(author.authorId || "").startsWith("web:") || username.includes(".");
+        const avatarSlot = previewKey && username && username.toLowerCase() !== "unknown" && !isWebLinkAuthor
+            ? `<button type="button" class="assistant-avatar-preview-btn" data-source-repost-preview="${escapeHtml(previewKey)}"${previewMatAttr} aria-label="预览转发 @${escapeHtml(username)} 时说什么" title="点击预览转发时我会说什么">${avatar}</button>`
+            : avatar;
         const extraCount = Number(options.extraCount || 0);
+        const handleLabel = username ? (isWebLinkAuthor ? username : `@${username}`) : "";
         return `<span class="assistant-author-chip${options.topic ? " is-topic" : ""}" data-i18n-ignore>
-            ${avatar}
+            ${avatarSlot}
             <span class="assistant-author-name">${escapeHtml(displayName)}</span>
             ${verifiedSvgHtml(verified)}
-            ${username ? `<span class="assistant-author-handle">@${escapeHtml(username)}</span>` : ""}
+            ${handleLabel ? `<span class="assistant-author-handle">${escapeHtml(handleLabel)}</span>` : ""}
             ${extraCount > 0 ? `<span class="assistant-author-extra">+${extraCount}</span>` : ""}
         </span>`;
     }
@@ -3551,17 +4673,21 @@
         }).join("")}</ol></div>` : "";
         const materialEvidence = Array.isArray(research.materialEvidence) ? research.materialEvidence : [];
         const materialHtml = materialEvidence.length
-            ? `<div class="assistant-research-block"><strong>已采集 X 原帖</strong><ol>${materialEvidence.map((source) => {
-                const role = String(source.id || "").match(/-(author-article|quoted-article|author|quoted)$/)?.[1];
+            ? `<div class="assistant-research-block"><strong>已采集一手原文</strong><ol>${materialEvidence.map((source) => {
+                const role = String(source.id || "").match(/-(author-article|quoted-article|author|quoted|link)$/)?.[1];
                 const roleLabel = { author: "作者正文", quoted: "引用帖正文",
-                    "author-article": "作者文章全文", "quoted-article": "引用帖文章全文" }[role] || "正文角色未知";
+                    "author-article": "作者文章全文", "quoted-article": "引用帖文章全文",
+                    link: "链接原文" }[role] || "正文角色未知";
                 const url = String(source.url || "");
                 const linkedPost = /^https:\/\/x\.com\/([A-Za-z0-9_]{1,15})\/status\/\d+$/.exec(url);
-                const author = linkedPost ? `@${linkedPost[1]}` : source.publisher || "原帖作者";
+                const safeExternalUrl = !linkedPost && url ? safeHttpUrl(url) : "";
+                const author = linkedPost ? `@${linkedPost[1]}` : (source.title || source.publisher || "原帖作者");
                 const excerpts = Array.isArray(source.excerpts) ? source.excerpts : [];
                 return `<li><span>${roleLabel} · </span>${linkedPost
                     ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(author)} 原帖 ↗</a>`
-                    : escapeHtml(author)}
+                    : (safeExternalUrl
+                        ? `<a href="${safeExternalUrl}" target="_blank" rel="noopener noreferrer">${escapeHtml(author)} ↗</a>`
+                        : escapeHtml(author))}
                     ${excerpts.filter((excerpt) => excerpt?.text).map((excerpt) => `<blockquote>${escapeHtml(excerpt.text)}</blockquote>`).join("")}</li>`;
             }).join("")}</ol></div>` : "";
         const formatSourceRef = (rawRef) => typeof assistantSourceRefLabel === "function" ? assistantSourceRefLabel(rawRef) : String(rawRef || "");
@@ -3674,12 +4800,19 @@
                 const newest = source[prefix + "NewestAt"];
                 const failure = source[prefix + "Error"] || "";
                 const rawReason = failure || source[prefix + "TerminalReason"] || (!complete ? "待续采" : "");
-                const reason = { UPSTREAM_EXHAUSTED: "上游已明确耗尽", COVERAGE_LIMIT: "上游覆盖受限" }[rawReason] || rawReason;
+                const reason = { UPSTREAM_EXHAUSTED: "已拉至上游最早页", COVERAGE_LIMIT: "上游覆盖受限" }[rawReason] || rawReason;
                 return `<div><strong>${label}</strong><span>${oldest ? formatAssistantDateTime(oldest) : "起点未知"} → ${newest ? formatAssistantDateTime(newest) : "终点未知"}</span>
-                    <small>${failure ? escapeHtml(failure) : exhausted ? escapeHtml(reason || "上游已耗尽") : complete ? "本轮回填完成" : escapeHtml(reason)}</small></div>`;
+                    <small>${failure ? escapeHtml(failure) : exhausted ? escapeHtml(reason || "已拉至最早页") : complete ? "本轮回填完成" : escapeHtml(reason)}</small></div>`;
             };
+            const sourceComplete = source.timelineBackfillComplete === true && source.inboundBackfillComplete === true;
+            const retryExhausted = source.timelineRetryExhausted === true || source.inboundRetryExhausted === true;
+            const sourceStateClass = source.eligible === false ? "muted" : retryExhausted ? "warn" : sourceComplete ? "ok" : "running";
+            const sourceStateText = source.eligible === false ? "已退出范围" : retryExhausted ? "等待手动重试" : sourceComplete ? "已归档 · 增量中" : "归档中";
+            const retryBtnHtml = retryExhausted
+                ? `<button type="button" class="link-inline-btn" data-assistant-history-retry="1">手动重试</button>`
+                : "";
             return `<article class="assistant-history-source"><div class="assistant-pane-head"><span><strong>${escapeHtml(name)}</strong><small>${escapeHtml(scope)}</small></span>
-                <span class="assistant-state ${source.eligible === false ? "muted" : "running"}">${source.eligible === false ? "已退出范围" : "归档中"}</span></div>
+                <span class="assistant-head-actions"><span class="assistant-state ${sourceStateClass}">${sourceStateText}</span>${retryBtnHtml}</span></div>
                 <div class="assistant-history-dimensions">${dimension("timeline", "动态")}${dimension("inbound", "入站")}</div></article>`;
         }).join("") : `<div class="assistant-empty compact">尚无本人或前 10 历史来源。</div>`;
         return summary + rows;
@@ -3905,11 +5038,13 @@
         const fallbackName = material.authorName || fallbackSrc?.displayName || material.username || fallbackSrc?.username || "unknown";
         const authorHtml = typeof assistantAuthorChipHtml === "function"
             ? assistantAuthorChipHtml({
+                sourceId: fallbackSrc?.id || "",
+                authorId: material.authorId || fallbackSrc?.authorId || "",
                 username: material.username || fallbackSrc?.username || "unknown",
                 displayName: fallbackName,
                 avatarUrl: material.authorAvatarUrl || fallbackSrc?.avatarUrl || "",
                 verified: Boolean(material.authorVerified || fallbackSrc?.verified)
-            })
+            }, { materialId: material.id })
             : `<strong>@${escapeHtml(material.username || "unknown")}</strong>`;
         const formatMetric = (n) => typeof fmtNum === "function" ? fmtNum(n) : String(n);
         const engagementParts = [];
@@ -4010,6 +5145,8 @@
                     <button type="button" class="pill-chip sm" data-assistant-optimize-preset="仅做文字润色与节奏优化，保持原有结构，严禁新增任何数字、百分比或未核实信息" data-draft-id="${escapeHtml(draft.id)}">仅润色</button>
                 </div>
                 <div class="assistant-draft-actions">
+                    <select id="assistantOptimizeGenTargetSelect" class="x-select assistant-gen-select sm" aria-label="本次改稿生成模型" data-i18n-ignore>${renderGenerationTargetOptionsHtml(state.assistantGenerationTargetSpec)}</select>
+                    <select id="assistantOptimizeEffortSelect" class="x-select assistant-effort-select sm" aria-label="本次改稿推理强度" data-i18n-ignore${!providerSupportsEffort((state.assistantGenerationTargetSpec || "chatgpt").split("|")[0]) ? " disabled" : ""}>${renderReasoningEffortOptionsHtml(state.assistantGenerationEffort, (state.assistantGenerationTargetSpec || "chatgpt").split("|")[0])}</select>
                     <input id="assistantOptimizeInstruction" type="text" placeholder="改稿要求…" aria-label="改稿要求" />
                     <button type="button" class="x-outline-pill sm" data-assistant-optimize="${escapeHtml(draft.id)}">改写新版本</button>
                 </div>
@@ -4021,8 +5158,8 @@
                 </div>
                 <div class="assistant-export-primary">
                     <button type="button" class="x-outline-pill sm" data-assistant-tweet-intent="${escapeHtml(draft.id)}">发推 ↗</button>
-                    ${sourcePost ? `<button type="button" class="x-outline-pill sm" data-assistant-quote-intent="${escapeHtml(draft.id)}" data-quote-url="${escapeHtml(sourcePost.url)}">引用原帖 ↗</button><button type="button" class="x-outline-pill sm" data-assistant-publish-now="${escapeHtml(draft.id)}" data-quote-source="true">引用直发</button>` : ""}
-                    <button type="button" class="x-blue-pill sm" data-assistant-schedule="${escapeHtml(draft.id)}">转入定时</button>
+                    ${sourcePost ? `<button type="button" class="x-outline-pill sm" data-assistant-quote-intent="${escapeHtml(draft.id)}" data-quote-url="${escapeHtml(sourcePost.url)}">引用原帖 ↗</button><button type="button" class="x-outline-pill sm" data-assistant-publish-now="${escapeHtml(draft.id)}" data-quote-source="true">引用直发</button><button type="button" class="x-blue-pill sm" data-assistant-schedule="${escapeHtml(draft.id)}" data-quote-source="true">引用定时</button>` : ""}
+                    <button type="button" class="${sourcePost ? "x-outline-pill" : "x-blue-pill"} sm" data-assistant-schedule="${escapeHtml(draft.id)}">转入定时</button>
                 </div>
             </div>
             ${researchBlockHtml}
@@ -4148,8 +5285,35 @@
         if (!settingsForm.dataset.editRevision || settingsForm.dataset.version === undefined) {
             const activeProvider = String(settings.provider || dashboard.providerDefaults?.provider || "chatgpt").toLowerCase();
             if ($("assistantProvider")) {
-                $("assistantProvider").value = ["chatgpt", "minimax", "commandcode"].includes(activeProvider) ? activeProvider : "commandcode";
+                $("assistantProvider").value = ["chatgpt", "openai", "google", "deepseek", "minimax", "commandcode"].includes(activeProvider)
+                    ? activeProvider : "commandcode";
             }
+            const modCfg = settings.moduleConfigs || {};
+            const stageRouting = dashboard.providerDefaults?.stageRouting || {};
+            if ($("assistantCollectionModel")) {
+                $("assistantCollectionModel").value = modCfg.collection?.model || stageRouting.collection?.model || "MiniMax-M2.7";
+            }
+            if ($("assistantSearchModel")) {
+                $("assistantSearchModel").value = modCfg.search?.model || stageRouting.search?.model || "deepseek-chat";
+            }
+            const repostProv = String(modCfg.repost?.provider || stageRouting.repost?.provider || "chatgpt").toLowerCase();
+            const safeRepostProv = ["chatgpt", "openai", "google", "minimax", "deepseek"].includes(repostProv) ? repostProv : "chatgpt";
+            const repostMod = modCfg.repost?.model || stageRouting.repost?.model || composeModelWithEffort(safeRepostProv, DEFAULT_MODEL_BY_PROVIDER[safeRepostProv], DEFAULT_EFFORT_BY_PROVIDER[safeRepostProv]);
+            syncRepostSettingsModelControls(safeRepostProv, repostMod);
+            const repostSplit = splitModelAndEffort(repostMod);
+            const repostEl = $("repostGenTargetSelect");
+            if (repostEl) {
+                const candidateSpec = `${safeRepostProv}|${repostSplit.modelId || DEFAULT_MODEL_BY_PROVIDER[safeRepostProv]}`;
+                if ([...(repostEl.options || [])].some((opt) => opt.value === candidateSpec)) {
+                    repostEl.value = candidateSpec;
+                }
+            }
+            syncEffortSelectAvailability($("repostGenEffortSelect"), safeRepostProv, repostSplit.effort);
+            const genProvRaw = String(modCfg.generation?.provider || stageRouting.generation?.defaultProvider || "chatgpt").toLowerCase();
+            const safeGenProv = ["chatgpt", "openai", "google", "minimax", "deepseek"].includes(genProvRaw) ? genProvRaw : "chatgpt";
+            const genMod = modCfg.generation?.model || stageRouting.generation?.defaultModel || composeModelWithEffort(safeGenProv, DEFAULT_MODEL_BY_PROVIDER[safeGenProv], DEFAULT_EFFORT_BY_PROVIDER[safeGenProv]);
+            syncStageModelControls("generation", safeGenProv, genMod);
+            applySavedGenerationDefault(dashboard);
             $("assistantEnabled").checked = settings.enabled !== false;
             $("assistantInterval").value = settings.intervalMinutes ?? 5;
             $("assistantThreshold").value = settings.threshold ?? 80;
@@ -4163,6 +5327,9 @@
             $("assistantResearchProtocol").value = settings.researchProtocol || "RESPONSES";
             $("assistantResearchContextTokens").value = settings.researchContextTokens ?? 0;
             settingsForm.dataset.version = String(settings.version ?? 0);
+        }
+        if (typeof syncPolishPromptControls === "function") {
+            syncPolishPromptControls(settings);
         }
         const sourceHandles = (dashboard.sources || [])
             .map((source) => source.username || source.handle || "")
@@ -4188,11 +5355,14 @@
                     const tier = [1, 5, 30].includes(Number(source.intervalMinutes)) ? Number(source.intervalMinutes) : 5;
                     const autoOn = source.autoRepostEnabled === true;
                     const textMode = String(source.autoRepostTextMode || "AI").toUpperCase() === "TEMPLATE" ? "TEMPLATE" : "AI";
-                    const minScore = Number.isFinite(Number(source.autoRepostMinScore)) ? Number(source.autoRepostMinScore) : 82;
+                    const minScore = Number.isFinite(Number(source.autoRepostMinScore)) ? Number(source.autoRepostMinScore) : 70;
                     const uname = String(source.username || source.handle || source.id || "").replace(/^@+/, "");
                     const displayName = String(source.displayName || uname || source.id).trim();
                     const avatar = typeof avatarHtml === "function"
                         ? avatarHtml({ username: uname || displayName, displayName, avatarUrl: source.avatarUrl || "" }, "sm")
+                        : "";
+                    const avatarBtn = avatar
+                        ? `<button type="button" class="assistant-avatar-preview-btn" data-source-repost-preview="${esc(source.id)}" aria-label="预览转发 @${esc(uname)} 时说什么" title="点击预览转发时我会说什么">${avatar}</button>`
                         : "";
                     const verifiedHtml = typeof verifiedSvgHtml === "function" ? verifiedSvgHtml(Boolean(source.verified)) : "";
                     const metaParts = [];
@@ -4210,7 +5380,7 @@
                     return `<div class="assistant-source-card" data-source-row="${esc(source.id)}">
                         <div class="assistant-source-head">
                             <div class="assistant-source-identity" data-i18n-ignore>
-                                ${avatar}
+                                ${avatarBtn}
                                 <div class="assistant-source-identity-copy">
                                     <span class="assistant-source-title-line">
                                         <strong>${esc(displayName)}</strong>
@@ -4238,7 +5408,7 @@
                                 <option value="AI"${textMode === "AI" ? " selected" : ""}>AI 评述</option>
                                 <option value="TEMPLATE"${textMode === "TEMPLATE" ? " selected" : ""}>固定文案</option>
                             </select>
-                            <input type="number" class="autorepost-score-input" min="60" max="99" value="${minScore}" data-source-autorepost-score="${esc(source.id)}" aria-label="热度阈值" title="热度阈值（60-99）" />
+                            <input type="number" class="autorepost-score-input" min="50" max="99" value="${minScore}" data-source-autorepost-score="${esc(source.id)}" aria-label="走热潜力阈值" title="走热潜力阈值（50-99）" />
                             ${textMode === "TEMPLATE"
                                 ? `<input type="text" class="autorepost-tpl-input" maxlength="240" placeholder="固定附文（支持 {summary}）" value="${esc(source.autoRepostTemplate || "")}" data-source-autorepost-template="${esc(source.id)}" />`
                                 : `<input type="text" class="autorepost-tpl-input" maxlength="200" placeholder="侧重方向（如：重大人事、新品发布）" value="${esc(source.autoRepostRuleHint || "")}" data-source-autorepost-hint="${esc(source.id)}" />`}
@@ -4273,7 +5443,8 @@
                     PUBLISHED: ["ok", "已引用转发"],
                     EVALUATING: ["running", "判定中"],
                     SENDING: ["running", "发送中"],
-                    SKIPPED: ["muted", "未达爆款线"],
+                    SKIPPED: ["muted", "未达转发条件"],
+                    SKIPPED_AUTHOR_COOLDOWN: ["muted", "16h同作者限频"],
                     SKIPPED_DUPLICATE: ["muted", "同事件去重"],
                     SKIPPED_LIMIT: ["muted", "达日上限"],
                     SKIPPED_COOLDOWN: ["muted", "冷却跳过"],
@@ -4290,7 +5461,7 @@
                     const pubUrl = item.publishedTweetUrl && typeof safeHttpUrl === "function" ? safeHttpUrl(item.publishedTweetUrl) : "";
                     const srcUrl = item.sourceUrl && typeof safeHttpUrl === "function" ? safeHttpUrl(item.sourceUrl) : "";
                     const detailText = item.commentText || item.reason || item.error || item.summary || "";
-                    const canRetry = ["AUTH_REQUIRED", "JUDGE_FAILED", "FAILED", "SKIPPED_COOLDOWN"].includes(st);
+                    const canRetry = ["AUTH_REQUIRED", "JUDGE_FAILED", "FAILED", "SKIPPED_COOLDOWN", "SKIPPED_AUTHOR_COOLDOWN"].includes(st);
                     const itemId = item.materialId || item.id || "";
                     const retryBtnHtml = canRetry && itemId
                         ? `<button type="button" class="link-inline-btn" data-autorepost-retry="${esc(itemId)}">重试</button>`
@@ -4315,12 +5486,31 @@
         }
         const capabilities = dashboard.capabilities || {};
         const providerDefaults = dashboard.providerDefaults || {};
+        const maskedKeys = providerDefaults.maskedApiKeys || {};
+        const cfgProvs = providerDefaults.configuredProviders || {};
+        const syncKeyInputHint = (id, keyName, envLabel) => {
+            const el = $(id);
+            if (!el) return;
+            const masked = maskedKeys[keyName] || "";
+            const isReady = Boolean(cfgProvs[keyName]);
+            el.placeholder = masked ? `已配置 ${masked}` : (isReady ? `已就绪（${envLabel}）` : `填入 ${envLabel}`);
+        };
+        syncKeyInputHint("assistantMinimaxApiKey", "minimax", "MINIMAX_API_KEY");
+        syncKeyInputHint("assistantDeepseekApiKey", "deepseek", "DEEPSEEK_API_KEY");
+        syncKeyInputHint("assistantOpenaiApiKey", "openai", "OPENAI_API_KEY");
+        syncKeyInputHint("assistantGoogleApiKey", "google", "GEMINI_API_KEY");
         const providerId = String(settings.provider || providerDefaults.provider || "chatgpt").toLowerCase();
         const providerHintEl = $("assistantProviderHint");
         if (providerHintEl) {
             providerHintEl.textContent = providerId === "chatgpt"
                 ? "gpt-6.2-astra low · 200K"
-                : (providerId === "minimax" ? "MiniMax-M2.7 · 200K" : "gpt-5.4 · 128K");
+                : (providerId === "openai"
+                    ? "gpt-6.2-sol · 200K"
+                    : (providerId === "google"
+                        ? "gemini-4-neon · 1M"
+                        : (providerId === "deepseek"
+                            ? "deepseek-chat · 128K"
+                            : (providerId === "minimax" ? "MiniMax-M2.7 · 200K" : "gpt-6.2-sol · 128K"))));
         }
         const advancedDetails = $("assistantAdvancedSettings");
         const chatGptOAuthReady = providerId === "chatgpt" && dashboard.piAgent?.ready === true;
@@ -4509,6 +5699,7 @@
         if ($("contentMaterialsView")) $("contentMaterialsView").hidden = state.assistantView !== "materials";
         if ($("contentReviewView")) $("contentReviewView").hidden = state.assistantView !== "review";
         $("contentMonitorView").hidden = state.assistantView !== "monitor";
+        if ($("contentSettingsView")) $("contentSettingsView").hidden = state.assistantView !== "settings";
         if ($("assistantCreationToolbar")) {
             $("assistantCreationToolbar").hidden = !(state.assistantView === "assistant" || state.assistantView === "materials");
         }
@@ -4804,25 +5995,37 @@
         state.assistantDraftSaveTimerId = setTimeout(() => void saveAssistantDraftEditor(), 1000);
     }
 
-    async function sendAssistantDraftToSchedule(draftId) {
+    async function sendAssistantDraftToSchedule(draftId, quoteSource = false) {
         const draft = (state.assistantDashboard?.drafts || []).find((item) => item.id === draftId);
         const editor = $("assistantDraftEditor");
         if (!draft || !editor) return;
         const saved = await saveAssistantDraftEditor();
         if (!saved) return;
         const resolved = saved.id ? saved : { ...draft, ...saved };
+        const topicId = resolved.topicId || draft.topicId;
+        const topicMaterials = (state.assistantDashboard?.materials || []).filter((item) =>
+            item.topicId === topicId);
+        const sourcePost = quoteSource ? resolveAssistantDraftSourcePost(resolved, topicMaterials) : null;
+        if (quoteSource && !sourcePost) {
+            setContentAssistantError("该素材不含有效推文 ID，不支持引用原帖定时发布。");
+            return;
+        }
         ensureScheduleDraftInitialized();
         const target = state.scheduleDraftItems.find((item) => !hasScheduleDraftContent(item));
         const sourceRef = {
             assistantDraftId: resolved.id || draft.id,
             assistantDraftVersion: Number(resolved.version || draft.version),
-            topicId: resolved.topicId || draft.topicId
+            topicId,
+            quoteSource: Boolean(quoteSource && sourcePost)
         };
+        const quoteMeta = sourcePost ? { quoteTweetId: sourcePost.tweetId, quoteTweetUrl: sourcePost.url } : null;
         if (target) {
             target.text = editor.value;
             target.sourceRef = sourceRef;
+            target.quoteTweetId = quoteMeta ? quoteMeta.quoteTweetId : "";
+            target.quoteTweetUrl = quoteMeta ? quoteMeta.quoteTweetUrl : "";
         } else if (state.scheduleDraftItems.length < MAX_BATCH_SCHEDULE_ITEMS) {
-            state.scheduleDraftItems.push(createScheduleDraftItem(editor.value, null, [], false, sourceRef));
+            state.scheduleDraftItems.push(createScheduleDraftItem(editor.value, null, [], false, sourceRef, null, quoteMeta));
             state.activeScheduleDraftIdx = state.scheduleDraftItems.length - 1;
         } else {
             setContentAssistantError("排期草稿已满，请先提交或移除一条。");
@@ -4837,7 +6040,7 @@
             setScheduleComposerError(scheduleTextLengthError(targetIndex, state.scheduleDraftItems.length),
                 true, { draftIndex: targetIndex, field: "text" });
         } else {
-            showToast("已将助手稿件带入定时编辑区");
+            showToast(sourcePost ? "已带原帖引用转入定时编辑区" : "已将助手稿件带入定时编辑区");
         }
     }
 
@@ -6953,7 +8156,7 @@
         return changed;
     }
 
-    function createScheduleDraftItem(text = "", epochMs = null, files = [], timeTouched = false, sourceRef = null, jitterMin = null) {
+    function createScheduleDraftItem(text = "", epochMs = null, files = [], timeTouched = false, sourceRef = null, jitterMin = null, quoteMeta = null) {
         const existingItems = state.scheduleDraftItems || [];
         const resolvedJitter = Number.isInteger(jitterMin) && jitterMin >= 1 && jitterMin <= 10
             ? jitterMin
@@ -6976,10 +8179,13 @@
             files: Array.isArray(files) ? files : [],
             timeTouched: Boolean(timeTouched),
             recommendedJitterMin: resolvedJitter,
+            quoteTweetId: String(quoteMeta?.quoteTweetId || "").trim(),
+            quoteTweetUrl: String(quoteMeta?.quoteTweetUrl || "").trim(),
             sourceRef: sourceRef && sourceRef.assistantDraftId ? {
                 assistantDraftId: String(sourceRef.assistantDraftId),
                 assistantDraftVersion: Number(sourceRef.assistantDraftVersion || 0),
-                topicId: String(sourceRef.topicId || "")
+                topicId: String(sourceRef.topicId || ""),
+                quoteSource: Boolean(sourceRef.quoteSource)
             } : null
         };
     }
@@ -7128,7 +8334,7 @@
     const scheduleDraftMediaSaved = new Map();
 
     function hasScheduleDraftContent(item) {
-        return Boolean(item && (String(item.text || "").length || (item.files || []).length || item.timeTouched));
+        return Boolean(item && (String(item.text || "").length || (item.files || []).length || item.timeTouched || item.quoteTweetId));
     }
 
     function getScheduleDraftStorageKey(userId) {
@@ -7302,6 +8508,8 @@
             items: items.map((item) => ({
                 draftId: item.draftId, text: String(item.text || ""), scheduledAtValue: String(item.scheduledAtValue || ""),
                 timeTouched: Boolean(item.timeTouched), mediaCount: (item.files || []).length,
+                quoteTweetId: String(item.quoteTweetId || ""),
+                quoteTweetUrl: String(item.quoteTweetUrl || ""),
                 sourceRef: item.sourceRef || null
             })),
             mediaSignature
@@ -7392,8 +8600,9 @@
         }
         const items = parsed.items.slice(0, MAX_BATCH_SCHEDULE_ITEMS).map((item) => {
             const ms = item?.scheduledAtValue ? new Date(item.scheduledAtValue).getTime() : NaN;
+            const quoteMeta = item?.quoteTweetId ? { quoteTweetId: item.quoteTweetId, quoteTweetUrl: item.quoteTweetUrl || "" } : null;
             const draft = createScheduleDraftItem(String(item?.text || ""),
-                Number.isFinite(ms) ? ms : null, [], item?.timeTouched !== false, item?.sourceRef);
+                Number.isFinite(ms) ? ms : null, [], item?.timeTouched !== false, item?.sourceRef, null, quoteMeta);
             draft.draftId = String(item?.draftId || draft.draftId);
             if (typeof item?.scheduledAtValue === "string") draft.scheduledAtValue = item.scheduledAtValue;
             return draft;
@@ -7803,10 +9012,24 @@
         return mins > 0 ? `UTC${sign}${hrs}:${String(mins).padStart(2, "0")}` : `UTC${sign}${hrs}`;
     }
 
+    function scheduleDraftQuoteHtml(item, idx) {
+        const qid = String(item?.quoteTweetId || "").trim();
+        if (!qid) return "";
+        const rawUrl = String(item?.quoteTweetUrl || `https://x.com/i/status/${qid}`).trim();
+        const qUrl = typeof safeHttpUrl === "function" ? safeHttpUrl(rawUrl, `https://x.com/i/status/${qid}`) : rawUrl;
+        const handleMatch = qUrl.match(/https?:\/\/(?:(?:www|mobile)\.)?(?:x|twitter)\.com\/([A-Za-z0-9_]{1,15})\/status\//i);
+        const label = handleMatch && handleMatch[1].toLowerCase() !== "i" ? `@${handleMatch[1]}` : `#${qid}`;
+        return `<div class="schedule-quote-attachment" data-draft-quote-bar="${idx}">
+            <span>引用原帖 <a href="${escapeHtml(qUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(label)} ↗</a></span>
+            <button type="button" class="link-inline-btn" data-draft-action="clear-quote" data-draft-idx="${idx}" aria-label="移除引用原帖">×</button>
+        </div>`;
+    }
+
     function scheduleDraftCardHtml(item, idx, isSingle) {
         const placeholder = isSingle ? "输入定时推文内容…" : `第 ${idx + 1} 条推文内容…`;
         const minAttrVal = formatEpochToDatetimeLocalValue(Date.now() + 60_000);
         const tzBadge = getLocalTimezoneBadge();
+        const quoteHtml = scheduleDraftQuoteHtml(item, idx);
         return `<div class="schedule-draft-item" data-draft-idx="${idx}" data-draft-key="${escapeHtml(item.draftId)}">
             <div class="schedule-draft-item-head" data-draft-head="${idx}" ${isSingle ? "hidden" : ""}>
                 <div class="schedule-draft-head-left">
@@ -7819,6 +9042,7 @@
             </div>
             <textarea class="sim-textarea schedule-textarea" data-draft-textarea="${idx}" rows="${isSingle ? 4 : 3}"
                 aria-label="第 ${idx + 1} 条推文正文" placeholder="${placeholder}">${escapeHtml(item.text || "")}</textarea>
+            <div data-draft-quote-slot="${idx}" ${quoteHtml ? "" : "hidden"}>${quoteHtml}</div>
             <div class="schedule-media-grid" data-draft-media-grid="${idx}" ${(item.files || []).length ? "" : "hidden"}>${scheduleDraftMediaHtml(item, idx)}</div>
             <div class="schedule-draft-item-foot">
                 <div class="schedule-compose-left">
@@ -7857,8 +9081,17 @@
             card.dataset.draftKey = item.draftId;
             card.dataset.draftIdx = String(idx);
             for (const attr of ["data-draft-idx", "data-draft-head", "data-draft-gap-tag", "data-draft-textarea",
-                "data-draft-media-grid", "data-draft-counter", "data-draft-link-hint", "data-draft-algo-chip", "data-draft-time"]) {
+                "data-draft-quote-slot", "data-draft-media-grid", "data-draft-counter", "data-draft-link-hint", "data-draft-algo-chip", "data-draft-time"]) {
                 card.querySelectorAll("[" + attr + "]").forEach((node) => node.setAttribute(attr, String(idx)));
+            }
+            const quoteSlot = card.querySelector(`[data-draft-quote-slot="${idx}"]`);
+            if (quoteSlot) {
+                const quoteHtml = scheduleDraftQuoteHtml(item, idx);
+                if (quoteSlot._sourceMarkup !== quoteHtml) {
+                    quoteSlot._sourceMarkup = quoteHtml;
+                    quoteSlot.innerHTML = quoteHtml;
+                }
+                quoteSlot.hidden = !quoteHtml;
             }
             const sequence = card.querySelector(".schedule-seq-pill");
             if (sequence) sequence.textContent = "#" + (idx + 1);
@@ -7980,7 +9213,7 @@
         });
     }
 
-    function sendTextDraftToSchedule(text, attachedFiles = []) {
+    function sendTextDraftToSchedule(text, attachedFiles = [], quoteMeta = null) {
         switchTab("schedule");
         if (state.scheduleDraftRestoring) {
             setScheduleComposerError("图片正在恢复，请稍候再加入草稿。", true);
@@ -7993,7 +9226,7 @@
         }
         ensureScheduleDraftInitialized();
         const items = state.scheduleDraftItems;
-        const isEmpty = (item) => !String(item.text || "").trim() && !(item.files || []).length;
+        const isEmpty = (item) => !String(item.text || "").trim() && !(item.files || []).length && !String(item.quoteTweetId || "").trim();
         let idx = isEmpty(items[state.activeScheduleDraftIdx]) ? state.activeScheduleDraftIdx : items.findIndex(isEmpty);
         if (idx < 0 && items.length >= MAX_BATCH_SCHEDULE_ITEMS) {
             setScheduleComposerError("草稿已满，请先提交或移除一条后再添加；现有内容已保留。", true);
@@ -8008,13 +9241,16 @@
             const gapMs = MIN_SCHEDULE_INTERVAL_MS + jitterMin * 60_000;
             const last = parseDraftItemEpochMs(items[items.length - 1]);
             const preferred = Math.max(getRecommendedBaselineEpochMs(Date.now()), Number.isFinite(last) ? last + gapMs : 0);
-            item = createScheduleDraftItem("", getRecommendedScheduleEpochMs(preferred, { draftIndex: idx, gapMs }), [], false, null, jitterMin);
+            item = createScheduleDraftItem("", getRecommendedScheduleEpochMs(preferred, { draftIndex: idx, gapMs }), [], false, null, jitterMin, quoteMeta);
             items.push(item);
         } else {
             item = items[idx];
         }
         item.text = String(text || "");
         item.files = media.files;
+        item.quoteTweetId = String(quoteMeta?.quoteTweetId || "").trim();
+        item.quoteTweetUrl = String(quoteMeta?.quoteTweetUrl || "").trim();
+        if (!quoteMeta?.quoteTweetId) item.sourceRef = null;
         if (!item.timeTouched) {
             const jitterMin = getRecommendedScheduleJitterMin(item);
             const gapMs = MIN_SCHEDULE_INTERVAL_MS + jitterMin * 60_000;
@@ -8275,12 +9511,20 @@
                     ? `原定 ${formatScheduleEpochLabel(job.scheduledAtEpochMs)}`
                     : "";
 
+                const jobQuoteUrl = job.quoteTweetId
+                    ? escapeHtml(safeHttpUrl(job.quoteTweetUrl || `https://x.com/i/status/${job.quoteTweetId}`, `https://x.com/i/status/${job.quoteTweetId}`))
+                    : "";
+                const jobQuoteHtml = jobQuoteUrl
+                    ? `<div class="schedule-quote-attachment is-queued"><a href="${jobQuoteUrl}" target="_blank" rel="noopener noreferrer">引用原帖 ↗</a></div>`
+                    : "";
+
                 return `<article class="schedule-job-card${showRescheduleBox ? " is-rescheduling" : ""}">
                     <div class="schedule-job-head">
                         <span class="mini-tag ${st.cls}">${escapeHtml(st.label)}</span>
                         <span class="schedule-job-time" ${timeTitle ? `title="${escapeHtml(timeTitle)}"` : ""}>${escapeHtml(timePrefix)}</span>
                     </div>
                     <div class="schedule-job-text" ${job.text ? "data-i18n-ignore" : ""}>${job.text ? escapeHtml(job.text) : "<span class=\"user-handle-muted\">图片推文</span>"}</div>
+                    ${jobQuoteHtml}
                     ${mediaHtml}
                     ${alertHtml}
                     ${rescheduleBoxHtml}
@@ -8630,6 +9874,10 @@
                     payload.assistantDraftId = items[0].sourceRef.assistantDraftId;
                     payload.assistantDraftVersion = Number(items[0].sourceRef.assistantDraftVersion || 0);
                 }
+                if (items[0].quoteTweetId) {
+                    payload.quoteTweetId = items[0].quoteTweetId;
+                    if (items[0].quoteTweetUrl) payload.quoteTweetUrl = items[0].quoteTweetUrl;
+                }
                 ({ resp, body } = await requestJsonWithin("/api/scheduled-tweets", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
@@ -8641,7 +9889,9 @@
                     scheduledAtEpochMs: draftEpochs[idx],
                     clientRequestId: `${state.composerClientRequestId}_${idx}`,
                     assistantDraftId: it.sourceRef?.assistantDraftId || null,
-                    assistantDraftVersion: it.sourceRef?.assistantDraftVersion || null
+                    assistantDraftVersion: it.sourceRef?.assistantDraftVersion || null,
+                    quoteTweetId: it.quoteTweetId || null,
+                    quoteTweetUrl: it.quoteTweetUrl || null
                 }));
                 ({ resp, body } = await requestJsonWithin("/api/scheduled-tweets/batch", {
                     method: "POST",
@@ -8657,6 +9907,10 @@
                     fd.append("assistantDraftId", items[0].sourceRef.assistantDraftId);
                     fd.append("assistantDraftVersion", String(items[0].sourceRef.assistantDraftVersion || 0));
                 }
+                if (items[0].quoteTweetId) {
+                    fd.append("quoteTweetId", items[0].quoteTweetId);
+                    if (items[0].quoteTweetUrl) fd.append("quoteTweetUrl", items[0].quoteTweetUrl);
+                }
                 for (const media of items[0].files || []) {
                     fd.append("files", media.file, media.name);
                 }
@@ -8670,7 +9924,9 @@
                     scheduledAtEpochMs: draftEpochs[idx],
                     clientRequestId: `${state.composerClientRequestId}_${idx}`,
                     assistantDraftId: it.sourceRef?.assistantDraftId || null,
-                    assistantDraftVersion: it.sourceRef?.assistantDraftVersion || null
+                    assistantDraftVersion: it.sourceRef?.assistantDraftVersion || null,
+                    quoteTweetId: it.quoteTweetId || null,
+                    quoteTweetUrl: it.quoteTweetUrl || null
                 }));
                 fd.append("itemsJson", JSON.stringify(metas));
                 items.forEach((it, idx) => {
@@ -9243,6 +10499,55 @@
         $("assistantCreationAngleInput")?.addEventListener("input", (event) => {
             state.assistantCreationAngle = event.target.value || "";
         });
+        const submitAssistantLinkResearch = async (mode = "RESEARCH") => {
+            const linkInput = $("assistantLinkResearchInput");
+            const rawUrl = (linkInput?.value || "").trim();
+            if (!rawUrl) {
+                setContentAssistantError("请先粘贴需要调研的链接。");
+                linkInput?.focus?.();
+                return;
+            }
+            if (!await saveAssistantDraftEditor()) return;
+            const instruction = ($("assistantCreationAngleInput")?.value ?? state.assistantCreationAngle ?? "").trim();
+            const genTarget = parseGenerationTargetSpec(
+                $("assistantGenTargetSelect")?.value || state.assistantGenerationTargetSpec,
+                $("assistantGenEffortSelect") ? $("assistantGenEffortSelect").value : state.assistantGenerationEffort
+            );
+            const payload = {
+                url: rawUrl,
+                mode,
+                skillId: state.assistantSelectedSkill || "AUTO",
+                generationProvider: genTarget.generationProvider,
+                generationModel: genTarget.generationModel,
+                clientRequestId: newClientRequestId()
+            };
+            if (instruction) payload.instruction = instruction;
+            const researchBtn = $("assistantLinkResearchBtn");
+            const fastBtn = $("assistantLinkFastBtn");
+            if (researchBtn) researchBtn.disabled = true;
+            if (fastBtn) fastBtn.disabled = true;
+            try {
+                const res = await runAssistantMutation("research-link", "/research-link", payload, 180000);
+                if (res && res.topicId) {
+                    if (linkInput) linkInput.value = "";
+                    state.assistantSelectedTopicId = res.topicId;
+                    state.assistantOrganizeMode = false;
+                    state.assistantView = "assistant";
+                    await loadContentAssistant(true, 0, true);
+                    showToast(mode === "FAST" ? "已读取链接正文，正在生成推文…" : "已提交链接调研，正在生成推文…");
+                }
+            } finally {
+                if (researchBtn) researchBtn.disabled = false;
+                if (fastBtn) fastBtn.disabled = false;
+            }
+        };
+        $("assistantLinkResearchForm")?.addEventListener("submit", (event) => {
+            event.preventDefault();
+            void submitAssistantLinkResearch("RESEARCH");
+        });
+        $("assistantLinkFastBtn")?.addEventListener("click", () => {
+            void submitAssistantLinkResearch("FAST");
+        });
         $("assistantTopicTagChips")?.addEventListener("click", (event) => {
             const chip = event.target.closest("[data-assistant-topic-tag-chip]");
             if (!chip) return;
@@ -9281,10 +10586,16 @@
                     renderAssistantSkillBar(state.assistantDashboard);
                 }
                 const instruction = ($("assistantCreationAngleInput")?.value ?? state.assistantCreationAngle ?? "").trim();
+                const genTarget = parseGenerationTargetSpec(
+                    $("assistantGenTargetSelect")?.value || state.assistantGenerationTargetSpec,
+                    $("assistantGenEffortSelect") ? $("assistantGenEffortSelect").value : state.assistantGenerationEffort
+                );
                 const payload = {
                     materialId: researchBtn.dataset.assistantResearch,
                     mode: researchBtn.dataset.researchMode || "RESEARCH",
                     skillId: state.assistantSelectedSkill || "AUTO",
+                    generationProvider: genTarget.generationProvider,
+                    generationModel: genTarget.generationModel,
                     clientRequestId: newClientRequestId(),
                     regenerate: researchBtn.dataset.regenerate === "true"
                 };
@@ -9305,6 +10616,7 @@
                 focusAssistantDraftEditor();
                 return;
             }
+            if (event.target.closest("[data-source-repost-preview]")) return;
             const card = event.target.closest("[data-assistant-topic]");
             if (!card || !await saveAssistantDraftEditor()) return;
             if (state.assistantSelectedTopicId !== card.dataset.assistantTopic) {
@@ -9355,20 +10667,18 @@
             if (!btn) return;
             await submitAssistantSources(btn.dataset.assistantAddSuggested, $("assistantSourceTier")?.value);
         });
-        const collectSourceAutoRepostPayload = (row, sourceId) => {
-            const toggle = row?.querySelector(`[data-source-autorepost-toggle="${CSS.escape(sourceId)}"]`);
-            const modeEl = row?.querySelector(`[data-source-autorepost-mode="${CSS.escape(sourceId)}"]`);
-            const scoreEl = row?.querySelector(`[data-source-autorepost-score="${CSS.escape(sourceId)}"]`);
-            const tplEl = row?.querySelector(`[data-source-autorepost-template="${CSS.escape(sourceId)}"]`);
-            const hintEl = row?.querySelector(`[data-source-autorepost-hint="${CSS.escape(sourceId)}"]`);
-            const payload = {};
-            if (toggle) payload.autoRepostEnabled = Boolean(toggle.checked);
-            if (modeEl) payload.autoRepostTextMode = modeEl.value;
-            if (scoreEl && scoreEl.value !== "") payload.autoRepostMinScore = Number(scoreEl.value);
-            if (tplEl) payload.autoRepostTemplate = tplEl.value.trim();
-            if (hintEl) payload.autoRepostRuleHint = hintEl.value.trim();
-            return payload;
-        };
+        const collectSourceAutoRepostPayload = (row, sourceId) => collectSourceAutoRepostOverrides(row, sourceId);
+        document.addEventListener("click", (event) => {
+            const previewBtn = event.target?.closest?.("[data-source-repost-preview]");
+            if (!previewBtn) return;
+            event.preventDefault();
+            event.stopPropagation();
+            const sourceKey = previewBtn.dataset.sourceRepostPreview || "";
+            const materialId = previewBtn.dataset.repostPreviewMaterialId || "";
+            const row = previewBtn.closest("[data-source-row]");
+            const overrides = row ? collectSourceAutoRepostOverrides(row, row.dataset.sourceRow || sourceKey) : {};
+            openRepostPreviewModal(sourceKey, { materialId, overrides });
+        });
         $("assistantSourcesList")?.addEventListener("change", async (event) => {
             const tierSelect = event.target.closest("[data-assistant-source-tier]");
             if (tierSelect) {
@@ -9449,6 +10759,18 @@
             const res = await runAssistantMutation("autorepost-retry", `/auto-reposts/${encodeURIComponent(id)}/retry`, {});
             if (res) showToast("已重新提交自动引用转推");
         });
+        $("assistantHistoryStatus")?.addEventListener("click", async (event) => {
+            const retryBtn = event.target.closest("[data-assistant-history-retry]");
+            if (!retryBtn) return;
+            const res = await runAssistantMutation("history-retry", "/history/retry", {});
+            if (res && state.assistantDashboard) {
+                state.assistantDashboard.history = res;
+                if ($("assistantHistoryStatus")) {
+                    $("assistantHistoryStatus").innerHTML = renderAssistantHistory(res);
+                }
+                showToast("已触发历史归档手动重试");
+            }
+        });
         const markAssistantEdit = (event) => {
             const field = event.currentTarget;
             field.dataset.editRevision = String(Number(field.dataset.editRevision || 0) + 1);
@@ -9462,9 +10784,15 @@
             const provider = String(selectedProvider || dashboard.settings?.provider || dashboard.providerDefaults?.provider || "chatgpt").toLowerCase();
             const preset = provider === "chatgpt"
                 ? { model: "gpt-6.2-astra low", protocol: "RESPONSES", contextTokens: 200000, label: "ChatGPT OAuth" }
-                : (provider === "minimax"
-                    ? { model: "MiniMax-M2.7", protocol: "MESSAGES", contextTokens: 200000, label: "MiniMax" }
-                    : { model: "gpt-5.4", protocol: "RESPONSES", contextTokens: 128000, label: "CommandCode" });
+                : (provider === "openai"
+                    ? { model: "gpt-6.2-sol", protocol: "RESPONSES", contextTokens: 200000, label: "OpenAI API" }
+                    : (provider === "google"
+                        ? { model: "gemini-4-neon", protocol: "RESPONSES", contextTokens: 1000000, label: "Google Gemini API" }
+                        : (provider === "deepseek"
+                            ? { model: "deepseek-chat", protocol: "CHAT_COMPLETIONS", contextTokens: 128000, label: "DeepSeek" }
+                            : (provider === "minimax"
+                                ? { model: "MiniMax-M2.7", protocol: "MESSAGES", contextTokens: 200000, label: "MiniMax" }
+                                : { model: "gpt-6.2-sol", protocol: "RESPONSES", contextTokens: 128000, label: "CommandCode" }))));
             if ($("assistantModel")) $("assistantModel").value = preset.model;
             if ($("assistantProtocol")) $("assistantProtocol").value = preset.protocol;
             if ($("assistantContextTokens")) $("assistantContextTokens").value = String(preset.contextTokens);
@@ -9472,39 +10800,11 @@
             if (form) form.dataset.editRevision = String(Number(form.dataset.editRevision || 0) + 1);
             showToast(`已填入 ${preset.label} 推荐预设`);
         });
-        $("assistantProvider")?.addEventListener("change", async (event) => {
-            const select = event.currentTarget;
-            const nextProvider = select.value;
-            const form = $("assistantSettingsForm");
-            const dashboard = state.assistantDashboard;
-            if (!form || !dashboard || form.dataset.version === undefined) return;
-            const saved = await runAssistantMutation("settings-provider", "/settings", {
-                version: Number(form.dataset.version),
-                provider: nextProvider
-            });
-            if (!saved) {
-                select.value = String(dashboard.settings?.provider || "chatgpt").toLowerCase();
-                return;
-            }
-            dashboard.settings = saved;
-            if (dashboard.providerDefaults) dashboard.providerDefaults.provider = saved.provider;
-            form.dataset.version = String(saved.version);
-            delete form.dataset.editRevision;
-            renderAssistantMonitor(dashboard);
-            const providerLabel = saved.provider === "chatgpt"
-                ? "ChatGPT OAuth"
-                : (saved.provider === "minimax" ? "MiniMax" : "CommandCode");
-            showToast(`已切换至 ${providerLabel}`);
-            if (saved.credentialConfigured && saved.modelEnabled !== false && Boolean(saved.model) && Number(saved.contextTokens) > 0) {
-                await runAssistantMutation("verify", "/capabilities/verify", { clientRequestId: newClientRequestId() }, 180000);
-            }
-        });
-        $("assistantSettingsForm")?.addEventListener("input", (event) => {
-            if (event.target?.id === "assistantProvider") return;
-            markAssistantEdit(event);
-        });
+        $("assistantSettingsForm")?.addEventListener("input", markAssistantEdit);
+        $("assistantSettingsForm")?.addEventListener("change", markAssistantEdit);
         $("assistantStyleRevisionInput")?.addEventListener("input", markAssistantEdit);
         $("assistantPreferencesInput")?.addEventListener("input", markAssistantEdit);
+        $("assistantPostPolishPrompt")?.addEventListener("input", markAssistantEdit);
         $("assistantSettingsForm")?.addEventListener("submit", async (event) => {
             event.preventDefault();
             const form = event.currentTarget;
@@ -9529,7 +10829,28 @@
                 researchProtocol: $("assistantResearchProtocol").value,
                 researchContextTokens: Number($("assistantResearchContextTokens").value)
             };
+            const collModel = ($("assistantCollectionModel")?.value || "").trim() || "MiniMax-M2.7";
+            const srchModel = ($("assistantSearchModel")?.value || "").trim() || "deepseek-chat";
+            const genCfg = readStageModelControls("generation");
+            const repostCfg = readRepostSettingsComposedModel();
+            payload.moduleConfigs = {
+                collection: { provider: "minimax", model: collModel },
+                search: { provider: "deepseek", model: srchModel },
+                generation: { provider: genCfg.provider, model: genCfg.model },
+                repost: { provider: repostCfg.provider, model: repostCfg.model }
+            };
+            const apiKeys = {};
+            const mmKey = ($("assistantMinimaxApiKey")?.value || "").trim();
+            const dsKey = ($("assistantDeepseekApiKey")?.value || "").trim();
+            const oaKey = ($("assistantOpenaiApiKey")?.value || "").trim();
+            const ggKey = ($("assistantGoogleApiKey")?.value || "").trim();
+            if (mmKey) apiKeys.minimax = mmKey;
+            if (dsKey) apiKeys.deepseek = dsKey;
+            if (oaKey) apiKeys.openai = oaKey;
+            if (ggKey) apiKeys.google = ggKey;
+            if (Object.keys(apiKeys).length) payload.apiKeys = apiKeys;
             const modelConfigChanged =
+                payload.provider !== String(prevSettings.provider || "") ||
                 payload.model !== String(prevSettings.model || "") ||
                 payload.protocol !== String(prevSettings.protocol || "RESPONSES") ||
                 payload.contextTokens !== Number(prevSettings.contextTokens ?? 0) ||
@@ -9539,6 +10860,14 @@
                 payload.modelEnabled !== (prevSettings.modelEnabled !== false);
             const saved = await runAssistantMutation("settings", "/settings", payload);
             if (!saved) return;
+            if ($("assistantMinimaxApiKey")) $("assistantMinimaxApiKey").value = "";
+            if ($("assistantDeepseekApiKey")) $("assistantDeepseekApiKey").value = "";
+            if ($("assistantOpenaiApiKey")) $("assistantOpenaiApiKey").value = "";
+            if ($("assistantGoogleApiKey")) $("assistantGoogleApiKey").value = "";
+            showToast("设置已保存");
+            state.assistantGenerationTargetPinned = false;
+            const savedGenSplit = splitModelAndEffort(genCfg.model);
+            syncGenerationTargetSelects(`${genCfg.provider}|${savedGenSplit.modelId}`, savedGenSplit.effort);
             const dashboard = state.assistantDashboard;
             if (saved.version >= (dashboard.settings?.version ?? 0)) dashboard.settings = saved;
             if (form.dataset.version === version) form.dataset.version = String(saved.version);
@@ -9612,6 +10941,28 @@
                 delete input.dataset.editRevision;
             }
             if (dashboard) renderAssistantMonitor(dashboard);
+        });
+        $("saveAssistantPolishPromptBtn")?.addEventListener("click", async () => {
+            const chk = $("assistantPostPolishEnabled");
+            const input = $("assistantPostPolishPrompt");
+            try {
+                const saved = await persistOwnerPolishPrompt(
+                    chk ? chk.checked : true,
+                    input ? input.value : "",
+                    false
+                );
+                if (saved) showToast("二次改写提示词已保存");
+            } catch (err) {
+                setContentAssistantError(formatLocalizedFetchError(err, "保存二次改写提示词失败"));
+            }
+        });
+        $("resetAssistantPolishPromptBtn")?.addEventListener("click", async () => {
+            try {
+                const saved = await persistOwnerPolishPrompt(true, "", true);
+                if (saved) showToast("已恢复默认二次改写提示词");
+            } catch (err) {
+                setContentAssistantError(formatLocalizedFetchError(err, "恢复默认提示词失败"));
+            }
         });
         $("assistantTopicDetail")?.addEventListener("input", (event) => {
             if (event.target.id === "assistantDraftEditor") {
@@ -9746,12 +11097,18 @@
             if (optimize) {
                 const draftId = optimize.dataset.assistantOptimize;
                 const instruction = $("assistantOptimizeInstruction").value.trim();
+                const genTarget = parseGenerationTargetSpec(
+                    $("assistantOptimizeGenTargetSelect")?.value || state.assistantGenerationTargetSpec,
+                    $("assistantOptimizeEffortSelect") ? $("assistantOptimizeEffortSelect").value : state.assistantGenerationEffort
+                );
                 if (!await saveAssistantDraftEditor()) return;
                 const draft = (state.assistantDashboard?.drafts || []).find((item) => item.id === draftId);
                 if (!draft) return;
                 await runAssistantMutation("optimize", `/drafts/${encodeURIComponent(draft.id)}/optimize`, {
                     version: draft.version,
                     instruction,
+                    generationProvider: genTarget.generationProvider,
+                    generationModel: genTarget.generationModel,
                     clientRequestId: newClientRequestId()
                 }, 180000);
                 return;
@@ -9761,6 +11118,10 @@
                 const draftId = skillRewrite.dataset.draftId;
                 const skillId = (skillRewrite.dataset.assistantSkillRewrite || "").trim();
                 const instruction = ($("assistantOptimizeInstruction")?.value || "").trim();
+                const genTarget = parseGenerationTargetSpec(
+                    $("assistantOptimizeGenTargetSelect")?.value || state.assistantGenerationTargetSpec,
+                    $("assistantOptimizeEffortSelect") ? $("assistantOptimizeEffortSelect").value : state.assistantGenerationEffort
+                );
                 if (!await saveAssistantDraftEditor()) return;
                 const draft = (state.assistantDashboard?.drafts || []).find((item) => item.id === draftId);
                 if (!draft || !skillId) return;
@@ -9770,6 +11131,8 @@
                     version: draft.version,
                     skillId,
                     instruction,
+                    generationProvider: genTarget.generationProvider,
+                    generationModel: genTarget.generationModel,
                     clientRequestId: newClientRequestId()
                 }, 180000);
                 return;
@@ -9778,6 +11141,10 @@
             if (optimizePreset) {
                 const draftId = optimizePreset.dataset.draftId;
                 const instruction = (optimizePreset.dataset.assistantOptimizePreset || "").trim();
+                const genTarget = parseGenerationTargetSpec(
+                    $("assistantOptimizeGenTargetSelect")?.value || state.assistantGenerationTargetSpec,
+                    $("assistantOptimizeEffortSelect") ? $("assistantOptimizeEffortSelect").value : state.assistantGenerationEffort
+                );
                 const input = $("assistantOptimizeInstruction");
                 if (input) input.value = instruction;
                 if (!await saveAssistantDraftEditor()) return;
@@ -9786,6 +11153,8 @@
                 await runAssistantMutation("optimize", `/drafts/${encodeURIComponent(draft.id)}/optimize`, {
                     version: draft.version,
                     instruction,
+                    generationProvider: genTarget.generationProvider,
+                    generationModel: genTarget.generationModel,
                     clientRequestId: newClientRequestId()
                 }, 180000);
                 return;
@@ -9883,7 +11252,10 @@
             }
             const schedule = event.target.closest("[data-assistant-schedule]");
             if (schedule) {
-                await sendAssistantDraftToSchedule(schedule.dataset.assistantSchedule);
+                await sendAssistantDraftToSchedule(
+                    schedule.dataset.assistantSchedule,
+                    schedule.dataset.quoteSource === "true"
+                );
                 return;
             }
             const updateScheduled = event.target.closest("[data-assistant-update-scheduled]");
@@ -9960,6 +11332,264 @@
         document.getElementById("unlockGuideCloseBtn")?.addEventListener("click", closeUnlockGuideModal);
         document.getElementById("unlockGuideLaterBtn")?.addEventListener("click", closeUnlockGuideModal);
 
+        const repostPreviewModalEl = document.getElementById("repostPreviewModal");
+        if (repostPreviewModalEl) {
+            repostPreviewModalEl.addEventListener("click", (e) => {
+                if (e.target === repostPreviewModalEl) {
+                    closeRepostPreviewModal();
+                }
+            });
+        }
+        document.getElementById("repostPreviewCloseBtn")?.addEventListener("click", () => closeRepostPreviewModal());
+        for (const [stage, ids] of Object.entries(STAGE_MODEL_CONTROL_IDS)) {
+            document.getElementById(ids.provider)?.addEventListener("change", (e) => {
+                const prov = String(e.target.value || "chatgpt").toLowerCase();
+                syncStageModelControls(stage, prov, composeModelWithEffort(prov, DEFAULT_MODEL_BY_PROVIDER[prov], DEFAULT_EFFORT_BY_PROVIDER[prov]));
+            });
+            document.getElementById(ids.model)?.addEventListener("change", (e) => {
+                const customInput = $(ids.custom);
+                const isCustom = e.target.value === "__custom__";
+                if (customInput) {
+                    customInput.hidden = !isCustom;
+                    if (isCustom && (PROVIDER_MODEL_CATALOG[$(ids.provider)?.value || "chatgpt"] || []).includes(splitModelAndEffort(customInput.value).modelId)) {
+                        customInput.value = "";
+                        customInput.focus();
+                    } else {
+                        readStageModelControls(stage);
+                    }
+                }
+            });
+            document.getElementById(ids.effort)?.addEventListener("change", () => {
+                readStageModelControls(stage);
+            });
+        }
+        document.getElementById("assistantGenTargetSelect")?.addEventListener("change", (e) => {
+            state.assistantGenerationTargetPinned = true;
+            syncGenerationTargetSelects(e.target.value);
+        });
+        document.getElementById("assistantGenEffortSelect")?.addEventListener("change", (e) => {
+            state.assistantGenerationTargetPinned = true;
+            syncGenerationTargetSelects(state.assistantGenerationTargetSpec, e.target.value);
+        });
+        document.getElementById("repostGenTargetSelect")?.addEventListener("change", (e) => {
+            const prov = String(e.target.value || "chatgpt").split("|")[0];
+            syncEffortSelectAvailability($("repostGenEffortSelect"), prov, DEFAULT_EFFORT_BY_PROVIDER[prov] ?? "");
+        });
+        document.getElementById("repostSaveDefaultModelBtn")?.addEventListener("click", async () => {
+            const sel = $("repostGenTargetSelect");
+            const effSel = $("repostGenEffortSelect");
+            const parsed = parseGenerationTargetSpec(sel ? sel.value : "", effSel ? effSel.value : "");
+            const curSettings = state.assistantDashboard?.settings || {};
+            const curMods = curSettings.moduleConfigs || {};
+            const nextMods = {
+                collection: curMods.collection || { provider: "minimax", model: "MiniMax-M2.7" },
+                search: curMods.search || { provider: "deepseek", model: "deepseek-chat" },
+                repost: { provider: parsed.generationProvider, model: parsed.generationModel }
+            };
+            if (curMods.generation) nextMods.generation = curMods.generation;
+            const btn = $("repostSaveDefaultModelBtn");
+            if (btn) btn.disabled = true;
+            try {
+                const saved = await runAssistantMutation("settings", "/settings", { moduleConfigs: nextMods });
+                if (saved) {
+                    if (state.assistantDashboard) state.assistantDashboard.settings = saved;
+                    const form = $("assistantSettingsForm");
+                    if (form && saved.version !== undefined) form.dataset.version = String(saved.version);
+                    syncRepostSettingsModelControls(parsed.generationProvider, parsed.generationModel);
+                    if (btn) {
+                        const prevTxt = btn.textContent;
+                        btn.textContent = "已设为默认";
+                        setTimeout(() => { btn.textContent = prevTxt; }, 1600);
+                    }
+                }
+            } finally {
+                if (btn) btn.disabled = false;
+            }
+        });
+        document.getElementById("assistantTopicDetail")?.addEventListener("change", (e) => {
+            if (e.target?.id === "assistantOptimizeGenTargetSelect") {
+                state.assistantGenerationTargetPinned = true;
+                syncGenerationTargetSelects(e.target.value);
+            } else if (e.target?.id === "assistantOptimizeEffortSelect") {
+                state.assistantGenerationTargetPinned = true;
+                syncGenerationTargetSelects(state.assistantGenerationTargetSpec, e.target.value);
+            }
+        });
+        document.getElementById("repostPolishPromptToggleBtn")?.addEventListener("click", () => {
+            repostPreviewState.polishDrawerOpen = !repostPreviewState.polishDrawerOpen;
+            syncPolishPromptControls(repostPreviewState.source || state.assistantDashboard?.settings || {});
+        });
+        document.getElementById("repostSavePolishPromptBtn")?.addEventListener("click", async () => {
+            const chk = $("repostPolishEnabledCheck");
+            const input = $("repostPolishPromptInput");
+            try {
+                const saved = await persistOwnerPolishPrompt(
+                    chk ? chk.checked : true,
+                    input ? input.value : "",
+                    false
+                );
+                if (saved) showToast("二次改写提示词已保存，点「换一句」即可按新要求重写");
+            } catch (err) {
+                showToast(formatLocalizedFetchError(err, "保存二次改写提示词失败"));
+            }
+        });
+        document.getElementById("repostResetPolishPromptBtn")?.addEventListener("click", async () => {
+            try {
+                const saved = await persistOwnerPolishPrompt(true, "", true);
+                if (saved) showToast("已恢复默认二次改写提示词");
+            } catch (err) {
+                showToast(formatLocalizedFetchError(err, "恢复默认提示词失败"));
+            }
+        });
+        document.getElementById("repostPreviewFilterBar")?.addEventListener("click", (event) => {
+            const btn = event.target?.closest?.("[data-repost-filter]");
+            if (!btn) return;
+            const nextMode = btn.dataset.repostFilter || "ALL";
+            if (repostPreviewState.filterMode === nextMode) return;
+            repostPreviewState.filterMode = nextMode;
+            renderRepostPreviewTimeline();
+        });
+        document.getElementById("repostPreviewEvalRestBtn")?.addEventListener("click", () => {
+            void evaluateAuthorAccountOnceInModal(repostPreviewState.requestToken, true);
+        });
+        document.getElementById("repostPreviewTimelineList")?.addEventListener("input", (event) => {
+            const input = event.target?.closest?.("[data-repost-comment-input]");
+            if (!input) return;
+            const id = input.dataset.repostCommentInput || "";
+            if (!id) return;
+            repostPreviewState.editedComments.set(id, input.value);
+            const row = input.closest("[data-timeline-material]");
+            const link = row?.querySelector?.("[data-repost-intent-link]");
+            if (link) {
+                link.href = buildRepostIntentHref(buildRepostItemComposedText(id));
+            }
+        });
+        document.getElementById("repostPreviewTimelineList")?.addEventListener("click", (event) => {
+            const expandBtn = event.target?.closest?.("[data-repost-expand-item]");
+            if (expandBtn) {
+                const id = expandBtn.dataset.repostExpandItem || "";
+                if (id) {
+                    repostPreviewState.expandedIds.add(id);
+                    renderRepostPreviewTimeline(id);
+                }
+                return;
+            }
+            const writeBtn = event.target?.closest?.("[data-repost-write-item]");
+            if (writeBtn) {
+                const id = writeBtn.dataset.repostWriteItem || "";
+                if (id) {
+                    void evaluateSingleTimelineItem(id, true, repostPreviewState.requestToken, true, true);
+                }
+                return;
+            }
+            const evalBtn = event.target?.closest?.("[data-repost-eval-item]");
+            if (evalBtn) {
+                const id = evalBtn.dataset.repostEvalItem || "";
+                if (id) {
+                    void evaluateSingleTimelineItem(id, false, repostPreviewState.requestToken, true, true);
+                }
+                return;
+            }
+            const regenBtn = event.target?.closest?.("[data-repost-regen-item]");
+            if (regenBtn) {
+                const id = regenBtn.dataset.repostRegenItem || "";
+                if (id) {
+                    void evaluateSingleTimelineItem(id, true, repostPreviewState.requestToken, true, true);
+                }
+                return;
+            }
+            const copyBtn = event.target?.closest?.("[data-repost-copy-item]");
+            if (copyBtn) {
+                const id = copyBtn.dataset.repostCopyItem || "";
+                const text = getRepostItemCommentText(id).trim();
+                if (!text) {
+                    showToast("暂无可复制的转发附文");
+                    return;
+                }
+                copyTextWithFallback(text)
+                    .then(() => showToast("已复制转发附文"))
+                    .catch(() => showToast("复制未成功，请手动选中复制"));
+                return;
+            }
+            const schedBtn = event.target?.closest?.("[data-repost-schedule-item]");
+            if (schedBtn) {
+                const id = schedBtn.dataset.repostScheduleItem || "";
+                const found = (repostPreviewState.items || []).find((it) => String(it.material?.id || "") === id);
+                const comment = getRepostItemCommentText(id).trim();
+                if (!comment) {
+                    showToast("暂无可转入的转发内容");
+                    return;
+                }
+                const quoteTweetId = resolveRepostQuoteTweetId(found?.material || { id });
+                const quoteTweetUrl = found ? resolveRepostMaterialUrl(found.material) : "";
+                if (!quoteTweetId) {
+                    showToast("该素材缺少有效原帖推文 ID，无法引用转发");
+                    return;
+                }
+                if (sendTextDraftToSchedule(comment, [], { quoteTweetId, quoteTweetUrl }) !== false) {
+                    closeRepostPreviewModal();
+                    showToast("已带原帖引用转入定时发布");
+                }
+                return;
+            }
+            const pubBtn = event.target?.closest?.("[data-repost-publish-item]");
+            if (pubBtn) {
+                const id = pubBtn.dataset.repostPublishItem || "";
+                if (!id || repostPreviewState.publishingIds.has(id)) return;
+                const found = (repostPreviewState.items || []).find((it) => String(it.material?.id || "") === id);
+                const comment = getRepostItemCommentText(id).trim();
+                if (!comment) {
+                    showToast("转发附文不能为空");
+                    return;
+                }
+                const sourceUrl = found ? resolveRepostMaterialUrl(found.material) : "";
+                const quoteTweetId = resolveRepostQuoteTweetId(found?.material || { id });
+                if (!quoteTweetId) {
+                    showToast("该素材缺少有效原帖推文 ID，无法引用转发");
+                    return;
+                }
+                const token = repostPreviewState.requestToken;
+                repostPreviewState.publishingIds.add(id);
+                renderRepostPreviewTimeline(id);
+                void (async () => {
+                    try {
+                        const res = await contentAssistantRequest(
+                            `/sources/${encodeURIComponent(repostPreviewState.sourceKey)}/publish-quote`,
+                            {
+                                materialId: id,
+                                sourceUrl,
+                                commentText: comment,
+                                clientRequestId: newClientRequestId()
+                            },
+                            60000
+                        );
+                        if (token !== repostPreviewState.requestToken) return;
+                        if (found) {
+                            found.decision = {
+                                ...(found.decision || {}),
+                                evaluated: true,
+                                wouldAutoRepost: true,
+                                persistedStatus: "PUBLISHED",
+                                decisionCode: "PUBLISHED",
+                                publishedTweetUrl: res?.publishedTweetUrl || found.decision?.publishedTweetUrl || "",
+                                commentText: res?.text || comment
+                            };
+                        }
+                        showToast("已引用原帖发布");
+                    } catch (err) {
+                        if (token === repostPreviewState.requestToken) {
+                            showToast(formatLocalizedFetchError(err, "引用原帖发布失败，请稍后重试"));
+                        }
+                    } finally {
+                        if (token === repostPreviewState.requestToken) {
+                            repostPreviewState.publishingIds.delete(id);
+                            renderRepostPreviewTimeline(id);
+                        }
+                    }
+                })();
+            }
+        });
+
         const authorModalEl = document.getElementById("authorPromptModal");
         if (authorModalEl) {
             authorModalEl.addEventListener("click", (e) => {
@@ -10024,6 +11654,7 @@
                 closeAuthorPromptModal();
                 closeUnlockGuideModal();
                 closeConfirmResendModal();
+                if (typeof closeRepostPreviewModal === "function") closeRepostPreviewModal();
                 $("peerSearchInput").value = "";
                 $("followFilterInput").value = "";
                 $("draftSimulatorInput").value = "";
@@ -10048,6 +11679,11 @@
         // 全局无侵入键盘快捷键（Esc 关闭弹窗/错误提示/清空搜索框；1-6 切模块，M/W/D/T 秒切 30天/7天/48h/24h）
         document.addEventListener("keydown", (e) => {
             if (e.key === "Escape") {
+                const repostModal = document.getElementById("repostPreviewModal");
+                if (repostModal && !repostModal.hidden) {
+                    closeRepostPreviewModal();
+                    return;
+                }
                 const confirmModal = document.getElementById("confirmResendModal");
                 if (confirmModal && !confirmModal.hidden) {
                     closeConfirmResendModal();
@@ -10097,7 +11733,7 @@
                     return;
                 }
             }
-            if (!isLoggedIn() || e.metaKey || e.ctrlKey || e.altKey) return;
+            if (!isLoggedIn() || e.metaKey || e.ctrlKey || e.altKey || document.body.classList.contains("modal-open")) return;
             const tag = (e.target && e.target.tagName ? e.target.tagName : "").toUpperCase();
             if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || (e.target && e.target.isContentEditable)) {
                 return;
@@ -10671,6 +12307,15 @@
                     renderScheduleDraftMedia(idx);
                     clearScheduleComposeErrorForDraft(idx);
                     syncScheduleAuthBanner();
+                } else if (action === "clear-quote") {
+                    const draftItem = (state.scheduleDraftItems || [])[idx];
+                    if (!draftItem) return;
+                    draftItem.quoteTweetId = "";
+                    draftItem.quoteTweetUrl = "";
+                    if (draftItem.sourceRef) draftItem.sourceRef.quoteSource = false;
+                    rotateComposerRequestId();
+                    renderScheduleDraftItems();
+                    queueScheduleDraftPersistence();
                 } else if (action === "remove-item") {
                     removeScheduleDraftItem(idx);
                 } else if (action === "check-algo") {

@@ -530,6 +530,16 @@ public class CommunityHubService {
 
             // Every request reads real persistence under the same account lock, including cold starts.
             boolean authorCaller = isAuthorIdentity(handleKey, expectedAccountId);
+            if (authorCaller && forceRefresh) {
+                if (twitterApiIoProvider != null) {
+                    twitterApiIoProvider.resetFreeCircuitForActiveSync();
+                }
+                if (paidCapabilityGate != null) {
+                    paidCapabilityGate.resetByPrefix("silent-history:elidlicom");
+                    paidCapabilityGate.resetByPrefix("history-source:");
+                    paidCapabilityGate.resetByPrefix("workspace-sync:elidlicom:");
+                }
+            }
             AccountStore.StoredAccount rawStored = resolvedMode == ProviderMode.DEMO
                     ? null : loadStore(handleKey, expectedAccountId);
             if (rawStored != null) verifyAccountOwner(rawStored.profile(), handleKey, expectedAccountId);
@@ -545,24 +555,28 @@ public class CommunityHubService {
                     && stored != null && !freshDaily && !exhaustedDailyAttempts) {
                 return serveStoredAndScheduleRefresh(
                         cacheKey, rawHandle, handleKey, resolvedPeriod, requestedProvider, clientIp, expectedAccountId,
-                        stored, completedDaily, quotaEntry, zone, today, initialRank, configuredTtl, now, algoFp,
+                        stored, active, completedDaily, quotaEntry, zone, today, initialRank, configuredTtl, now, algoFp,
                         "已返回最近一次完整入库快照；后台刷新已受理。");
             }
+            Instant checkedNow = Instant.now();
             boolean coalesced = !backgroundExecution && active != null && active != activeSnapshot
                     && active.computedAt() != null && !active.computedAt().isBefore(requestedAt);
             BackgroundRefreshStatus latestBg = backgroundRefreshStatuses.get(cacheKey);
-            long recentBgWindowSeconds = authorCaller ? 5L : 60L;
+            long recentBgWindowSeconds = 120L;
             boolean recentBgResult = !backgroundExecution && latestBg != null
                     && "SUCCEEDED".equals(latestBg.state()) && latestBg.completedAt() != null
                     && active != null && active.computedAt() != null
-                    && !active.computedAt().isBefore(latestBg.completedAt().minusSeconds(2))
-                    && Duration.between(latestBg.completedAt(), now).getSeconds() < recentBgWindowSeconds;
+                    && (latestBg.startedAt() == null || !active.computedAt().isBefore(latestBg.startedAt().minusSeconds(2)))
+                    && Duration.between(latestBg.completedAt(), checkedNow).getSeconds() < recentBgWindowSeconds;
+            boolean justComputedSnapshot = !backgroundExecution && !forceRefresh && active != null
+                    && active.computedAt() != null
+                    && Duration.between(active.computedAt(), checkedNow).getSeconds() < 15L;
             boolean recentDegradedCooldown = !authorCaller && !backgroundExecution && active != null && active.computedAt() != null
                     && active.bundle() != null && active.bundle().dailyCacheStatus() != null
                     && active.bundle().dailyCacheStatus().lastAttemptDegraded()
-                    && Duration.between(active.computedAt(), now).getSeconds() < 60;
+                    && Duration.between(active.computedAt(), checkedNow).getSeconds() < 60;
             if (resolvedMode != ProviderMode.DEMO && stored != null
-                    && (coalesced || (!forceRefresh && (recentBgResult || recentDegradedCooldown))) && !freshDaily
+                    && (coalesced || (!forceRefresh && (recentBgResult || justComputedSnapshot || recentDegradedCooldown))) && !freshDaily
                     && cacheIdentityMatches(active, handleKey, expectedAccountId)
                     && Objects.equals(algoFp, active.algoFingerprint())
                     && active.bundle() != null && active.bundle().hours24() != null) {
@@ -598,10 +612,10 @@ public class CommunityHubService {
             if (preferStored && !forceRefresh && !backgroundExecution && !continueRelations
                     && resolvedMode != ProviderMode.DEMO && stored != null
                     && !freshDaily && !exhaustedDailyAttempts
-                    && !(coalesced || recentBgResult || recentDegradedCooldown)) {
+                    && !(coalesced || recentBgResult || justComputedSnapshot || recentDegradedCooldown)) {
                 return serveStoredAndScheduleRefresh(
                         cacheKey, rawHandle, handleKey, resolvedPeriod, requestedProvider, clientIp, expectedAccountId,
-                        stored, completedDaily, quotaEntry, zone, today, initialRank, configuredTtl, now, algoFp,
+                        stored, active, completedDaily, quotaEntry, zone, today, initialRank, configuredTtl, now, algoFp,
                         "已返回最近一次完整入库快照；后台刷新已受理。");
             }
             if (resolvedMode == ProviderMode.DEMO && cacheValid && !forceRefresh && initialLoadedToday) {
@@ -713,7 +727,10 @@ public class CommunityHubService {
             activeForegroundSyncs.incrementAndGet();
             try {
                 AccountStore.StoredAccount baseStore = stored;
-                boolean doHeadSync = (authorCaller && forceRefresh) || !canContinueDailyRefresh(stored, now);
+                boolean staleOwnerFreeHead = authorCaller && stored != null
+                        && twitterApiIoProvider.canReadTimelineForFree("")
+                        && (now.getEpochSecond() - stored.syncedAt() >= 45L);
+                boolean doHeadSync = (authorCaller && forceRefresh) || staleOwnerFreeHead || !canContinueDailyRefresh(stored, now);
                 outcome = bindPaidScope
                         ? com.xops.hub.provider.PaidCapabilityGate.withCaller(scopedCaller, expectedAccountId,
                                 () -> twitterApiIoProvider.syncStoreByHours(
@@ -824,13 +841,23 @@ public class CommunityHubService {
     private MultiPeriodDashboardBundle serveStoredAndScheduleRefresh(
             String cacheKey, String rawHandle, String handleKey, ReportPeriod resolvedPeriod,
             String requestedProvider, String clientIp, String expectedAccountId,
-            AccountStore.StoredAccount stored, boolean completedDaily,
+            AccountStore.StoredAccount stored, CachedSnapshot active, boolean completedDaily,
             UserUsageEntry quotaEntry, ZoneId zone, String today, Integer initialRank,
             long configuredTtl, Instant now, String algoFp, String notice
     ) {
+        Instant expires = dailyRefreshExpiresAt(stored, now);
+        if (active != null && active.bundle() != null && active.snapshot() != null
+                && cacheIdentityMatches(active, handleKey, expectedAccountId)
+                && Objects.equals(stored.syncedAtInstant(), active.snapshot().fetchedAt())
+                && Objects.equals(algoFp, active.algoFingerprint())) {
+            AccessPolicy cachedPolicy = buildAccessPolicy(handleKey, active.snapshot(), quotaEntry, zone, today, initialRank);
+            scheduleWorkspaceRefresh(cacheKey, rawHandle, resolvedPeriod, requestedProvider,
+                    clientIp, expectedAccountId);
+            return refreshWorkspaceTimestamps(active.bundle(), true, configuredTtl, expires, cachedPolicy)
+                    .withDailyCacheStatus(dailyCacheStatus(stored));
+        }
         RawAccountSnapshot persisted = TwitterApiIoProvider.snapshotOf(stored, notice, !completedDaily);
         AccessPolicy policy = buildAccessPolicy(handleKey, persisted, quotaEntry, zone, today, initialRank);
-        Instant expires = dailyRefreshExpiresAt(stored, now);
         MultiPeriodDashboardBundle immediate = buildWorkspaceBundle(
                 persisted, policy, true, configuredTtl, expires, !completedDaily,
                 TwitterApiIoProvider.pendingRelationshipChecks(stored))
@@ -918,6 +945,62 @@ public class CommunityHubService {
         String key = resolveProviderMode(provider).name() + ":" + accountOwnerKey(handleKey, accountId);
         return backgroundRefreshStatuses.getOrDefault(key,
                 new BackgroundRefreshStatus("IDLE", null, null, ""));
+    }
+
+    @org.springframework.context.event.EventListener(org.springframework.boot.context.event.ApplicationReadyEvent.class)
+    public void warmOwnerSnapshotCacheOnReady() {
+        if (resolvePreferredModeQuietly() != ProviderMode.TWITTERAPI_IO) return;
+        silentHistoryExecutor.submit(() -> {
+            try {
+                AccountStore.StoredAccount raw = findAuthorStoredAccount();
+                if (raw == null || raw.profile() == null || raw.syncedAtInstant() == null) return;
+                Instant now = Instant.now();
+                AccountStore.StoredAccount stored = AccountStore.pruneToRollingWindow(raw, now);
+                String handleKey = validateIsolatedHandleKey(stored.profile().username());
+                String accountId = stored.profile().id();
+                String ownerKey = accountOwnerKey(handleKey, accountId);
+                String cacheKey = ProviderMode.TWITTERAPI_IO.name() + ":" + ownerKey;
+                if (snapshotCache.containsKey(cacheKey)) return;
+                boolean completedDaily = isDailyRefreshComplete(stored);
+                RawAccountSnapshot persisted = TwitterApiIoProvider.snapshotOf(stored, "", !completedDaily);
+                ZoneId zone = resolveZoneId();
+                String today = LocalDate.now(zone).toString();
+                UserUsageEntry quotaEntry = readUsageSnapshot(ownerKey);
+                Integer rank = resolveAuthorInteractionRank(handleKey, accountId);
+                AccessPolicy policy = buildAccessPolicy(handleKey, persisted, quotaEntry, zone, today, rank);
+                long ttl = DAILY_REFRESH_SECONDS;
+                Instant expires = dailyRefreshExpiresAt(stored, now);
+                MultiPeriodDashboardBundle warm = buildWorkspaceBundle(
+                        persisted, policy, true, ttl, expires, !completedDaily,
+                        TwitterApiIoProvider.pendingRelationshipChecks(stored))
+                        .withDailyCacheStatus(dailyCacheStatus(stored));
+                putSnapshotCache(cacheKey, persisted, warm, ttl, expires, currentAlgoFingerprint());
+                log.info("Pre-warmed stored workspace bundle for @{} ({} tweets, {} inbound)",
+                        handleKey, stored.tweets().size(), stored.inbound().size());
+            } catch (Exception ex) {
+                log.debug("Skipped startup owner snapshot cache warm-up: {}", ex.getMessage());
+            }
+        });
+    }
+
+    public long latestCachedOwnerPostEpochMs(String accountId, String username) {
+        long latest = 0L;
+        String normUser = username == null ? "" : HandleNormalizer.normalize(username);
+        for (CachedSnapshot entry : snapshotCache.values()) {
+            RawAccountSnapshot snap = entry == null ? null : entry.snapshot();
+            if (snap == null || snap.profile() == null || snap.timeline() == null) continue;
+            boolean sameOwner = (accountId != null && !accountId.isBlank() && accountId.equals(snap.profile().id()))
+                    || (!normUser.isBlank() && normUser.equalsIgnoreCase(snap.profile().username()));
+            if (!sameOwner) continue;
+            for (RawTweet t : snap.timeline()) {
+                if (t == null || t.createdAt() == null || t.selfThreadReply()) continue;
+                if (t.kind() == com.xops.hub.model.RawSnapshotModels.TweetKind.POST
+                        || t.kind() == com.xops.hub.model.RawSnapshotModels.TweetKind.QUOTE) {
+                    latest = Math.max(latest, t.createdAt().toEpochMilli());
+                }
+            }
+        }
+        return latest;
     }
 
     @PreDestroy
@@ -1026,7 +1109,7 @@ public class CommunityHubService {
     }
 
     private DailyCacheStatus dailyCacheStatus(AccountStore.StoredAccount stored, boolean lastAttemptDegraded) {
-        long anchor = stored.dailyRefreshStartedAt() > 0 ? stored.dailyRefreshStartedAt() : stored.syncedAt();
+        long anchor = Math.max(stored.dailyRefreshStartedAt(), stored.syncedAt());
         int posts = (int) stored.tweets().stream()
                 .filter(t -> t.createdAt() >= anchor - 86_400L && t.createdAt() <= anchor).count();
         int inbound = (int) stored.inbound().stream()
@@ -2638,6 +2721,8 @@ public class CommunityHubService {
         Instant now = Instant.ofEpochMilli(nowMs);
         LongHistoryCandidate chosen = null;
         long oldestAttempt = Long.MAX_VALUE;
+        final String ownerSilentTimelineKey = "silent-history:elidlicom";
+        final String ownerSilentInboundKey = "silent-history:elidlicom:inbound";
         for (LongHistoryCandidate candidate : candidates) {
             XUserSummary u = candidate.user();
             if (u == null || u.id() == null || u.id().isBlank() || u.username() == null || u.username().isBlank()) {
@@ -2647,6 +2732,13 @@ public class CommunityHubService {
             try {
                 handleKey = validateIsolatedHandleKey(HandleNormalizer.normalize(u.username()));
             } catch (RuntimeException ex) {
+                continue;
+            }
+            boolean isOwnerCand = candidate.owner() || isAuthorIdentity(handleKey, u.id());
+            boolean ownerTimelineExhausted = isOwnerCand && paidCapabilityGate != null
+                    && (paidCapabilityGate.isExhausted("silent-history:elidlicom")
+                        || paidCapabilityGate.isExhausted(ownerSilentTimelineKey));
+            if (ownerTimelineExhausted) {
                 continue;
             }
             String ownerKey = accountOwnerKey(handleKey, u.id());
@@ -2691,21 +2783,53 @@ public class CommunityHubService {
         boolean chosenOwner = chosen.owner() || isAuthorIdentity(handleKey, uid);
         boolean bindSilentScope = chosenOwner || !twitterApiIoProvider.isUsingLoopbackBaseUrl() || paidCapabilityGate != null;
         String silentCaller = chosenOwner ? com.xops.hub.provider.PaidCapabilityGate.PRIVILEGED_USERNAME : handleKey;
+        boolean usePureFreeSilent = twitterApiIoProvider.isFreeInboundConfigured();
+        boolean ownerInboundPaused = chosenOwner && usePureFreeSilent && paidCapabilityGate != null
+                && paidCapabilityGate.isExhausted(ownerSilentInboundKey);
+        boolean freeSearchCircuitOpen = chosenOwner && usePureFreeSilent && twitterApiIoProvider.isFreeSearchCircuitOpen();
+        boolean skipInboundThisTick = ownerInboundPaused || freeSearchCircuitOpen;
+        java.util.function.Supplier<TwitterApiIoProvider.SyncOutcome> silentCall = () -> {
+            if (!usePureFreeSilent) {
+                return twitterApiIoProvider.syncStoreSilentHistoryStep(handle, before, 3, uid);
+            }
+            return skipInboundThisTick
+                    ? twitterApiIoProvider.syncStoreSilentHistoryStep(handle, before, 3, uid, true, true)
+                    : twitterApiIoProvider.syncStoreSilentHistoryStep(handle, before, 3, uid, true);
+        };
         TwitterApiIoProvider.SyncOutcome outcome = bindSilentScope
-                ? com.xops.hub.provider.PaidCapabilityGate.withCaller(
-                        silentCaller, uid, () -> twitterApiIoProvider.syncStoreSilentHistoryStep(handle, before, 3, uid))
-                : twitterApiIoProvider.syncStoreSilentHistoryStep(handle, before, 3, uid);
+                ? com.xops.hub.provider.PaidCapabilityGate.withCaller(silentCaller, uid, silentCall)
+                : silentCall.get();
+        // If free inbound search circuit is open and not yet exhausted, register inbound idempotent retry separately without blocking timeline!
+        if (chosenOwner && usePureFreeSilent && !ownerInboundPaused && freeSearchCircuitOpen && paidCapabilityGate != null) {
+            paidCapabilityGate.scheduleIdempotentRetry(
+                    ownerSilentInboundKey,
+                    "fxtwitter_free_read",
+                    com.xops.hub.provider.PaidCapabilityGate.PRIVILEGED_USERNAME,
+                    uid,
+                    "免费入站搜索暂不可用",
+                    () -> {
+                        twitterApiIoProvider.resetFreeCircuitForActiveSync();
+                        runOneSilentTop10HistoryStepNow();
+                    }
+            );
+        } else if (chosenOwner && !skipInboundThisTick && !outcome.degraded() && paidCapabilityGate != null) {
+            paidCapabilityGate.markSucceeded(ownerSilentInboundKey);
+        }
         if (outcome.degraded() && !outcome.progressed()) {
             long cooldownUntil = System.currentTimeMillis() + com.xops.hub.provider.PaidCapabilityGate.RETRY_INTERVAL_MS;
             silentHistoryDegradedCooldownUntilMs.put(ownerKey, cooldownUntil);
             if (chosenOwner && paidCapabilityGate != null) {
                 paidCapabilityGate.scheduleIdempotentRetry(
-                        "silent-history:elidlicom:" + LocalDate.now(resolveZoneId()),
-                        "twitterapi_io_read",
+                        ownerSilentTimelineKey,
+                        usePureFreeSilent ? "fxtwitter_free_read" : "twitterapi_io_read",
                         com.xops.hub.provider.PaidCapabilityGate.PRIVILEGED_USERNAME,
                         uid,
                         "静默历史回填暂未推进",
-                        this::runOneSilentTop10HistoryStepNow
+                        () -> {
+                            silentHistoryDegradedCooldownUntilMs.remove(ownerKey);
+                            twitterApiIoProvider.resetFreeCircuitForActiveSync();
+                            runOneSilentTop10HistoryStepNow();
+                        }
                 );
             }
             if (!chosenOwner && twitterApiIoProvider.isBackgroundPaidBudgetExhausted()) {
@@ -2714,7 +2838,8 @@ public class CommunityHubService {
         } else {
             silentHistoryDegradedCooldownUntilMs.remove(ownerKey);
             if (chosenOwner && paidCapabilityGate != null) {
-                paidCapabilityGate.markSucceeded("silent-history:elidlicom:" + LocalDate.now(resolveZoneId()));
+                paidCapabilityGate.markSucceeded(ownerSilentTimelineKey);
+                paidCapabilityGate.markSucceeded("silent-history:elidlicom");
             }
         }
         if (outcome.store() == null || outcome.store().profile() == null || (!outcome.progressed() && before != null)) {
@@ -2732,6 +2857,9 @@ public class CommunityHubService {
             AccountStore.StoredAccount merged = AccountStore.mergeStoredSlice(latest, outcome.store());
             verifyAccountOwner(merged.profile(), handleKey, uid);
             saveStore(handleKey, uid, merged);
+            if (AUTHOR_USERNAME.equalsIgnoreCase(merged.profile().username())) {
+                cacheAuthorProfile(merged.profile());
+            }
             CachedSnapshot cached = snapshotCache.get(cacheKey);
             if (cached != null && cacheIdentityMatches(cached, handleKey, uid)) {
                 boolean completedDaily = isDailyRefreshComplete(merged);
@@ -2756,7 +2884,7 @@ public class CommunityHubService {
             return true;
         }
         boolean ownerFullHistory = AccountStore.retainsFullHistory(stored.profile().username());
-        if (Duration.between(stored.syncedAtInstant(), now).toMinutes() >= (ownerFullHistory ? 5 : 360)) {
+        if (Duration.between(stored.syncedAtInstant(), now).getSeconds() >= (ownerFullHistory ? 120L : 21_600L)) {
             return true;
         }
         long to = stored.syncedAt();
