@@ -519,5 +519,7 @@ const cssVer = (indexHtml.match(/\/styles\.css\?v=([^"']+)/) || [])[1];
 const jsVer = (indexHtml.match(/\/app\.js\?v=([^"']+)/) || [])[1];
 assert.ok(cssVer && cssVer === jsVer, `Expected styles.css (${cssVer}) and app.js (${jsVer}) cache versions to match`);
 assert.match(appSource, /\/research-link/);
+assert.match(appSource, /换话题切口/);
+assert.match(appSource, /补深挖增量/);
 
 console.log("assistant-creation-regression: passed");

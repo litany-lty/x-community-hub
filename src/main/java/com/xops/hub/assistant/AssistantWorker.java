@@ -363,6 +363,11 @@ public final class AssistantWorker {
                         .put("styleVersion",ver(input.path("style"))).put("preferenceVersion",ver(input.path("preferences")))
                         .put("researchId",input.path("research").path("id").asText()).put("originTaskId",task.path("id").asText()).put("editor","MODEL");
                 String appliedSkill = result.path("skillId").asText(input.path("skillId").asText(""));
+                String target=input.path("draftId").asText("");
+                var base=target.isEmpty()?null:tx.get("draft",target);
+                if (appliedSkill.isBlank() && base != null) {
+                    appliedSkill = ViralWritingSkills.normalizeId(base.path("skillId").asText(""));
+                }
                 if (!appliedSkill.isBlank()) draft.put("skillId", appliedSkill);
                 draft.set("research",input.path("research"));
                 draft.set("generation",output);
@@ -371,8 +376,6 @@ public final class AssistantWorker {
                 if (result.path("hanLength").isObject()) draft.set("hanLength",result.get("hanLength"));
                 if (result.path("numberChanges").isObject()) draft.set("numberChanges",result.get("numberChanges"));
                 if (task.path("constraintRepair").isObject()) draft.set("constraintRepair",task.get("constraintRepair"));
-                String target=input.path("draftId").asText("");
-                var base=target.isEmpty()?null:tx.get("draft",target);
                 if ("DRAFT".equals(stage)) {
                     String angle = input.path("instruction").asText("").strip();
                     if (!angle.isBlank()) draft.put("angleInstruction", angle);

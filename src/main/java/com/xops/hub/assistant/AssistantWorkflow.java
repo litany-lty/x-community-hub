@@ -365,7 +365,8 @@ public final class AssistantWorkflow {
             weights.reach().forEach(reachWeights::put);
         }
         if (kind.equals("RESEARCH") || kind.equals("DRAFT")) {
-            ObjectNode content = ((ObjectNode)input).deepCopy().without(List.of("topicVersion", "research", "winningHint"));
+            ObjectNode content = ((ObjectNode)input).deepCopy().without(List.of(
+                    "topicVersion", "research", "winningHint", "baseSkillId", "baseAngleInstruction"));
             if (content.path("skillId").asText("").isBlank()) {
                 List<JsonNode> matList = new ArrayList<>();
                 input.path("materials").forEach(matList::add);
@@ -375,8 +376,9 @@ public final class AssistantWorkflow {
             var topic = content.putObject("topic");
             for (String key : List.of("id", "title", "summary")) topic.put(key,input.path("topic").path(key).asText());
             identity.set("input",content);
-        } else if (input instanceof ObjectNode obj && obj.has("winningHint")) {
-            identity.set("input", obj.deepCopy().without("winningHint"));
+        } else if (input instanceof ObjectNode obj
+                && (obj.has("winningHint") || obj.has("baseSkillId") || obj.has("baseAngleInstruction"))) {
+            identity.set("input", obj.deepCopy().without(List.of("winningHint", "baseSkillId", "baseAngleInstruction")));
         } else identity.set("input",input);
         return digest(identity);
     }
@@ -494,6 +496,14 @@ public final class AssistantWorkflow {
                 input.put("newAttempt", field(body, "clientRequestId"));
             }
             ObjectNode directResearch = buildDirectMaterialResearch(tx, input);
+            ObjectNode priorRich = findLatestRichResearch(tx, topic, mid);
+            if (priorRich != null) {
+                mergeRichResearchInto(directResearch, priorRich);
+                String rid = directResearch.path("id").asText("");
+                if (!rid.isBlank()) {
+                    directResearch = tx.put("research", rid, directResearch);
+                }
+            }
             input.set("research", directResearch);
             return enqueue(tx, "DRAFT", input, field(body, "clientRequestId"), body);
         }
@@ -625,16 +635,24 @@ public final class AssistantWorkflow {
         String skillId = ViralWritingSkills.normalizeId(body.path("skillId").asText(""));
         String instruction = body.path("instruction").asText("").strip();
         if (instruction.isBlank() && !skillId.isEmpty()) {
-            instruction = "按所选预置爆款体裁重构全篇钩子、节奏与段落结构，严格保留已核实事实与数据";
+            instruction = "按所选预置爆款体裁重写新版本：摒弃平铺直叙的复述与总结腔，结合深度研究与一手参考资料换出更有流量钩子与评论讨论度的话题切口，严格保留已核实事实与数据";
         }
         if (instruction.isBlank()) {
             throw new IllegalArgumentException("缺少 instruction");
         }
-        var input=AssistantTopics.snapshot(tx,AssistantTopics.topicOf(tx,draft.path("materialId").asText()),draft.path("materialId").asText());
+        String matId = draft.path("materialId").asText("");
+        String topicId = AssistantTopics.topicOf(tx, matId);
+        if (topicId.isBlank()) topicId = draft.path("topicId").asText("");
+        var input=AssistantTopics.snapshot(tx, topicId, matId);
         input.put("draftId",id).put("text",draft.path("text").asText()).put("draftVersion",ver(draft)).put("instruction",instruction);
         if (!skillId.isEmpty()) input.put("skillId", skillId);
-        input.set("research",draft.path("research"));
-        if (memberIds(input).containsAll(memberIds(draft.path("research").path("snapshot")))) {
+        String baseSkillId = ViralWritingSkills.normalizeId(draft.path("skillId").asText(""));
+        if (!baseSkillId.isEmpty()) input.put("baseSkillId", baseSkillId);
+        String baseAngle = draft.path("angleInstruction").asText("").strip();
+        if (!baseAngle.isBlank()) input.put("baseAngleInstruction", baseAngle);
+        ObjectNode resolvedResearch = resolveResearchForOptimize(tx, draft, input, topicId, matId);
+        input.set("research", resolvedResearch);
+        if (memberIds(input).containsAll(memberIds(resolvedResearch.path("snapshot")))) {
             var prior = previousResearch(tx, input);
             if (prior != null) input.set("previousResearch", prior);
         }
@@ -644,6 +662,148 @@ public final class AssistantWorkflow {
         if (!winningHint.isEmpty()) input.put("winningHint", winningHint);
         applyRuntimeGenerationTarget(body, input);
         return enqueue(tx,"OPTIMIZE",input,field(request,"clientRequestId"),request);
+    }
+
+    private static ObjectNode resolveResearchForOptimize(
+            AssistantStore.Tx tx, ObjectNode draft, ObjectNode snapshotInput, String topicId, String materialId) {
+        ObjectNode base = null;
+        if (draft.path("research").isObject() && !draft.path("research").isEmpty()) {
+            base = ((ObjectNode) draft.path("research")).deepCopy();
+        } else {
+            String researchId = draft.path("researchId").asText("").strip();
+            if (!researchId.isBlank()) {
+                ObjectNode stored = tx.get("research", researchId);
+                if (stored != null) base = stored.deepCopy();
+            }
+        }
+        ObjectNode latestRich = findLatestRichResearch(tx, topicId, materialId);
+        if (base == null) {
+            if (latestRich != null) return latestRich;
+            return buildEphemeralMaterialResearch(snapshotInput);
+        }
+        if (latestRich != null) {
+            mergeRichResearchInto(base, latestRich);
+        }
+        return base;
+    }
+
+    static ObjectNode findLatestRichResearch(AssistantStore.Tx tx, String topicId, String selectedMaterialId) {
+        List<ObjectNode> candidateTasks = new ArrayList<>();
+        if (topicId != null && !topicId.isBlank()) {
+            candidateTasks.addAll(tx.matching("task", "topicId", topicId, -1));
+        }
+        if (candidateTasks.isEmpty() && selectedMaterialId != null && !selectedMaterialId.isBlank()) {
+            candidateTasks.addAll(tx.matching("task", "materialId", selectedMaterialId, -1));
+        }
+        for (int i = candidateTasks.size() - 1; i >= 0; i--) {
+            ObjectNode task = candidateTasks.get(i);
+            ObjectNode stored = tx.get("research", task.path("id").asText(""));
+            if (stored == null && task.path("research").isObject()) {
+                stored = (ObjectNode) task.path("research");
+            }
+            if (isRichSynthesizedResearch(stored)) {
+                return stored.deepCopy();
+            }
+        }
+        if (topicId != null && !topicId.isBlank()) {
+            List<ObjectNode> topicDrafts = tx.matching("draft", "topicId", topicId, -1);
+            topicDrafts.sort(Comparator.comparingLong((ObjectNode d) -> d.path("updatedAt").asLong(0L)).reversed());
+            for (ObjectNode d : topicDrafts) {
+                JsonNode dr = d.path("research");
+                if (isRichSynthesizedResearch(dr)) {
+                    return ((ObjectNode) dr).deepCopy();
+                }
+                String rid = d.path("researchId").asText("");
+                if (!rid.isBlank()) {
+                    ObjectNode stored = tx.get("research", rid);
+                    if (isRichSynthesizedResearch(stored)) {
+                        return stored.deepCopy();
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    private static boolean isRichSynthesizedResearch(JsonNode research) {
+        if (research == null || !research.isObject()) return false;
+        if ("MATERIAL_DIRECT".equals(research.path("quality").asText("")) || research.path("fastMode").asBoolean(false)) {
+            return false;
+        }
+        if (research.path("pendingSynthesis").asBoolean(false)) return false;
+        return !research.path("evidence").isEmpty()
+                || !research.path("sourceReads").isEmpty()
+                || (research.path("draftable").asBoolean(false) && !research.path("claims").isEmpty());
+    }
+
+    private static void mergeRichResearchInto(ObjectNode target, ObjectNode richSource) {
+        if (target == null || richSource == null) return;
+        String richSummary = richSource.path("summary").asText("").strip();
+        if (!richSummary.isBlank()
+                && (target.path("summary").asText("").isBlank()
+                || "MATERIAL_DIRECT".equals(target.path("quality").asText("")))) {
+            target.put("summary", richSummary);
+        }
+        if (target.path("evidence").isEmpty() && richSource.path("evidence").isArray() && !richSource.path("evidence").isEmpty()) {
+            target.set("evidence", richSource.path("evidence").deepCopy());
+        } else if (richSource.path("evidence").isArray() && !richSource.path("evidence").isEmpty()) {
+            ArrayNode targetEv = target.withArray("evidence");
+            Set<String> existingIds = new LinkedHashSet<>();
+            targetEv.forEach(item -> existingIds.add(item.path("id").asText("")));
+            for (JsonNode item : richSource.path("evidence")) {
+                String id = item.path("id").asText("");
+                if (!id.isBlank() && existingIds.add(id)) targetEv.add(item.deepCopy());
+            }
+        }
+        if (target.path("materialEvidence").isEmpty()
+                && richSource.path("materialEvidence").isArray()
+                && !richSource.path("materialEvidence").isEmpty()) {
+            target.set("materialEvidence", richSource.path("materialEvidence").deepCopy());
+        }
+        if (target.path("sourceReads").isEmpty() && richSource.path("sourceReads").isArray() && !richSource.path("sourceReads").isEmpty()) {
+            target.set("sourceReads", richSource.path("sourceReads").deepCopy());
+        }
+        if (richSource.path("angles").isArray() && !richSource.path("angles").isEmpty()) {
+            ArrayNode targetAngles = target.withArray("angles");
+            Set<String> seenAngles = new LinkedHashSet<>();
+            targetAngles.forEach(a -> seenAngles.add(a.asText("")));
+            for (JsonNode angle : richSource.path("angles")) {
+                String text = angle.asText("").strip();
+                if (!text.isBlank() && seenAngles.add(text)) targetAngles.add(text);
+            }
+        }
+        if (richSource.path("unverified").isArray() && !richSource.path("unverified").isEmpty() && target.path("unverified").isEmpty()) {
+            target.set("unverified", richSource.path("unverified").deepCopy());
+        }
+        if (richSource.path("claims").isArray() && !richSource.path("claims").isEmpty()) {
+            ArrayNode targetClaims = target.withArray("claims");
+            Set<String> seenClaims = new LinkedHashSet<>();
+            targetClaims.forEach(c -> seenClaims.add(c.path("claim").asText("").strip()));
+            for (JsonNode claim : richSource.path("claims")) {
+                String text = claim.path("claim").asText("").strip();
+                if (!text.isBlank() && seenClaims.add(text)) {
+                    targetClaims.add(claim.deepCopy());
+                }
+            }
+        }
+    }
+
+    private static ObjectNode buildEphemeralMaterialResearch(ObjectNode snapshotInput) {
+        JsonNode topicNode = snapshotInput.path("topic");
+        String summary = !topicNode.path("summary").asText("").isBlank()
+                ? topicNode.path("summary").asText()
+                : topicNode.path("title").asText("已采集一手素材");
+        var research = object()
+                .put("quality", "MATERIAL_DIRECT")
+                .put("draftable", true)
+                .put("summary", summary);
+        research.putArray("claims");
+        research.putArray("angles");
+        research.putArray("unverified");
+        research.putArray("sourceReads");
+        research.putArray("evidence");
+        research.set("snapshot", snapshotInput.deepCopy().without(List.of("style", "preferences", "research")));
+        return research;
     }
 
     private static void applyRuntimeGenerationTarget(JsonNode body, ObjectNode input) {

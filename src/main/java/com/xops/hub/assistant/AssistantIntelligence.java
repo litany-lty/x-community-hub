@@ -657,6 +657,7 @@ public final class AssistantIntelligence {
     private ObjectNode draft(TextModelClient.ModelBinding binding, ObjectNode settings, ObjectNode input) {
         var research = draftResearch(input.path("research"));
         var style = input.path("style").isObject() ? draftStyle(input.path("style")) : null;
+        var writingCtx = writingContext(input);
         String instruction = input.path("instruction").asText("");
         String skillId = input.path("skillId").asText("");
         String baseline = input.path("text").asText("");
@@ -667,15 +668,17 @@ public final class AssistantIntelligence {
             instruction += "\n补充研究需要落实的问题：" + input.path("questions");
         String mergedPrefs = mergePreferencesWithWinningHint(input);
         var value = tasks.draft(binding, research, style, mergedPrefs,
-                instruction, baseline, skillId);
+                instruction, baseline, skillId, writingCtx);
         ContentIntelligenceEngine.Draft finalDraft = value.value();
         var finalRaw = value;
         if (settings != null && settings.has("postPolishPrompt")
                 && settings.path("postPolishEnabled").asBoolean(true)) {
             String polishPrompt = settings.path("postPolishPrompt").asText("").strip();
-            if (!polishPrompt.isBlank() && !finalDraft.text().isBlank()) {
+            if (!polishPrompt.isBlank()
+                    && !OwnerQuoteStyleDistiller.isBuiltInQuotePolishPrompt(polishPrompt)
+                    && !finalDraft.text().isBlank()) {
                 try {
-                    String secondPassInstruction = "【二次改写提示词（在保持事实与证据锚点不变的前提下，严格按以下我的要求对初稿重写一遍）】\n"
+                    String secondPassInstruction = "【二次改写提示词（在保持事实与证据锚点不变、保留流量钩子与话题张力的前提下，严格按以下我的要求对初稿重写一遍）】\n"
                             + polishPrompt;
                     ObjectNode polishInput = input == null ? null : input.deepCopy();
                     if (polishInput != null && polishInput.has("generationModel")) {
@@ -685,7 +688,7 @@ public final class AssistantIntelligence {
                         }
                     }
                     var polished = tasks.optimize(binding(settings, Stage.OPTIMIZE, polishInput), finalDraft.text(),
-                            research, style, mergedPrefs, secondPassInstruction, null, skillId);
+                            research, style, mergedPrefs, secondPassInstruction, null, skillId, writingCtx);
                     if (polished.value() != null && !polished.value().text().isBlank()) {
                         finalDraft = polished.value();
                         finalRaw = polished;
@@ -701,9 +704,13 @@ public final class AssistantIntelligence {
     private ObjectNode optimize(TextModelClient.ModelBinding binding, ObjectNode input, boolean correcting) {
         var research = draftResearch(input.path("research"));
         var style = input.path("style").isObject() ? draftStyle(input.path("style")) : null;
+        var writingCtx = writingContext(input);
         String baseline = input.path("text").asText("");
         String instruction = input.path("instruction").asText("");
-        String skillId = input.path("skillId").asText("");
+        String explicitSkillId = ViralWritingSkills.normalizeId(input.path("skillId").asText(""));
+        String effectiveSkillId = !explicitSkillId.isEmpty()
+                ? explicitSkillId
+                : ViralWritingSkills.normalizeId(input.path("baseSkillId").asText(""));
         var constraints = DraftRevisionConstraints.from(instruction);
         instruction += constraints.prompt(baseline);
         var first = input.path("correctionCandidate");
@@ -711,10 +718,10 @@ public final class AssistantIntelligence {
         try {
             var value = tasks.optimize(binding, baseline, research, style,
                     mergePreferencesWithWinningHint(input), instruction,
-                    correcting ? first.path("text").asText() : null, skillId);
+                    correcting ? first.path("text").asText() : null, effectiveSkillId, writingCtx);
             ObjectNode output = writingResult(value.value(), constraints, baseline);
             output.put("needsAdditionalResearch", false);
-            if (!ViralWritingSkills.normalizeId(skillId).isEmpty()) output.put("skillId", ViralWritingSkills.normalizeId(skillId));
+            if (!effectiveSkillId.isEmpty()) output.put("skillId", effectiveSkillId);
             return result(output, value.raw());
         } catch (ContentAssistantModelTasks.AdditionalResearchRequiredException e) {
             if (correcting) throw new AssistantIntelligenceException(FailureKind.DEFINITE_FAILURE, false, null,
@@ -724,6 +731,17 @@ public final class AssistantIntelligence {
             output.put("originalText", e.originalDraft());
             return result(output, null);
         }
+    }
+
+    private static ContentAssistantModelTasks.WritingContext writingContext(ObjectNode input) {
+        if (input == null) return ContentAssistantModelTasks.WritingContext.EMPTY;
+        return new ContentAssistantModelTasks.WritingContext(
+                input.path("topic"),
+                input.path("materials"),
+                input.path("selectedMaterialId").asText(input.path("materialId").asText("")),
+                input.path("research"),
+                input.path("baseAngleInstruction").asText("")
+        );
     }
 
     private static String mergePreferencesWithWinningHint(ObjectNode input) {

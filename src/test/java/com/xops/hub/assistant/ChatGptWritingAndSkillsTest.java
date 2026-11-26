@@ -1,5 +1,6 @@
 package com.xops.hub.assistant;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.xops.hub.controller.ApiExceptionHandler;
@@ -973,6 +974,212 @@ class ChatGptWritingAndSkillsTest {
                     .andExpect(jsonPath("$[2].id").value("m-short"));
         } finally {
             worker.close();
+        }
+    }
+
+    @Test
+    void deepResearchContextAndMaterialsInjectIntoDraftFastRegenAndOptimizeWithTrafficFocus() throws Exception {
+        AssistantStore store = new AssistantStore(tempDir.resolve("deep-ctx-store"), mapper);
+        SourceCollector sources = mock(SourceCollector.class);
+        when(sources.styleSamples()).thenReturn(object());
+        when(sources.list()).thenReturn(List.of());
+        when(sources.history()).thenReturn(object());
+
+        URI externalDoc = URI.create("https://engineering.example.org/agent-cache-benchmark");
+        TextSourceReader reader = uri -> new TextSourceReader.ReadResult(
+                uri, uri, "text/html", "Agent Prompt Cache Benchmark 2026",
+                "实测多轮仓库级重构时，跨轮次未命中前缀会导致尾延迟飙升 3.2 倍，而新架构通过增量索引把冷启动压到了 480ms。",
+                "第1段", Instant.parse("2026-11-26T09:00:00Z"), TextSourceReader.Status.READ, "", List.of()
+        );
+
+        List<String> draftPrompts = new ArrayList<>();
+        List<String> optimizePrompts = new ArrayList<>();
+        TextModelClient fakeModel = new TextModelClient() {
+            @Override
+            public java.util.Set<Protocol> supportedProtocols() {
+                return java.util.EnumSet.of(Protocol.RESPONSES);
+            }
+
+            @Override
+            public Protocol defaultProtocol() {
+                return Protocol.RESPONSES;
+            }
+
+            @Override
+            public ModelResult complete(ModelBinding binding, TextRequest request) {
+                if (request.webSearch()) {
+                    return new ModelResult(
+                            "{\"summary\":\"Found engineering benchmark\"}",
+                            List.of(new SearchResult("agent cache benchmark", externalDoc,
+                                    "Agent Prompt Cache Benchmark 2026", "480ms cold start", "2026-11-26")),
+                            null, "req-web-search", object(),
+                            Map.of("web_search_1", object().put("query", "agent cache benchmark"))
+                    );
+                }
+                String userText = request.userText();
+                if (userText.startsWith("Build a research result")) {
+                    assertThat(userText).contains("debate-worthy X angles");
+                    var synth = object().put("summary", "新架构针对长会话 Agent 缓存做了底层改造");
+                    var claim = synth.putArray("claims").addObject()
+                            .put("claim", "增量索引将仓库级 Agent 冷启动压至 480ms")
+                            .put("relation", "SUPPORTS");
+                    claim.putArray("sourceIds").add("source-1");
+                    claim.putArray("excerptIds").add("source-1#p1");
+                    synth.putArray("angles").add("天天跑大仓库的人最痛的其实是跨轮次缓存失效后的尾延迟账单");
+                    synth.putArray("unverified");
+                    return new ModelResult(synth.toString(), List.of(), null, "req-synth", object(), Map.of());
+                }
+                if (userText.startsWith("Write one")) {
+                    draftPrompts.add(userText);
+                    ObjectNode clean = object()
+                            .put("draft", "重度跑过仓库级 Agent 的人都懂，真正让人肉疼的从来不是首轮响应，而是跨轮次缓存失效时飙升的尾延迟。\n\n这次把冷启动直接压到 480ms，等于把高频自动改代码的隐形税砍掉了。");
+                    clean.putArray("usedClaimIds").add("claim-1");
+                    clean.putArray("caveats");
+                    clean.putArray("factChanges");
+                    return new ModelResult(clean.toString(), List.of(), null, "req-draft", object(), Map.of());
+                }
+                if (userText.startsWith("Improve structure")) {
+                    optimizePrompts.add(userText);
+                    ObjectNode clean = object()
+                            .put("needsAdditionalResearch", false)
+                            .put("draft", "别光看官宣口号，真正决定编程 Agent 能不能全天候挂机的生死线其实是跨轮次尾延迟：冷启动压进 480ms 后，小团队挂机跑测试和人工盯屏的成本账彻底反过来了。");
+                    clean.putArray("usedClaimIds").add("claim-1");
+                    clean.putArray("caveats");
+                    return new ModelResult(clean.toString(), List.of(), null, "req-opt", object(), Map.of());
+                }
+                throw new IllegalStateException("Unexpected prompt: " + userText);
+            }
+        };
+
+        MockEnvironment env = new MockEnvironment().withProperty("X_CONTENT_ASSISTANT_MODEL_PROVIDER", "chatgpt");
+        AssistantIntelligence intelligence = new AssistantIntelligence(mapper, env, fakeModel, reader);
+        AssistantWorker worker = new AssistantWorker(store, intelligence, sources);
+        try {
+            store.tx(tx -> {
+                tx.put("meta", "owner", object().put("accountId", "owner-1").put("username", "elidlicom"));
+                // Also set built-in quote polish prompt on settings to ensure standalone draft is NOT hijacked into quote TL;DR
+                ObjectNode cfg = AssistantWorkflow.settings(tx)
+                        .put("provider", "chatgpt")
+                        .put("model", "chatgpt-default")
+                        .put("protocol", "RESPONSES")
+                        .put("contextTokens", 200_000)
+                        .put("enabled", true)
+                        .put("modelEnabled", true)
+                        .put("postPolishEnabled", true)
+                        .put("postPolishPrompt", OwnerQuoteStyleDistiller.DEFAULT_POST_POLISH_PROMPT);
+                tx.put("meta", "settings", cfg);
+                AssistantWorkflow.ingest(tx, object()
+                        .put("id", "195001")
+                        .put("authorId", "8801")
+                        .put("username", "bcherny")
+                        .put("authorName", "Boris Cherny")
+                        .put("authorBio", "Claude Code creator")
+                        .put("text", "We reworked prompt cache indexing for repo-scale coding sessions.")
+                        .put("quotedUsername", "anthropicai")
+                        .put("quotedAuthorId", "8802")
+                        .put("quotedId", "195000")
+                        .put("quotedText", "Faster repo indexing is now live for all developers.")
+                        .put("textStatus", "TEXT_ONLY")
+                        .put("authorTextStatus", "FULL")
+                        .put("quotedTextStatus", "FULL")
+                        .put("sourceIdentity", "ROW_ID_VERIFIED")
+                        .put("views", 85_000).put("likes", 1_900).put("replies", 140)
+                        .put("sourceUrl", "https://x.com/bcherny/status/195001")
+                        .put("publishedAt", Instant.now().toEpochMilli()));
+                return null;
+            });
+
+            var mvc = MockMvcBuilders.standaloneSetup(
+                    new AssistantController(store, sources, worker, mock(AssistantPublishing.class), mapper))
+                    .setControllerAdvice(new ApiExceptionHandler()).build();
+            var session = new MockHttpSession();
+            session.setAttribute(XOAuthController.SESSION_AUTH_USER,
+                    new AuthenticatedXUser("owner-1", "elidlicom", "elidlicom", "", false, Instant.now()));
+
+            // 1. Run full Deep Research -> Synthesis -> Draft
+            String resStr = mvc.perform(post("/api/content-assistant/research").session(session)
+                            .header("X-Requested-With", "XMLHttpRequest")
+                            .contentType("application/json")
+                            .content(object()
+                                    .put("materialId", "195001")
+                                    .put("mode", "RESEARCH")
+                                    .put("skillId", "SHARP_OPINION")
+                                    .put("instruction", "从重度挂机开发者的真实痛点切入")
+                                    .put("clientRequestId", "req-deep-1")
+                                    .toString()))
+                    .andExpect(status().isAccepted())
+                    .andReturn().getResponse().getContentAsString();
+            String taskId = mapper.readTree(resStr).path("id").asText();
+
+            for (int step = 0; step < 3; step++) {
+                ObjectNode running = store.tx(t -> t.put("task", taskId,
+                        t.get("task", taskId).put("attempt", AssistantWorkflow.id()).put("status", "RUNNING")));
+                worker.execute(running);
+            }
+
+            ObjectNode doneTask = store.tx(t -> t.get("task", taskId));
+            assertThat(doneTask.path("status").asText()).isEqualTo("READY");
+            // Built-in quote polish prompt must NOT trigger a second-pass optimize on standalone Content Assistant drafts
+            assertThat(draftPrompts).hasSize(1);
+            assertThat(optimizePrompts).isEmpty();
+
+            String draftPrompt = draftPrompts.get(0);
+            assertThat(draftPrompt)
+                    .contains("referenceContext")
+                    .contains("deepResearchSources")
+                    .contains("尾延迟飙升 3.2 倍")
+                    .contains("Agent Prompt Cache Benchmark 2026")
+                    .contains("primaryMaterials")
+                    .contains("Anthropic Claude Code 负责人")
+                    .contains("Faster repo indexing is now live")
+                    .contains("严禁当“课代表总结”");
+
+            String draftId = doneTask.path("draftId").asText();
+            ObjectNode v1Draft = store.tx(t -> t.get("draft", draftId));
+            assertThat(v1Draft.path("skillId").asText()).isEqualTo("SHARP_OPINION");
+
+            // 2. Rewrite new version (OPTIMIZE without explicit skillId) -> receives full deep research & material context + keeps skillId
+            String optStr = mvc.perform(post("/api/content-assistant/drafts/" + draftId + "/optimize").session(session)
+                            .header("X-Requested-With", "XMLHttpRequest")
+                            .contentType("application/json")
+                            .content(object()
+                                    .put("version", 1)
+                                    .put("instruction", "换一个更有争议与评论讨论度的话题切口重写新版本")
+                                    .put("clientRequestId", "req-deep-opt-1")
+                                    .toString()))
+                    .andExpect(status().isAccepted())
+                    .andReturn().getResponse().getContentAsString();
+            String optTaskId = mapper.readTree(optStr).path("id").asText();
+            ObjectNode claimedOpt = store.tx(t -> t.put("task", optTaskId,
+                    t.get("task", optTaskId).put("attempt", AssistantWorkflow.id()).put("status", "RUNNING")));
+            worker.execute(claimedOpt);
+
+            assertThat(optimizePrompts).hasSize(1);
+            assertThat(optimizePrompts.get(0))
+                    .contains("referenceContext")
+                    .contains("deepResearchSources")
+                    .contains("尾延迟飙升 3.2 倍")
+                    .contains("primaryMaterials")
+                    .contains("Anthropic Claude Code 负责人")
+                    .contains("从重度挂机开发者的真实痛点切入")
+                    .contains("犀利观点促评");
+
+            ObjectNode v2Draft = store.tx(t -> t.get("draft", draftId));
+            assertThat(v2Draft.path("version").asInt()).isEqualTo(2);
+            assertThat(v2Draft.path("skillId").asText()).isEqualTo("SHARP_OPINION");
+
+            // 3. Fast regenerate on a topic that ALREADY has completed Deep Research preserves external deep research evidence!
+            ObjectNode fastRegenTask = store.tx(tx -> AssistantWorkflow.research(tx, object()
+                    .put("materialId", "195001")
+                    .put("mode", "FAST")
+                    .put("regenerate", true)
+                    .put("clientRequestId", "req-fast-after-deep")));
+            JsonNode mergedFastResearch = fastRegenTask.path("input").path("research");
+            assertThat(mergedFastResearch.path("evidence")).isNotEmpty();
+            assertThat(mergedFastResearch.toString()).contains("尾延迟飙升 3.2 倍");
+        } finally {
+            worker.close();
+            intelligence.closeReadPool();
         }
     }
 }

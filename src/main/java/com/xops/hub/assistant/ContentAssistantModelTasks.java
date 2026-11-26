@@ -3,6 +3,7 @@ package com.xops.hub.assistant;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import java.util.ArrayList;
@@ -118,6 +119,8 @@ public final class ContentAssistantModelTasks {
                 "\"angles\":[\"string\"],\"unverified\":[\"string\"]}. " +
                 "Use relation SUPPORTS, REFUTES, BACKGROUND, or UNVERIFIED. The claim itself is a string called claim. " +
                 "For each supported, refuted or background claim provide at least one excerpt ID belonging to each cited source. " +
+                "Extract concrete numbers, technical/business mechanisms, before/after contrasts, hidden constraints, and cross-source corroborations into claims rather than generic headline paraphrases. " +
+                "In angles, propose 2–4 high-traffic, debate-worthy X angles grounded in the evidence (counter-intuitive findings, winner/loser shifts, real user pain points, or concrete trade-offs that spark discussion) instead of bland summary topics. " +
                 "Sources with MATERIAL_FULL status are attributed X material with its own original or quoted post URL. " +
                 "They are usable evidence of what that author wrote. Do not claim the author is an official representative unless a source establishes it. " +
                 "Treat sources sharing a URL as one origin. Material is separate from independently read web evidence. " +
@@ -169,13 +172,20 @@ public final class ContentAssistantModelTasks {
     public TaskResult<ContentIntelligenceEngine.Draft> draft(
             TextModelClient.ModelBinding binding, ContentIntelligenceEngine.Research research,
             StyleProfile style, String longTermPreferences, String currentInstruction, String baselineDraft) {
-        return draft(binding, research, style, longTermPreferences, currentInstruction, baselineDraft, "");
+        return draft(binding, research, style, longTermPreferences, currentInstruction, baselineDraft, "", WritingContext.EMPTY);
     }
 
     public TaskResult<ContentIntelligenceEngine.Draft> draft(
             TextModelClient.ModelBinding binding, ContentIntelligenceEngine.Research research,
             StyleProfile style, String longTermPreferences, String currentInstruction, String baselineDraft,
             String skillId) {
+        return draft(binding, research, style, longTermPreferences, currentInstruction, baselineDraft, skillId, WritingContext.EMPTY);
+    }
+
+    public TaskResult<ContentIntelligenceEngine.Draft> draft(
+            TextModelClient.ModelBinding binding, ContentIntelligenceEngine.Research research,
+            StyleProfile style, String longTermPreferences, String currentInstruction, String baselineDraft,
+            String skillId, WritingContext writingContext) {
         ObjectNode input = mapper.createObjectNode();
         input.set("research", researchForWriting(research));
         input.put("styleProfile", style == null ? "" : style.profile());
@@ -184,8 +194,10 @@ public final class ContentAssistantModelTasks {
         input.put("currentInstruction", safe(currentInstruction));
         input.put("baselineDraft", safe(baselineDraft));
         String viralDirective = ViralWritingSkills.directiveFor(skillId);
-        String prompt = "Write one high-signal, natural Chinese X post grounded strictly in the supplied evidence. " +
+        String promptPrefix = "Write one high-traffic, discussion-sparking Chinese X post grounded strictly in the supplied evidence — NEVER write a dry news summary, press-release retelling, or bullet digest of the source. " +
                 "Current instruction overrides preset skill structure, which overrides long-term preferences and automatic style. " +
+                "Actively mine referenceContext (deepResearchSources web excerpts, primaryMaterials original posts/articles, authorContext, and engagement signals) alongside research.claims and research.angles to surface concrete contrasts, behind-the-scenes details, real stakes, or information asymmetry that casual readers of the source post would miss. " +
+                "Lead with immediate stakes, a sharp contrast, or a counter-intuitive judgment in the first two lines, take a clear practitioner stance, and land on a concrete, debatable trade-off or fault-line that naturally invites informed replies and quote-tweets (never generic 'what do you think?' bait). " +
                 "Use style examples only for expression rhythm, and never reuse their facts as current evidence. " +
                 "If baselineDraft is present, revise that exact draft instead of starting over while applying the requested structure. " +
                 "Do not add stiff meta-disclaimers unless an essential fact is genuinely contested; simply omit unverified claims, prices, or future predictions. " +
@@ -194,22 +206,30 @@ public final class ContentAssistantModelTasks {
                 "Return exactly " +
                 "{\"draft\":\"post text\",\"usedClaimIds\":[\"exact supplied claimId\"],\"caveats\":[\"string\"]," +
                 "\"factChanges\":[{\"before\":\"string\",\"after\":\"string\",\"sourceIds\":[\"exact ID\"],\"excerptIds\":[\"exact ID\"]}]}. " +
-                "Use accepted research evidence only. Return claim IDs in usedClaimIds without copying or rewriting their text in that array. " +
-                "For a first draft or unchanged facts use an empty factChanges array.\n" + json(input);
-        TextModelClient.ModelResult raw = call(binding, prompt, false);
+                "Use accepted research evidence and referenceContext only. Return exact claim IDs from research.claims in usedClaimIds (use [] when research.claims is empty) without copying or rewriting their text in that array. " +
+                "For a first draft or unchanged facts use an empty factChanges array.\n";
+        attachBudgetedReferenceContext(input, writingContext, binding, promptPrefix);
+        TextModelClient.ModelResult raw = call(binding, promptPrefix + json(input), false);
         return new TaskResult<>(validator.parseDraft(validator.parseJson(raw), research), raw);
     }
 
     public TaskResult<ContentIntelligenceEngine.Draft> optimize(
             TextModelClient.ModelBinding binding, String currentDraft, ContentIntelligenceEngine.Research research,
             StyleProfile style, String longTermPreferences, String instruction, String candidateDraft) {
-        return optimize(binding, currentDraft, research, style, longTermPreferences, instruction, candidateDraft, "");
+        return optimize(binding, currentDraft, research, style, longTermPreferences, instruction, candidateDraft, "", WritingContext.EMPTY);
     }
 
     public TaskResult<ContentIntelligenceEngine.Draft> optimize(
             TextModelClient.ModelBinding binding, String currentDraft, ContentIntelligenceEngine.Research research,
             StyleProfile style, String longTermPreferences, String instruction, String candidateDraft,
             String skillId) {
+        return optimize(binding, currentDraft, research, style, longTermPreferences, instruction, candidateDraft, skillId, WritingContext.EMPTY);
+    }
+
+    public TaskResult<ContentIntelligenceEngine.Draft> optimize(
+            TextModelClient.ModelBinding binding, String currentDraft, ContentIntelligenceEngine.Research research,
+            StyleProfile style, String longTermPreferences, String instruction, String candidateDraft,
+            String skillId, WritingContext writingContext) {
         ObjectNode input = mapper.createObjectNode();
         input.put("currentDraft", currentDraft);
         if (candidateDraft != null) input.put("candidateDraft", candidateDraft);
@@ -221,20 +241,284 @@ public final class ContentAssistantModelTasks {
         input.put("longTermPreferences", safe(longTermPreferences));
         input.put("instruction", safe(instruction));
         String viralDirective = ViralWritingSkills.directiveFor(skillId);
-        String prompt = "Improve structure, hook, expression, length, or tone while preserving supported names, numbers, dates, and evidence certainty. " +
+        String promptPrefix = "Improve structure, hook, traffic potential, discussion angle, expression, length, or tone while preserving supported names, numbers, dates, and evidence certainty. " +
+                "Do NOT merely paraphrase currentDraft or fall back into a bland summary/retelling of the source post. " +
+                "Unless the instruction explicitly asks for polish-only or forbids adding new numbers, actively draw on referenceContext (deepResearchSources web excerpts, primaryMaterials original posts/articles, authorContext, and topicContext) plus research.claims and research.angles to bring in stronger evidence details, sharper information asymmetry, a punchier opening hook, and a more debate-worthy topic angle for X engagement. " +
+                "When the instruction forbids adding new numbers or requests length/constraint repair on candidateDraft, strictly obey every numeric and length constraint on currentDraft without introducing new Arabic numerals or percentages from referenceContext. " +
                 "Use style examples only for expression, and never reuse their facts as current evidence. " +
                 "Never portray the system's research as the author's personal search, verification, or testing unless the user explicitly directs it and provided that experience. " +
                 "Omit unsupported predictions about future plans, subscription tiers and prices.\n" +
                 viralDirective + "\n" +
-                "If the instruction explicitly asks for new external facts absent from research, return {\"needsAdditionalResearch\":true,\"researchQuestions\":[\"string\"]}. " +
+                "If the instruction explicitly asks for new external facts absent from both research and referenceContext, return {\"needsAdditionalResearch\":true,\"researchQuestions\":[\"string\"]}. " +
                 "Otherwise return {\"needsAdditionalResearch\":false,\"draft\":\"post text\",\"usedClaimIds\":[\"exact supplied claimId\"],\"caveats\":[\"string\"]}. " +
-                "Return only claim IDs in usedClaimIds, never paraphrase or copy the claim text there.\n" + json(input);
-        TextModelClient.ModelResult raw = call(binding, prompt, false);
+                "Return only exact claim IDs from research.claims in usedClaimIds (use [] when research.claims is empty), never paraphrase or copy the claim text there.\n";
+        attachBudgetedReferenceContext(input, writingContext, binding, promptPrefix);
+        TextModelClient.ModelResult raw = call(binding, promptPrefix + json(input), false);
         JsonNode parsed = validator.parseJson(raw);
         if (parsed.path("needsAdditionalResearch").asBoolean(false)) {
             throw new AdditionalResearchRequiredException(currentDraft, stringArray(parsed.path("researchQuestions")));
         }
         return new TaskResult<>(validator.parseDraft(parsed, research), raw);
+    }
+
+    private void attachBudgetedReferenceContext(
+            ObjectNode payload, WritingContext ctx, TextModelClient.ModelBinding binding, String promptPrefix) {
+        if (ctx == null) return;
+        int maxAllowedTokens = (int) (binding.contextTokens() * 0.90) - binding.maxOutputTokens() - 192;
+        int baseTokens = StyleBatchPlanner.estimatedTokens(JSON_ONLY + promptPrefix + json(payload));
+        int remaining = Math.min(12_000, maxAllowedTokens - baseTokens);
+        if (remaining < 120) return;
+
+        ObjectNode ref = mapper.createObjectNode();
+
+        // 1. Topic & original angle context
+        ObjectNode topicCtx = mapper.createObjectNode();
+        if (ctx.topic() != null && ctx.topic().isObject()) {
+            String title = ctx.topic().path("title").asText("").strip();
+            String summary = ctx.topic().path("summary").asText("").strip();
+            String reason = ctx.topic().path("reason").asText("").strip();
+            if (!title.isBlank()) topicCtx.put("title", limitCodePoints(title, 160));
+            if (!summary.isBlank()) topicCtx.put("summary", limitCodePoints(summary, 280));
+            if (!reason.isBlank()) topicCtx.put("scoreReason", limitCodePoints(reason, 200));
+            if (ctx.topic().path("tags").isArray() && !ctx.topic().path("tags").isEmpty()) {
+                ArrayNode tags = topicCtx.putArray("tags");
+                for (JsonNode t : ctx.topic().path("tags")) {
+                    if (!t.asText("").isBlank() && tags.size() < 8) tags.add(t.asText().strip());
+                }
+            }
+        }
+        String origAngle = safe(ctx.baseAngleInstruction()).strip();
+        if (!origAngle.isBlank()) {
+            topicCtx.put("originalCreationAngle", limitCodePoints(origAngle, 300));
+        }
+        if (!topicCtx.isEmpty()) {
+            int cost = StyleBatchPlanner.estimatedTokens(json(topicCtx)) + 12;
+            if (cost <= remaining / 3) {
+                ref.set("topicContext", topicCtx);
+                remaining -= cost;
+            }
+        }
+
+        // 2. Deep research external web evidence & excerpts (highest priority for information asymmetry)
+        JsonNode rawRes = ctx.rawResearch();
+        if (rawRes != null && rawRes.isObject() && remaining >= 100) {
+            Map<String, JsonNode> readsById = new LinkedHashMap<>();
+            if (rawRes.path("sourceReads").isArray()) {
+                for (JsonNode sr : rawRes.path("sourceReads")) {
+                    String sid = sr.path("id").asText("").strip();
+                    if (!sid.isBlank()) readsById.put(sid, sr);
+                }
+            }
+            int deepBudget = Math.min(remaining, Math.max(remaining * 2 / 3, remaining - 2400));
+            ArrayNode deepArr = mapper.createArrayNode();
+            Set<String> includedSourceIds = new LinkedHashSet<>();
+            if (rawRes.path("evidence").isArray()) {
+                int extCount = 0;
+                for (JsonNode src : rawRes.path("evidence")) {
+                    String sid = src.path("id").asText("").strip();
+                    if (!sid.isBlank() && !sid.startsWith("material-")) extCount++;
+                }
+                int idx = 0;
+                for (JsonNode src : rawRes.path("evidence")) {
+                    String sid = src.path("id").asText("").strip();
+                    if (sid.isBlank() || sid.startsWith("material-")) continue;
+                    if (deepBudget < 80) break;
+                    int perSourceBudget = Math.max(120, deepBudget / Math.max(1, extCount - idx));
+                    idx++;
+                    JsonNode readMeta = readsById.get(sid);
+                    String title = !src.path("title").asText("").isBlank()
+                            ? src.path("title").asText().strip()
+                            : (readMeta == null ? "" : readMeta.path("title").asText("").strip());
+                    String publisher = !src.path("publisher").asText("").isBlank()
+                            ? src.path("publisher").asText().strip()
+                            : (readMeta == null ? "" : readMeta.path("publisher").asText("").strip());
+                    String url = !src.path("url").asText("").isBlank()
+                            ? src.path("url").asText().strip()
+                            : (readMeta == null ? "" : readMeta.path("url").asText("").strip());
+                    String pubAt = !src.path("publishedAt").asText("").isBlank()
+                            ? src.path("publishedAt").asText().strip()
+                            : (readMeta == null ? "" : readMeta.path("publishedAt").asText("").strip());
+
+                    ObjectNode srcOut = mapper.createObjectNode().put("sourceId", sid);
+                    if (!title.isBlank()) srcOut.put("title", limitCodePoints(title, 160));
+                    if (!publisher.isBlank()) srcOut.put("publisher", limitCodePoints(publisher, 80));
+                    if (!url.isBlank()) srcOut.put("url", url);
+                    if (!pubAt.isBlank()) srcOut.put("publishedAt", pubAt);
+
+                    int headerCost = StyleBatchPlanner.estimatedTokens(json(srcOut)) + 8;
+                    if (headerCost > deepBudget) continue;
+                    int excerptBudget = Math.min(perSourceBudget, deepBudget) - headerCost;
+                    ArrayNode exArr = srcOut.putArray("excerpts");
+                    if (src.path("excerpts").isArray()) {
+                        for (JsonNode ex : src.path("excerpts")) {
+                            if (exArr.size() >= 6 || excerptBudget < 40) break;
+                            String exText = ex.path("text").asText("").strip();
+                            if (exText.isBlank()) continue;
+                            String capped = limitCodePoints(exText, Math.min(900, Math.max(120, excerptBudget * 4 / 3)));
+                            ObjectNode exNode = mapper.createObjectNode()
+                                    .put("excerptId", ex.path("id").asText(""))
+                                    .put("text", capped);
+                            int exCost = StyleBatchPlanner.estimatedTokens(json(exNode)) + 4;
+                            if (exCost > excerptBudget) continue;
+                            exArr.add(exNode);
+                            excerptBudget -= exCost;
+                        }
+                    }
+                    if (exArr.isEmpty() && title.isBlank() && url.isBlank()) continue;
+                    int totalSrcCost = StyleBatchPlanner.estimatedTokens(json(srcOut)) + 6;
+                    if (totalSrcCost <= deepBudget) {
+                        deepArr.add(srcOut);
+                        includedSourceIds.add(sid);
+                        deepBudget -= totalSrcCost;
+                        remaining -= totalSrcCost;
+                    }
+                }
+            }
+            if (rawRes.path("sourceReads").isArray() && deepBudget >= 60) {
+                for (JsonNode sr : rawRes.path("sourceReads")) {
+                    if (deepArr.size() >= 8 || deepBudget < 60) break;
+                    String sid = sr.path("id").asText("").strip();
+                    if (sid.isBlank() || includedSourceIds.contains(sid)) continue;
+                    if (!"READ".equalsIgnoreCase(sr.path("status").asText(""))) continue;
+                    ObjectNode metaOnly = mapper.createObjectNode().put("sourceId", sid);
+                    String title = sr.path("title").asText("").strip();
+                    String pub = sr.path("publisher").asText("").strip();
+                    String url = sr.path("url").asText("").strip();
+                    if (!title.isBlank()) metaOnly.put("title", limitCodePoints(title, 140));
+                    if (!pub.isBlank()) metaOnly.put("publisher", limitCodePoints(pub, 80));
+                    if (!url.isBlank()) metaOnly.put("url", url);
+                    int cost = StyleBatchPlanner.estimatedTokens(json(metaOnly)) + 6;
+                    if (cost <= deepBudget) {
+                        deepArr.add(metaOnly);
+                        includedSourceIds.add(sid);
+                        deepBudget -= cost;
+                        remaining -= cost;
+                    }
+                }
+            }
+            if (!deepArr.isEmpty()) {
+                ref.set("deepResearchSources", deepArr);
+            }
+        }
+
+        // 3. Primary X posts, quoted posts, long articles, author identity & engagement signals
+        if (remaining >= 90) {
+            ArrayNode primaryArr = mapper.createArrayNode();
+            String selectedId = safe(ctx.selectedMaterialId()).strip();
+            List<JsonNode> orderedMats = new ArrayList<>();
+            List<JsonNode> secondaryMats = new ArrayList<>();
+            if (ctx.materials() != null && ctx.materials().isArray()) {
+                for (JsonNode m : ctx.materials()) {
+                    if (m == null || !m.isObject()) continue;
+                    if (!selectedId.isBlank() && selectedId.equals(m.path("id").asText(""))) {
+                        orderedMats.add(m);
+                    } else {
+                        secondaryMats.add(m);
+                    }
+                }
+            }
+            orderedMats.addAll(secondaryMats);
+
+            for (JsonNode mat : orderedMats) {
+                if (primaryArr.size() >= 5 || remaining < 90) break;
+                String mid = mat.path("id").asText("").strip();
+                String rawUser = mat.path("username").asText("").strip().replaceFirst("^@+", "");
+                String authorName = mat.path("authorName").asText("").strip();
+                String authorBio = mat.path("authorBio").asText("").strip();
+                String authorRole = OwnerQuoteStyleDistiller.resolveAuthorContext(rawUser, authorBio);
+
+                String authorText = mat.path("text").asText("").strip();
+                String quotedText = mat.path("quotedText").asText("").strip();
+                String articleText = mat.path("articleText").asText("").strip();
+                if (authorText.isBlank() && quotedText.isBlank() && articleText.isBlank()) continue;
+
+                ObjectNode mNode = mapper.createObjectNode();
+                if (!mid.isBlank()) mNode.put("materialId", mid);
+                if (!selectedId.isBlank()) mNode.put("primarySelected", selectedId.equals(mid));
+                if (!rawUser.isBlank() || !authorName.isBlank()) {
+                    String authorLabel = authorName.isBlank()
+                            ? ("@" + rawUser)
+                            : (rawUser.isBlank() ? authorName : (authorName + " (@" + rawUser + ")"));
+                    mNode.put("author", authorLabel);
+                }
+                if (!authorRole.isBlank()) mNode.put("authorContext", authorRole);
+                String srcUrl = mat.path("sourceUrl").asText("").strip();
+                if (!srcUrl.isBlank()) mNode.put("sourceUrl", srcUrl);
+
+                ObjectNode eng = mapper.createObjectNode();
+                for (String metric : List.of("views", "likes", "reposts", "replies", "bookmarks")) {
+                    long val = mat.path(metric).asLong(0L);
+                    if (val > 0L) eng.put(metric, val);
+                }
+                if (!eng.isEmpty()) mNode.set("engagement", eng);
+
+                int maxBodyCodePoints = Math.max(160, Math.min(2800, remaining * 4 / 5));
+                if (!authorText.isBlank()) {
+                    mNode.put("authorText", limitCodePoints(authorText, Math.min(1000, maxBodyCodePoints)));
+                }
+                if (!quotedText.isBlank()) {
+                    String qUser = mat.path("quotedUsername").asText("").strip().replaceFirst("^@+", "");
+                    if (!qUser.isBlank()) mNode.put("quotedAuthor", "@" + qUser);
+                    mNode.put("quotedText", limitCodePoints(quotedText, Math.min(1000, maxBodyCodePoints)));
+                }
+                if (!articleText.isBlank()) {
+                    mNode.put("articleText", limitCodePoints(articleText, maxBodyCodePoints));
+                }
+
+                int cost = StyleBatchPlanner.estimatedTokens(json(mNode)) + 8;
+                if (cost <= remaining) {
+                    primaryArr.add(mNode);
+                    remaining -= cost;
+                }
+            }
+
+            if (primaryArr.isEmpty() && rawRes != null && rawRes.path("materialEvidence").isArray()) {
+                for (JsonNode me : rawRes.path("materialEvidence")) {
+                    if (primaryArr.size() >= 4 || remaining < 80) break;
+                    ObjectNode mNode = mapper.createObjectNode()
+                            .put("sourceId", me.path("id").asText(""))
+                            .put("publisher", me.path("publisher").asText(""))
+                            .put("url", me.path("url").asText(""));
+                    ArrayNode exArr = mNode.putArray("excerpts");
+                    for (JsonNode ex : me.path("excerpts")) {
+                        if (exArr.size() >= 3) break;
+                        String t = ex.path("text").asText("").strip();
+                        if (!t.isBlank()) {
+                            exArr.add(limitCodePoints(t, Math.min(1200, Math.max(160, remaining * 4 / 5))));
+                        }
+                    }
+                    if (exArr.isEmpty()) continue;
+                    int cost = StyleBatchPlanner.estimatedTokens(json(mNode)) + 8;
+                    if (cost <= remaining) {
+                        primaryArr.add(mNode);
+                        remaining -= cost;
+                    }
+                }
+            }
+
+            if (!primaryArr.isEmpty()) {
+                ref.set("primaryMaterials", primaryArr);
+            }
+        }
+
+        if (ref.isEmpty()) return;
+        payload.set("referenceContext", ref);
+        while (StyleBatchPlanner.estimatedTokens(JSON_ONLY + promptPrefix + json(payload)) > maxAllowedTokens) {
+            if (ref.has("primaryMaterials") && ref.path("primaryMaterials") instanceof ArrayNode pm && !pm.isEmpty()) {
+                pm.remove(pm.size() - 1);
+                if (pm.isEmpty()) ref.remove("primaryMaterials");
+            } else if (ref.has("deepResearchSources") && ref.path("deepResearchSources") instanceof ArrayNode ds && !ds.isEmpty()) {
+                ds.remove(ds.size() - 1);
+                if (ds.isEmpty()) ref.remove("deepResearchSources");
+            } else {
+                payload.remove("referenceContext");
+                break;
+            }
+            if (ref.isEmpty()) {
+                payload.remove("referenceContext");
+                break;
+            }
+        }
     }
 
     private ObjectNode researchForWriting(ContentIntelligenceEngine.Research research) {
@@ -408,6 +692,15 @@ public final class ContentAssistantModelTasks {
     }
     public record EvidenceExcerpt(String id, String sourceId, String locator, int startCodePoint, int endCodePoint,
                                   String text, int relevance) { }
+    public record WritingContext(
+            JsonNode topic,
+            JsonNode materials,
+            String selectedMaterialId,
+            JsonNode rawResearch,
+            String baseAngleInstruction
+    ) {
+        public static final WritingContext EMPTY = new WritingContext(null, null, "", null, "");
+    }
     public record BatchStyle(String profile, List<String> processedSampleIds, List<String> exampleSampleIds) { }
     public record StyleExample(String sampleId, String text) { }
     public record StyleProfile(String profile, List<String> processedSampleIds, List<String> exampleSampleIds,

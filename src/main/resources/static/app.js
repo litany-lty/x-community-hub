@@ -5138,6 +5138,8 @@
                         `<button type="button" class="pill-chip sm${draft.skillId === skill.id ? " active" : ""}" data-assistant-skill-rewrite="${escapeHtml(skill.id)}" data-draft-id="${escapeHtml(draft.id)}">${escapeHtml(skill.name)}</button>`
                     ).join("")}
                     <span class="assistant-preset-sep" aria-hidden="true"></span>
+                    <button type="button" class="pill-chip sm" data-assistant-optimize-preset="拒绝复述与总结腔，结合深度研究与一手素材换一个更有冲突张力与评论讨论度的话题切口重写新版本，首句直击切身利害或反差" data-draft-id="${escapeHtml(draft.id)}">换话题切口</button>
+                    <button type="button" class="pill-chip sm" data-assistant-optimize-preset="充分调取深度研究外部资料与原帖细节补充信息差（横向对比、真实成本账或隐含边界），写出让人愿意收藏转发的增量洞察" data-draft-id="${escapeHtml(draft.id)}">补深挖增量</button>
                     <button type="button" class="pill-chip sm" data-assistant-optimize-preset="精炼为单条标准推文篇幅（控制在115个汉字以内，总长不超过280权重），第一句直接给出最硬结论，保留核心事实且不要新增任何数字" data-draft-id="${escapeHtml(draft.id)}">≤280短帖</button>
                     <button type="button" class="pill-chip sm" data-assistant-optimize-preset="将正文控制在180–220个汉字以内，保留核心事实与原始数据，不要新增任何数字" data-draft-id="${escapeHtml(draft.id)}">180–220字</button>
                     <button type="button" class="pill-chip sm" data-assistant-optimize-preset="结论前置：第一句直接给出核心判断，再展开关键论据，不要新增任何数字" data-draft-id="${escapeHtml(draft.id)}">结论前置</button>
@@ -5147,7 +5149,7 @@
                 <div class="assistant-draft-actions">
                     <select id="assistantOptimizeGenTargetSelect" class="x-select assistant-gen-select sm" aria-label="本次改稿生成模型" data-i18n-ignore>${renderGenerationTargetOptionsHtml(state.assistantGenerationTargetSpec)}</select>
                     <select id="assistantOptimizeEffortSelect" class="x-select assistant-effort-select sm" aria-label="本次改稿推理强度" data-i18n-ignore${!providerSupportsEffort((state.assistantGenerationTargetSpec || "chatgpt").split("|")[0]) ? " disabled" : ""}>${renderReasoningEffortOptionsHtml(state.assistantGenerationEffort, (state.assistantGenerationTargetSpec || "chatgpt").split("|")[0])}</select>
-                    <input id="assistantOptimizeInstruction" type="text" placeholder="改稿要求…" aria-label="改稿要求" />
+                    <input id="assistantOptimizeInstruction" type="text" placeholder="改稿要求（留空点「改写新版本」即结合研究资料换高流量话题切口重写）…" aria-label="改稿要求" />
                     <button type="button" class="x-outline-pill sm" data-assistant-optimize="${escapeHtml(draft.id)}">改写新版本</button>
                 </div>
             </div>
@@ -11096,7 +11098,9 @@
             const optimize = event.target.closest("[data-assistant-optimize]");
             if (optimize) {
                 const draftId = optimize.dataset.assistantOptimize;
-                const instruction = $("assistantOptimizeInstruction").value.trim();
+                const rawInstruction = $("assistantOptimizeInstruction").value.trim();
+                const instruction = rawInstruction
+                    || "拒绝复述与总结腔，结合深度研究资料与一手素材换一个更有流量钩子与评论讨论度的话题切口重写新版本";
                 const genTarget = parseGenerationTargetSpec(
                     $("assistantOptimizeGenTargetSelect")?.value || state.assistantGenerationTargetSpec,
                     $("assistantOptimizeEffortSelect") ? $("assistantOptimizeEffortSelect").value : state.assistantGenerationEffort
@@ -11104,13 +11108,15 @@
                 if (!await saveAssistantDraftEditor()) return;
                 const draft = (state.assistantDashboard?.drafts || []).find((item) => item.id === draftId);
                 if (!draft) return;
-                await runAssistantMutation("optimize", `/drafts/${encodeURIComponent(draft.id)}/optimize`, {
+                const payload = {
                     version: draft.version,
                     instruction,
                     generationProvider: genTarget.generationProvider,
                     generationModel: genTarget.generationModel,
                     clientRequestId: newClientRequestId()
-                }, 180000);
+                };
+                if (draft.skillId) payload.skillId = draft.skillId;
+                await runAssistantMutation("optimize", `/drafts/${encodeURIComponent(draft.id)}/optimize`, payload, 180000);
                 return;
             }
             const skillRewrite = event.target.closest("[data-assistant-skill-rewrite]");

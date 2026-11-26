@@ -109,6 +109,15 @@ public final class OwnerQuoteStyleDistiller {
         return saved;
     }
 
+    public static boolean isBuiltInQuotePolishPrompt(String rawPrompt) {
+        String saved = rawPrompt == null ? "" : rawPrompt.strip();
+        return saved.isEmpty()
+                || saved.equals(DEFAULT_POST_POLISH_PROMPT)
+                || saved.startsWith(LEGACY_V1_POLISH_PROMPT_PREFIX)
+                || saved.startsWith(LEGACY_V2_POLISH_PROMPT_PREFIX)
+                || saved.startsWith(LEGACY_V3_POLISH_PROMPT_PREFIX);
+    }
+
     public static boolean isBriefFlashPost(String postText, String quotedText, String articleText) {
         if (articleText != null) {
             String cleanArticle = URL_PATTERN.matcher(articleText).replaceAll("").strip();
