@@ -73,6 +73,24 @@ class ContentIntelligenceTest {
     }
 
     @Test
+    void recoversMissingScoreTitleCaseInsensitiveMergeDecisionAndFencedJson() throws Exception {
+        var engine = new ContentIntelligenceEngine(mapper);
+        var fenced = new TextModelClient.ModelResult("```json\n{\"summary\":\"DeepSeek 新架构降低显存占用。进一步提升长上下文吞吐。\",\"tags\":[\"AI\"],"
+                + "\"topic\":{\"components\":{\"novelty\":82},\"reasons\":[\"r1\"]},"
+                + "\"reach\":{\"components\":{\"hook\":78},\"reasons\":[\"r2\"]}}\n```", List.of(), null, "req-1", mapper.createObjectNode(), Map.of());
+        JsonNode parsed = engine.parseJson(fenced);
+        var score = engine.parseScore(parsed, ContentIntelligenceEngine.defaultWeights(), false);
+        assertThat(score.title()).isEqualTo("DeepSeek 新架构降低显存占用");
+
+        JsonNode lowerMerge = mapper.readTree("""
+                {"kind":"new_topic","confidence":"high","reason":"independent topic"}
+                """);
+        var decision = engine.parseMergeDecision(lowerMerge, List.of("topic-1"));
+        assertThat(decision.kind()).isEqualTo(ContentIntelligenceEngine.MergeKind.NEW_TOPIC);
+        assertThat(decision.confidence()).isEqualTo(ContentIntelligenceEngine.Confidence.HIGH);
+    }
+
+    @Test
     void researchClaimsMustCiteAnExcerptBelongingToTheClaimedSource() throws Exception {
         var engine = new ContentIntelligenceEngine(mapper);
         JsonNode result = mapper.readTree("""

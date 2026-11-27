@@ -147,6 +147,7 @@ public class SourceCollector {
                                 .put("verified", copy.path("verified").asBoolean(false))
                                 .put("followersCount", copy.path("followersCount").asLong(0))
                                 .put("autoRepostEnabled", copy.path("autoRepostEnabled").asBoolean(false))
+                                .put("autoRewriteEnabled", copy.path("autoRewriteEnabled").asBoolean(false))
                                 .put("autoRepostTextMode", copy.path("autoRepostTextMode").asText("AI"))
                                 .put("autoRepostTemplate", copy.path("autoRepostTemplate").asText(""))
                                 .put("autoRepostMinScore", resolveAutoRepostMinScore(copy))
@@ -300,6 +301,128 @@ public class SourceCollector {
         });
     }
 
+    /**
+     * When a quote-repost source has no brand-new posts in the short freshness window, syncs recent
+     * timeline posts if needed and returns up to 12 most recent stored posts (within retention window)
+     * so quote-repost can fall back to recent content while keeping 16h same-author locking.
+     */
+    List<ObjectNode> syncSourceMaterialsForRecentRepost(ObjectNode source, long maxAgeMs) {
+        if (source == null) return List.of();
+        String authorId = source.path("authorId").asText(source.path("id").asText("")).strip();
+        String username = source.path("username").asText("").replaceFirst("^@+", "").strip();
+        if (username.isBlank() && authorId.isBlank()) return List.of();
+        long nowMs = clock.millis();
+        long effectiveMaxAge = maxAgeMs > 0L ? maxAgeMs : 30L * 24L * 60L * 60_000L;
+        int existingCount = store.tx(tx -> {
+            int c = 0;
+            for (ObjectNode m : tx.all("material")) {
+                boolean same = (!authorId.isBlank() && authorId.equals(m.path("authorId").asText("")))
+                        || (!username.isBlank() && username.equalsIgnoreCase(m.path("username").asText("").replaceFirst("^@+", "")));
+                if (same && !m.path("selfThreadReply").asBoolean(false)) c++;
+            }
+            return c;
+        });
+        long lastSuccessAt = source.path("lastSuccessAt").asLong(0L);
+        if (provider != null && !username.isBlank() && !authorId.isBlank()
+                && (existingCount < 5 || nowMs - lastSuccessAt >= 10L * 60_000L)) {
+            try {
+                ObjectNode owner = store.tx(tx -> tx.get("meta", "owner"));
+                String ownerAccountId = owner == null ? "" : owner.path("accountId").asText("");
+                TextPostPage page = PaidCapabilityGate.withCaller(
+                        PaidCapabilityGate.PRIVILEGED_USERNAME,
+                        ownerAccountId,
+                        () -> provider.fetchTextPostsPage(username, authorId, "", 30, clock.instant().plusSeconds(25))
+                );
+                if (page != null && page.posts() != null && !page.posts().isEmpty()) {
+                    long completedAt = clock.millis();
+                    long commitCutoff = AssistantRetention.cutoffMillis(completedAt);
+                    XUserSummary pageAuthor = page.author();
+                    store.tx(tx -> {
+                        for (TextPost post : page.posts()) {
+                            if (post.publishedAt().toEpochMilli() < commitCutoff) continue;
+                            AssistantWorkflow.ingest(tx, toMaterial(post, pageAuthor, false));
+                        }
+                        ObjectNode live = tx.get("source", authorId);
+                        if (live != null && "ACTIVE".equals(live.path("status").asText(""))) {
+                            tx.put("source", authorId, live.deepCopy().put("lastSuccessAt", completedAt).put("error", ""));
+                        }
+                        return null;
+                    });
+                }
+            } catch (Exception ignored) {
+                // Fall back to existing stored materials if upstream is transiently unavailable
+            }
+        }
+        return store.tx(tx -> {
+            List<ObjectNode> matches = new ArrayList<>();
+            for (ObjectNode m : tx.all("material")) {
+                boolean same = (!authorId.isBlank() && authorId.equals(m.path("authorId").asText("")))
+                        || (!username.isBlank() && username.equalsIgnoreCase(m.path("username").asText("").replaceFirst("^@+", "")));
+                if (!same) continue;
+                long pubAt = m.path("publishedAt").asLong(0L);
+                if (pubAt <= 0L || nowMs - pubAt > effectiveMaxAge) continue;
+                matches.add(m.deepCopy());
+            }
+            matches.sort(Comparator.comparingLong((ObjectNode m) -> m.path("publishedAt").asLong(0L)).reversed());
+            return matches.stream().limit(12).toList();
+        });
+    }
+
+    /**
+     * Ensures recent posts and engagement metrics are synced for an account with pure-text wash-rewrite enabled,
+     * then returns all stored posts of this author within {@code maxAgeMs}.
+     */
+    List<ObjectNode> syncSourceMaterialsForRewrite(ObjectNode source, long maxAgeMs) {
+        if (source == null) return List.of();
+        String authorId = source.path("authorId").asText(source.path("id").asText("")).strip();
+        String username = source.path("username").asText("").replaceFirst("^@+", "").strip();
+        if (username.isBlank() && authorId.isBlank()) return List.of();
+        long nowMs = clock.millis();
+        long lastSuccessAt = source.path("lastSuccessAt").asLong(0L);
+        if (provider != null && !username.isBlank() && !authorId.isBlank() && (nowMs - lastSuccessAt >= 10L * 60_000L)) {
+            try {
+                ObjectNode owner = store.tx(tx -> tx.get("meta", "owner"));
+                String ownerAccountId = owner == null ? "" : owner.path("accountId").asText("");
+                TextPostPage page = PaidCapabilityGate.withCaller(
+                        PaidCapabilityGate.PRIVILEGED_USERNAME,
+                        ownerAccountId,
+                        () -> provider.fetchTextPostsPage(username, authorId, "", 40, clock.instant().plusSeconds(25))
+                );
+                if (page != null && page.posts() != null && !page.posts().isEmpty()) {
+                    long completedAt = clock.millis();
+                    long commitCutoff = AssistantRetention.cutoffMillis(completedAt);
+                    XUserSummary pageAuthor = page.author();
+                    store.tx(tx -> {
+                        for (TextPost post : page.posts()) {
+                            if (post.publishedAt().toEpochMilli() < commitCutoff) continue;
+                            AssistantWorkflow.ingest(tx, toMaterial(post, pageAuthor, false));
+                        }
+                        ObjectNode live = tx.get("source", authorId);
+                        if (live != null && "ACTIVE".equals(live.path("status").asText(""))) {
+                            tx.put("source", authorId, live.deepCopy().put("lastSuccessAt", completedAt).put("error", ""));
+                        }
+                        return null;
+                    });
+                }
+            } catch (Exception ignored) {
+                // Fall back to existing local materials if upstream refresh fails transiently
+            }
+        }
+        long effectiveMaxAge = maxAgeMs > 0L ? maxAgeMs : 30L * 24L * 60L * 60_000L;
+        return store.tx(tx -> {
+            List<ObjectNode> matches = new ArrayList<>();
+            for (ObjectNode m : tx.all("material")) {
+                boolean same = (!authorId.isBlank() && authorId.equals(m.path("authorId").asText("")))
+                        || (!username.isBlank() && username.equalsIgnoreCase(m.path("username").asText("").replaceFirst("^@+", "")));
+                if (!same) continue;
+                long pubAt = m.path("publishedAt").asLong(0L);
+                if (pubAt <= 0L || nowMs - pubAt > effectiveMaxAge) continue;
+                matches.add(m.deepCopy());
+            }
+            return matches;
+        });
+    }
+
     public ObjectNode add(String input, int intervalMinutes) {
         int tierMinutes = validateTierMinutes(intervalMinutes);
         XUserSummary author = provider.resolvePublicAuthor(parseUsername(input));
@@ -339,6 +462,7 @@ public class SourceCollector {
                     .put("lastSuccessAt", 0).put("lastCompleteAt", 0)
                     .put("error", "");
             if (!source.has("autoRepostEnabled")) source.put("autoRepostEnabled", false);
+            if (!source.has("autoRewriteEnabled")) source.put("autoRewriteEnabled", false);
             if (!source.has("autoRepostTextMode")) source.put("autoRepostTextMode", "AI");
             if (!source.has("autoRepostTemplate")) source.put("autoRepostTemplate", "");
             if (!source.has("autoRepostMinScore")) source.put("autoRepostMinScore", DEFAULT_AUTO_REPOST_MIN_SCORE);
@@ -372,6 +496,17 @@ public class SourceCollector {
                 next.put("autoRepostEnabled", enabled);
                 if (enabled && !wasEnabled) {
                     next.put("autoRepostEnabledAt", now);
+                }
+            }
+            if (body.has("autoRewriteEnabled")) {
+                if (!body.path("autoRewriteEnabled").isBoolean()) {
+                    throw new IllegalArgumentException("autoRewriteEnabled 必须是布尔值");
+                }
+                boolean rewriteEnabled = body.path("autoRewriteEnabled").asBoolean();
+                boolean wasRewriteEnabled = current.path("autoRewriteEnabled").asBoolean(false);
+                next.put("autoRewriteEnabled", rewriteEnabled);
+                if (rewriteEnabled && !wasRewriteEnabled) {
+                    next.put("autoRewriteEnabledAt", now);
                 }
             }
             if (body.has("autoRepostTextMode")) {

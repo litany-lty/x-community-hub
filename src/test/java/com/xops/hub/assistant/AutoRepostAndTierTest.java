@@ -1696,4 +1696,592 @@ class AutoRepostAndTierTest {
                 .hasMessageContaining("PI Agent")
                 .hasMessageContaining("simulated pi failure");
     }
+
+    @Test
+    void multiSlotIntervalEvaluatesFreshPinnedPostsAndDefersRunnerUpForSubsequentSlot() throws Exception {
+        ZoneId shanghai = ZoneId.of("Asia/Shanghai");
+        Instant slot1Time = ZonedDateTime.of(2026, 11, 27, 1, 35, 0, 0, shanghai).toInstant();
+        ObjectMapper mapper = new ObjectMapper();
+        AssistantStore store = new AssistantStore(tempDir.resolve("multi-slot-pinned-store"), mapper);
+        SourceCollector mockSources = mock(SourceCollector.class);
+        XOAuthService mockOauth = mock(XOAuthService.class);
+        XPublishClient mockPublish = mock(XPublishClient.class);
+        when(mockOauth.getValidWriteAccessToken("owner-ms", false)).thenReturn("ms-write-token");
+        when(mockPublish.createTweet(eq("ms-write-token"), anyString(), eq(List.of()), eq("6100001"))).thenReturn("6199001");
+        when(mockPublish.createTweet(eq("ms-write-token"), anyString(), eq(List.of()), eq("6100002"))).thenReturn("6199002");
+
+        ObjectNode srcAndMats = store.tx(tx -> {
+            tx.put("meta", "owner", mapper.createObjectNode().put("accountId", "owner-ms").put("username", "elidlicom"));
+            tx.put("meta", "settings", AssistantWorkflow.settings(tx).put("enabled", true));
+            ObjectNode src = tx.put("source", "src-agy", mapper.createObjectNode()
+                    .put("id", "src-agy")
+                    .put("authorId", "src-agy")
+                    .put("username", "antigravity")
+                    .put("displayName", "Antigravity")
+                    .put("status", "ACTIVE")
+                    .put("intervalMinutes", 5)
+                    .put("autoRepostEnabled", true)
+                    .put("autoRepostEnabledAt", slot1Time.minusSeconds(7200).toEpochMilli())
+                    .put("autoRepostTextMode", "AI")
+                    .put("autoRepostMinScore", 70));
+            ObjectNode m1 = mapper.createObjectNode()
+                    .put("id", "6100001")
+                    .put("authorId", "src-agy")
+                    .put("username", "antigravity")
+                    .put("authorName", "Antigravity")
+                    .put("text", "Introducing Antigravity 2.0 agent workspace with parallel verification.")
+                    .put("textStatus", "TEXT_ONLY")
+                    .put("kind", "POST")
+                    .put("pinned", true)
+                    .put("publishedAt", slot1Time.minusSeconds(300).toEpochMilli())
+                    .put("sourceUrl", "https://x.com/antigravity/status/6100001");
+            ObjectNode m2 = mapper.createObjectNode()
+                    .put("id", "6100002")
+                    .put("authorId", "src-agy")
+                    .put("username", "antigravity")
+                    .put("authorName", "Antigravity")
+                    .put("text", "All developer sandbox quotas have been refreshed and doubled for the weekend.")
+                    .put("textStatus", "TEXT_ONLY")
+                    .put("kind", "POST")
+                    .put("pinned", false)
+                    .put("publishedAt", slot1Time.minusSeconds(900).toEpochMilli())
+                    .put("sourceUrl", "https://x.com/antigravity/status/6100002");
+            AssistantWorkflow.ingest(tx, m1);
+            AssistantWorkflow.ingest(tx, m2);
+            ObjectNode out = mapper.createObjectNode();
+            out.set("source", src);
+            out.set("m1", tx.get("material", "6100001"));
+            out.set("m2", tx.get("material", "6100002"));
+            return out;
+        });
+
+        Path fakeCodex = Files.createFile(tempDir.resolve("fake-codex-multislot"),
+                PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rwxr-xr-x")));
+        MockEnvironment codexEnv = new MockEnvironment()
+                .withProperty(PiAgentViralJudge.CODEX_CLI_PATH_ENV, fakeCodex.toString())
+                .withProperty(PiAgentViralJudge.BACKEND_ENV, "codex");
+        PiAgentViralJudge judge = new PiAgentViralJudge(mapper, codexEnv, (cmd, stdin, timeout) -> {
+            if (cmd.contains("login") && cmd.contains("status")) {
+                return new PiAgentViralJudge.CliResult(0, "Logged in using ChatGPT", "");
+            }
+            int outIdx = cmd.indexOf("-o");
+            String outBody;
+            if (cmd.contains("--output-schema") && stdin.contains("selectedMaterialId")) {
+                outBody = """
+                        {"selectedMaterialId":"6100001","items":[
+                          {"materialId":"6100001","verdict":"VIRAL_REPOST","viralScore":90,"factScore":88,"trendScore":86,"attentionScore":85,"accountFit":true,"fitScore":92,"eventMagnitude":88,"publicResonance":86,"credibility":95,"category":"FEATURE_UPDATE","summary":"AGY 2.0上线","reason":"功能更新直通"},
+                          {"materialId":"6100002","verdict":"VIRAL_REPOST","viralScore":89,"factScore":87,"trendScore":84,"attentionScore":86,"accountFit":true,"fitScore":90,"eventMagnitude":85,"publicResonance":86,"credibility":94,"category":"QUOTA_RESET","summary":"沙盒额度翻倍","reason":"额度刷新直通"}
+                        ]}
+                        """;
+            } else if (cmd.contains("--output-schema")) {
+                outBody = """
+                        {"verdict":"VIRAL_REPOST","viralScore":89,"factScore":87,"trendScore":84,"attentionScore":86,"accountFit":true,"fitScore":90,"eventMagnitude":85,"publicResonance":86,"credibility":94,"category":"QUOTA_RESET","summary":"沙盒额度翻倍","reason":"额度刷新直通"}
+                        """;
+            } else {
+                outBody = "🎉 Antigravity 刚推了新动作，重度写代码终于更顺手啦😺\n\n这波给开发者的诚意比挤牙膏实在多了。";
+            }
+            if (outIdx >= 0 && outIdx + 1 < cmd.size()) {
+                Files.writeString(Path.of(cmd.get(outIdx + 1)), outBody);
+            }
+            return new PiAgentViralJudge.CliResult(0, outBody, "");
+        });
+
+        AutoRepostService slot1Svc = new AutoRepostService(
+                store, mockSources, judge, mockOauth, mockPublish, Clock.fixed(slot1Time, shanghai));
+        try {
+            slot1Svc.processAuthorBatch(
+                    (ObjectNode) srcAndMats.get("source"),
+                    List.of((ObjectNode) srcAndMats.get("m1"), (ObjectNode) srcAndMats.get("m2")));
+            assertThat(store.<ObjectNode>tx(tx -> tx.get("auto_repost", "6100001")).path("status").asText())
+                    .isEqualTo("PUBLISHED");
+            ObjectNode deferredRunnerUp = store.tx(tx -> tx.get("auto_repost", "6100002"));
+            assertThat(deferredRunnerUp.path("status").asText()).isEqualTo("SKIPPED_COOLDOWN");
+            assertThat(deferredRunnerUp.path("deferredPendingEval").asBoolean()).isTrue();
+        } finally {
+            slot1Svc.shutdown();
+        }
+
+        // 90 minutes later (< 16h): @antigravity is strictly locked for 16 hours after being quote-reposted
+        Instant within16hTime = slot1Time.plusSeconds(90 * 60L);
+        when(mockSources.syncSourceMaterialsForPatrol(any(), anyLong()))
+                .thenReturn(List.of((ObjectNode) srcAndMats.get("m1"), (ObjectNode) srcAndMats.get("m2")));
+        AutoRepostService lockedSvc = new AutoRepostService(
+                store, mockSources, judge, mockOauth, mockPublish, Clock.fixed(within16hTime, shanghai));
+        try {
+            ObjectNode lockedPatrol = lockedSvc.runOwnerIdleRepostPatrol();
+            assertThat(lockedPatrol.path("status").asText()).isEqualTo("NO_ELIGIBLE_CANDIDATE");
+            assertThat(lockedPatrol.path("reason").asText()).isEqualTo("ALL_REPOST_SOURCES_IN_16H_LOCK");
+        } finally {
+            lockedSvc.shutdown();
+        }
+
+        // Next active window (+24h > 16h same-author lock): @antigravity unlocks and publishes deferred 6100002!
+        Instant slot2Time = slot1Time.plusSeconds(24L * 3600L);
+        AutoRepostService slot2Svc = new AutoRepostService(
+                store, mockSources, judge, mockOauth, mockPublish, Clock.fixed(slot2Time, shanghai));
+        try {
+            ObjectNode patrol2 = slot2Svc.runOwnerIdleRepostPatrol();
+            assertThat(patrol2.path("status").asText()).isEqualTo("PUBLISHED");
+            assertThat(patrol2.path("materialId").asText()).isEqualTo("6100002");
+            verify(mockPublish, times(1)).createTweet(eq("ms-write-token"), anyString(), eq(List.of()), eq("6100001"));
+            verify(mockPublish, times(1)).createTweet(eq("ms-write-token"), anyString(), eq(List.of()), eq("6100002"));
+        } finally {
+            slot2Svc.shutdown();
+        }
+    }
+
+    @Test
+    void highTrafficPureTextWashRewriteFiltersNonPureTextSharesTimeLockAndFiresAcrossMultipleIntervals() throws Exception {
+        ZoneId shanghai = ZoneId.of("Asia/Shanghai");
+        Instant t1 = ZonedDateTime.of(2026, 11, 27, 1, 10, 0, 0, shanghai).toInstant();
+        ObjectMapper mapper = new ObjectMapper();
+        AssistantStore store = new AssistantStore(tempDir.resolve("wash-rewrite-store"), mapper);
+        TwitterApiIoProvider mockProvider = mock(TwitterApiIoProvider.class);
+        CommunityHubService mockCommunity = mock(CommunityHubService.class);
+        when(mockCommunity.longHistoryCandidates()).thenReturn(List.of());
+        SourceCollector collector = new SourceCollector(store, mockProvider, mockCommunity, mapper, Clock.fixed(t1, shanghai));
+
+        XOAuthService mockOauth = mock(XOAuthService.class);
+        XPublishClient mockPublish = mock(XPublishClient.class);
+        when(mockOauth.getValidWriteAccessToken("owner-rw", false)).thenReturn("rw-write-token");
+        AtomicInteger pubSeq = new AtomicInteger(790000);
+        List<String> publishedTexts = new java.util.concurrent.CopyOnWriteArrayList<>();
+        List<String> publishedQuoteIds = new java.util.concurrent.CopyOnWriteArrayList<>();
+        when(mockPublish.createTweet(eq("rw-write-token"), anyString(), eq(List.of()), org.mockito.ArgumentMatchers.nullable(String.class)))
+                .thenAnswer(inv -> {
+                    publishedTexts.add(inv.getArgument(1, String.class));
+                    String qid = inv.getArgument(3, String.class);
+                    publishedQuoteIds.add(qid == null ? "NULL_QUOTE" : qid);
+                    return String.valueOf(pubSeq.incrementAndGet());
+                });
+
+        store.tx(tx -> {
+            tx.put("meta", "owner", mapper.createObjectNode().put("accountId", "owner-rw").put("username", "elidlicom"));
+            tx.put("meta", "settings", AssistantWorkflow.settings(tx)
+                    .put("enabled", true)
+                    .put("postPolishEnabled", true)
+                    .put("postPolishPrompt", "保持口语化，像发朋友圈。如果是转发引用，需要先把引用内容简述下。"));
+            tx.put("source", "src-karpathy", mapper.createObjectNode()
+                    .put("id", "src-karpathy")
+                    .put("authorId", "src-karpathy")
+                    .put("username", "karpathy")
+                    .put("displayName", "Andrej Karpathy")
+                    .put("status", "ACTIVE")
+                    .put("intervalMinutes", 5)
+                    .put("lastSuccessAt", t1.toEpochMilli())
+                    .put("autoRepostEnabled", false)
+                    .put("autoRewriteEnabled", false));
+            // 1) High traffic but hasMedia = true -> must NOT be selected for pure-text wash rewrite
+            AssistantWorkflow.ingest(tx, mapper.createObjectNode()
+                    .put("id", "7100001").put("authorId", "src-karpathy").put("username", "karpathy")
+                    .put("text", "Visualizing attention heads in transformers over 100k context windows in detail.")
+                    .put("textStatus", "TEXT_ONLY").put("kind", "POST").put("hasMedia", true)
+                    .put("views", 120_000L).put("likes", 2_800L).put("reposts", 320L)
+                    .put("publishedAt", t1.minusSeconds(36_000).toEpochMilli()));
+            // 2) High traffic but contains external link -> must NOT be selected
+            AssistantWorkflow.ingest(tx, mapper.createObjectNode()
+                    .put("id", "7100002").put("authorId", "src-karpathy").put("username", "karpathy")
+                    .put("text", "My new 3-hour lecture on building LLM tokenizers from scratch is live: https://example.com/video")
+                    .put("textStatus", "TEXT_ONLY").put("kind", "POST").put("hasMedia", false)
+                    .put("views", 110_000L).put("likes", 2_500L).put("reposts", 290L)
+                    .put("publishedAt", t1.minusSeconds(40_000).toEpochMilli()));
+            // 3) High traffic QUOTE post -> must NOT be selected
+            AssistantWorkflow.ingest(tx, mapper.createObjectNode()
+                    .put("id", "7100003").put("authorId", "src-karpathy").put("username", "karpathy")
+                    .put("text", "Strong agreement with this systems engineering breakdown on memory bandwidth.")
+                    .put("quotedId", "999111").put("quotedText", "Memory wall is the real bottleneck.")
+                    .put("textStatus", "TEXT_ONLY").put("kind", "QUOTE").put("hasMedia", false)
+                    .put("views", 95_000L).put("likes", 1_900L).put("reposts", 180L)
+                    .put("publishedAt", t1.minusSeconds(45_000).toEpochMilli()));
+            // 4) Pure text but LOW traffic relative to author baseline -> must NOT be selected
+            AssistantWorkflow.ingest(tx, mapper.createObjectNode()
+                    .put("id", "7100004").put("authorId", "src-karpathy").put("username", "karpathy")
+                    .put("text", "Quick note on Python virtual environments when switching between local CUDA versions on Linux.")
+                    .put("textStatus", "TEXT_ONLY").put("kind", "POST").put("hasMedia", false)
+                    .put("views", 1_200L).put("likes", 18L).put("reposts", 1L)
+                    .put("publishedAt", t1.minusSeconds(50_000).toEpochMilli()));
+            // 5) Pure text + HIGHEST traffic (#1) -> selected on Slot 1!
+            AssistantWorkflow.ingest(tx, mapper.createObjectNode()
+                    .put("id", "7100005").put("authorId", "src-karpathy").put("username", "karpathy")
+                    .put("text", "The biggest mistake people make with coding agents is treating prompts like wishes instead of specs. Give tight verification loops and small diffs, and reliability jumps dramatically.")
+                    .put("textStatus", "TEXT_ONLY").put("kind", "POST").put("hasMedia", false)
+                    .put("views", 85_000L).put("likes", 2_100L).put("reposts", 260L).put("replies", 110L)
+                    .put("publishedAt", t1.minusSeconds(60_000).toEpochMilli()));
+            // 6) Pure text + SECOND HIGHEST traffic (#2) -> selected on Slot 2!
+            AssistantWorkflow.ingest(tx, mapper.createObjectNode()
+                    .put("id", "7100006").put("authorId", "src-karpathy").put("username", "karpathy")
+                    .put("text", "Context engineering is quietly replacing prompt engineering. Deciding what NOT to stuff into the context window matters more than clever wording.")
+                    .put("textStatus", "TEXT_ONLY").put("kind", "POST").put("hasMedia", false)
+                    .put("views", 62_000L).put("likes", 1_480L).put("reposts", 175L).put("replies", 80L)
+                    .put("publishedAt", t1.minusSeconds(80_000).toEpochMilli()));
+            return null;
+        });
+
+        // Toggle activation config on the source
+        ObjectNode updatedCfg = collector.updateConfig("src-karpathy", mapper.createObjectNode().put("autoRewriteEnabled", true));
+        assertThat(updatedCfg.path("autoRewriteEnabled").asBoolean()).isTrue();
+        assertThat(collector.list().get(0).path("autoRewriteEnabled").asBoolean()).isTrue();
+
+        Path fakeCodex = Files.createFile(tempDir.resolve("fake-codex-rewrite"),
+                PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rwxr-xr-x")));
+        MockEnvironment codexEnv = new MockEnvironment()
+                .withProperty(PiAgentViralJudge.CODEX_CLI_PATH_ENV, fakeCodex.toString())
+                .withProperty(PiAgentViralJudge.BACKEND_ENV, "codex");
+        List<String> capturedPrompts = new java.util.concurrent.CopyOnWriteArrayList<>();
+        PiAgentViralJudge judge = new PiAgentViralJudge(mapper, codexEnv, (cmd, stdin, timeout) -> {
+            if (cmd.contains("login") && cmd.contains("status")) {
+                return new PiAgentViralJudge.CliResult(0, "Logged in using ChatGPT", "");
+            }
+            capturedPrompts.add(stdin);
+            int outIdx = cmd.indexOf("-o");
+            String body;
+            if (cmd.contains("--output-schema")) {
+                body = stdin.contains("Context engineering")
+                        ? "{\"suitableForRewrite\":true,\"suitabilityScore\":89,\"hookPattern\":\"新旧概念交替反差\",\"coreInsight\":\"上下文工程正在替代提示词工程，克制塞入无关上下文更关键\",\"reason\":\"高流量纯文本洞察，适合独立原创改写\"}"
+                        : "{\"suitableForRewrite\":true,\"suitabilityScore\":91,\"hookPattern\":\"反直觉误区切入+短句对比\",\"coreInsight\":\"写代码Agent靠明确验收闭环和小步修改，而不是许愿式提示词\",\"reason\":\"高流量纯文本工程认知，非常适合独立改写\"}";
+            } else if (stdin.contains("wishes instead of specs")) {
+                body = "很多人用写代码 Agent 翻车，其实都是把提示词当成了许愿池。\n\n真正在项目里稳住输出，靠的从来不是花哨措辞，而是把改动拆小、配好能自动跑通的验证闭环。";
+            } else {
+                body = "现在折腾大模型，真正拉开差距的早就不只是怎么措辞了。\n\n懂得克制往上下文里塞垃圾信息，往往比写一百句漂亮指令管用得多。";
+            }
+            if (outIdx >= 0 && outIdx + 1 < cmd.size()) {
+                Files.writeString(Path.of(cmd.get(outIdx + 1)), body);
+            }
+            return new PiAgentViralJudge.CliResult(0, body, "");
+        });
+
+        // Slot 1 (01:10 CST): picks highest-traffic pure-text 7100005, publishes WITHOUT quoteTweetId!
+        AutoRepostService svc1 = new AutoRepostService(
+                store, collector, judge, mockOauth, mockPublish, Clock.fixed(t1, shanghai));
+        try {
+            ObjectNode res1 = svc1.runOwnerIdleRepostPatrol();
+            assertThat(res1.path("status").asText()).isEqualTo("PUBLISHED");
+            assertThat(res1.path("mode").asText()).isEqualTo("REWRITE");
+            assertThat(res1.path("materialId").asText()).isEqualTo("7100005");
+            assertThat(publishedQuoteIds).containsExactly("NULL_QUOTE");
+            assertThat(publishedTexts.get(0)).contains("许愿池").doesNotContain("karpathy").doesNotContain("http");
+            ObjectNode pubRec = store.tx(tx -> tx.get("publication", "auto-rewrite-7100005"));
+            assertThat(pubRec.path("source").asText()).isEqualTo("AUTO_REWRITE_POST");
+            assertThat(pubRec.has("quoteTweetId")).isFalse();
+        } finally {
+            svc1.shutdown();
+        }
+
+        // 25 minutes later (01:35 CST): shared global 1h+jitter time lock blocks BOTH rewrite patrol AND quote-repost!
+        Instant tLocked = t1.plusSeconds(25 * 60L);
+        AutoRepostService svcLocked = new AutoRepostService(
+                store, collector, judge, mockOauth, mockPublish, Clock.fixed(tLocked, shanghai));
+        try {
+            ObjectNode lockedRes = svcLocked.runOwnerIdleRepostPatrol();
+            assertThat(lockedRes.path("status").asText()).isEqualTo("RECENTLY_TWEETED");
+            assertThat(publishedQuoteIds).hasSize(1);
+        } finally {
+            svcLocked.shutdown();
+        }
+
+        // Slot 2 (02:40 CST, +90m > 1h+jitter): same account fires AGAIN with second-highest-traffic pure-text 7100006!
+        Instant t2 = t1.plusSeconds(90 * 60L);
+        AutoRepostService svc2 = new AutoRepostService(
+                store, collector, judge, mockOauth, mockPublish, Clock.fixed(t2, shanghai));
+        try {
+            ObjectNode res2 = svc2.runOwnerIdleRepostPatrol();
+            assertThat(res2.path("status").asText()).isEqualTo("PUBLISHED");
+            assertThat(res2.path("mode").asText()).isEqualTo("REWRITE");
+            assertThat(res2.path("materialId").asText()).isEqualTo("7100006");
+            assertThat(publishedQuoteIds).containsExactly("NULL_QUOTE", "NULL_QUOTE");
+            assertThat(publishedTexts.get(1)).contains("上下文").doesNotContain("karpathy");
+        } finally {
+            svc2.shutdown();
+            collector.stop();
+        }
+    }
+
+    @Test
+    void recentContentFallbackQuotesOlderPostsWhenNoNewPostsAndStrictlyLocksSameAuthorForSixteenHours() throws Exception {
+        ZoneId shanghai = ZoneId.of("Asia/Shanghai");
+        Instant night1Slot1 = ZonedDateTime.of(2026, 11, 27, 1, 0, 0, 0, shanghai).toInstant();
+        ObjectMapper mapper = new ObjectMapper();
+        AssistantStore store = new AssistantStore(tempDir.resolve("recent-fallback-16h-store"), mapper);
+        TwitterApiIoProvider mockProvider = mock(TwitterApiIoProvider.class);
+        CommunityHubService mockCommunity = mock(CommunityHubService.class);
+        when(mockCommunity.longHistoryCandidates()).thenReturn(List.of());
+        SourceCollector collector = new SourceCollector(store, mockProvider, mockCommunity, mapper, Clock.fixed(night1Slot1, shanghai));
+
+        XOAuthService mockOauth = mock(XOAuthService.class);
+        XPublishClient mockPublish = mock(XPublishClient.class);
+        when(mockOauth.getValidWriteAccessToken("owner-fb", false)).thenReturn("fb-token");
+        List<String> quotedTweetIds = new java.util.concurrent.CopyOnWriteArrayList<>();
+        AtomicInteger seq = new AtomicInteger(890000);
+        when(mockPublish.createTweet(eq("fb-token"), anyString(), eq(List.of()), anyString()))
+                .thenAnswer(inv -> {
+                    quotedTweetIds.add(inv.getArgument(3, String.class));
+                    return String.valueOf(seq.incrementAndGet());
+                });
+
+        // All posts are 4~6 days old (> 48h fresh window), testing fallback to recent content + 16h lock!
+        long fiveDaysAgo = night1Slot1.minusSeconds(5L * 24 * 3600).toEpochMilli();
+        long sixDaysAgo = night1Slot1.minusSeconds(6L * 24 * 3600).toEpochMilli();
+        long fourDaysAgo = night1Slot1.minusSeconds(4L * 24 * 3600).toEpochMilli();
+
+        store.tx(tx -> {
+            tx.put("meta", "owner", mapper.createObjectNode().put("accountId", "owner-fb").put("username", "elidlicom"));
+            tx.put("meta", "settings", AssistantWorkflow.settings(tx).put("enabled", true).put("postPolishEnabled", false));
+            tx.put("source", "src-ds", mapper.createObjectNode()
+                    .put("id", "src-ds").put("authorId", "src-ds").put("username", "deepseek_ai")
+                    .put("displayName", "DeepSeek").put("status", "ACTIVE").put("intervalMinutes", 5)
+                    .put("lastSuccessAt", night1Slot1.toEpochMilli())
+                    .put("autoRepostEnabled", true).put("autoRepostMinScore", 70));
+            tx.put("source", "src-claude", mapper.createObjectNode()
+                    .put("id", "src-claude").put("authorId", "src-claude").put("username", "claudeai")
+                    .put("displayName", "Claude").put("status", "ACTIVE").put("intervalMinutes", 30)
+                    .put("lastSuccessAt", night1Slot1.toEpochMilli())
+                    .put("autoRepostEnabled", true).put("autoRepostMinScore", 70));
+            AssistantWorkflow.ingest(tx, mapper.createObjectNode()
+                    .put("id", "8100001").put("authorId", "src-ds").put("username", "deepseek_ai")
+                    .put("text", "DeepSeek open-sources FlashMLA kernel achieving 3000 GB/s memory bandwidth on H800 GPUs.")
+                    .put("textStatus", "TEXT_ONLY").put("kind", "POST").put("views", 90_000L).put("likes", 2_200L)
+                    .put("publishedAt", fiveDaysAgo).put("sourceUrl", "https://x.com/deepseek_ai/status/8100001"));
+            AssistantWorkflow.ingest(tx, mapper.createObjectNode()
+                    .put("id", "8100002").put("authorId", "src-ds").put("username", "deepseek_ai")
+                    .put("text", "Day 2 open-source drop: DeepEP communication library for MoE training and inference.")
+                    .put("textStatus", "TEXT_ONLY").put("kind", "POST").put("views", 82_000L).put("likes", 1_950L)
+                    .put("publishedAt", sixDaysAgo).put("sourceUrl", "https://x.com/deepseek_ai/status/8100002"));
+            AssistantWorkflow.ingest(tx, mapper.createObjectNode()
+                    .put("id", "8200001").put("authorId", "src-claude").put("username", "claudeai")
+                    .put("text", "Claude Code now supports background sub-agents and persistent memory across large repositories.")
+                    .put("textStatus", "TEXT_ONLY").put("kind", "POST").put("views", 75_000L).put("likes", 1_800L)
+                    .put("publishedAt", fourDaysAgo).put("sourceUrl", "https://x.com/claudeai/status/8200001"));
+            return null;
+        });
+
+        Path fakeCodex = Files.createFile(tempDir.resolve("fake-codex-recent-fb"),
+                PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rwxr-xr-x")));
+        MockEnvironment codexEnv = new MockEnvironment()
+                .withProperty(PiAgentViralJudge.CODEX_CLI_PATH_ENV, fakeCodex.toString())
+                .withProperty(PiAgentViralJudge.BACKEND_ENV, "codex");
+        List<String> writerInputs = new java.util.concurrent.CopyOnWriteArrayList<>();
+        PiAgentViralJudge judge = new PiAgentViralJudge(mapper, codexEnv, (cmd, stdin, timeout) -> {
+            if (cmd.contains("login") && cmd.contains("status")) {
+                return new PiAgentViralJudge.CliResult(0, "Logged in using ChatGPT", "");
+            }
+            int outIdx = cmd.indexOf("-o");
+            String body;
+            if (cmd.contains("--output-schema") && stdin.contains("selectedMaterialId")) {
+                String pick = stdin.contains("8100001") ? "8100001" : (stdin.contains("8100002") ? "8100002" : "8200001");
+                List<String> rows = new java.util.ArrayList<>();
+                for (String cid : List.of("8100001", "8100002", "8200001")) {
+                    if (stdin.contains(cid)) {
+                        rows.add("{\"materialId\":\"" + cid + "\",\"verdict\":\"VIRAL_REPOST\",\"viralScore\":88,\"factScore\":90,\"trendScore\":84,\"attentionScore\":88,\"accountFit\":true,\"fitScore\":92,\"eventMagnitude\":86,\"publicResonance\":86,\"credibility\":95,\"category\":\"MODEL_RELEASE\",\"summary\":\"近期硬核开源回顾\",\"reason\":\"高关注硬核内容\"}");
+                    }
+                }
+                body = "{\"selectedMaterialId\":\"" + pick + "\",\"items\":[" + String.join(",", rows) + "]}";
+            } else if (cmd.contains("--output-schema")) {
+                body = "{\"verdict\":\"VIRAL_REPOST\",\"viralScore\":88,\"factScore\":90,\"trendScore\":84,\"attentionScore\":88,\"accountFit\":true,\"fitScore\":92,\"eventMagnitude\":86,\"publicResonance\":86,\"credibility\":95,\"category\":\"FEATURE_UPDATE\",\"summary\":\"Claude子代理\",\"reason\":\"实用工程能力\"}";
+            } else {
+                writerInputs.add(stdin);
+                body = "🎉 回看这条硬核技术动作依然很有含金量。\n\n把底层算力吃透才是实打实的工程壁垒。";
+            }
+            if (outIdx >= 0 && outIdx + 1 < cmd.size()) {
+                Files.writeString(Path.of(cmd.get(outIdx + 1)), body);
+            }
+            return new PiAgentViralJudge.CliResult(0, body, "");
+        });
+
+        // 1) Slot 1 (01:00 CST): no fresh posts -> falls back to recent posts of @deepseek_ai (5m tier), quotes 8100001
+        AutoRepostService s1 = new AutoRepostService(store, collector, judge, mockOauth, mockPublish, Clock.fixed(night1Slot1, shanghai));
+        try {
+            ObjectNode r1 = s1.runOwnerIdleRepostPatrol();
+            assertThat(r1.path("status").asText()).isEqualTo("PUBLISHED");
+            assertThat(r1.path("repostSourceTier").asText()).isEqualTo("RECENT_FALLBACK");
+            assertThat(r1.path("materialId").asText()).isEqualTo("8100001");
+            assertThat(writerInputs.get(0)).contains("RECENT_POST_NOT_BREAKING");
+        } finally {
+            s1.shutdown();
+        }
+
+        // 2) Slot 2 (02:30 CST, +90m): @deepseek_ai is strictly locked for 16h (even though 8100002 is MODEL_RELEASE!) -> quotes @claudeai 8200001
+        Instant night1Slot2 = night1Slot1.plusSeconds(90 * 60L);
+        AutoRepostService s2 = new AutoRepostService(store, collector, judge, mockOauth, mockPublish, Clock.fixed(night1Slot2, shanghai));
+        try {
+            ObjectNode r2 = s2.runOwnerIdleRepostPatrol();
+            assertThat(r2.path("status").asText()).isEqualTo("PUBLISHED");
+            assertThat(r2.path("repostSourceTier").asText()).isEqualTo("RECENT_FALLBACK");
+            assertThat(r2.path("materialId").asText()).isEqualTo("8200001");
+            assertThat(quotedTweetIds).containsExactly("8100001", "8200001");
+        } finally {
+            s2.shutdown();
+        }
+
+        // 3) Slot 3 (04:00 CST, +180m): BOTH @deepseek_ai and @claudeai are inside 16h lock -> NO_ELIGIBLE_CANDIDATE (ALL_REPOST_SOURCES_IN_16H_LOCK)
+        Instant night1Slot3 = night1Slot1.plusSeconds(180 * 60L);
+        AutoRepostService s3 = new AutoRepostService(store, collector, judge, mockOauth, mockPublish, Clock.fixed(night1Slot3, shanghai));
+        try {
+            ObjectNode r3 = s3.runOwnerIdleRepostPatrol();
+            assertThat(r3.path("status").asText()).isEqualTo("NO_ELIGIBLE_CANDIDATE");
+            assertThat(r3.path("reason").asText()).isEqualTo("ALL_REPOST_SOURCES_IN_16H_LOCK");
+            assertThat(quotedTweetIds).hasSize(2);
+        } finally {
+            s3.shutdown();
+        }
+
+        // 4) Next night (24h later > 16h lock): @deepseek_ai unlocks and quotes 8100002!
+        Instant night2Slot1 = night1Slot1.plusSeconds(24L * 3600L);
+        AutoRepostService s4 = new AutoRepostService(store, collector, judge, mockOauth, mockPublish, Clock.fixed(night2Slot1, shanghai));
+        try {
+            ObjectNode r4 = s4.runOwnerIdleRepostPatrol();
+            assertThat(r4.path("status").asText()).isEqualTo("PUBLISHED");
+            assertThat(r4.path("materialId").asText()).isEqualTo("8100002");
+            assertThat(quotedTweetIds).containsExactly("8100001", "8200001", "8100002");
+        } finally {
+            s4.shutdown();
+            collector.stop();
+        }
+    }
+
+    @Test
+    void autoPublishDispatchOrderUsesOddRepostEvenRewriteAndForcesOppositeAfterTwoConsecutiveSameMode() throws Exception {
+        // Pure unit verification of the exact odd/even + 2-streak anti-repeat contract
+        AtomicInteger rngCalls = new AtomicInteger();
+        var dOdd = AutoRepostService.resolveNextAutoPublishOrder(List.of(), () -> { rngCalls.incrementAndGet(); return 7; });
+        assertThat(dOdd.primaryMode()).isEqualTo(AutoRepostService.AutoPublishMode.REPOST);
+        assertThat(dOdd.forcedByTwoStreak()).isFalse();
+        assertThat(dOdd.reasonCode()).isEqualTo("RANDOM_ODD_REPOST");
+
+        var dEven = AutoRepostService.resolveNextAutoPublishOrder(
+                List.of(AutoRepostService.AutoPublishMode.REPOST), () -> { rngCalls.incrementAndGet(); return 12; });
+        assertThat(dEven.primaryMode()).isEqualTo(AutoRepostService.AutoPublishMode.REWRITE);
+        assertThat(dEven.forcedByTwoStreak()).isFalse();
+        assertThat(dEven.reasonCode()).isEqualTo("RANDOM_EVEN_REWRITE");
+        assertThat(rngCalls.get()).isEqualTo(2);
+
+        // 2x REPOST in a row -> next MUST NOT call rng and MUST force REWRITE
+        var forceRewrite = AutoRepostService.resolveNextAutoPublishOrder(
+                List.of(AutoRepostService.AutoPublishMode.REPOST, AutoRepostService.AutoPublishMode.REPOST),
+                () -> { rngCalls.incrementAndGet(); return 99; });
+        assertThat(forceRewrite.primaryMode()).isEqualTo(AutoRepostService.AutoPublishMode.REWRITE);
+        assertThat(forceRewrite.forcedByTwoStreak()).isTrue();
+        assertThat(forceRewrite.reasonCode()).isEqualTo("STREAK_2_FORCE_REWRITE");
+        assertThat(rngCalls.get()).isEqualTo(2);
+
+        // 2x REWRITE in a row -> next MUST NOT call rng and MUST force REPOST
+        var forceRepost = AutoRepostService.resolveNextAutoPublishOrder(
+                List.of(AutoRepostService.AutoPublishMode.REWRITE, AutoRepostService.AutoPublishMode.REWRITE),
+                () -> { rngCalls.incrementAndGet(); return 88; });
+        assertThat(forceRepost.primaryMode()).isEqualTo(AutoRepostService.AutoPublishMode.REPOST);
+        assertThat(forceRepost.forcedByTwoStreak()).isTrue();
+        assertThat(forceRepost.reasonCode()).isEqualTo("STREAK_2_FORCE_REPOST");
+        assertThat(rngCalls.get()).isEqualTo(2);
+
+        // End-to-end 5-slot sequence: Odd(REPOST) -> Odd(REPOST) -> Forced(REWRITE) -> Even(REWRITE) -> Forced(REPOST)
+        ZoneId shanghai = ZoneId.of("Asia/Shanghai");
+        Instant baseTime = ZonedDateTime.of(2026, 11, 27, 0, 10, 0, 0, shanghai).toInstant();
+        ObjectMapper mapper = new ObjectMapper();
+        AssistantStore store = new AssistantStore(tempDir.resolve("order-5slot-store"), mapper);
+        TwitterApiIoProvider mockProvider = mock(TwitterApiIoProvider.class);
+        CommunityHubService mockCommunity = mock(CommunityHubService.class);
+        when(mockCommunity.longHistoryCandidates()).thenReturn(List.of());
+        SourceCollector collector = new SourceCollector(store, mockProvider, mockCommunity, mapper, Clock.fixed(baseTime, shanghai));
+        XOAuthService mockOauth = mock(XOAuthService.class);
+        XPublishClient mockPublish = mock(XPublishClient.class);
+        when(mockOauth.getValidWriteAccessToken("owner-ord", false)).thenReturn("ord-token");
+        AtomicInteger tweetSeq = new AtomicInteger(950000);
+        List<String> publishModesObserved = new java.util.concurrent.CopyOnWriteArrayList<>();
+        when(mockPublish.createTweet(eq("ord-token"), anyString(), eq(List.of()), org.mockito.ArgumentMatchers.nullable(String.class)))
+                .thenAnswer(inv -> {
+                    String qid = inv.getArgument(3, String.class);
+                    publishModesObserved.add(qid != null ? "REPOST:" + qid : "REWRITE");
+                    return String.valueOf(tweetSeq.incrementAndGet());
+                });
+
+        store.tx(tx -> {
+            tx.put("meta", "owner", mapper.createObjectNode().put("accountId", "owner-ord").put("username", "elidlicom"));
+            tx.put("meta", "settings", AssistantWorkflow.settings(tx).put("enabled", true).put("postPolishEnabled", false));
+            for (int i = 1; i <= 3; i++) {
+                String sid = "src-rp-" + i;
+                String mid = "910000" + i;
+                tx.put("source", sid, mapper.createObjectNode()
+                        .put("id", sid).put("authorId", sid).put("username", "repost_src_" + i)
+                        .put("status", "ACTIVE").put("intervalMinutes", 5)
+                        .put("lastSuccessAt", baseTime.toEpochMilli())
+                        .put("autoRepostEnabled", true).put("autoRepostMinScore", 70));
+                AssistantWorkflow.ingest(tx, mapper.createObjectNode()
+                        .put("id", mid).put("authorId", sid).put("username", "repost_src_" + i)
+                        .put("text", "Major model release #" + i + " with 2x throughput and open weights.")
+                        .put("textStatus", "TEXT_ONLY").put("kind", "POST").put("views", 50_000L).put("likes", 1_200L)
+                        .put("publishedAt", baseTime.minusSeconds(600L * i).toEpochMilli())
+                        .put("sourceUrl", "https://x.com/repost_src_" + i + "/status/" + mid));
+            }
+            tx.put("source", "src-rw", mapper.createObjectNode()
+                    .put("id", "src-rw").put("authorId", "src-rw").put("username", "rewrite_blogger")
+                    .put("status", "ACTIVE").put("intervalMinutes", 5)
+                    .put("lastSuccessAt", baseTime.toEpochMilli())
+                    .put("autoRewriteEnabled", true));
+            for (int j = 1; j <= 3; j++) {
+                AssistantWorkflow.ingest(tx, mapper.createObjectNode()
+                        .put("id", "920000" + j).put("authorId", "src-rw").put("username", "rewrite_blogger")
+                        .put("text", "High-traffic pure text insight #" + j + " explaining why small verifiable diffs always beat giant speculative rewrites in engineering.")
+                        .put("textStatus", "TEXT_ONLY").put("kind", "POST").put("hasMedia", false)
+                        .put("views", (90_000L - j * 5_000L)).put("likes", (2_000L - j * 100L)).put("reposts", 200L)
+                        .put("publishedAt", baseTime.minusSeconds(3_600L * j).toEpochMilli()));
+            }
+            return null;
+        });
+
+        Path fakeCodex = Files.createFile(tempDir.resolve("fake-codex-ord"),
+                PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rwxr-xr-x")));
+        MockEnvironment codexEnv = new MockEnvironment()
+                .withProperty(PiAgentViralJudge.CODEX_CLI_PATH_ENV, fakeCodex.toString())
+                .withProperty(PiAgentViralJudge.BACKEND_ENV, "codex");
+        PiAgentViralJudge judge = new PiAgentViralJudge(mapper, codexEnv, (cmd, stdin, timeout) -> {
+            if (cmd.contains("login") && cmd.contains("status")) {
+                return new PiAgentViralJudge.CliResult(0, "Logged in using ChatGPT", "");
+            }
+            int outIdx = cmd.indexOf("-o");
+            String body;
+            if (cmd.contains("--output-schema") && stdin.contains("suitableForRewrite")) {
+                body = "{\"suitableForRewrite\":true,\"suitabilityScore\":90,\"hookPattern\":\"工程反差\",\"coreInsight\":\"小步可验证改动胜过推倒重写\",\"reason\":\"高流量纯文本洞察\"}";
+            } else if (cmd.contains("--output-schema")) {
+                body = "{\"verdict\":\"VIRAL_REPOST\",\"viralScore\":90,\"factScore\":88,\"trendScore\":86,\"attentionScore\":86,\"accountFit\":true,\"fitScore\":90,\"eventMagnitude\":88,\"publicResonance\":86,\"credibility\":94,\"category\":\"MODEL_RELEASE\",\"summary\":\"模型发布\",\"reason\":\"模型发布直通\"}";
+            } else {
+                body = "独立打磨后的推文内容：把每次改动控制在能立刻验证的粒度，比憋大招稳得多。";
+            }
+            if (outIdx >= 0 && outIdx + 1 < cmd.size()) {
+                Files.writeString(Path.of(cmd.get(outIdx + 1)), body);
+            }
+            return new PiAgentViralJudge.CliResult(0, body, "");
+        });
+
+        // Queue of random draws: 13 (odd->REPOST), 25 (odd->REPOST), [slot 3 skips rng -> forced REWRITE], 42 (even->REWRITE), [slot 5 skips rng -> forced REPOST]
+        java.util.Queue<Integer> draws = new java.util.ArrayDeque<>(List.of(13, 25, 42));
+        AtomicInteger drawInvocations = new AtomicInteger();
+        java.util.function.IntSupplier controlledSupplier = () -> {
+            drawInvocations.incrementAndGet();
+            Integer v = draws.poll();
+            return v != null ? v : 1;
+        };
+
+        List<String> expectedModes = List.of("REPOST", "REPOST", "REWRITE", "REWRITE", "REPOST");
+        List<Boolean> expectedForced = List.of(false, false, true, false, true);
+        for (int slot = 0; slot < 5; slot++) {
+            Instant slotTime = baseTime.plusSeconds(slot * 90L * 60L); // 00:10, 01:40, 03:10, 04:40, 06:10 CST
+            AutoRepostService svc = new AutoRepostService(store, collector, judge, mockOauth, mockPublish, Clock.fixed(slotTime, shanghai));
+            svc.setRandomDrawSupplier(controlledSupplier);
+            try {
+                ObjectNode res = svc.runOwnerIdleRepostPatrol();
+                assertThat(res.path("status").asText()).isEqualTo("PUBLISHED");
+                assertThat(res.path("mode").asText()).isEqualTo(expectedModes.get(slot));
+                assertThat(res.path("forcedByTwoStreak").asBoolean()).isEqualTo(expectedForced.get(slot));
+            } finally {
+                svc.shutdown();
+            }
+        }
+        assertThat(drawInvocations.get()).isEqualTo(3); // Slots 3 and 5 did NOT randomize!
+        assertThat(publishModesObserved).hasSize(5);
+        assertThat(publishModesObserved.get(0)).startsWith("REPOST:");
+        assertThat(publishModesObserved.get(1)).startsWith("REPOST:");
+        assertThat(publishModesObserved.get(2)).isEqualTo("REWRITE");
+        assertThat(publishModesObserved.get(3)).isEqualTo("REWRITE");
+        assertThat(publishModesObserved.get(4)).startsWith("REPOST:");
+        collector.stop();
+    }
 }

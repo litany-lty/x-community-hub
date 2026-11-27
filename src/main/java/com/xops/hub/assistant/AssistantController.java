@@ -179,7 +179,27 @@ public final class AssistantController {
             d.set("style",Optional.ofNullable(tx.get("meta","style")).orElse(object()));
             d.set("preferences",preferences(tx));
             d.set("publications",mapper.valueToTree(tx.page("publication",size,start)));
-            d.set("autoReposts",mapper.valueToTree(tx.page("auto_repost",20,0)));
+            List<ObjectNode> combinedAutoFeed = new ArrayList<>();
+            for (ObjectNode r : tx.page("auto_repost", 20, 0)) {
+                ObjectNode copy = r.deepCopy();
+                if (!copy.has("autoKind")) copy.put("autoKind", "REPOST");
+                combinedAutoFeed.add(copy);
+            }
+            List<ObjectNode> rewrites = tx.page("auto_rewrite", 20, 0);
+            for (ObjectNode rw : rewrites) {
+                ObjectNode copy = rw.deepCopy();
+                copy.put("autoKind", "REWRITE");
+                if (copy.path("commentText").asText("").isBlank() && !copy.path("rewrittenText").asText("").isBlank()) {
+                    copy.put("commentText", copy.path("rewrittenText").asText(""));
+                }
+                combinedAutoFeed.add(copy);
+            }
+            combinedAutoFeed.sort(Comparator.comparingLong((ObjectNode n) -> Math.max(
+                    n.path("publishedAt").asLong(0L),
+                    Math.max(n.path("updatedAt").asLong(0L),
+                            Math.max(n.path("evaluatedAt").asLong(0L), n.path("createdAt").asLong(0L))))).reversed());
+            d.set("autoReposts", mapper.valueToTree(combinedAutoFeed.stream().limit(20).toList()));
+            d.set("autoRewrites", mapper.valueToTree(rewrites));
             d.set("observations",mapper.valueToTree(tx.page("observation",size,start)));
             d.set("followers",mapper.valueToTree(tx.page("followers",size,start)));
             return d;

@@ -3636,12 +3636,14 @@
             ? CSS.escape(sourceId)
             : String(sourceId).replace(/(["\\])/g, "\\$1");
         const toggle = row.querySelector(`[data-source-autorepost-toggle="${escSel}"]`);
+        const rewriteToggle = row.querySelector(`[data-source-autorewrite-toggle="${escSel}"]`);
         const modeEl = row.querySelector(`[data-source-autorepost-mode="${escSel}"]`);
         const scoreEl = row.querySelector(`[data-source-autorepost-score="${escSel}"]`);
         const tplEl = row.querySelector(`[data-source-autorepost-template="${escSel}"]`);
         const hintEl = row.querySelector(`[data-source-autorepost-hint="${escSel}"]`);
         const payload = {};
         if (toggle) payload.autoRepostEnabled = Boolean(toggle.checked);
+        if (rewriteToggle) payload.autoRewriteEnabled = Boolean(rewriteToggle.checked);
         if (modeEl) payload.autoRepostTextMode = modeEl.value;
         if (scoreEl && scoreEl.value !== "") payload.autoRepostMinScore = Number(scoreEl.value);
         if (tplEl) payload.autoRepostTemplate = tplEl.value.trim();
@@ -3928,8 +3930,12 @@
             const minScore = Number(sourceInfo.minScore || sourceInfo.autoRepostMinScore || 70);
             const isTpl = String(sourceInfo.textMode || sourceInfo.autoRepostTextMode || "AI").toUpperCase() === "TEMPLATE";
             const autoOn = Boolean(sourceInfo.autoRepostEnabled);
-            ruleEl.className = `assistant-state ${autoOn ? "ok" : "muted"}`;
-            ruleEl.textContent = `${autoOn ? "自动转推" : "仅预览"} · 潜力≥${minScore}${isTpl ? " · 固定文案" : ""}`;
+            const rewriteOn = Boolean(sourceInfo.autoRewriteEnabled);
+            const modeText = autoOn && rewriteOn
+                ? "自动转推+洗稿"
+                : (autoOn ? "自动转推" : (rewriteOn ? "洗稿发送" : "仅预览"));
+            ruleEl.className = `assistant-state ${(autoOn || rewriteOn) ? "ok" : "muted"}`;
+            ruleEl.textContent = `${modeText} · 潜力≥${minScore}${isTpl ? " · 固定文案" : ""}`;
             ruleEl.hidden = false;
         }
         const profLink = $("repostPreviewProfileLink");
@@ -5408,6 +5414,7 @@
                     const gapCount = Array.isArray(source.gaps) ? source.gaps.length : 0;
                     const tier = [1, 5, 30].includes(Number(source.intervalMinutes)) ? Number(source.intervalMinutes) : 5;
                     const autoOn = source.autoRepostEnabled === true;
+                    const rewriteOn = source.autoRewriteEnabled === true;
                     const textMode = String(source.autoRepostTextMode || "AI").toUpperCase() === "TEMPLATE" ? "TEMPLATE" : "AI";
                     const minScore = Number.isFinite(Number(source.autoRepostMinScore)) ? Number(source.autoRepostMinScore) : 70;
                     const uname = String(source.username || source.handle || source.id || "").replace(/^@+/, "");
@@ -5447,6 +5454,7 @@
                             </div>
                             <div class="assistant-source-controls">
                                 <label class="assistant-setting-toggle is-inline"><input type="checkbox" data-source-autorepost-toggle="${esc(source.id)}"${autoOn ? " checked" : ""} /><span>自动转推</span></label>
+                                <label class="assistant-setting-toggle is-inline" title="找出该账号高流量纯文本内容进行学习与改写，共用全局时间锁间隔发送（不引用原帖）"><input type="checkbox" data-source-autorewrite-toggle="${esc(source.id)}"${rewriteOn ? " checked" : ""} /><span>洗稿发送</span></label>
                                 <select class="x-select assistant-tier-select" data-assistant-source-tier="${esc(source.id)}" aria-label="采集档位">
                                     <option value="1"${tier === 1 ? " selected" : ""}>1 分钟</option>
                                     <option value="5"${tier === 5 ? " selected" : ""}>5 分钟</option>
@@ -5507,14 +5515,30 @@
                     UNCERTAIN: ["error", "回执待核"],
                     FAILED: ["error", "发送失败"]
                 };
+                const rewriteStatusLabels = {
+                    PUBLISHED: ["ok", "已洗稿发送"],
+                    EVALUATING: ["running", "洗稿判定中"],
+                    SENDING: ["running", "洗稿发送中"],
+                    SKIPPED: ["muted", "不适合洗稿"],
+                    SKIPPED_DUPLICATE: ["muted", "同选题去重"],
+                    SKIPPED_LIMIT: ["muted", "达日上限"],
+                    SKIPPED_COOLDOWN: ["muted", "冷却跳过"],
+                    SKIPPED_QUIET_HOURS: ["muted", "静默期跳过"],
+                    AUTH_REQUIRED: ["error", "需发推授权"],
+                    JUDGE_FAILED: ["error", "洗稿异常"],
+                    UNCERTAIN: ["error", "回执待核"],
+                    FAILED: ["error", "发送失败"]
+                };
                 autoFeedEl.innerHTML = items.map((item) => {
                     const st = String(item.status || "").toUpperCase();
-                    const [cls, label] = statusLabels[st] || ["muted", st || "记录"];
-                    const scorePart = Number.isFinite(Number(item.viralScore)) && Number(item.viralScore) > 0
-                        ? ` · 热度 ${Number(item.viralScore)}` : "";
+                    const isRewrite = String(item.autoKind || item.mode || "").toUpperCase() === "REWRITE";
+                    const [cls, label] = (isRewrite ? rewriteStatusLabels[st] : statusLabels[st]) || statusLabels[st] || ["muted", st || "记录"];
+                    const rawScore = isRewrite ? Number(item.suitabilityScore || item.viralScore) : Number(item.viralScore);
+                    const scorePart = Number.isFinite(rawScore) && rawScore > 0
+                        ? (isRewrite ? ` · 适格 ${rawScore}` : ` · 热度 ${rawScore}`) : "";
                     const pubUrl = item.publishedTweetUrl && typeof safeHttpUrl === "function" ? safeHttpUrl(item.publishedTweetUrl) : "";
                     const srcUrl = item.sourceUrl && typeof safeHttpUrl === "function" ? safeHttpUrl(item.sourceUrl) : "";
-                    const detailText = item.commentText || item.reason || item.error || item.summary || "";
+                    const detailText = item.rewrittenText || item.commentText || item.reason || item.error || item.summary || "";
                     const canRetry = ["AUTH_REQUIRED", "JUDGE_FAILED", "FAILED", "SKIPPED_COOLDOWN", "SKIPPED_AUTHOR_COOLDOWN"].includes(st);
                     const itemId = item.materialId || item.id || "";
                     const retryBtnHtml = canRetry && itemId
@@ -10758,6 +10782,19 @@
                     `/sources/${encodeURIComponent(sourceId)}/config`,
                     { autoRepostEnabled: enabled, autoRepostTextMode: nextMode });
                 if (updated) showToast(enabled ? "已开启高热度自动引用转推" : "已关闭自动引用转推");
+                return;
+            }
+            const rewriteToggle = event.target.closest("[data-source-autorewrite-toggle]");
+            if (rewriteToggle) {
+                const sourceId = rewriteToggle.dataset.sourceAutorewriteToggle;
+                const enabled = Boolean(rewriteToggle.checked);
+                if (document.activeElement && $("assistantSourcesList")?.contains(document.activeElement)) {
+                    document.activeElement.blur();
+                }
+                const updated = await runAssistantMutation("source-autorewrite",
+                    `/sources/${encodeURIComponent(sourceId)}/config`,
+                    { autoRewriteEnabled: enabled });
+                if (updated) showToast(enabled ? "已开启高流量纯文本洗稿发送" : "已关闭洗稿发送");
                 return;
             }
             const modeSelect = event.target.closest("[data-source-autorepost-mode]");

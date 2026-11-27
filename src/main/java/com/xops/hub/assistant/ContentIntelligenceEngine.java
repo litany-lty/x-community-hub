@@ -27,6 +27,13 @@ public final class ContentIntelligenceEngine {
         if (direct != null) return direct;
 
         String cleaned = THINK_TAG_PATTERN.matcher(raw).replaceAll("").replace("\uFEFF", "").strip();
+        if (cleaned.startsWith("```")) {
+            int nl = cleaned.indexOf('\n');
+            if (nl > 0) cleaned = cleaned.substring(nl + 1).strip();
+            if (cleaned.endsWith("```")) cleaned = cleaned.substring(0, cleaned.length() - 3).strip();
+        }
+        JsonNode fenceCleaned = tryParseObject(cleaned);
+        if (fenceCleaned != null) return fenceCleaned;
         String extracted = ChatGptOAuthTextModelClient.extractJsonObjectString(cleaned, null);
         if (!extracted.isBlank() && !extracted.equals(raw)) {
             JsonNode recovered = tryParseObject(extracted);
@@ -52,7 +59,15 @@ public final class ContentIntelligenceEngine {
     }
 
     public MergeDecision parseMergeDecision(JsonNode json, List<String> candidateIds) {
-        MergeKind kind = requiredEnum(json, "decision", MergeKind.class);
+        String rawDecision = text(json, "decision").strip();
+        if (rawDecision.isEmpty()) rawDecision = text(json, "kind").strip();
+        MergeKind kind;
+        try {
+            if (rawDecision.isEmpty()) throw new IllegalArgumentException("decision is required");
+            kind = MergeKind.valueOf(rawDecision.toUpperCase(java.util.Locale.ROOT));
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("decision is invalid", e);
+        }
         String candidateId = text(json, "candidateId");
         boolean requiresCandidate = kind != MergeKind.NEW_TOPIC && kind != MergeKind.UNCERTAIN;
         if (requiresCandidate && candidateId.isBlank() || !candidateId.isBlank() && !candidateIds.contains(candidateId)) {
@@ -61,7 +76,15 @@ public final class ContentIntelligenceEngine {
         if (kind == MergeKind.NEW_TOPIC && !candidateId.isBlank()) {
             throw new IllegalArgumentException("NEW_TOPIC cannot reference candidateId");
         }
-        return new MergeDecision(kind, candidateId, requiredEnum(json, "confidence", Confidence.class),
+        String rawConf = text(json, "confidence").strip();
+        Confidence confidence;
+        try {
+            if (rawConf.isEmpty()) throw new IllegalArgumentException("confidence is required");
+            confidence = Confidence.valueOf(rawConf.toUpperCase(java.util.Locale.ROOT));
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("confidence is invalid", e);
+        }
+        return new MergeDecision(kind, candidateId, confidence,
                 requiredText(json, "reason"), strings(json.path("newFacts")), strings(json.path("conflicts")));
     }
 
@@ -69,10 +92,32 @@ public final class ContentIntelligenceEngine {
         Dimension topic = dimension(json.path("topic"), weights.topic());
         Dimension reach = dimension(json.path("reach"), weights.reach());
         int composite = (int) Math.round((topic.score() + reach.score()) / 2.0);
-        return new Score(requiredText(json, "title"), requiredText(json, "summary"), strings(json.path("tags")),
+        String summary = requiredText(json, "summary");
+        String title = text(json, "title").strip();
+        if (title.isEmpty()) {
+            title = deriveFallbackTitle(summary);
+        }
+        if (title.isEmpty()) {
+            throw new IllegalArgumentException("title is required");
+        }
+        return new Score(title, summary, strings(json.path("tags")),
                 topic.score(), reach.score(), composite, topic.coverage(), reach.coverage(),
                 verified ? EvidenceStatus.RESEARCH_VERIFIED : EvidenceStatus.PENDING_VERIFICATION,
                 topic.reasons(), reach.reasons());
+    }
+
+    private static String deriveFallbackTitle(String summary) {
+        if (summary == null || summary.isBlank()) return "";
+        String singleLine = summary.replaceAll("\\s+", " ").strip();
+        int cut = singleLine.length();
+        for (char sep : new char[]{'。', '！', '？', '；', '\n'}) {
+            int idx = singleLine.indexOf(sep);
+            if (idx > 0 && idx < cut) cut = idx;
+        }
+        String clause = singleLine.substring(0, cut).strip();
+        if (clause.isEmpty()) clause = singleLine;
+        int cp = clause.codePointCount(0, clause.length());
+        return cp <= 42 ? clause : clause.substring(0, clause.offsetByCodePoints(0, 42)).strip();
     }
 
     public Research parseResearch(JsonNode json, List<String> sourceIds) {

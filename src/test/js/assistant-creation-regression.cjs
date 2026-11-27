@@ -534,5 +534,9 @@ assert.match(appSource, /换话题切口/);
 assert.match(appSource, /补深挖增量/);
 assert.match(appSource, /联网深挖出新版/);
 assert.match(appSource, /data-assistant-research-upgrade/);
+assert.match(previewEls.assistantSourcesList.innerHTML, /data-source-autorewrite-toggle="src-openai"/);
+assert.match(previewEls.assistantSourcesList.innerHTML, /洗稿发送/);
+assert.match(appSource, /已洗稿发送/);
+assert.match(appSource, /已开启高流量纯文本洗稿发送/);
 
 console.log("assistant-creation-regression: passed");

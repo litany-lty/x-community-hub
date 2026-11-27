@@ -223,6 +223,7 @@ public class PiAgentViralJudge {
             - 只有遇到真正好用、省钱、爽到的更新时，才自然带点轻松语气或猫猫表情（`😺` / `😽` / `😼`）。
             - 严禁在结尾追加提问段或反问互动句（不要留提问收尾）。
             - 严禁出现：「值得注意的是」「总而言之」「意味着」「标志着」「分水岭」「这一步才见功夫」「才是真本事」「真正的考验在于」「不仅……更是……」「赋能」「闭环」「生态位」「重塑格局」「拭目以待」「降维打击」。
+            - 若输入含 `postRecency = RECENT_POST_NOT_BREAKING`（引用近期往期推文而非刚刚突发），聚焦内容本身与使用体感点评，不要写「刚刚发布」「刚上线」等即时字眼。
             - 所有事实与数字严格来自原帖与输入上下文，绝不编造未发生的亲身耗时实验。
             """;
 
@@ -1959,6 +1960,9 @@ public class PiAgentViralJudge {
             postNode.put("authorBio", resolvedBio);
         }
         postNode.put("briefFlashPost", briefFlashPost);
+        if (input.ageMinutes() >= 24L * 60L) {
+            postNode.put("postRecency", "RECENT_POST_NOT_BREAKING（近期往期高价值推文回看引用，请围绕核心信息与真实体感点评，不要写‘刚刚上线/刚发’等即时字眼）");
+        }
         if (!input.postText().isBlank()) {
             postNode.put("postText", truncate(input.postText(), 3000));
         }
@@ -2277,5 +2281,440 @@ public class PiAgentViralJudge {
     private static String safeMessage(Exception ex) {
         String msg = ex.getMessage();
         return msg == null || msg.isBlank() ? ex.getClass().getSimpleName() : truncate(msg, 200);
+    }
+
+    // ==================== High-Traffic Pure-Text Wash-Rewrite ====================
+
+    private static final String REWRITE_JUDGE_SCHEMA_JSON = """
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["suitableForRewrite", "suitabilityScore", "hookPattern", "coreInsight", "reason"],
+              "properties": {
+                "suitableForRewrite": { "type": "boolean" },
+                "suitabilityScore": { "type": "integer", "minimum": 0, "maximum": 100 },
+                "hookPattern": { "type": "string" },
+                "coreInsight": { "type": "string" },
+                "reason": { "type": "string" }
+              }
+            }
+            """;
+
+    private static final String REWRITE_JUDGE_SYSTEM_PROMPT = """
+            你是资深 X（Twitter）爆款纯文本内容拆解与选题评审员。
+            当前任务不是做引用转发，而是判断一条该账号的高流量纯文本推文是否适合「学习其走红结构与核心洞察，改写为 @elidlicom 本人独立发布的原创纯文本推文」。
+            严禁调用任何本地工具或命令，只输出一个合法 JSON 对象。
+
+            【准入标准（suitableForRewrite = true 且 suitabilityScore >= 68）】
+            1. 原文具备可迁移的认知密度、行业观察、AI / 模型 / 编程 / Agent / 产品商业洞察、反直觉观点或实操方法论，值得拆解学习并转化为独立原创观点。
+            2. 契合 @elidlicom 的账号定位（AI 模型与工具真实体验、独立开发、科技与商业思考；若有 ownerPreferences 则优先对齐）。
+
+            【一票否决（必须令 suitableForRewrite = false，suitabilityScore < 60）】
+            1. 招聘启事、抽奖互动（RT/Follow 领奖）、纯商务软广、求关注/私信领资料。
+            2. 高度依赖原作者私人身份且无法转化为行业公共观察的私人琐事（如家庭纪念日、个人入职离职官宣、线下聚会寒暄）。
+            3. 残缺长推串首条（如「1/ 下面展开讲讲…」但正文并未给出实质论据）或纯情绪宣泄无观点。
+            4. 与科技 / AI / 开发 / 商业产品完全无关的娱乐八卦、体育赛事或引战骂街。
+            （注：若原文是某团队第一人称谈行业趋势或产品工程取舍，只要能自然转换为外部重度用户/开发者的独立观察视角且不冒充官方，可判为 suitableForRewrite = true，并在 coreInsight 中按外部观察者视角提炼。）
+
+            只输出一个 JSON 对象，不要使用 Markdown 代码块：
+            {"suitableForRewrite":true或false,"suitabilityScore":0到100整数,"hookPattern":"35字内拆解原文抓人开头、反差节奏或情绪钩子","coreInsight":"80字内提炼可转化为独立原创帖的核心观点与论据骨架","reason":"40字内中文判定理由"}
+            """;
+
+    private static final String REWRITE_WRITER_SYSTEM_PROMPT = """
+            你是独立开发者与重度 AI 订阅用户 @elidlicom 本人，正在发布一条【完全独立原创的纯文本 X 推文】（不是转发引用，正下方没有任何原帖卡片！）。
+            你的任务是：学习参考高流量纯文本样本的【抓人钩子、反差张力与节奏结构】，消化其核心观点后，用你自己的语言习惯和视角【彻底重构改写】成一条全新的中文原创推文。
+            严禁调用任何本地工具或命令，不要输出 JSON、标题、引号或任何解释，直接输出最终要发布的推文正文！
+
+            【洗稿重构与原创化硬约束】
+            1. 只学「流量结构 + 核心认知」，绝不逐句顺译或同义词替换：
+               - 重新组织切入角度、句式长短与段落顺序；开头第一句直接亮出反差判断、真实痛点或犀利观察，3 秒抓住注意力。
+               - 把抽象概念落回具体日常开发/使用场景，像在朋友圈跟同行朋友直白聊真实体感。
+            2. 严禁出现任何「转发/引用/搬运」痕迹：
+               - 绝对禁止出现 `@原作者`、「刚刷到一条推」「看到有人说」「某大佬提到」「原帖说」「💡 省流重点：」或任何链接 URL。
+               - 读者看到的必须是你本人自然发出的独立观点帖。
+            3. 严守事实与身份边界：
+               - 若原样本包含原作者专属的第一人称经历（如「我们公司刚融资」「我花了十万美元测卡」），必须转化为行业观察或普通重度付费用户视角，绝不伪造未发生的亲身实验或虚假身份。
+               - 原文有明确公开数字/事实时可自然融入，绝不捏造新数字。
+            4. 去 AI 味与排版节奏（humanizer-zh）：
+               - 全文控制在 2～4 个短自然段（段间空一行 `\\n\\n`，总字数通常 70～220 字，精炼有嚼头，不写冗长裹脚布）。
+               - 吐槽、看穿大厂套路时干脆犀利（可用 `……` 留白），真香实用话题可自然带轻松感；严禁在结尾硬加「你怎么看？」「大家觉得呢？」之类的廉价互动提问。
+               - 严禁出现：「值得注意的是」「总而言之」「意味着」「标志着」「分水岭」「不仅……更是……」「赋能」「闭环」「生态位」「重塑格局」「降维打击」。
+            """;
+
+    private static final String REWRITE_POLISHER_SYSTEM_PROMPT = """
+            你是 @elidlicom 本人的原创推文定稿编辑器。当前稿件是【独立发布的原创纯文本推文（非转发引用，下方无原帖）】。
+            请严格按用户的【二次改写要求】与真人日常口吻把初稿打磨定稿；严禁调用任何本地工具或命令，不要输出解释、引号或 JSON，只直接输出最终纯文本推文正文！
+
+            【定稿铁律】
+            1. 本条是独立原创推文（不是转发引用！）：即便二次改写要求里提到「如果是转发引用需要先简述引用内容」，本条也【不适用】该条，严禁加入「原帖说」「💡 省流重点：」或 `@原作者` 等引用痕迹！
+            2. 彻底消除英文翻译腔、AI 公关腔与生僻单字缩写（能用自然双音节词就不用拗口单字），确保每句话都通俗直白、符合微信朋友圈/日常交流语感。
+            3. 保持 2～4 个短段落（段间空一行），保留抓人的开头反差与真实态度，不编造虚假亲身实验，不在末尾硬塞愚蠢提问。
+            """;
+
+    public record RewriteInput(
+            String authorUsername,
+            String authorDisplayName,
+            String authorBio,
+            String sourceText,
+            Long views,
+            Long likes,
+            Long reposts,
+            Long replies,
+            long authorMedianViews,
+            long authorMedianLikes,
+            String ownerStyleProfile,
+            String ownerPreferences,
+            List<String> ownerRecentStances,
+            String postPolishPrompt,
+            String generationProvider,
+            String generationModel
+    ) { }
+
+    public record RewriteJudgment(
+            boolean suitable,
+            int suitabilityScore,
+            String hookPattern,
+            String coreInsight,
+            String reason,
+            String rewrittenText
+    ) { }
+
+    public RewriteJudgment evaluateAndWriteRewrite(RewriteInput input) {
+        if (input == null || input.sourceText() == null || input.sourceText().isBlank()) {
+            throw new IllegalArgumentException("洗稿源文本不能为空");
+        }
+        boolean useMiniMaxGate = isMiniMaxGateReady();
+        ResolvedQuoteTarget writerTarget = resolveRepostQuoteTarget(input.generationProvider(), input.generationModel());
+        boolean useApiWriter = writerTarget.isApiWriter();
+        boolean needChatGptAuth = !useMiniMaxGate && !useApiWriter;
+        ObjectNode auth = needChatGptAuth ? checkAuth(true) : mapper.createObjectNode().put("ready", true);
+        if (needChatGptAuth && !auth.path("ready").asBoolean(false)) {
+            throw new IllegalStateException(auth.path("message").asText("尚未完成 ChatGPT OAuth 第三方登录"));
+        }
+        String activeBackend = auth.path("activeBackend").asText("");
+        String judgeUserPrompt = buildRewriteJudgeUserPrompt(input);
+        String rawJudgeOutput;
+        if (useMiniMaxGate) {
+            rawJudgeOutput = runMiniMaxGateCompletion(REWRITE_JUDGE_SYSTEM_PROMPT, judgeUserPrompt);
+        } else if (useApiWriter) {
+            rawJudgeOutput = runApiQuoteCall(writerTarget.provider(), writerTarget.model(), REWRITE_JUDGE_SYSTEM_PROMPT, judgeUserPrompt, true);
+        } else {
+            rawJudgeOutput = "PI_AGENT_OAUTH".equals(activeBackend)
+                    ? runPiGenericStructured(REWRITE_JUDGE_SYSTEM_PROMPT, judgeUserPrompt, writerTarget.model())
+                    : runCodexGenericStructured(REWRITE_JUDGE_SCHEMA_JSON, REWRITE_JUDGE_SYSTEM_PROMPT, judgeUserPrompt, writerTarget.model());
+        }
+
+        JsonNode judgeJson = parseFirstJsonObject(rawJudgeOutput);
+        if (judgeJson == null || !judgeJson.isObject()) {
+            throw new IllegalStateException("洗稿适格性判定未返回有效 JSON：" + truncate(rawJudgeOutput, 160));
+        }
+        int suitabilityScore = clampScore(judgeJson.path("suitabilityScore").asInt(0));
+        boolean rawSuitable = judgeJson.path("suitableForRewrite").asBoolean(false);
+        String hookPattern = truncate(judgeJson.path("hookPattern").asText("").strip(), 120);
+        String coreInsight = truncate(judgeJson.path("coreInsight").asText("").strip(), 240);
+        String reason = truncate(judgeJson.path("reason").asText("").strip(), 140);
+        boolean pass = rawSuitable && suitabilityScore >= 68;
+        if (!pass) {
+            return new RewriteJudgment(false, suitabilityScore, hookPattern, coreInsight,
+                    reason.isBlank() ? "该纯文本推文不适合转化为独立原创帖" : reason, "");
+        }
+
+        String skillGuidance = loadQuoteVoiceSkillGuidance();
+        String writerPrompt = buildRewriteWriterUserPrompt(input, hookPattern, coreInsight);
+        String rawDraft;
+        if (useApiWriter) {
+            rawDraft = runApiQuoteCall(writerTarget.provider(), writerTarget.model(), REWRITE_WRITER_SYSTEM_PROMPT, writerPrompt);
+        } else {
+            if (!needChatGptAuth) {
+                ObjectNode writerAuth = checkAuth(true);
+                if (!writerAuth.path("ready").asBoolean(false)) {
+                    throw new IllegalStateException(writerAuth.path("message").asText("尚未完成 ChatGPT OAuth 第三方登录"));
+                }
+                activeBackend = writerAuth.path("activeBackend").asText("");
+            }
+            rawDraft = "PI_AGENT_OAUTH".equals(activeBackend)
+                    ? runPiGenericWriter(REWRITE_WRITER_SYSTEM_PROMPT, writerPrompt, writerTarget.model(), resolveHumanizerSkillFiles())
+                    : runCodexGenericWriter(REWRITE_WRITER_SYSTEM_PROMPT, writerPrompt, writerTarget.model());
+        }
+        String cleanedDraft = cleanStandaloneRewriteText(rawDraft);
+        if (cleanedDraft.isBlank()) {
+            throw new IllegalStateException("洗稿初稿生成返回为空，请重试");
+        }
+        String finalRewrite = cleanedDraft;
+        String customPolish = input.postPolishPrompt() == null ? "" : input.postPolishPrompt().strip();
+        if (!customPolish.isBlank()) {
+            String polishUserPrompt = buildRewritePolishUserPrompt(input, cleanedDraft, customPolish, hookPattern, coreInsight);
+            String rawPolished;
+            if (useApiWriter) {
+                rawPolished = runApiQuoteCall(
+                        writerTarget.provider(),
+                        fastPolishModelSpec(writerTarget.provider(), writerTarget.model()),
+                        REWRITE_POLISHER_SYSTEM_PROMPT,
+                        polishUserPrompt
+                );
+            } else {
+                rawPolished = "PI_AGENT_OAUTH".equals(activeBackend)
+                        ? runPiGenericWriter(REWRITE_POLISHER_SYSTEM_PROMPT, polishUserPrompt, writerTarget.model(), resolveHumanizerSkillFiles())
+                        : runCodexGenericWriter(REWRITE_POLISHER_SYSTEM_PROMPT, polishUserPrompt, writerTarget.model());
+            }
+            String cleanedPolished = cleanStandaloneRewriteText(rawPolished);
+            if (!cleanedPolished.isBlank()) {
+                finalRewrite = cleanedPolished;
+            }
+        }
+        return new RewriteJudgment(true, suitabilityScore, hookPattern, coreInsight,
+                reason.isBlank() ? "高流量纯文本结构清晰，已完成学习与原创改写" : reason, finalRewrite);
+    }
+
+    static String cleanStandaloneRewriteText(String raw) {
+        if (raw == null || raw.isBlank()) return "";
+        String trimmed = OwnerQuoteStyleDistiller.stripWrappingQuotesOrFences(raw);
+        if (trimmed.startsWith("{")) {
+            // Guard against accidental JSON wrapper
+            int idx = trimmed.indexOf("\"text\"");
+            if (idx < 0) idx = trimmed.indexOf("\"rewrittenText\"");
+            if (idx >= 0) {
+                try {
+                    JsonNode node = new ObjectMapper().readTree(trimmed);
+                    String extracted = node.path("rewrittenText").asText(node.path("text").asText("")).strip();
+                    if (!extracted.isBlank()) trimmed = extracted;
+                } catch (Exception ignored) { }
+            }
+        }
+        String withoutUrls = trimmed.replaceAll("https?://\\S+", "").strip();
+        String[] rawParas = withoutUrls.split("\\n\\s*\\n+");
+        List<String> cleanParas = new ArrayList<>();
+        for (String p : rawParas) {
+            String line = p.replaceAll("[ \\t]+", " ").strip();
+            line = line.replaceFirst("^(?:💡\\s*)?省流重点[：:]\\s*", "").strip();
+            if (!line.isEmpty()) {
+                cleanParas.add(line);
+            }
+        }
+        String joined = String.join("\n\n", cleanParas).strip();
+        return truncateCodePoints(joined, 500);
+    }
+
+    private String buildRewriteJudgeUserPrompt(RewriteInput input) {
+        var payload = mapper.createObjectNode();
+        payload.put("authorUsername", "@" + input.authorUsername().replaceFirst("^@+", ""));
+        if (!input.authorDisplayName().isBlank()) payload.put("authorDisplayName", input.authorDisplayName());
+        String bio = OwnerQuoteStyleDistiller.resolveAuthorContext(input.authorUsername(), input.authorBio());
+        if (!bio.isBlank()) payload.put("authorBio", bio);
+        payload.put("sourcePureText", truncate(input.sourceText(), 3500));
+        var traffic = payload.putObject("trafficMetrics");
+        if (input.views() != null) traffic.put("views", input.views());
+        if (input.likes() != null) traffic.put("likes", input.likes());
+        if (input.reposts() != null) traffic.put("reposts", input.reposts());
+        if (input.replies() != null) traffic.put("replies", input.replies());
+        if (input.authorMedianViews() > 0) traffic.put("authorMedianViews", input.authorMedianViews());
+        if (input.authorMedianLikes() > 0) traffic.put("authorMedianLikes", input.authorMedianLikes());
+        if (input.ownerPreferences() != null && !input.ownerPreferences().isBlank()) {
+            payload.put("ownerPreferences", truncate(input.ownerPreferences(), 400));
+        }
+        return "请评估这条高流量纯文本推文是否适合学习其爆款结构并改写为独立原创推文，只返回 JSON：\n" + payload;
+    }
+
+    private String buildRewriteWriterUserPrompt(RewriteInput input, String hookPattern, String coreInsight) {
+        var ctx = mapper.createObjectNode();
+        ctx.put("mode", "ORIGINAL_STANDALONE_POST");
+        ctx.put("sourceAuthorContext", OwnerQuoteStyleDistiller.resolveAuthorContext(input.authorUsername(), input.authorBio()));
+        ctx.put("highTrafficSourceTextForStudyOnly", truncate(input.sourceText(), 3500));
+        if (!hookPattern.isBlank()) ctx.put("viralHookPatternToLearn", hookPattern);
+        if (!coreInsight.isBlank()) ctx.put("coreInsightToTransform", coreInsight);
+        if (input.ownerPreferences() != null && !input.ownerPreferences().isBlank()) {
+            ctx.put("ownerPreferences", truncate(input.ownerPreferences(), 350));
+        }
+        if (input.ownerStyleProfile() != null && !input.ownerStyleProfile().isBlank()) {
+            ctx.put("ownerDistilledPersona", truncateCodePoints(input.ownerStyleProfile(), 900));
+        }
+        if (input.ownerRecentStances() != null && !input.ownerRecentStances().isEmpty()) {
+            var arr = ctx.putArray("ownerRecentStances");
+            input.ownerRecentStances().stream().limit(4).forEach(arr::add);
+        }
+        return "请学习下方高流量纯文本的走红钩子与节奏结构，彻底改写重构为 @elidlicom 本人独立发布的全新中文原创纯文本推文（严禁做引用转发、严禁提原作者或加省流标签、直接输出正文）：\n"
+                + ctx;
+    }
+
+    private String buildRewritePolishUserPrompt(
+            RewriteInput input,
+            String firstDraft,
+            String polishPrompt,
+            String hookPattern,
+            String coreInsight
+    ) {
+        var ctx = mapper.createObjectNode();
+        ctx.put("mode", "ORIGINAL_STANDALONE_POST（独立原创推文，非转发引用）");
+        ctx.put("referenceSourceFacts", truncate(input.sourceText(), 2500));
+        if (!hookPattern.isBlank()) ctx.put("viralHookPattern", hookPattern);
+        if (!coreInsight.isBlank()) ctx.put("coreInsight", coreInsight);
+        return "【参考背景与事实核对基线（本条为独立原创推文，非转发引用，绝不提及原帖或原作者）】\n"
+                + ctx
+                + "\n\n【洗稿初稿】\n"
+                + firstDraft
+                + "\n\n【我的二次改写提示词（注意：忽略其中仅针对“如果是转发引用”的子句，其余通俗化、去翻译腔、生活场景化与大厂态度要求全部严格执行）】\n"
+                + polishPrompt
+                + "\n\n请直接输出打磨后的最终独立原创纯文本推文：";
+    }
+
+    private String runPiGenericStructured(String systemPrompt, String userPrompt, String rawModelOverride) {
+        String binary = resolvePiBinary();
+        String rawModel = (rawModelOverride != null && !rawModelOverride.isBlank())
+                ? rawModelOverride.strip()
+                : resolveRequestedChatGptWriterModel(null);
+        ChatGptOAuthTextModelClient.ModelSpec spec = ChatGptOAuthTextModelClient.parseModelSpec(rawModel);
+        boolean explicitEffort = rawModel.matches("(?i).*[\\s@:]+(minimal|low|medium|high|xhigh|ultra|max)$");
+        String effort = explicitEffort ? spec.reasoningEffort() : "low";
+        String model = rawModel.isBlank() ? "" : spec.modelId();
+        List<Path> tempDirs = new ArrayList<>();
+        try {
+            List<String> cmd = new ArrayList<>(List.of(
+                    binary, "-p",
+                    "--no-session", "--no-tools", "--no-extensions", "--no-mcp",
+                    "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-approve",
+                    "--provider", DEFAULT_PI_PROVIDER,
+                    "--thinking", effort
+            ));
+            addPiPromptFlag(cmd, "--system-prompt", systemPrompt, tempDirs);
+            if (!model.isBlank()) {
+                cmd.add("--model");
+                cmd.add(model);
+            }
+            CliResult result = executeCli(cmd, userPrompt, Duration.ofSeconds(45));
+            if (result.exitCode() != 0) {
+                String err = !result.stderr().isBlank() ? result.stderr() : result.stdout();
+                throw new IllegalStateException("PI Agent (ChatGPT OAuth) 洗稿判定异常：" + truncate(err, 200));
+            }
+            return result.stdout();
+        } catch (IOException ex) {
+            throw new IllegalStateException("PI Agent (ChatGPT OAuth) 洗稿判定提示词准备失败：" + safeMessage(ex), ex);
+        } finally {
+            cleanupTempDirs(tempDirs);
+        }
+    }
+
+    private String runCodexGenericStructured(String schemaJson, String systemPrompt, String userPrompt, String rawModelOverride) {
+        String binary = resolveCodexBinary();
+        String rawModel = (rawModelOverride != null && !rawModelOverride.isBlank())
+                ? rawModelOverride.strip()
+                : resolveRequestedChatGptWriterModel(null);
+        ChatGptOAuthTextModelClient.ModelSpec spec = ChatGptOAuthTextModelClient.parseModelSpec(rawModel);
+        String modelId = ChatGptOAuthTextModelClient.effectiveCodexModelId(spec);
+        Path workDir = null;
+        try {
+            workDir = Files.createTempDirectory("xops-rewrite-judge-");
+            Path schemaFile = workDir.resolve("schema.json");
+            Path outFile = workDir.resolve("last-message.json");
+            Files.writeString(schemaFile, schemaJson, StandardCharsets.UTF_8);
+            List<String> cmd = List.of(
+                    binary, "exec",
+                    "--ephemeral", "--skip-git-repo-check", "--ignore-user-config", "--ignore-rules",
+                    "--color", "never", "-s", "read-only",
+                    "-m", modelId,
+                    "-c", "model_reasoning_effort=\"" + spec.reasoningEffort() + "\"",
+                    "-C", workDir.toString(),
+                    "--output-schema", schemaFile.toString(),
+                    "-o", outFile.toString(),
+                    "-"
+            );
+            CliResult result = executeCli(cmd, systemPrompt + "\n\n" + userPrompt, Duration.ofSeconds(45));
+            if (Files.isRegularFile(outFile)) {
+                String fileContent = Files.readString(outFile, StandardCharsets.UTF_8).strip();
+                if (!fileContent.isBlank()) return fileContent;
+            }
+            if (result.exitCode() != 0) {
+                String err = !result.stderr().isBlank() ? result.stderr() : result.stdout();
+                throw new IllegalStateException("Codex CLI (ChatGPT OAuth) 洗稿判定异常：" + truncate(err, 200));
+            }
+            return result.stdout();
+        } catch (IOException ioe) {
+            throw new IllegalStateException("准备 Codex 洗稿判定沙箱失败：" + safeMessage(ioe), ioe);
+        } finally {
+            deleteQuietly(workDir);
+        }
+    }
+
+    private String runPiGenericWriter(String systemPrompt, String userPrompt, String rawModelOverride, List<Path> skills) {
+        String binary = resolvePiBinary();
+        String rawModel = (rawModelOverride != null && !rawModelOverride.isBlank())
+                ? rawModelOverride.strip()
+                : resolveRequestedChatGptWriterModel(null);
+        ChatGptOAuthTextModelClient.ModelSpec spec = ChatGptOAuthTextModelClient.parseModelSpec(rawModel);
+        boolean explicitEffort = rawModel.matches("(?i).*[\\s@:]+(minimal|low|medium|high|xhigh|ultra|max)$");
+        String effort = explicitEffort ? spec.reasoningEffort() : "medium";
+        String model = rawModel.isBlank() ? "" : spec.modelId();
+        List<Path> tempDirs = new ArrayList<>();
+        try {
+            List<String> cmd = new ArrayList<>(List.of(
+                    binary, "-p",
+                    "--no-session", "--no-tools", "--no-extensions", "--no-mcp",
+                    "--no-prompt-templates", "--no-context-files", "--no-approve",
+                    "--provider", DEFAULT_PI_PROVIDER,
+                    "--thinking", effort
+            ));
+            if (skills != null && !skills.isEmpty()) {
+                for (Path sf : skills) {
+                    cmd.add("--skill");
+                    cmd.add(sf.toString());
+                }
+            } else {
+                cmd.add("--no-skills");
+            }
+            addPiPromptFlag(cmd, "--system-prompt", systemPrompt, tempDirs);
+            if (!model.isBlank()) {
+                cmd.add("--model");
+                cmd.add(model);
+            }
+            CliResult result = executeCli(cmd, userPrompt, Duration.ofSeconds(60));
+            if (result.exitCode() != 0) {
+                String err = !result.stderr().isBlank() ? result.stderr() : result.stdout();
+                throw new IllegalStateException("PI Agent (ChatGPT OAuth) 洗稿生成异常：" + truncate(err, 200));
+            }
+            return result.stdout();
+        } catch (IOException ex) {
+            throw new IllegalStateException("PI Agent (ChatGPT OAuth) 洗稿提示词准备失败：" + safeMessage(ex), ex);
+        } finally {
+            cleanupTempDirs(tempDirs);
+        }
+    }
+
+    private String runCodexGenericWriter(String systemPrompt, String userPrompt, String rawModelOverride) {
+        String binary = resolveCodexBinary();
+        String rawModel = (rawModelOverride != null && !rawModelOverride.isBlank())
+                ? rawModelOverride.strip()
+                : resolveRequestedChatGptWriterModel(null);
+        ChatGptOAuthTextModelClient.ModelSpec spec = ChatGptOAuthTextModelClient.parseModelSpec(rawModel);
+        String modelId = ChatGptOAuthTextModelClient.effectiveCodexModelId(spec);
+        boolean explicitEffort = rawModel.matches("(?i).*[\\s@:]+(minimal|low|medium|high|xhigh|ultra|max)$");
+        String effort = explicitEffort ? spec.reasoningEffort() : "medium";
+        Path workDir = null;
+        try {
+            workDir = Files.createTempDirectory("xops-rewrite-writer-");
+            Path outFile = workDir.resolve("rewrite-out.txt");
+            List<String> cmd = List.of(
+                    binary, "exec",
+                    "--ephemeral", "--skip-git-repo-check", "--ignore-user-config", "--ignore-rules",
+                    "--color", "never", "-s", "read-only",
+                    "-m", modelId,
+                    "-c", "model_reasoning_effort=\"" + effort + "\"",
+                    "-C", workDir.toString(),
+                    "-o", outFile.toString(),
+                    "-"
+            );
+            CliResult result = executeCli(cmd, systemPrompt + "\n\n" + userPrompt, Duration.ofSeconds(60));
+            if (Files.isRegularFile(outFile)) {
+                String fileContent = Files.readString(outFile, StandardCharsets.UTF_8).strip();
+                if (!fileContent.isBlank()) return fileContent;
+            }
+            if (result.exitCode() != 0) {
+                String err = !result.stderr().isBlank() ? result.stderr() : result.stdout();
+                throw new IllegalStateException("Codex CLI (ChatGPT OAuth) 洗稿生成异常：" + truncate(err, 200));
+            }
+            return result.stdout();
+        } catch (IOException ioe) {
+            throw new IllegalStateException("准备 Codex 洗稿生成沙箱失败：" + safeMessage(ioe), ioe);
+        } finally {
+            deleteQuietly(workDir);
+        }
     }
 }

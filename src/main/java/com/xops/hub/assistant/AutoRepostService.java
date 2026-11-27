@@ -31,12 +31,17 @@ import static com.xops.hub.assistant.AssistantStore.object;
 public class AutoRepostService {
     private static final Logger log = LoggerFactory.getLogger(AutoRepostService.class);
     static final long MAX_FRESHNESS_AGE_MS = 4L * 60L * 60_000L;
-    static final long PATROL_MAX_FRESHNESS_AGE_MS = 24L * 60L * 60_000L;
+    static final long PATROL_MAX_FRESHNESS_AGE_MS = 48L * 60L * 60_000L;
+    static final long RECENT_REPOST_FALLBACK_MAX_AGE_MS = 30L * 24L * 60L * 60_000L;
+    static final long REWRITE_MAX_AGE_MS = 30L * 24L * 60L * 60_000L;
     public static final long SAME_AUTHOR_COOLDOWN_MS = 16L * 60L * 60_000L;
     public static final long OWNER_TWEET_BASE_INTERVAL_MS = 60L * 60_000L;
     public static final int OWNER_TWEET_MIN_JITTER_MINUTES = 1;
     public static final int OWNER_TWEET_MAX_JITTER_MINUTES = 20;
     private static final long HOT_CONTEXT_WINDOW_MS = 48L * 60L * 60_000L;
+    private static final java.util.regex.Pattern EMBEDDED_URL_PATTERN = java.util.regex.Pattern.compile("(?i)https?://\\S+");
+    private static final java.util.regex.Pattern THREAD_OR_VISUAL_DEPENDENCY_PATTERN = java.util.regex.Pattern.compile(
+            "(?is)(?:^\\s*(?:1\\s*/\\s*\\d*|🧵)|[👇⬇]|(?:如下图|见下图|配图|看图|视频里|评论区见|link\\s+in\\s+bio|see\\s+(?:below|thread)))");
     private static final java.util.regex.Pattern QUANT_FACT_PATTERN = java.util.regex.Pattern.compile(
             "(?i)(?:\\b\\d+(?:\\.\\d+)?\\s*(?:%|x|倍|ms|s|gb|tb|mb|k|m|b|fps|tps|qps|tokens?|亿|万|美元|usd)|\\$\\d+|\\bv\\d+\\.\\d+)");
     private static final java.util.regex.Pattern DIRECT_PASS_HINT_PATTERN = java.util.regex.Pattern.compile(
@@ -91,6 +96,80 @@ public class AutoRepostService {
                 return t;
             });
     private final Map<String, Long> deferredSourceReadyAtMs = new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.concurrent.atomic.AtomicLong nextPatrolWakeupAtMs = new java.util.concurrent.atomic.AtomicLong(0L);
+    private volatile java.util.function.IntSupplier randomDrawSupplier =
+            () -> java.util.concurrent.ThreadLocalRandom.current().nextInt(1, 101);
+
+    public enum AutoPublishMode {
+        REPOST,
+        REWRITE
+    }
+
+    public record AutoPublishOrderDecision(
+            AutoPublishMode primaryMode,
+            boolean forcedByTwoStreak,
+            int randomNumber,
+            String reasonCode
+    ) { }
+
+    void setRandomDrawSupplier(java.util.function.IntSupplier supplier) {
+        this.randomDrawSupplier = supplier != null
+                ? supplier
+                : () -> java.util.concurrent.ThreadLocalRandom.current().nextInt(1, 101);
+    }
+
+    /**
+     * Resolves the next automatic publish mode:
+     * - If the last 2 automatic publishes were the same mode, does NOT randomize and strictly switches to the other mode;
+     * - Otherwise draws a random integer: odd (单数) => REPOST (引用), even (偶数) => REWRITE (洗稿).
+     */
+    static AutoPublishOrderDecision resolveNextAutoPublishOrder(
+            List<AutoPublishMode> recentAutoModesNewestFirst,
+            java.util.function.IntSupplier drawSupplier
+    ) {
+        if (recentAutoModesNewestFirst != null && recentAutoModesNewestFirst.size() >= 2) {
+            AutoPublishMode last1 = recentAutoModesNewestFirst.get(0);
+            AutoPublishMode last2 = recentAutoModesNewestFirst.get(1);
+            if (last1 != null && last1 == last2) {
+                AutoPublishMode opposite = (last1 == AutoPublishMode.REPOST)
+                        ? AutoPublishMode.REWRITE
+                        : AutoPublishMode.REPOST;
+                return new AutoPublishOrderDecision(
+                        opposite,
+                        true,
+                        0,
+                        opposite == AutoPublishMode.REWRITE ? "STREAK_2_FORCE_REWRITE" : "STREAK_2_FORCE_REPOST"
+                );
+            }
+        }
+        int draw = drawSupplier != null ? drawSupplier.getAsInt() : 1;
+        boolean isOdd = (draw & 1) != 0;
+        AutoPublishMode chosen = isOdd ? AutoPublishMode.REPOST : AutoPublishMode.REWRITE;
+        return new AutoPublishOrderDecision(
+                chosen,
+                false,
+                draw,
+                isOdd ? "RANDOM_ODD_REPOST" : "RANDOM_EVEN_REWRITE"
+        );
+    }
+
+    static List<AutoPublishMode> collectRecentAutoPublishModesNewestFirst(AssistantStore.Tx tx, int limit) {
+        record TimedMode(long publishedAtMs, AutoPublishMode mode) { }
+        List<TimedMode> history = new ArrayList<>();
+        for (ObjectNode rec : tx.all("auto_repost")) {
+            if (rec.path("manual").asBoolean(false)) continue;
+            if (!Set.of("PUBLISHED", "UNCERTAIN").contains(rec.path("status").asText(""))) continue;
+            long ts = rec.path("publishedAt").asLong(rec.path("dispatchedAt").asLong(0L));
+            if (ts > 0L) history.add(new TimedMode(ts, AutoPublishMode.REPOST));
+        }
+        for (ObjectNode rec : tx.all("auto_rewrite")) {
+            if (!Set.of("PUBLISHED", "UNCERTAIN").contains(rec.path("status").asText(""))) continue;
+            long ts = rec.path("publishedAt").asLong(rec.path("dispatchedAt").asLong(0L));
+            if (ts > 0L) history.add(new TimedMode(ts, AutoPublishMode.REWRITE));
+        }
+        history.sort(Comparator.comparingLong(TimedMode::publishedAtMs).reversed());
+        return history.stream().limit(Math.max(1, limit)).map(TimedMode::mode).toList();
+    }
     private final Map<String, ObjectNode> previewCache = java.util.Collections.synchronizedMap(
             new LinkedHashMap<>(64, 0.75f, true) {
                 @Override
@@ -164,11 +243,17 @@ public class AutoRepostService {
         List<String> startupRetryIds = recoverStaleRecords();
         sources.setIngestHook(this::enqueue);
         sources.setBatchIngestHook(this::enqueueAuthorBatch);
+        long bootNowMs = clock.millis();
+        if (isInAutoRepostQuietWindow(bootNowMs)) {
+            scheduleQuietWindowEndWakeup(bootNowMs);
+        }
         if (!startupRetryIds.isEmpty()) {
             deferredScheduler.schedule(() -> {
-                if (isInAutoRepostQuietWindow(clock.millis())) {
+                long retryNow = clock.millis();
+                if (isInAutoRepostQuietWindow(retryNow)) {
                     log.info("Skipping {} startup auto-repost retries during quiet window ({}).",
                             startupRetryIds.size(), quietWindowReason());
+                    scheduleQuietWindowEndWakeup(retryNow);
                     return;
                 }
                 for (String id : startupRetryIds) {
@@ -185,23 +270,27 @@ public class AutoRepostService {
     List<String> recoverStaleRecords() {
         List<String> startupRetryIds = new ArrayList<>();
         store.tx(tx -> {
-            for (ObjectNode rec : tx.all("auto_repost")) {
-                String id = rec.path("materialId").asText(rec.path("id").asText("")).strip();
-                if (id.isBlank()) continue;
-                String status = rec.path("status").asText("");
-                if ("EVALUATING".equals(status)) {
-                    tx.put("auto_repost", id, rec.deepCopy()
-                            .put("status", "JUDGE_FAILED")
-                            .put("error", "服务重启中断判定，可手动重试"));
-                } else if ("SENDING".equals(status)) {
-                    tx.put("auto_repost", id, rec.deepCopy()
-                            .put("status", "UNCERTAIN")
-                            .put("error", "发送途中服务重启，请先核实线上时间线避免重复发送"));
-                } else if ("RETRY_QUEUED".equals(status)) {
-                    tx.put("auto_repost", id, rec.deepCopy()
-                            .put("status", "FAILED")
-                            .put("error", "等待重启后重发"));
-                    startupRetryIds.add(id);
+            for (String table : List.of("auto_repost", "auto_rewrite")) {
+                for (ObjectNode rec : tx.all(table)) {
+                    String id = rec.path("materialId").asText(rec.path("id").asText("")).strip();
+                    if (id.isBlank()) continue;
+                    String status = rec.path("status").asText("");
+                    if ("EVALUATING".equals(status)) {
+                        tx.put(table, id, rec.deepCopy()
+                                .put("status", "JUDGE_FAILED")
+                                .put("error", "服务重启中断判定，可手动重试"));
+                    } else if ("SENDING".equals(status)) {
+                        tx.put(table, id, rec.deepCopy()
+                                .put("status", "UNCERTAIN")
+                                .put("error", "发送途中服务重启，请先核实线上时间线避免重复发送"));
+                    } else if ("RETRY_QUEUED".equals(status)) {
+                        tx.put(table, id, rec.deepCopy()
+                                .put("status", "FAILED")
+                                .put("error", "等待重启后重发"));
+                        if ("auto_repost".equals(table)) {
+                            startupRetryIds.add(id);
+                        }
+                    }
                 }
             }
             return null;
@@ -212,6 +301,10 @@ public class AutoRepostService {
     public ObjectNode retry(String materialId) {
         String id = materialId == null ? "" : materialId.strip();
         if (id.isBlank()) throw new IllegalArgumentException("缺少 materialId");
+        boolean isRewriteOnly = store.tx(tx -> tx.get("auto_repost", id) == null && tx.get("auto_rewrite", id) != null);
+        if (isRewriteOnly) {
+            return retryRewrite(id);
+        }
 
         record RetryPlan(
                 ObjectNode updated,
@@ -541,7 +634,7 @@ public class AutoRepostService {
         if (settings != null && settings.has("autoRepostCooldownMinutes")) {
             long customMin = settings.path("autoRepostCooldownMinutes").asLong(-1L);
             if (customMin == 0L) return 0L;
-            if (customMin > 60L) return customMin * 60_000L;
+            if (customMin >= 15L) return customMin * 60_000L;
         }
         return resolveOwnerTweetRequiredGapMs(latestOwnerTweetAtMs);
     }
@@ -556,7 +649,15 @@ public class AutoRepostService {
         long latest = 0L;
         String cleanExclude = excludeMaterialId == null ? "" : excludeMaterialId.strip();
         String excludePubId = cleanExclude.isBlank() ? "" : ("auto-repost-" + cleanExclude);
+        String excludeRewritePubId = cleanExclude.isBlank() ? "" : ("auto-rewrite-" + cleanExclude);
         for (ObjectNode rec : tx.all("auto_repost")) {
+            String recId = rec.path("materialId").asText(rec.path("id").asText("")).strip();
+            if (!cleanExclude.isBlank() && cleanExclude.equals(recId)) continue;
+            if (!Set.of("PUBLISHED", "SENDING", "UNCERTAIN").contains(rec.path("status").asText(""))) continue;
+            long recAt = rec.path("publishedAt").asLong(rec.path("dispatchedAt").asLong(rec.path("createdAt").asLong(0)));
+            if (recAt > 0L && recAt <= nowMs) latest = Math.max(latest, recAt);
+        }
+        for (ObjectNode rec : tx.all("auto_rewrite")) {
             String recId = rec.path("materialId").asText(rec.path("id").asText("")).strip();
             if (!cleanExclude.isBlank() && cleanExclude.equals(recId)) continue;
             if (!Set.of("PUBLISHED", "SENDING", "UNCERTAIN").contains(rec.path("status").asText(""))) continue;
@@ -566,7 +667,10 @@ public class AutoRepostService {
         for (ObjectNode pub : tx.all("publication")) {
             if (pub.path("deleted").asBoolean(false)) continue;
             String pubMatId = pub.path("materialId").asText("").strip();
-            if (!cleanExclude.isBlank() && (cleanExclude.equals(pubMatId) || excludePubId.equals(pub.path("id").asText("")))) {
+            String pubId = pub.path("id").asText("");
+            if (!cleanExclude.isBlank() && (cleanExclude.equals(pubMatId)
+                    || excludePubId.equals(pubId)
+                    || excludeRewritePubId.equals(pubId))) {
                 continue;
             }
             if (!Set.of("PUBLISHED", "SENDING", "UNCERTAIN").contains(pub.path("status").asText(""))) continue;
@@ -1048,6 +1152,7 @@ public class AutoRepostService {
                 .put("status", effectiveSource.path("status").asText("ACTIVE"))
                 .put("intervalMinutes", effectiveSource.path("intervalMinutes").asInt(5))
                 .put("autoRepostEnabled", effectiveSource.path("autoRepostEnabled").asBoolean(false))
+                .put("autoRewriteEnabled", effectiveSource.path("autoRewriteEnabled").asBoolean(false))
                 .put("textMode", textMode)
                 .put("minScore", minScore)
                 .put("ruleHint", effectiveSource.path("autoRepostRuleHint").asText("").strip())
@@ -1797,7 +1902,11 @@ public class AutoRepostService {
 
     public void enqueueAuthorBatch(ObjectNode source, List<ObjectNode> materials) {
         if (!isAutoRepostRuntimeEnabled()) return;
-        if (isInAutoRepostQuietWindow(clock.millis())) return;
+        long nowMs = clock.millis();
+        if (isInAutoRepostQuietWindow(nowMs)) {
+            scheduleQuietWindowEndWakeup(nowMs);
+            return;
+        }
         if (source == null || materials == null || materials.isEmpty()) return;
         ObjectNode sourceCopy = source.deepCopy();
         List<ObjectNode> copies = materials.stream().map(ObjectNode::deepCopy).toList();
@@ -1813,9 +1922,72 @@ public class AutoRepostService {
 
     public void enqueue(ObjectNode source, ObjectNode material) {
         if (!isAutoRepostRuntimeEnabled()) return;
-        if (isInAutoRepostQuietWindow(clock.millis())) return;
+        long nowMs = clock.millis();
+        if (isInAutoRepostQuietWindow(nowMs)) {
+            scheduleQuietWindowEndWakeup(nowMs);
+            return;
+        }
         if (source == null || material == null) return;
         enqueueAuthorBatch(source, List.of(material));
+    }
+
+    private void scheduleQuietWindowEndWakeup(long nowMs) {
+        if (!isAutoRepostRuntimeEnabled()) return;
+        long wakeMs = com.xops.hub.config.XOpsProperties.nextQuietWindowEndEpochMs(
+                nowMs, AssistantRetention.ZONE, quietStartHour(), quietEndHour());
+        schedulePatrolWakeupAt(wakeMs, nowMs);
+    }
+
+    private void schedulePatrolWakeupAt(long targetEpochMs, long nowMs) {
+        if (!isAutoRepostRuntimeEnabled() || targetEpochMs <= 0L) return;
+        long effectiveTarget = targetEpochMs;
+        if (isInAutoRepostQuietWindow(effectiveTarget)) {
+            effectiveTarget = com.xops.hub.config.XOpsProperties.nextQuietWindowEndEpochMs(
+                    effectiveTarget, AssistantRetention.ZONE, quietStartHour(), quietEndHour());
+        }
+        long delayMs = Math.max(1_000L, effectiveTarget - nowMs);
+        long fireAt = nowMs + delayMs;
+        while (true) {
+            long prev = nextPatrolWakeupAtMs.get();
+            if (prev > nowMs && prev <= fireAt + 1_000L) {
+                return;
+            }
+            if (nextPatrolWakeupAtMs.compareAndSet(prev, fireAt)) {
+                break;
+            }
+        }
+        final long scheduledFor = fireAt;
+        try {
+            deferredScheduler.schedule(() -> {
+                nextPatrolWakeupAtMs.compareAndSet(scheduledFor, 0L);
+                executor.submit(() -> {
+                    try {
+                        recheckDeferredCooldownCandidates();
+                        runOwnerIdleRepostPatrol();
+                    } catch (Exception ex) {
+                        log.warn("Scheduled interval auto-send wakeup failed: {}", ex.getMessage());
+                    }
+                });
+            }, delayMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (java.util.concurrent.RejectedExecutionException ignored) {
+            nextPatrolWakeupAtMs.compareAndSet(scheduledFor, 0L);
+        }
+    }
+
+    private void recordOwnerPublishAndScheduleNextSlot(long publishedAtMs) {
+        long nextGapMs = store.tx(tx -> {
+            ObjectNode prev = tx.get("meta", "owner_latest_tweet");
+            long merged = prev == null ? publishedAtMs : Math.max(publishedAtMs, prev.path("latestTweetAt").asLong(0L));
+            tx.put("meta", "owner_latest_tweet", object()
+                    .put("username", "elidlicom")
+                    .put("latestTweetAt", merged)
+                    .put("checkedAt", publishedAtMs));
+            ObjectNode settings = AssistantWorkflow.settings(tx);
+            return resolveEffectiveOwnerGapMs(settings, merged);
+        });
+        if (nextGapMs > 0L) {
+            schedulePatrolWakeupAt(publishedAtMs + nextGapMs + 1_500L, publishedAtMs);
+        }
     }
 
     private void scheduleDeferredCdWakeup(String sourceId, long readyAtMs, long nowMs) {
@@ -1906,7 +2078,11 @@ public class AutoRepostService {
     )
     public void scheduledOwnerIdleRepostCheck() {
         if (!isAutoRepostRuntimeEnabled()) return;
-        if (isInAutoRepostQuietWindow(clock.millis())) return;
+        long nowMs = clock.millis();
+        if (isInAutoRepostQuietWindow(nowMs)) {
+            scheduleQuietWindowEndWakeup(nowMs);
+            return;
+        }
         executor.submit(() -> {
             try {
                 runOwnerIdleRepostPatrol();
@@ -1917,9 +2093,10 @@ public class AutoRepostService {
     }
 
     /**
-     * Checks @elidlicom's latest tweet publish timestamp every 30 minutes; if more than
-     * 1 hour + N(1-20) minutes have elapsed without a new tweet, selects a candidate from
-     * quote-repost configured accounts and publishes one quote-repost tweet.
+     * Shared interval dispatcher outside quiet hours (00:00:00–11:59:59 CST by default):
+     * enforces the single global @elidlicom time lock (1h + 1~20m jitter or configured minutes),
+     * coordinates both Auto Quote-Repost and High-Traffic Pure-Text Wash-Rewrite, and schedules
+     * the exact next wakeup so multiple interval sends happen reliably across the active window.
      */
     ObjectNode runOwnerIdleRepostPatrol() {
         if (!isAutoRepostRuntimeEnabled()) {
@@ -1927,30 +2104,36 @@ public class AutoRepostService {
         }
         long nowMs = clock.millis();
         if (isInAutoRepostQuietWindow(nowMs)) {
+            scheduleQuietWindowEndWakeup(nowMs);
             return object()
                     .put("status", "QUIET_HOURS")
                     .put("quietStartHour", quietStartHour())
                     .put("quietEndHour", quietEndHour())
                     .put("reason", quietWindowReason());
         }
-        record SourceOrderEntry(ObjectNode source, boolean authorCdActive, int tierMinutes, long lastRepostAtMs) { }
+        record SourceOrderEntry(ObjectNode source, boolean authorCdActive, int tierMinutes, long lastActionAtMs) { }
         record PatrolSnapshot(
                 String status,
                 String ownerAccountId,
                 String ownerUsername,
                 ObjectNode settings,
                 long localLatestOwnerTweetAtMs,
-                List<ObjectNode> orderedSources
+                long cachedLiveTweetAtMs,
+                long cachedLiveCheckedAtMs,
+                List<ObjectNode> unlockedRepostSources,
+                List<ObjectNode> orderedRewriteSources,
+                boolean anyRepostSourceConfigured,
+                List<AutoPublishMode> recentAutoModesNewestFirst
         ) { }
 
         PatrolSnapshot snapshot = store.tx(tx -> {
             ObjectNode owner = tx.get("meta", "owner");
             ObjectNode settings = AssistantWorkflow.settings(tx);
             if (owner == null || owner.path("accountId").asText("").isBlank()) {
-                return new PatrolSnapshot("NO_OWNER", "", "elidlicom", settings, 0L, List.of());
+                return new PatrolSnapshot("NO_OWNER", "", "elidlicom", settings, 0L, 0L, 0L, List.of(), List.of(), false, List.of());
             }
             if (!settings.path("enabled").asBoolean(true)) {
-                return new PatrolSnapshot("DISABLED", "", "elidlicom", settings, 0L, List.of());
+                return new PatrolSnapshot("DISABLED", "", "elidlicom", settings, 0L, 0L, 0L, List.of(), List.of(), false, List.of());
             }
             String ownerAccountId = owner.path("accountId").asText("");
             String rawOwnerUser = owner.path("username").asText("").replaceFirst("^@+", "").strip();
@@ -1960,8 +2143,23 @@ public class AutoRepostService {
             LocalDate today = Instant.ofEpochMilli(nowMs).atZone(AssistantRetention.ZONE).toLocalDate();
             long todayStart = today.atStartOfDay(AssistantRetention.ZONE).toInstant().toEpochMilli();
             int publishedToday = 0;
-            Map<String, Long> latestByAuthorKey = new java.util.HashMap<>();
+            Map<String, Long> latestRepostByAuthorKey = new java.util.HashMap<>();
+            Map<String, Long> latestRewriteByAuthorKey = new java.util.HashMap<>();
             for (ObjectNode rec : tx.all("auto_repost")) {
+                String recStatus = rec.path("status").asText("");
+                if (!rec.path("manual").asBoolean(false) && Set.of("PUBLISHED", "UNCERTAIN").contains(recStatus)) {
+                    long recPubAt = rec.path("publishedAt").asLong(rec.path("dispatchedAt").asLong(0L));
+                    if (recPubAt >= todayStart) publishedToday++;
+                }
+                if (Set.of("PUBLISHED", "SENDING", "UNCERTAIN").contains(recStatus)) {
+                    long recAt = rec.path("publishedAt").asLong(rec.path("dispatchedAt").asLong(rec.path("createdAt").asLong(0L)));
+                    String aid = rec.path("authorId").asText("").strip();
+                    String uname = rec.path("username").asText("").replaceFirst("^@+", "").toLowerCase(Locale.ROOT);
+                    if (!aid.isBlank() && recAt > 0L) latestRepostByAuthorKey.merge("id:" + aid, recAt, Math::max);
+                    if (!uname.isBlank() && recAt > 0L) latestRepostByAuthorKey.merge("u:" + uname, recAt, Math::max);
+                }
+            }
+            for (ObjectNode rec : tx.all("auto_rewrite")) {
                 String recStatus = rec.path("status").asText("");
                 if (Set.of("PUBLISHED", "UNCERTAIN").contains(recStatus)) {
                     long recPubAt = rec.path("publishedAt").asLong(rec.path("dispatchedAt").asLong(0L));
@@ -1971,47 +2169,71 @@ public class AutoRepostService {
                     long recAt = rec.path("publishedAt").asLong(rec.path("dispatchedAt").asLong(rec.path("createdAt").asLong(0L)));
                     String aid = rec.path("authorId").asText("").strip();
                     String uname = rec.path("username").asText("").replaceFirst("^@+", "").toLowerCase(Locale.ROOT);
-                    if (!aid.isBlank() && recAt > 0L) latestByAuthorKey.merge("id:" + aid, recAt, Math::max);
-                    if (!uname.isBlank() && recAt > 0L) latestByAuthorKey.merge("u:" + uname, recAt, Math::max);
+                    if (!aid.isBlank() && recAt > 0L) latestRewriteByAuthorKey.merge("id:" + aid, recAt, Math::max);
+                    if (!uname.isBlank() && recAt > 0L) latestRewriteByAuthorKey.merge("u:" + uname, recAt, Math::max);
                 }
             }
             if (publishedToday >= dailyLimit) {
-                return new PatrolSnapshot("DAILY_LIMIT_REACHED", ownerAccountId, ownerUsername, settings, 0L, List.of());
+                return new PatrolSnapshot("DAILY_LIMIT_REACHED", ownerAccountId, ownerUsername, settings, 0L, 0L, 0L, List.of(), List.of(), false, List.of());
             }
 
             int defaultTier = settings.path("intervalMinutes").asInt(5);
-            List<SourceOrderEntry> entries = new ArrayList<>();
+            List<SourceOrderEntry> unlockedRepostEntries = new ArrayList<>();
+            boolean anyRepostConfigured = false;
+            List<SourceOrderEntry> rewriteEntries = new ArrayList<>();
             for (ObjectNode s : tx.all("source")) {
-                if (!"ACTIVE".equals(s.path("status").asText("")) || !s.path("autoRepostEnabled").asBoolean(false)) {
-                    continue;
-                }
+                if (!"ACTIVE".equals(s.path("status").asText(""))) continue;
                 String aid = s.path("authorId").asText(s.path("id").asText("")).strip();
                 String uname = s.path("username").asText("").replaceFirst("^@+", "").toLowerCase(Locale.ROOT);
-                long lastAuthorAt = Math.max(
-                        aid.isBlank() ? 0L : latestByAuthorKey.getOrDefault("id:" + aid, 0L),
-                        uname.isBlank() ? 0L : latestByAuthorKey.getOrDefault("u:" + uname, 0L)
-                );
-                boolean authorCd = lastAuthorAt > 0L && nowMs - lastAuthorAt >= 0L && nowMs - lastAuthorAt < SAME_AUTHOR_COOLDOWN_MS;
                 int tier = SourceCollector.resolveTierMinutes(s, defaultTier);
-                entries.add(new SourceOrderEntry(s.deepCopy(), authorCd, tier, lastAuthorAt));
+                if (s.path("autoRepostEnabled").asBoolean(false)) {
+                    anyRepostConfigured = true;
+                    long lastAuthorAt = Math.max(
+                            aid.isBlank() ? 0L : latestRepostByAuthorKey.getOrDefault("id:" + aid, 0L),
+                            uname.isBlank() ? 0L : latestRepostByAuthorKey.getOrDefault("u:" + uname, 0L)
+                    );
+                    boolean authorCd = lastAuthorAt > 0L && nowMs - lastAuthorAt >= 0L && nowMs - lastAuthorAt < SAME_AUTHOR_COOLDOWN_MS;
+                    // Strictly keep 16-hour per-author lock after quote-reposting an account
+                    if (!authorCd) {
+                        unlockedRepostEntries.add(new SourceOrderEntry(s.deepCopy(), false, tier, lastAuthorAt));
+                    }
+                }
+                if (s.path("autoRewriteEnabled").asBoolean(false)) {
+                    long lastRwAt = Math.max(
+                            aid.isBlank() ? 0L : latestRewriteByAuthorKey.getOrDefault("id:" + aid, 0L),
+                            uname.isBlank() ? 0L : latestRewriteByAuthorKey.getOrDefault("u:" + uname, 0L)
+                    );
+                    rewriteEntries.add(new SourceOrderEntry(s.deepCopy(), false, tier, lastRwAt));
+                }
             }
-            if (entries.isEmpty()) {
-                return new PatrolSnapshot("NO_CONFIGURED_SOURCES", ownerAccountId, ownerUsername, settings, 0L, List.of());
+            if (!anyRepostConfigured && rewriteEntries.isEmpty()) {
+                return new PatrolSnapshot("NO_CONFIGURED_SOURCES", ownerAccountId, ownerUsername, settings, 0L, 0L, 0L, List.of(), List.of(), false, List.of());
             }
-            entries.sort(Comparator.comparing(SourceOrderEntry::authorCdActive)
-                    .thenComparingInt(SourceOrderEntry::tierMinutes)
-                    .thenComparingLong(SourceOrderEntry::lastRepostAtMs));
+            unlockedRepostEntries.sort(Comparator.comparingInt(SourceOrderEntry::tierMinutes)
+                    .thenComparingLong(SourceOrderEntry::lastActionAtMs));
+            rewriteEntries.sort(Comparator.comparingLong(SourceOrderEntry::lastActionAtMs)
+                    .thenComparingInt(SourceOrderEntry::tierMinutes));
+
             long localLatest = resolveLatestOwnerTweetEpochMs(tx, ownerAccountId, "elidlicom", "", nowMs);
             if (!"elidlicom".equalsIgnoreCase(ownerUsername)) {
                 localLatest = Math.max(localLatest, resolveLatestOwnerTweetEpochMs(tx, ownerAccountId, ownerUsername, "", nowMs));
             }
+            ObjectNode observedNode = tx.get("meta", "owner_latest_tweet");
+            long cachedLiveTs = observedNode == null ? 0L : observedNode.path("latestTweetAt").asLong(0L);
+            long cachedCheckedAt = observedNode == null ? 0L : observedNode.path("checkedAt").asLong(0L);
+            List<AutoPublishMode> recentAutoModes = collectRecentAutoPublishModesNewestFirst(tx, 2);
             return new PatrolSnapshot(
                     "READY",
                     ownerAccountId,
                     ownerUsername,
                     settings.deepCopy(),
                     localLatest,
-                    entries.stream().map(SourceOrderEntry::source).toList()
+                    cachedLiveTs,
+                    cachedCheckedAt,
+                    unlockedRepostEntries.stream().map(SourceOrderEntry::source).toList(),
+                    rewriteEntries.stream().map(SourceOrderEntry::source).toList(),
+                    anyRepostConfigured,
+                    recentAutoModes
             );
         });
 
@@ -2019,27 +2241,30 @@ public class AutoRepostService {
             return object().put("status", snapshot.status());
         }
 
-        long liveLatest = 0L;
+        long liveLatest = snapshot.cachedLiveTweetAtMs();
         boolean liveCheckFailed = false;
-        if (sources != null) {
+        boolean recentlyCheckedLive = snapshot.cachedLiveCheckedAtMs() > 0L
+                && nowMs - snapshot.cachedLiveCheckedAtMs() >= 0L
+                && nowMs - snapshot.cachedLiveCheckedAtMs() < 5L * 60_000L;
+        if (sources != null && !recentlyCheckedLive) {
             try {
                 liveLatest = sources.fetchLatestAccountPostEpochMs("elidlicom", snapshot.ownerAccountId());
             } catch (Exception ex) {
                 liveCheckFailed = true;
                 log.warn("Patrol failed to fetch live @elidlicom timeline: {}", ex.getMessage());
             }
-        }
-        if (liveLatest > 0L) {
-            long observedTs = liveLatest;
-            store.tx(tx -> {
-                ObjectNode prev = tx.get("meta", "owner_latest_tweet");
-                long merged = prev == null ? observedTs : Math.max(observedTs, prev.path("latestTweetAt").asLong(0L));
-                tx.put("meta", "owner_latest_tweet", object()
-                        .put("username", "elidlicom")
-                        .put("latestTweetAt", merged)
-                        .put("checkedAt", clock.millis()));
-                return null;
-            });
+            if (liveLatest > 0L) {
+                long observedTs = liveLatest;
+                store.tx(tx -> {
+                    ObjectNode prev = tx.get("meta", "owner_latest_tweet");
+                    long merged = prev == null ? observedTs : Math.max(observedTs, prev.path("latestTweetAt").asLong(0L));
+                    tx.put("meta", "owner_latest_tweet", object()
+                            .put("username", "elidlicom")
+                            .put("latestTweetAt", merged)
+                            .put("checkedAt", clock.millis()));
+                    return null;
+                });
+            }
         }
 
         long latestOwnerAt = Math.max(snapshot.localLatestOwnerTweetAtMs(), Math.max(0L, liveLatest));
@@ -2053,6 +2278,8 @@ public class AutoRepostService {
         if (requiredGapMs > 0L && latestOwnerAt > 0L
                 && checkNowMs - latestOwnerAt >= 0L
                 && checkNowMs - latestOwnerAt <= requiredGapMs) {
+            long readyAtMs = latestOwnerAt + requiredGapMs + 1_500L;
+            schedulePatrolWakeupAt(readyAtMs, checkNowMs);
             long remainingMin = Math.max(1L, (requiredGapMs - (checkNowMs - latestOwnerAt) + 59_999L) / 60_000L);
             return object()
                     .put("status", "RECENTLY_TWEETED")
@@ -2062,43 +2289,140 @@ public class AutoRepostService {
                     .put("remainingMinutes", remainingMin);
         }
 
-        for (ObjectNode source : snapshot.orderedSources()) {
-            List<ObjectNode> candidates = sources == null
-                    ? List.of()
-                    : sources.syncSourceMaterialsForPatrol(source, PATROL_MAX_FRESHNESS_AGE_MS);
-            if (candidates == null || candidates.isEmpty()) {
-                String aid = source.path("authorId").asText(source.path("id").asText("")).strip();
-                String uname = source.path("username").asText("").replaceFirst("^@+", "").strip();
-                long scanNow = clock.millis();
-                candidates = store.tx(tx -> {
-                    List<ObjectNode> local = new ArrayList<>();
-                    for (ObjectNode m : tx.all("material")) {
-                        boolean same = (!aid.isBlank() && aid.equals(m.path("authorId").asText("")))
-                                || (!uname.isBlank() && uname.equalsIgnoreCase(m.path("username").asText("").replaceFirst("^@+", "")));
-                        if (!same) continue;
-                        long pubAt = m.path("publishedAt").asLong(0L);
-                        if (pubAt <= 0L || scanNow - pubAt > PATROL_MAX_FRESHNESS_AGE_MS) continue;
-                        local.add(m.deepCopy());
-                    }
-                    local.sort(Comparator.comparingLong((ObjectNode m) -> m.path("publishedAt").asLong(0L)).reversed());
-                    return local.stream().limit(8).toList();
-                });
+        boolean hasRepostPool = !snapshot.unlockedRepostSources().isEmpty();
+        boolean hasRewritePool = !snapshot.orderedRewriteSources().isEmpty();
+        if (!hasRepostPool && !hasRewritePool) {
+            return object()
+                    .put("status", "NO_ELIGIBLE_CANDIDATE")
+                    .put("reason", snapshot.anyRepostSourceConfigured() ? "ALL_REPOST_SOURCES_IN_16H_LOCK" : "NO_ACTIVE_SOURCES")
+                    .put("latestOwnerTweetAt", latestOwnerAt)
+                    .put("jitterMinutes", jitterMinutes);
+        }
+
+        // Only one mode has eligible sources configured -> run that mode directly without consuming a random draw
+        if (hasRepostPool && !hasRewritePool) {
+            ObjectNode rpOnly = tryPatrolRepostSources(snapshot.unlockedRepostSources(), latestOwnerAt, jitterMinutes);
+            if (rpOnly != null) {
+                return rpOnly.put("dispatchOrder", "ONLY_REPOST_CONFIGURED");
             }
-            if (candidates.isEmpty()) continue;
-            String publishedMaterialId = processAuthorBatchInternal(source, candidates, true);
+            return object().put("status", "NO_ELIGIBLE_CANDIDATE").put("latestOwnerTweetAt", latestOwnerAt).put("jitterMinutes", jitterMinutes);
+        }
+        if (!hasRepostPool && hasRewritePool) {
+            ObjectNode rwOnly = tryPatrolRewriteSources(snapshot.orderedRewriteSources(), snapshot.ownerAccountId(), snapshot.ownerUsername(), latestOwnerAt, jitterMinutes);
+            if (rwOnly != null) {
+                return rwOnly.put("dispatchOrder", "ONLY_REWRITE_AVAILABLE");
+            }
+            return object().put("status", "NO_ELIGIBLE_CANDIDATE").put("latestOwnerTweetAt", latestOwnerAt).put("jitterMinutes", jitterMinutes);
+        }
+
+        // Both REPOST and REWRITE are available:
+        // Odd = REPOST, Even = REWRITE; if 2 consecutive auto-publishes were identical, skip random and force the other!
+        AutoPublishOrderDecision orderDecision = resolveNextAutoPublishOrder(
+                snapshot.recentAutoModesNewestFirst(), this.randomDrawSupplier);
+
+        if (orderDecision.primaryMode() == AutoPublishMode.REPOST) {
+            ObjectNode rpResult = tryPatrolRepostSources(snapshot.unlockedRepostSources(), latestOwnerAt, jitterMinutes);
+            if (rpResult != null) {
+                return rpResult
+                        .put("dispatchOrder", orderDecision.reasonCode())
+                        .put("forcedByTwoStreak", orderDecision.forcedByTwoStreak())
+                        .put("randomDraw", orderDecision.randomNumber());
+            }
+            ObjectNode rwFallback = tryPatrolRewriteSources(snapshot.orderedRewriteSources(), snapshot.ownerAccountId(), snapshot.ownerUsername(), latestOwnerAt, jitterMinutes);
+            if (rwFallback != null) {
+                return rwFallback
+                        .put("dispatchOrder", orderDecision.reasonCode() + "_FALLBACK_REWRITE")
+                        .put("forcedByTwoStreak", orderDecision.forcedByTwoStreak())
+                        .put("randomDraw", orderDecision.randomNumber());
+            }
+        } else {
+            ObjectNode rwResult = tryPatrolRewriteSources(snapshot.orderedRewriteSources(), snapshot.ownerAccountId(), snapshot.ownerUsername(), latestOwnerAt, jitterMinutes);
+            if (rwResult != null) {
+                return rwResult
+                        .put("dispatchOrder", orderDecision.reasonCode())
+                        .put("forcedByTwoStreak", orderDecision.forcedByTwoStreak())
+                        .put("randomDraw", orderDecision.randomNumber());
+            }
+            ObjectNode rpFallback = tryPatrolRepostSources(snapshot.unlockedRepostSources(), latestOwnerAt, jitterMinutes);
+            if (rpFallback != null) {
+                return rpFallback
+                        .put("dispatchOrder", orderDecision.reasonCode() + "_FALLBACK_REPOST")
+                        .put("forcedByTwoStreak", orderDecision.forcedByTwoStreak())
+                        .put("randomDraw", orderDecision.randomNumber());
+            }
+        }
+
+        return object()
+                .put("status", "NO_ELIGIBLE_CANDIDATE")
+                .put("dispatchOrder", orderDecision.reasonCode())
+                .put("latestOwnerTweetAt", latestOwnerAt)
+                .put("jitterMinutes", jitterMinutes);
+    }
+
+    private ObjectNode tryPatrolRepostSources(List<ObjectNode> unlockedSources, long latestOwnerAt, int jitterMinutes) {
+        if (unlockedSources == null || unlockedSources.isEmpty()) return null;
+        // Pass 1: Prefer newly published content within the 48h freshness window
+        for (ObjectNode source : unlockedSources) {
+            List<ObjectNode> freshCandidates = loadRepostCandidatesForWindow(source, PATROL_MAX_FRESHNESS_AGE_MS, false);
+            if (freshCandidates.isEmpty()) continue;
+            String publishedMaterialId = processAuthorBatchInternal(source, freshCandidates, true, false);
             if (publishedMaterialId != null && !publishedMaterialId.isBlank()) {
                 return object()
                         .put("status", "PUBLISHED")
+                        .put("mode", "REPOST")
+                        .put("repostSourceTier", "FRESH")
                         .put("materialId", publishedMaterialId)
                         .put("sourceUsername", source.path("username").asText(""))
                         .put("latestOwnerTweetAt", latestOwnerAt)
                         .put("jitterMinutes", jitterMinutes);
             }
         }
-        return object()
-                .put("status", "NO_ELIGIBLE_CANDIDATE")
-                .put("latestOwnerTweetAt", latestOwnerAt)
-                .put("jitterMinutes", jitterMinutes);
+        // Pass 2: No new qualifying content across unlocked sources -> fall back to recent posts (strictly keeping 16h author lock)
+        for (ObjectNode source : unlockedSources) {
+            List<ObjectNode> recentCandidates = loadRepostCandidatesForWindow(source, RECENT_REPOST_FALLBACK_MAX_AGE_MS, true);
+            if (recentCandidates.isEmpty()) continue;
+            String publishedMaterialId = processAuthorBatchInternal(source, recentCandidates, true, true);
+            if (publishedMaterialId != null && !publishedMaterialId.isBlank()) {
+                return object()
+                        .put("status", "PUBLISHED")
+                        .put("mode", "REPOST")
+                        .put("repostSourceTier", "RECENT_FALLBACK")
+                        .put("materialId", publishedMaterialId)
+                        .put("sourceUsername", source.path("username").asText(""))
+                        .put("latestOwnerTweetAt", latestOwnerAt)
+                        .put("jitterMinutes", jitterMinutes);
+            }
+        }
+        return null;
+    }
+
+    private List<ObjectNode> loadRepostCandidatesForWindow(ObjectNode source, long windowMs, boolean recentArchiveFallback) {
+        List<ObjectNode> synced = null;
+        if (sources != null) {
+            synced = recentArchiveFallback
+                    ? sources.syncSourceMaterialsForRecentRepost(source, windowMs)
+                    : sources.syncSourceMaterialsForPatrol(source, windowMs);
+        }
+        if (synced != null && !synced.isEmpty()) {
+            return synced;
+        }
+        String aid = source.path("authorId").asText(source.path("id").asText("")).strip();
+        String uname = source.path("username").asText("").replaceFirst("^@+", "").strip();
+        long scanNow = clock.millis();
+        int maxItems = recentArchiveFallback ? 12 : 8;
+        return store.tx(tx -> {
+            List<ObjectNode> local = new ArrayList<>();
+            for (ObjectNode m : tx.all("material")) {
+                boolean same = (!aid.isBlank() && aid.equals(m.path("authorId").asText("")))
+                        || (!uname.isBlank() && uname.equalsIgnoreCase(m.path("username").asText("").replaceFirst("^@+", "")));
+                if (!same) continue;
+                long pubAt = m.path("publishedAt").asLong(0L);
+                if (pubAt <= 0L || scanNow - pubAt > windowMs) continue;
+                local.add(m.deepCopy());
+            }
+            local.sort(Comparator.comparingLong((ObjectNode m) -> m.path("publishedAt").asLong(0L)).reversed());
+            return local.stream().limit(maxItems).toList();
+        });
     }
 
     void processCandidate(ObjectNode sourceSnapshot, ObjectNode materialSnapshot) {
@@ -2107,23 +2431,34 @@ public class AutoRepostService {
     }
 
     void processAuthorBatch(ObjectNode sourceSnapshot, List<ObjectNode> materialSnapshots) {
-        processAuthorBatchInternal(sourceSnapshot, materialSnapshots, false);
+        processAuthorBatchInternal(sourceSnapshot, materialSnapshots, false, false);
     }
 
     private String processAuthorBatchInternal(ObjectNode sourceSnapshot, List<ObjectNode> materialSnapshots, boolean patrolMode) {
+        return processAuthorBatchInternal(sourceSnapshot, materialSnapshots, patrolMode, false);
+    }
+
+    private String processAuthorBatchInternal(
+            ObjectNode sourceSnapshot,
+            List<ObjectNode> materialSnapshots,
+            boolean patrolMode,
+            boolean recentArchiveFallback
+    ) {
         if (sourceSnapshot == null || materialSnapshots == null || materialSnapshots.isEmpty()) return "";
         long now = clock.millis();
         if (isInAutoRepostQuietWindow(now)) {
             return "";
         }
-        long maxAgeMs = patrolMode ? PATROL_MAX_FRESHNESS_AGE_MS : MAX_FRESHNESS_AGE_MS;
+        long maxAgeMs = recentArchiveFallback
+                ? RECENT_REPOST_FALLBACK_MAX_AGE_MS
+                : (patrolMode ? PATROL_MAX_FRESHNESS_AGE_MS : MAX_FRESHNESS_AGE_MS);
         List<ObjectNode> filtered = new ArrayList<>();
         java.util.Set<String> seenIds = new java.util.LinkedHashSet<>();
         for (ObjectNode m : materialSnapshots) {
             if (m == null) continue;
             String mid = m.path("id").asText("").strip();
             if (!mid.matches("[0-9]+") || !seenIds.add(mid)) continue;
-            if (m.path("pinned").asBoolean(false) || m.path("selfThreadReply").asBoolean(false)) continue;
+            if (m.path("selfThreadReply").asBoolean(false)) continue;
             if (!Set.of("POST", "QUOTE").contains(m.path("kind").asText("POST"))) continue;
             String combinedText = AssistantTopics.text(m);
             if (combinedText.isBlank() || combinedText.codePointCount(0, combinedText.length()) < 10) continue;
@@ -2144,7 +2479,8 @@ public class AutoRepostService {
                 String postPolishPrompt,
                 DualCooldown deferredCd,
                 String deferredSourceId,
-                boolean onlyDirectPassAllowed
+                boolean onlyDirectPassAllowed,
+                boolean deferToScheduledRewriteTurn
         ) { }
 
         BatchClaimContext ctx = store.tx(tx -> {
@@ -2170,10 +2506,10 @@ public class AutoRepostService {
             for (ObjectNode snapMat : filtered) {
                 String mid = snapMat.path("id").asText("");
                 long pubAt = snapMat.path("publishedAt").asLong(0L);
-                if (!patrolMode && enabledAt > 0L && pubAt < enabledAt) continue;
+                if (!patrolMode && !recentArchiveFallback && enabledAt > 0L && pubAt < enabledAt) continue;
                 ObjectNode existingRec = tx.get("auto_repost", mid);
                 if (existingRec != null) {
-                    if (patrolMode) {
+                    if (patrolMode || recentArchiveFallback) {
                         String recStatus = existingRec.path("status").asText("");
                         boolean patrolRetryable = Set.of(
                                 "SKIPPED_COOLDOWN", "SKIPPED_AUTHOR_COOLDOWN", "SKIPPED_QUIET_HOURS", "JUDGE_FAILED"
@@ -2189,6 +2525,9 @@ public class AutoRepostService {
                 if (liveMat == null) continue;
                 String topicId = AssistantTopics.topicOf(tx, mid);
                 eligible.add(new ClaimedItem(mid, topicId, liveMat));
+                if (recentArchiveFallback && eligible.size() >= 3) {
+                    break;
+                }
             }
             if (eligible.isEmpty()) return null;
 
@@ -2199,6 +2538,17 @@ public class AutoRepostService {
             int publishedToday = 0;
             java.util.Set<String> activeTopics = new java.util.HashSet<>();
             for (ObjectNode rec : tx.all("auto_repost")) {
+                String recStatus = rec.path("status").asText("");
+                if (Set.of("PUBLISHED", "SENDING", "UNCERTAIN").contains(recStatus)) {
+                    String tid = rec.path("topicId").asText("");
+                    if (!tid.isBlank()) activeTopics.add(tid);
+                }
+                if (!rec.path("manual").asBoolean(false) && Set.of("PUBLISHED", "UNCERTAIN").contains(recStatus)) {
+                    long recPubAt = rec.path("publishedAt").asLong(rec.path("dispatchedAt").asLong(0L));
+                    if (recPubAt >= todayStart) publishedToday++;
+                }
+            }
+            for (ObjectNode rec : tx.all("auto_rewrite")) {
                 String recStatus = rec.path("status").asText("");
                 if (Set.of("PUBLISHED", "SENDING", "UNCERTAIN").contains(recStatus)) {
                     String tid = rec.path("topicId").asText("");
@@ -2223,8 +2573,6 @@ public class AutoRepostService {
             }
             if (nonDupItems.isEmpty()) return null;
 
-            // Priority Gate: Global CD (1h+N min) strictly short-circuits with 0 LLM calls (wakes up right at globalReadyAtMs!).
-            // When ONLY Author 16h CD is active, we still allow single-pass gate check so MODEL_RELEASE / FEATURE_UPDATE / QUOTA_RESET can exempt Author CD.
             DualCooldown dualCd = computeLiveDualCooldown(
                     tx, settings, ownerAccountId, ownerUsername, candidateAuthorId, candidateUsername, "", now);
             if (dualCd.globalCdActive()) {
@@ -2237,7 +2585,33 @@ public class AutoRepostService {
                             .put("reason", dualCd.blockingReasonText()));
                 }
                 return new BatchClaimContext(ownerAccountId, ownerUsername, liveSource, List.of(),
-                        "", "", "", dualCd, sourceId, false);
+                        "", "", "", dualCd, sourceId, false, false);
+            }
+
+            // When NOT in patrolMode (i.e. real-time ingest), if rewrite sources are also active, consult the shared
+            // odd=REPOST / even=REWRITE + 2-streak anti-repeat rule so real-time ingests cannot starve or break order!
+            if (!patrolMode) {
+                boolean anyRewriteEnabled = tx.all("source").stream()
+                        .anyMatch(s -> "ACTIVE".equals(s.path("status").asText("")) && s.path("autoRewriteEnabled").asBoolean(false));
+                if (anyRewriteEnabled) {
+                    List<AutoPublishMode> lastModes = collectRecentAutoPublishModesNewestFirst(tx, 2);
+                    AutoPublishOrderDecision liveOrder = resolveNextAutoPublishOrder(lastModes, this.randomDrawSupplier);
+                    if (liveOrder.primaryMode() == AutoPublishMode.REWRITE) {
+                        long nextGap = resolveOwnerTweetRequiredGapMs(now);
+                        String deferReason = liveOrder.forcedByTwoStreak()
+                                ? "已连续 2 次自动引用转发，本轮直接切换执行洗稿发送"
+                                : "本轮随机抽中双数（洗稿发送），优先执行洗稿发送";
+                        for (ClaimedItem item : nonDupItems) {
+                            tx.put("auto_repost", item.materialId(), baseRecord(liveSource, item.material(), item.topicId(), now)
+                                    .put("status", "SKIPPED_COOLDOWN")
+                                    .put("deferredPendingEval", true)
+                                    .put("deferredUntilMs", now + nextGap)
+                                    .put("reason", deferReason));
+                        }
+                        return new BatchClaimContext(ownerAccountId, ownerUsername, liveSource, List.of(),
+                                "", "", "", null, sourceId, false, true);
+                    }
+                }
             }
 
             if (publishedToday >= dailyLimit) {
@@ -2252,6 +2626,10 @@ public class AutoRepostService {
 
             List<ClaimedItem> evalItems = nonDupItems;
             if (dualCd.authorCdActive()) {
+                if (patrolMode || recentArchiveFallback) {
+                    // Strictly keep 16h same-author lock during interval patrol and recent-content fallback
+                    return null;
+                }
                 evalItems = new ArrayList<>();
                 for (ClaimedItem item : nonDupItems) {
                     if (mightBeDirectPassCandidate(item.material())) {
@@ -2287,11 +2665,26 @@ public class AutoRepostService {
                     polishPrompt,
                     null,
                     sourceId,
-                    dualCd.authorCdActive()
+                    dualCd.authorCdActive(),
+                    false
             );
         });
 
         if (ctx == null) return "";
+        if (ctx.deferToScheduledRewriteTurn()) {
+            scheduleDeferredCdWakeup(ctx.deferredSourceId(), now + resolveOwnerTweetRequiredGapMs(now), now);
+            // Execute a rewrite turn immediately while the global time lock is free; if no rewrite candidate is eligible,
+            // fall back to patrol repost so the open slot is never wasted.
+            List<ObjectNode> rewriteSources = store.tx(tx -> tx.all("source").stream()
+                    .filter(s -> "ACTIVE".equals(s.path("status").asText("")) && s.path("autoRewriteEnabled").asBoolean(false))
+                    .map(ObjectNode::deepCopy)
+                    .toList());
+            ObjectNode rwDone = tryPatrolRewriteSources(rewriteSources, ctx.ownerId(), ctx.ownerUsername(), 0L, 0);
+            if (rwDone == null) {
+                processAuthorBatchInternal(sourceSnapshot, materialSnapshots, true, false);
+            }
+            return "";
+        }
         if (ctx.deferredCd() != null && ctx.deferredCd().globalCdActive()) {
             scheduleDeferredCdWakeup(ctx.deferredSourceId(), ctx.deferredCd().globalReadyAtMs(), now);
             return "";
@@ -2310,7 +2703,9 @@ public class AutoRepostService {
                     ctx.styleProfile(),
                     ctx.preferencesText(),
                     now,
-                    ctx.onlyDirectPassAllowed()
+                    ctx.onlyDirectPassAllowed(),
+                    true,
+                    patrolMode || recentArchiveFallback
             );
             return wasDispatchedOrPublished(only.materialId()) ? only.materialId() : "";
         }
@@ -2404,21 +2799,24 @@ public class AutoRepostService {
                 winnerItem = item;
                 winnerJudgment = j;
             } else {
-                boolean extraDirectPass = !winnerId.isBlank() && j != null && j.shouldRepost()
-                        && PiAgentViralJudge.isDirectPassCategory(j.category());
-                if (extraDirectPass) {
+                boolean itemItselfQualifies = j != null && (j.shouldRepost()
+                        || (recentArchiveFallback
+                        && j.viralScore() >= minScore && j.accountFit() && j.credibility() >= 60 && j.factScore() >= 55));
+                boolean extraQualifying = !winnerId.isBlank() && itemItselfQualifies
+                        && (!ctx.onlyDirectPassAllowed() || (j != null && PiAgentViralJudge.isDirectPassCategory(j.category())));
+                if (extraQualifying) {
                     deferredExtraDirectPass = true;
                 }
                 store.tx(tx -> {
                     ObjectNode rec = tx.get("auto_repost", item.materialId());
                     if (rec != null && "EVALUATING".equals(rec.path("status").asText(""))) {
                         ObjectNode next = j != null ? applyJudgment(rec.deepCopy(), j, evaluatedAt) : rec.deepCopy();
-                        if (extraDirectPass) {
+                        if (extraQualifying) {
                             tx.put("auto_repost", item.materialId(), next
                                     .put("status", "SKIPPED_COOLDOWN")
                                     .put("deferredPendingEval", true)
                                     .put("deferredUntilMs", nextGlobalGapUntilMs)
-                                    .put("reason", "同批已有直通推文先行发送，待全局 1h+N分 CD 解除后继续转发"));
+                                    .put("reason", "同批已有优选推文先行发送，待该账号 16h 锁及全局时间锁解除后继续发送"));
                         } else if (ctx.onlyDirectPassAllowed()
                                 && (j == null || !PiAgentViralJudge.isDirectPassCategory(j.category()))) {
                             tx.put("auto_repost", item.materialId(), next
@@ -2462,7 +2860,9 @@ public class AutoRepostService {
                     winnerItem.topicId(),
                     commentText,
                     winnerJudgment,
-                    evaluatedAt
+                    evaluatedAt,
+                    true,
+                    patrolMode || recentArchiveFallback
             );
             return wasDispatchedOrPublished(winnerItem.materialId()) ? winnerItem.materialId() : "";
         }
@@ -2505,7 +2905,7 @@ public class AutoRepostService {
             boolean onlyDirectPassAllowed
     ) {
         evaluateAndPublish(materialId, ownerId, ownerUsername, topicId, source, material,
-                styleProfile, preferencesText, now, onlyDirectPassAllowed, true);
+                styleProfile, preferencesText, now, onlyDirectPassAllowed, true, false);
     }
 
     private void evaluateAndPublish(
@@ -2520,6 +2920,24 @@ public class AutoRepostService {
             long now,
             boolean onlyDirectPassAllowed,
             boolean enforceQuietWindow
+    ) {
+        evaluateAndPublish(materialId, ownerId, ownerUsername, topicId, source, material,
+                styleProfile, preferencesText, now, onlyDirectPassAllowed, enforceQuietWindow, false);
+    }
+
+    private void evaluateAndPublish(
+            String materialId,
+            String ownerId,
+            String ownerUsername,
+            String topicId,
+            ObjectNode source,
+            ObjectNode material,
+            String styleProfile,
+            String preferencesText,
+            long now,
+            boolean onlyDirectPassAllowed,
+            boolean enforceQuietWindow,
+            boolean strictSixteenHourAuthorLock
     ) {
         String textMode = source.path("autoRepostTextMode").asText("AI").toUpperCase();
         boolean useTemplate = "TEMPLATE".equals(textMode);
@@ -2618,7 +3036,7 @@ public class AutoRepostService {
             return;
         }
 
-        dispatchCommentAndPublish(materialId, ownerId, ownerUsername, topicId, commentText, judgment, evaluatedAt, enforceQuietWindow);
+        dispatchCommentAndPublish(materialId, ownerId, ownerUsername, topicId, commentText, judgment, evaluatedAt, enforceQuietWindow, strictSixteenHourAuthorLock);
     }
 
     private static final java.util.regex.Pattern STATUS_URL_ID_PATTERN = java.util.regex.Pattern.compile("/status/([0-9]{2,20})");
@@ -2787,6 +3205,7 @@ public class AutoRepostService {
                             .put("sourceUrl", prepared.sourceUrl())
                             .put("createdAt", doneMs);
             nextRepost.put("status", "PUBLISHED")
+                    .put("manual", true)
                     .put("commentText", commentText)
                     .put("quoteTweetId", prepared.quoteTweetId())
                     .put("quoteVoiceVersion", 7)
@@ -2822,6 +3241,20 @@ public class AutoRepostService {
             PiAgentViralJudge.ViralJudgment judgment,
             long evaluatedAt,
             boolean enforceQuietWindow
+    ) {
+        dispatchCommentAndPublish(materialId, ownerId, ownerUsername, topicId, commentText, judgment, evaluatedAt, enforceQuietWindow, false);
+    }
+
+    private void dispatchCommentAndPublish(
+            String materialId,
+            String ownerId,
+            String ownerUsername,
+            String topicId,
+            String commentText,
+            PiAgentViralJudge.ViralJudgment judgment,
+            long evaluatedAt,
+            boolean enforceQuietWindow,
+            boolean strictSixteenHourAuthorLock
     ) {
         final String accessToken;
         try {
@@ -2879,9 +3312,9 @@ public class AutoRepostService {
                         .put("reason", quietWindowReason()));
                 return null;
             }
-            boolean exemptAuthorCd = judgment != null
+            boolean exemptAuthorCd = !strictSixteenHourAuthorLock && (judgment != null
                     ? PiAgentViralJudge.isDirectPassCategory(judgment.category())
-                    : PiAgentViralJudge.isDirectPassCategory(rec.path("category").asText(""));
+                    : PiAgentViralJudge.isDirectPassCategory(rec.path("category").asText("")));
             ObjectNode recentSameAuthor = exemptAuthorCd
                     ? null
                     : findRecentSameAuthorRepost(
@@ -2959,6 +3392,7 @@ public class AutoRepostService {
                         .put("publishedAt", doneMs));
                 return null;
             });
+            recordOwnerPublishAndScheduleNextSlot(doneMs);
         } catch (XPublishException ex) {
             String terminalStatus = ex.isDeliveryUncertain() ? "UNCERTAIN" : "FAILED";
             store.tx(tx -> {
@@ -3083,5 +3517,553 @@ public class AutoRepostService {
         String m = ex.getMessage();
         if (m == null || m.isBlank()) m = ex.getClass().getSimpleName();
         return m.length() > 260 ? m.substring(0, 260) : m;
+    }
+
+    // ==================== High-Traffic Pure-Text Wash-Rewrite Engine ====================
+
+    static String extractPureRewriteSourceText(ObjectNode m) {
+        if (m == null) return "";
+        if (!"POST".equalsIgnoreCase(m.path("kind").asText("POST"))) return "";
+        if (m.path("selfThreadReply").asBoolean(false) || m.path("archiveOnly").asBoolean(false)) return "";
+        if (m.path("hasMedia").asBoolean(false)) return "";
+        if (!m.path("quotedId").asText("").isBlank() || !m.path("quotedText").asText("").isBlank()) return "";
+        if (!m.path("articleUrl").asText("").isBlank()) return "";
+        String textStatus = m.path("textStatus").asText("");
+        if (Set.of("MEDIA_ONLY", "MEDIA_URL_ONLY", "NO_ANALYZABLE_TEXT", "QUOTE_TEXT_MISSING", "QUOTE_SOURCE_MISSING").contains(textStatus)) {
+            return "";
+        }
+        if (!AssistantTopics.links(m).isEmpty()) return "";
+        String raw = !m.path("articleText").asText("").isBlank()
+                ? m.path("articleText").asText("").strip()
+                : m.path("text").asText("").strip();
+        if (raw.isBlank()) return "";
+        if (EMBEDDED_URL_PATTERN.matcher(raw).find()) return "";
+        if (raw.startsWith("@")) return "";
+        if (THREAD_OR_VISUAL_DEPENDENCY_PATTERN.matcher(raw).find()) return "";
+        int cp = raw.codePointCount(0, raw.length());
+        if (cp < 35 || cp > 4_000) return "";
+        return raw;
+    }
+
+    static boolean isPureTextRewriteCandidate(ObjectNode m) {
+        if (m == null) return false;
+        String id = m.path("id").asText("").strip();
+        if (!id.matches("[0-9]+")) return false;
+        return !extractPureRewriteSourceText(m).isBlank();
+    }
+
+    static long computeWeightedEngagement(ObjectNode m) {
+        if (m == null) return 0L;
+        long views = Math.max(0L, m.path("views").asLong(0L));
+        long likes = Math.max(0L, m.path("likes").asLong(0L));
+        long reposts = Math.max(0L, m.path("reposts").asLong(0L));
+        long replies = Math.max(0L, m.path("replies").asLong(0L));
+        long bookmarks = Math.max(0L, m.path("bookmarks").asLong(0L));
+        return likes + reposts * 3L + replies * 2L + bookmarks * 2L + (views / 100L);
+    }
+
+    static boolean isHighTrafficForAuthor(
+            ObjectNode m,
+            long medianViews,
+            long medianLikes,
+            long medianEngagement,
+            int baselineSampleCount
+    ) {
+        long views = Math.max(0L, m.path("views").asLong(0L));
+        long likes = Math.max(0L, m.path("likes").asLong(0L));
+        long reposts = Math.max(0L, m.path("reposts").asLong(0L));
+        long engagement = computeWeightedEngagement(m);
+        boolean meetsAbsoluteFloor = views >= 800L || likes >= 12L || engagement >= 24L;
+        if (!meetsAbsoluteFloor) return false;
+        if (views >= 8_000L || likes >= 80L || reposts >= 12L) {
+            return true;
+        }
+        if (baselineSampleCount >= 3 && (medianViews > 0L || medianLikes > 0L || medianEngagement > 0L)) {
+            boolean beatsViews = medianViews > 0L && views >= Math.round(medianViews * 1.10);
+            boolean beatsLikes = medianLikes > 0L && likes >= Math.round(medianLikes * 1.10);
+            boolean beatsEng = medianEngagement > 0L && engagement >= Math.round(medianEngagement * 1.15);
+            return beatsViews || beatsLikes || beatsEng;
+        }
+        return true;
+    }
+
+    private record RankedRewriteCandidate(
+            String materialId,
+            String topicId,
+            ObjectNode material,
+            String pureText,
+            double rankScore,
+            long medianViews,
+            long medianLikes
+    ) { }
+
+    private ObjectNode tryPatrolRewriteSources(
+            List<ObjectNode> orderedRewriteSources,
+            String ownerId,
+            String ownerUsername,
+            long latestOwnerAt,
+            int jitterMinutes
+    ) {
+        if (orderedRewriteSources == null || orderedRewriteSources.isEmpty()) return null;
+        for (ObjectNode source : orderedRewriteSources) {
+            String publishedMatId = processAuthorRewriteOnce(source, ownerId, ownerUsername);
+            if (publishedMatId != null && !publishedMatId.isBlank()) {
+                return object()
+                        .put("status", "PUBLISHED")
+                        .put("mode", "REWRITE")
+                        .put("materialId", publishedMatId)
+                        .put("sourceUsername", source.path("username").asText(""))
+                        .put("latestOwnerTweetAt", latestOwnerAt)
+                        .put("jitterMinutes", jitterMinutes);
+            }
+        }
+        return null;
+    }
+
+    String processAuthorRewriteOnce(ObjectNode sourceSnapshot, String ownerId, String ownerUsername) {
+        if (sourceSnapshot == null) return "";
+        long now = clock.millis();
+        if (isInAutoRepostQuietWindow(now)) {
+            scheduleQuietWindowEndWakeup(now);
+            return "";
+        }
+        if (sources != null) {
+            sources.syncSourceMaterialsForRewrite(sourceSnapshot, REWRITE_MAX_AGE_MS);
+        }
+
+        record RewriteBatchContext(
+                ObjectNode liveSource,
+                List<RankedRewriteCandidate> topCandidates,
+                String styleProfile,
+                String preferencesText,
+                String postPolishPrompt,
+                String generationProvider,
+                String generationModel
+        ) { }
+
+        RewriteBatchContext ctx = store.tx(tx -> {
+            String sourceId = sourceSnapshot.path("authorId").asText(sourceSnapshot.path("id").asText("")).strip();
+            ObjectNode liveSource = tx.get("source", sourceId);
+            if (liveSource == null || !"ACTIVE".equals(liveSource.path("status").asText(""))
+                    || !liveSource.path("autoRewriteEnabled").asBoolean(false)) {
+                return null;
+            }
+            ObjectNode settings = AssistantWorkflow.settings(tx);
+            if (!settings.path("enabled").asBoolean(true)) return null;
+
+            long latestOwner = resolveLatestOwnerTweetEpochMs(tx, ownerId, ownerUsername, "", now);
+            long requiredGap = resolveEffectiveOwnerGapMs(settings, latestOwner);
+            if (requiredGap > 0L && latestOwner > 0L && now - latestOwner >= 0L && now - latestOwner < requiredGap) {
+                return null;
+            }
+
+            int dailyLimit = Math.max(1, settings.path("autoRepostDailyLimit").asInt(DEFAULT_DAILY_LIMIT));
+            LocalDate today = Instant.ofEpochMilli(now).atZone(AssistantRetention.ZONE).toLocalDate();
+            long todayStart = today.atStartOfDay(AssistantRetention.ZONE).toInstant().toEpochMilli();
+            int publishedToday = 0;
+            Set<String> usedTopics = new java.util.HashSet<>();
+            Set<String> usedMaterials = new java.util.HashSet<>();
+            for (ObjectNode rec : tx.all("auto_repost")) {
+                String st = rec.path("status").asText("");
+                if (Set.of("PUBLISHED", "SENDING", "UNCERTAIN").contains(st)) {
+                    usedMaterials.add(rec.path("materialId").asText(rec.path("id").asText("")));
+                    String tid = rec.path("topicId").asText("");
+                    if (!tid.isBlank()) usedTopics.add(tid);
+                }
+                if (Set.of("PUBLISHED", "UNCERTAIN").contains(st)
+                        && rec.path("publishedAt").asLong(rec.path("dispatchedAt").asLong(0L)) >= todayStart) {
+                    publishedToday++;
+                }
+            }
+            for (ObjectNode rec : tx.all("auto_rewrite")) {
+                String st = rec.path("status").asText("");
+                String mid = rec.path("materialId").asText(rec.path("id").asText(""));
+                if (Set.of("PUBLISHED", "SENDING", "UNCERTAIN", "SKIPPED", "SKIPPED_DUPLICATE").contains(st)) {
+                    usedMaterials.add(mid);
+                }
+                if (Set.of("PUBLISHED", "SENDING", "UNCERTAIN").contains(st)) {
+                    String tid = rec.path("topicId").asText("");
+                    if (!tid.isBlank()) usedTopics.add(tid);
+                }
+                if (Set.of("PUBLISHED", "UNCERTAIN").contains(st)
+                        && rec.path("publishedAt").asLong(rec.path("dispatchedAt").asLong(0L)) >= todayStart) {
+                    publishedToday++;
+                }
+            }
+            if (publishedToday >= dailyLimit) return null;
+
+            String aid = liveSource.path("authorId").asText(sourceId).strip();
+            String uname = liveSource.path("username").asText("").replaceFirst("^@+", "").strip();
+            List<ObjectNode> authorMats = new ArrayList<>();
+            List<Long> allViews = new ArrayList<>();
+            List<Long> allLikes = new ArrayList<>();
+            List<Long> allEng = new ArrayList<>();
+            for (ObjectNode m : tx.all("material")) {
+                boolean same = (!aid.isBlank() && aid.equals(m.path("authorId").asText("")))
+                        || (!uname.isBlank() && uname.equalsIgnoreCase(m.path("username").asText("").replaceFirst("^@+", "")));
+                if (!same) continue;
+                long pubAt = m.path("publishedAt").asLong(0L);
+                if (pubAt <= 0L || now - pubAt > REWRITE_MAX_AGE_MS) continue;
+                authorMats.add(m);
+                long v = m.path("views").asLong(0L);
+                long l = m.path("likes").asLong(0L);
+                long e = computeWeightedEngagement(m);
+                if (v > 0L) allViews.add(v);
+                if (l > 0L) allLikes.add(l);
+                if (e > 0L) allEng.add(e);
+            }
+            if (authorMats.isEmpty()) return null;
+
+            long medViews = medianOf(allViews);
+            long medLikes = medianOf(allLikes);
+            long medEng = medianOf(allEng);
+            int sampleCount = Math.max(allViews.size(), allEng.size());
+
+            List<RankedRewriteCandidate> ranked = new ArrayList<>();
+            for (ObjectNode m : authorMats) {
+                String mid = m.path("id").asText("").strip();
+                if (mid.isBlank() || usedMaterials.contains(mid)) continue;
+                if (!isPureTextRewriteCandidate(m)) continue;
+                if (!isHighTrafficForAuthor(m, medViews, medLikes, medEng, sampleCount)) continue;
+                String tid = AssistantTopics.topicOf(tx, mid);
+                if (!tid.isBlank() && usedTopics.contains(tid)) continue;
+                String pureText = extractPureRewriteSourceText(m);
+                long eng = computeWeightedEngagement(m);
+                long views = Math.max(0L, m.path("views").asLong(0L));
+                double ratioBoost = medEng > 0L ? Math.min(8.0, (double) eng / medEng) : 1.5;
+                double viewBoost = medViews > 0L ? Math.min(8.0, (double) views / medViews) : 1.5;
+                double score = Math.log1p(eng) * 12.0 + Math.log1p(views) * 4.0 + (ratioBoost + viewBoost) * 10.0;
+                ranked.add(new RankedRewriteCandidate(mid, tid, m.deepCopy(), pureText, score, medViews, medLikes));
+            }
+            if (ranked.isEmpty()) return null;
+            ranked.sort(Comparator.comparingDouble(RankedRewriteCandidate::rankScore).reversed());
+
+            ObjectNode prefs = AssistantWorkflow.preferences(tx);
+            String polishPrompt = AssistantWorkflow.isPostPolishEnabled(settings)
+                    ? AssistantWorkflow.resolvePostPolishPrompt(settings)
+                    : "";
+            var repostMod = settings.path("moduleConfigs").path("repost");
+            String prov = repostMod.path("provider").asText("").strip();
+            String model = repostMod.path("model").asText("").strip();
+            return new RewriteBatchContext(
+                    liveSource.deepCopy(),
+                    ranked.stream().limit(3).toList(),
+                    composeOwnerQuoteVoiceProfile(tx),
+                    prefs.path("text").asText(""),
+                    polishPrompt,
+                    prov,
+                    model
+            );
+        });
+
+        if (ctx == null || ctx.topCandidates().isEmpty()) return "";
+
+        for (RankedRewriteCandidate cand : ctx.topCandidates()) {
+            long claimAt = clock.millis();
+            if (isInAutoRepostQuietWindow(claimAt)) {
+                scheduleQuietWindowEndWakeup(claimAt);
+                return "";
+            }
+            boolean claimed = store.tx(tx -> {
+                ObjectNode existing = tx.get("auto_rewrite", cand.materialId());
+                if (existing != null && Set.of("PUBLISHED", "SENDING", "UNCERTAIN", "SKIPPED").contains(existing.path("status").asText(""))) {
+                    return false;
+                }
+                tx.put("auto_rewrite", cand.materialId(), baseRecord(ctx.liveSource(), cand.material(), cand.topicId(), claimAt)
+                        .put("autoKind", "REWRITE")
+                        .put("mode", "REWRITE")
+                        .put("status", "EVALUATING"));
+                return true;
+            });
+            if (!claimed) continue;
+
+            String authorUname = cand.material().path("username").asText(ctx.liveSource().path("username").asText(""));
+            String authorBio = resolveAuthorBio(ctx.liveSource(), List.of(cand.material()));
+            List<String> stances = store.tx(tx -> OwnerQuoteStyleDistiller.findRelevantOwnerStances(
+                    tx, authorUname, authorBio, cand.pureText(), "", 4));
+
+            final PiAgentViralJudge.RewriteJudgment rwJudgment;
+            try {
+                rwJudgment = judge.evaluateAndWriteRewrite(new PiAgentViralJudge.RewriteInput(
+                        authorUname,
+                        cand.material().path("authorName").asText(ctx.liveSource().path("displayName").asText("")),
+                        authorBio,
+                        cand.pureText(),
+                        optionalLong(cand.material(), "views"),
+                        optionalLong(cand.material(), "likes"),
+                        optionalLong(cand.material(), "reposts"),
+                        optionalLong(cand.material(), "replies"),
+                        cand.medianViews(),
+                        cand.medianLikes(),
+                        ctx.styleProfile(),
+                        ctx.preferencesText(),
+                        stances,
+                        ctx.postPolishPrompt(),
+                        ctx.generationProvider(),
+                        ctx.generationModel()
+                ));
+            } catch (RuntimeException ex) {
+                long failAt = clock.millis();
+                store.tx(tx -> {
+                    ObjectNode rec = tx.get("auto_rewrite", cand.materialId());
+                    if (rec != null) {
+                        tx.put("auto_rewrite", cand.materialId(), rec.deepCopy()
+                                .put("status", "JUDGE_FAILED")
+                                .put("evaluatedAt", failAt)
+                                .put("error", safeError(ex)));
+                    }
+                    return null;
+                });
+                continue;
+            }
+
+            long evalAt = clock.millis();
+            if (!rwJudgment.suitable() || rwJudgment.rewrittenText().isBlank()) {
+                store.tx(tx -> {
+                    ObjectNode rec = tx.get("auto_rewrite", cand.materialId());
+                    if (rec != null) {
+                        tx.put("auto_rewrite", cand.materialId(), rec.deepCopy()
+                                .put("status", "SKIPPED")
+                                .put("suitabilityScore", rwJudgment.suitabilityScore())
+                                .put("hookPattern", rwJudgment.hookPattern())
+                                .put("summary", rwJudgment.coreInsight())
+                                .put("reason", rwJudgment.reason())
+                                .put("evaluatedAt", evalAt));
+                    }
+                    return null;
+                });
+                continue;
+            }
+
+            boolean published = dispatchRewriteAndPublish(
+                    cand.materialId(),
+                    ownerId,
+                    ownerUsername,
+                    cand.topicId(),
+                    rwJudgment.rewrittenText(),
+                    rwJudgment,
+                    evalAt,
+                    true
+            );
+            if (published) {
+                return cand.materialId();
+            }
+        }
+        return "";
+    }
+
+    private ObjectNode retryRewrite(String materialId) {
+        record RewriteRetryPlan(
+                ObjectNode updated,
+                boolean reuseText,
+                String existingText,
+                String ownerId,
+                String ownerUsername,
+                String topicId,
+                ObjectNode source,
+                ObjectNode material
+        ) { }
+
+        RewriteRetryPlan plan = store.tx(tx -> {
+            ObjectNode existing = tx.get("auto_rewrite", materialId);
+            if (existing == null) throw new XDataProviderException(404, "洗稿记录不存在");
+            String status = existing.path("status").asText("");
+            if (!RETRYABLE_STATUSES.contains(status)) {
+                throw new XDataProviderException(409, "当前洗稿状态不允许重发，请先核实线上回执");
+            }
+            ObjectNode owner = tx.get("meta", "owner");
+            if (owner == null || owner.path("accountId").asText("").isBlank()) {
+                throw new XDataProviderException(400, "缺少内容助手所有者信息");
+            }
+            String ownerAccountId = owner.path("accountId").asText("");
+            String ownerUsername = owner.path("username").asText("i");
+            long nowMs = clock.millis();
+            ObjectNode settings = AssistantWorkflow.settings(tx);
+            long latestOwnerAt = resolveLatestOwnerTweetEpochMs(tx, ownerAccountId, ownerUsername, materialId, nowMs);
+            long requiredGapMs = resolveEffectiveOwnerGapMs(settings, latestOwnerAt);
+            if (requiredGapMs > 0L && latestOwnerAt > 0L && nowMs - latestOwnerAt >= 0L && nowMs - latestOwnerAt < requiredGapMs) {
+                int jitterMin = resolveOwnerTweetJitterMinutes(latestOwnerAt);
+                long remMin = Math.max(1L, (requiredGapMs - (nowMs - latestOwnerAt) + 59_999L) / 60_000L);
+                throw new XDataProviderException(409, "全局时间锁冷却中（距上一条推文未满 1小时+" + jitterMin + "分钟，还差约 " + remMin + " 分钟）");
+            }
+            String existingText = existing.path("rewrittenText").asText("").strip();
+            boolean reuse = Set.of("AUTH_REQUIRED", "FAILED").contains(status) && !existingText.isBlank();
+            ObjectNode liveMat = tx.get("material", materialId);
+            String aid = existing.path("authorId").asText(liveMat == null ? "" : liveMat.path("authorId").asText(""));
+            ObjectNode liveSrc = aid.isBlank() ? null : tx.get("source", aid);
+            if (liveSrc == null) {
+                liveSrc = object().put("id", aid).put("authorId", aid)
+                        .put("username", existing.path("username").asText(""))
+                        .put("autoRewriteEnabled", true);
+            }
+            ObjectNode updated = tx.put("auto_rewrite", materialId, existing.deepCopy()
+                    .put("status", "EVALUATING")
+                    .put("error", ""));
+            return new RewriteRetryPlan(
+                    updated, reuse, existingText, ownerAccountId, ownerUsername,
+                    existing.path("topicId").asText(""), liveSrc.deepCopy(),
+                    liveMat == null ? null : liveMat.deepCopy()
+            );
+        });
+
+        executor.submit(() -> {
+            try {
+                if (plan.reuseText()) {
+                    dispatchRewriteAndPublish(materialId, plan.ownerId(), plan.ownerUsername(),
+                            plan.topicId(), plan.existingText(), null, clock.millis(), false);
+                } else {
+                    processAuthorRewriteOnce(plan.source(), plan.ownerId(), plan.ownerUsername());
+                }
+            } catch (Exception ex) {
+                log.warn("Auto-rewrite retry failed for {}: {}", materialId, ex.getMessage());
+            }
+        });
+        return plan.updated();
+    }
+
+    private boolean dispatchRewriteAndPublish(
+            String materialId,
+            String ownerId,
+            String ownerUsername,
+            String topicId,
+            String rewrittenText,
+            PiAgentViralJudge.RewriteJudgment judgment,
+            long evaluatedAt,
+            boolean enforceQuietWindow
+    ) {
+        final String accessToken;
+        try {
+            accessToken = com.xops.hub.provider.PaidCapabilityGate.withCaller(
+                    com.xops.hub.provider.PaidCapabilityGate.PRIVILEGED_USERNAME, ownerId,
+                    () -> oauthService.getValidWriteAccessToken(ownerId, false));
+        } catch (RuntimeException ex) {
+            store.tx(tx -> {
+                ObjectNode rec = tx.get("auto_rewrite", materialId);
+                if (rec != null) {
+                    ObjectNode next = applyRewriteJudgment(rec.deepCopy(), judgment, evaluatedAt, rewrittenText);
+                    tx.put("auto_rewrite", materialId, next
+                            .put("status", "AUTH_REQUIRED")
+                            .put("error", safeError(ex)));
+                }
+                return null;
+            });
+            return false;
+        }
+
+        boolean readyToSend = store.tx(tx -> {
+            ObjectNode rec = tx.get("auto_rewrite", materialId);
+            if (rec == null || !"EVALUATING".equals(rec.path("status").asText(""))) return false;
+            long dispatchMs = clock.millis();
+            if (enforceQuietWindow && isInAutoRepostQuietWindow(dispatchMs)) {
+                ObjectNode skipped = applyRewriteJudgment(rec.deepCopy(), judgment, evaluatedAt, rewrittenText);
+                tx.put("auto_rewrite", materialId, skipped
+                        .put("status", "SKIPPED_QUIET_HOURS")
+                        .put("reason", quietWindowReason()));
+                return false;
+            }
+            ObjectNode settings = AssistantWorkflow.settings(tx);
+            long latestOwnerTweetAt = resolveLatestOwnerTweetEpochMs(tx, ownerId, ownerUsername, materialId, dispatchMs);
+            long requiredOwnerGapMs = resolveEffectiveOwnerGapMs(settings, latestOwnerTweetAt);
+            if (requiredOwnerGapMs > 0L && latestOwnerTweetAt > 0L
+                    && dispatchMs - latestOwnerTweetAt >= 0L && dispatchMs - latestOwnerTweetAt < requiredOwnerGapMs) {
+                int jitterMin = resolveOwnerTweetJitterMinutes(latestOwnerTweetAt);
+                long remMin = Math.max(1L, (requiredOwnerGapMs - (dispatchMs - latestOwnerTweetAt) + 59_999L) / 60_000L);
+                ObjectNode skipped = applyRewriteJudgment(rec.deepCopy(), judgment, evaluatedAt, rewrittenText);
+                tx.put("auto_rewrite", materialId, skipped
+                        .put("status", "SKIPPED_COOLDOWN")
+                        .put("reason", "距我账号上一条推文不足 1小时+" + jitterMin + "分钟（还差约 " + remMin + " 分钟）"));
+                return false;
+            }
+            ObjectNode sending = applyRewriteJudgment(rec.deepCopy(), judgment, evaluatedAt, rewrittenText);
+            tx.put("auto_rewrite", materialId, sending
+                    .put("status", "SENDING")
+                    .put("dispatchedAt", dispatchMs));
+            return true;
+        });
+        if (!readyToSend) return false;
+
+        try {
+            // Pure standalone original post — strictly NO quoteTweetId and NO quoteTweetUrl!
+            String publishedTweetId = com.xops.hub.provider.PaidCapabilityGate.withCaller(
+                    com.xops.hub.provider.PaidCapabilityGate.PRIVILEGED_USERNAME, ownerId,
+                    () -> publishClient.createTweet(accessToken, rewrittenText, List.of(), null));
+            if (paidGate != null) {
+                paidGate.markSucceeded("auto-rewrite:" + materialId);
+            }
+            long doneMs = clock.millis();
+            String uname = ownerUsername.isBlank() ? "i" : ownerUsername;
+            String publishedUrl = "https://x.com/" + uname + "/status/" + publishedTweetId;
+            store.tx(tx -> {
+                ObjectNode rec = tx.get("auto_rewrite", materialId);
+                if (rec != null) {
+                    tx.put("auto_rewrite", materialId, rec.deepCopy()
+                            .put("status", "PUBLISHED")
+                            .put("rewrittenText", rewrittenText)
+                            .put("commentText", rewrittenText)
+                            .put("publishedTweetId", publishedTweetId)
+                            .put("publishedTweetUrl", publishedUrl)
+                            .put("publishedAt", doneMs)
+                            .put("error", ""));
+                }
+                tx.put("publication", "auto-rewrite-" + materialId, object()
+                        .put("status", "PUBLISHED")
+                        .put("source", "AUTO_REWRITE_POST")
+                        .put("topicId", topicId)
+                        .put("materialId", materialId)
+                        .put("text", rewrittenText)
+                        .put("publishedTweetId", publishedTweetId)
+                        .put("publishedTweetUrl", publishedUrl)
+                        .put("publishedAt", doneMs));
+                return null;
+            });
+            recordOwnerPublishAndScheduleNextSlot(doneMs);
+            return true;
+        } catch (XPublishException ex) {
+            String terminalStatus = ex.isDeliveryUncertain() ? "UNCERTAIN" : "FAILED";
+            store.tx(tx -> {
+                ObjectNode rec = tx.get("auto_rewrite", materialId);
+                if (rec != null) {
+                    tx.put("auto_rewrite", materialId, rec.deepCopy()
+                            .put("status", terminalStatus)
+                            .put("error", safeError(ex)));
+                }
+                return null;
+            });
+            return false;
+        } catch (RuntimeException ex) {
+            store.tx(tx -> {
+                ObjectNode rec = tx.get("auto_rewrite", materialId);
+                if (rec != null) {
+                    tx.put("auto_rewrite", materialId, rec.deepCopy()
+                            .put("status", "FAILED")
+                            .put("error", safeError(ex)));
+                }
+                return null;
+            });
+            return false;
+        }
+    }
+
+    private static ObjectNode applyRewriteJudgment(
+            ObjectNode rec,
+            PiAgentViralJudge.RewriteJudgment j,
+            long evaluatedAt,
+            String rewrittenText
+    ) {
+        rec.put("autoKind", "REWRITE")
+                .put("mode", "REWRITE")
+                .put("evaluatedAt", evaluatedAt);
+        if (j != null) {
+            rec.put("suitabilityScore", j.suitabilityScore())
+                    .put("viralScore", j.suitabilityScore())
+                    .put("hookPattern", j.hookPattern())
+                    .put("summary", j.coreInsight())
+                    .put("reason", j.reason());
+        }
+        if (rewrittenText != null && !rewrittenText.isBlank()) {
+            rec.put("rewrittenText", rewrittenText)
+                    .put("commentText", rewrittenText);
+        }
+        return rec;
     }
 }
