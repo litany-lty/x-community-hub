@@ -178,6 +178,14 @@ public class AutoRepostService {
                 }
             }
     );
+    private final Map<String, ObjectNode> rewritePreviewCache = java.util.Collections.synchronizedMap(
+            new LinkedHashMap<>(64, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, ObjectNode> eldest) {
+                    return size() > 128;
+                }
+            }
+    );
 
     @Autowired
     public AutoRepostService(
@@ -442,6 +450,7 @@ public class AutoRepostService {
 
     public void clearPreviewCache() {
         previewCache.clear();
+        rewritePreviewCache.clear();
     }
 
     record DualCooldown(
@@ -1105,6 +1114,22 @@ public class AutoRepostService {
                 + genKey + "|" + styleProfile.hashCode() + "|" + preferencesText.hashCode() + "|" + activePolish.hashCode();
     }
 
+    private String buildRewritePreviewCacheKey(
+            String materialId,
+            String styleProfile,
+            String preferencesText,
+            boolean postPolishEnabled,
+            String postPolishPrompt,
+            String generationProvider,
+            String generationModel
+    ) {
+        String activePolish = postPolishEnabled ? (postPolishPrompt == null ? "" : postPolishPrompt.strip()) : "";
+        String genKey = (generationProvider == null || generationProvider.isBlank() ? "chatgpt" : generationProvider)
+                + ":" + (generationModel == null ? "" : generationModel.strip());
+        return "rw-v1|" + materialId + "|" + genKey + "|"
+                + styleProfile.hashCode() + "|" + preferencesText.hashCode() + "|" + activePolish.hashCode();
+    }
+
     static String classifyDecisionCode(
             String persistedStatus,
             boolean authorCooldownBlocked,
@@ -1247,6 +1272,8 @@ public class AutoRepostService {
                 .put("authorName", m.path("authorName").asText(effectiveSource.path("displayName").asText("")))
                 .put("authorAvatarUrl", m.path("authorAvatarUrl").asText(effectiveSource.path("avatarUrl").asText("")))
                 .put("authorVerified", m.path("authorVerified").asBoolean(effectiveSource.path("verified").asBoolean(false)))
+                .put("kind", m.path("kind").asText("POST"))
+                .put("hasMedia", m.path("hasMedia").asBoolean(false))
                 .put("text", m.path("text").asText(""))
                 .put("quotedText", m.path("quotedText").asText(""))
                 .put("articleText", truncatePreview(m.path("articleText").asText(""), 280))
@@ -1392,14 +1419,43 @@ public class AutoRepostService {
                 .put("displayName", ctx.ownerUsername())
                 .put("avatarUrl", "/author-avatar.webp");
         ObjectNode sourceNode = buildSourceSummaryNode(effectiveSource, ctx);
-        DualCooldown dualCd = computeDualCooldownFromContext(ctx, clock.millis());
+        long nowMs = clock.millis();
+        DualCooldown dualCd = computeDualCooldownFromContext(ctx, nowMs);
         sourceNode.set("cooldown", dualCd.toJsonNode());
         out.set("source", sourceNode);
         out.set("cooldown", dualCd.toJsonNode());
 
-        record RawTimelineRow(ObjectNode materialNode, ObjectNode decisionNode, long publishedAt, String id) { }
+        AuthorRewriteBaseline rwBaseline = loadAuthorRewriteBaseline(
+                effectiveSource.path("authorId").asText(effectiveSource.path("id").asText("")),
+                effectiveSource.path("username").asText(""),
+                nowMs);
+        List<ObjectNode> timelineMaterials = new ArrayList<>(ctx.materials());
+        Set<String> existingMatIds = new java.util.HashSet<>();
+        for (ObjectNode m : timelineMaterials) {
+            String mid = m.path("id").asText("").strip();
+            if (!mid.isBlank()) existingMatIds.add(mid);
+        }
+        List<ObjectNode> extraRewriteMats = new ArrayList<>();
+        for (ObjectNode m : rwBaseline.windowMaterials()) {
+            String mid = m.path("id").asText("").strip();
+            if (mid.isBlank() || existingMatIds.contains(mid)) continue;
+            if (!isPureTextRewriteCandidate(m)) continue;
+            if (!isHighTrafficForAuthor(m, rwBaseline.medViews(), rwBaseline.medLikes(), rwBaseline.medEng(), rwBaseline.sampleCount())) {
+                continue;
+            }
+            extraRewriteMats.add(m);
+        }
+        extraRewriteMats.sort(Comparator.comparingDouble(
+                (ObjectNode m) -> computeRewriteRankScore(m, nowMs, rwBaseline.medViews(), rwBaseline.medEng())).reversed());
+        for (int i = 0; i < extraRewriteMats.size() && i < 6; i++) {
+            ObjectNode extra = extraRewriteMats.get(i);
+            timelineMaterials.add(extra);
+            existingMatIds.add(extra.path("id").asText("").strip());
+        }
+
+        record RawTimelineRow(ObjectNode rawMaterial, ObjectNode materialNode, ObjectNode decisionNode, ObjectNode rewriteNode, long publishedAt, String id) { }
         List<RawTimelineRow> rows = new ArrayList<>();
-        for (ObjectNode m : ctx.materials()) {
+        for (ObjectNode m : timelineMaterials) {
             ObjectNode decision = resolveStoredDecisionIfAvailable(m, ctx);
             if (!"PUBLISHED".equals(decision.path("persistedStatus").asText(""))) {
                 if (dualCd.globalCdActive()) {
@@ -1433,12 +1489,27 @@ public class AutoRepostService {
                     }
                 }
             }
+            ObjectNode rewriteNode = buildRewriteStatusNode(m, decision, ctx, rwBaseline, nowMs);
             rows.add(new RawTimelineRow(
+                    m,
                     buildMaterialSummaryNode(m, effectiveSource),
                     decision,
+                    rewriteNode,
                     m.path("publishedAt").asLong(0),
                     m.path("id").asText("")
             ));
+        }
+
+        // Assign 1-based priority rank across eligible pure-text high-traffic candidates (recent + high heat first)
+        List<RawTimelineRow> rankedRewrites = rows.stream()
+                .filter(r -> r.rewriteNode().path("candidate").asBoolean(false))
+                .sorted(Comparator
+                        .comparingDouble((RawTimelineRow r) -> r.rewriteNode().path("rankScore").asDouble(0.0))
+                        .thenComparingLong(RawTimelineRow::publishedAt)
+                        .reversed())
+                .toList();
+        for (int i = 0; i < rankedRewrites.size(); i++) {
+            rankedRewrites.get(i).rewriteNode().put("rank", i + 1);
         }
 
         // Enforce 16-hour non-consecutive same-author window chronologically (oldest -> newest) across preview items
@@ -1476,6 +1547,7 @@ public class AutoRepostService {
         int wouldRepostCount = 0;
         int skippedCount = 0;
         int pendingCount = 0;
+        int wouldRewriteCount = 0;
         var itemsArr = out.putArray("items");
         for (RawTimelineRow row : rows) {
             ObjectNode dec = row.decisionNode();
@@ -1491,15 +1563,20 @@ public class AutoRepostService {
             } else {
                 pendingCount++;
             }
+            if (row.rewriteNode().path("candidate").asBoolean(false)) {
+                wouldRewriteCount++;
+            }
             ObjectNode itemObj = itemsArr.addObject();
             itemObj.set("material", row.materialNode());
             itemObj.set("decision", dec);
+            itemObj.set("rewrite", row.rewriteNode());
         }
 
         out.putObject("summary")
                 .put("totalCount", rows.size())
                 .put("evaluatedCount", evaluatedCount)
                 .put("wouldRepostCount", wouldRepostCount)
+                .put("wouldRewriteCount", wouldRewriteCount)
                 .put("skippedCount", skippedCount)
                 .put("pendingCount", dualCd.globalCdActive() ? 0 : pendingCount)
                 .put("cdShortCircuited", dualCd.globalCdActive());
@@ -1884,6 +1961,311 @@ public class AutoRepostService {
         ObjectNode out = baseOut.deepCopy();
         out.set("preview", applySingleItemAuthorCooldownOverlay(rawPreviewNode, materialId, publishedAt, base));
         return out;
+    }
+
+    public ObjectNode previewRewrite(String rawSourceKey, ObjectNode body) {
+        ObjectNode req = body == null ? object() : body;
+        String requestedMaterialId = req.path("materialId").asText("").strip();
+        boolean forceRegenerate = req.path("forceRegenerate").asBoolean(false);
+        AuthorPreviewContext base = loadAuthorPreviewContext(rawSourceKey, req, 20);
+        ObjectNode effectiveSource = base.effectiveSource();
+        long nowMs = clock.millis();
+        String aid = effectiveSource.path("authorId").asText(effectiveSource.path("id").asText("")).strip();
+        String uname = effectiveSource.path("username").asText("").replaceFirst("^@+", "").strip();
+        AuthorRewriteBaseline rwBaseline = loadAuthorRewriteBaseline(aid, uname, nowMs);
+
+        List<ObjectNode> pool = new ArrayList<>();
+        Set<String> seen = new java.util.HashSet<>();
+        for (ObjectNode m : base.materials()) {
+            String mid = m.path("id").asText("").strip();
+            if (!mid.isBlank() && seen.add(mid)) pool.add(m);
+        }
+        for (ObjectNode m : rwBaseline.windowMaterials()) {
+            String mid = m.path("id").asText("").strip();
+            if (!mid.isBlank() && seen.add(mid)) pool.add(m);
+        }
+        if (pool.isEmpty()) {
+            throw new XDataProviderException(404, "@" + uname + " 暂无可预览的近期推文");
+        }
+
+        ObjectNode selectedMaterial = null;
+        if (!requestedMaterialId.isBlank()) {
+            for (ObjectNode c : pool) {
+                if (requestedMaterialId.equals(c.path("id").asText(""))) {
+                    selectedMaterial = c;
+                    break;
+                }
+            }
+            if (selectedMaterial == null) {
+                selectedMaterial = store.tx(tx -> {
+                    ObjectNode m = tx.get("material", requestedMaterialId);
+                    return m == null ? null : m.deepCopy();
+                });
+            }
+            if (selectedMaterial == null) {
+                throw new XDataProviderException(404, "未找到指定推文素材：" + requestedMaterialId);
+            }
+        } else {
+            selectedMaterial = pool.stream()
+                    .filter(AutoRepostService::isPureTextRewriteCandidate)
+                    .filter(m -> isHighTrafficForAuthor(m, rwBaseline.medViews(), rwBaseline.medLikes(), rwBaseline.medEng(), rwBaseline.sampleCount()))
+                    .max(Comparator.comparingDouble(
+                            m -> computeRewriteRankScore(m, nowMs, rwBaseline.medViews(), rwBaseline.medEng())))
+                    .orElse(pool.stream()
+                            .filter(AutoRepostService::isPureTextRewriteCandidate)
+                            .max(Comparator.comparingDouble(
+                                    m -> computeRewriteRankScore(m, nowMs, rwBaseline.medViews(), rwBaseline.medEng())))
+                            .orElse(pool.get(0)));
+        }
+
+        String pureText = extractPureRewriteSourceText(selectedMaterial);
+        if (pureText.isBlank()) {
+            throw new XDataProviderException(400, "该推文不满足纯文本洗稿条件（" + rewriteIneligibleReason(selectedMaterial) + "）");
+        }
+
+        String materialId = selectedMaterial.path("id").asText("");
+        String cacheKey = buildRewritePreviewCacheKey(
+                materialId, base.styleProfile(), base.preferencesText(),
+                base.postPolishEnabled(), base.postPolishPrompt(),
+                base.generationProvider(), base.generationModel());
+        if (!forceRegenerate) {
+            ObjectNode cached = rewritePreviewCache.get(cacheKey);
+            if (cached != null && !cached.path("rewrite").path("rewrittenText").asText("").isBlank()) {
+                ObjectNode copy = cached.deepCopy();
+                copy.withObject("/rewrite").put("cached", true);
+                copy.set("source", buildSourceSummaryNode(effectiveSource, base));
+                return copy;
+            }
+        }
+
+        String authorUname = selectedMaterial.path("username").asText(uname);
+        String authorBio = resolveAuthorBio(effectiveSource, List.of(selectedMaterial));
+        List<String> stances = store.tx(tx -> OwnerQuoteStyleDistiller.findRelevantOwnerStances(
+                tx, authorUname, authorBio, pureText, "", 4));
+        String activePolishPrompt = base.postPolishEnabled() ? base.postPolishPrompt() : "";
+
+        final PiAgentViralJudge.RewriteJudgment rwJudgment;
+        try {
+            rwJudgment = judge.evaluateAndWriteRewrite(new PiAgentViralJudge.RewriteInput(
+                    authorUname,
+                    selectedMaterial.path("authorName").asText(effectiveSource.path("displayName").asText("")),
+                    authorBio,
+                    pureText,
+                    optionalLong(selectedMaterial, "views"),
+                    optionalLong(selectedMaterial, "likes"),
+                    optionalLong(selectedMaterial, "reposts"),
+                    optionalLong(selectedMaterial, "replies"),
+                    rwBaseline.medViews(),
+                    rwBaseline.medLikes(),
+                    base.styleProfile(),
+                    base.preferencesText(),
+                    stances,
+                    activePolishPrompt,
+                    base.generationProvider(),
+                    base.generationModel()
+            ), true);
+        } catch (RuntimeException ex) {
+            throw new XDataProviderException(502, "洗稿评估或生成未完成：" + safeError(ex));
+        }
+
+        if (rwJudgment.rewrittenText().isBlank()) {
+            throw new XDataProviderException(502, "洗稿生成返回内容为空，请重试");
+        }
+
+        ObjectNode existingRewriteRec = rwBaseline.rewriteRecordsByMaterialId().get(materialId);
+        String persistedStatus = existingRewriteRec == null ? "" : existingRewriteRec.path("status").asText("");
+        String publishedTweetUrl = existingRewriteRec == null ? "" : existingRewriteRec.path("publishedTweetUrl").asText("");
+        double rankScore = computeRewriteRankScore(selectedMaterial, nowMs, rwBaseline.medViews(), rwBaseline.medEng());
+        boolean highTraffic = isHighTrafficForAuthor(
+                selectedMaterial, rwBaseline.medViews(), rwBaseline.medLikes(), rwBaseline.medEng(), rwBaseline.sampleCount());
+
+        ObjectNode rewriteNode = object()
+                .put("candidate", true)
+                .put("pureText", true)
+                .put("highTraffic", highTraffic)
+                .put("withinWindow", selectedMaterial.path("publishedAt").asLong(0L) > 0L
+                        && nowMs - selectedMaterial.path("publishedAt").asLong(0L) <= REWRITE_MAX_AGE_MS)
+                .put("engagement", computeWeightedEngagement(selectedMaterial))
+                .put("rankScore", rankScore)
+                .put("ineligibleReason", "")
+                .put("evaluated", true)
+                .put("suitable", rwJudgment.suitable())
+                .put("suitabilityScore", rwJudgment.suitabilityScore())
+                .put("hookPattern", rwJudgment.hookPattern())
+                .put("coreInsight", rwJudgment.coreInsight())
+                .put("reason", rwJudgment.reason())
+                .put("rewrittenText", rwJudgment.rewrittenText())
+                .put("publishedTweetUrl", publishedTweetUrl)
+                .put("persistedStatus", persistedStatus)
+                .put("status", "PUBLISHED".equals(persistedStatus) ? "PUBLISHED" : "EVALUATED")
+                .put("cached", false);
+
+        ObjectNode out = object();
+        out.putObject("owner")
+                .put("username", base.ownerUsername())
+                .put("displayName", base.ownerUsername())
+                .put("avatarUrl", "/author-avatar.webp");
+        out.set("source", buildSourceSummaryNode(effectiveSource, base));
+        out.set("material", buildMaterialSummaryNode(selectedMaterial, effectiveSource));
+        out.set("rewrite", rewriteNode);
+        rewritePreviewCache.put(cacheKey, out.deepCopy());
+        return out;
+    }
+
+    private record AuthorRewriteBaseline(
+            List<ObjectNode> windowMaterials,
+            java.util.Map<String, ObjectNode> rewriteRecordsByMaterialId,
+            long medViews,
+            long medLikes,
+            long medEng,
+            int sampleCount
+    ) { }
+
+    private AuthorRewriteBaseline loadAuthorRewriteBaseline(String authorId, String username, long nowMs) {
+        String aid = authorId == null ? "" : authorId.strip();
+        String uname = username == null ? "" : username.replaceFirst("^@+", "").strip();
+        return store.tx(tx -> {
+            List<ObjectNode> windowMats = new ArrayList<>();
+            List<Long> allViews = new ArrayList<>();
+            List<Long> allLikes = new ArrayList<>();
+            List<Long> allEng = new ArrayList<>();
+            for (ObjectNode m : tx.all("material")) {
+                boolean same = (!aid.isBlank() && aid.equals(m.path("authorId").asText("")))
+                        || (!uname.isBlank() && uname.equalsIgnoreCase(m.path("username").asText("").replaceFirst("^@+", "")));
+                if (!same) continue;
+                long pubAt = m.path("publishedAt").asLong(0L);
+                if (pubAt <= 0L || nowMs - pubAt > REWRITE_MAX_AGE_MS) continue;
+                windowMats.add(m.deepCopy());
+                long v = m.path("views").asLong(0L);
+                long l = m.path("likes").asLong(0L);
+                long e = computeWeightedEngagement(m);
+                if (v > 0L) allViews.add(v);
+                if (l > 0L) allLikes.add(l);
+                if (e > 0L) allEng.add(e);
+            }
+            java.util.Map<String, ObjectNode> rwByMat = new java.util.HashMap<>();
+            for (ObjectNode rec : tx.all("auto_rewrite")) {
+                String recAid = rec.path("authorId").asText("");
+                String recUname = rec.path("username").asText("").replaceFirst("^@+", "");
+                boolean same = (!aid.isBlank() && aid.equals(recAid))
+                        || (!uname.isBlank() && uname.equalsIgnoreCase(recUname));
+                if (!same) continue;
+                String mid = rec.path("materialId").asText(rec.path("id").asText("")).strip();
+                if (!mid.isBlank()) rwByMat.put(mid, rec.deepCopy());
+            }
+            return new AuthorRewriteBaseline(
+                    windowMats,
+                    rwByMat,
+                    medianOf(allViews),
+                    medianOf(allLikes),
+                    medianOf(allEng),
+                    Math.max(allViews.size(), allEng.size())
+            );
+        });
+    }
+
+    private ObjectNode buildRewriteStatusNode(
+            ObjectNode m,
+            ObjectNode repostDecision,
+            AuthorPreviewContext ctx,
+            AuthorRewriteBaseline baseline,
+            long nowMs
+    ) {
+        String materialId = m.path("id").asText("").strip();
+        long pubAt = m.path("publishedAt").asLong(0L);
+        boolean withinWindow = pubAt > 0L && nowMs - pubAt <= REWRITE_MAX_AGE_MS;
+        boolean pureText = isPureTextRewriteCandidate(m);
+        boolean highTraffic = isHighTrafficForAuthor(m, baseline.medViews(), baseline.medLikes(), baseline.medEng(), baseline.sampleCount());
+        long eng = computeWeightedEngagement(m);
+        double rankScore = computeRewriteRankScore(m, nowMs, baseline.medViews(), baseline.medEng());
+        String repostStatus = repostDecision.path("persistedStatus").asText("");
+        boolean alreadyHandledAsRepost = Set.of("PUBLISHED", "SENDING", "UNCERTAIN").contains(repostStatus);
+
+        ObjectNode persisted = baseline.rewriteRecordsByMaterialId().get(materialId);
+        String persistedStatus = persisted == null ? "" : persisted.path("status").asText("");
+        String publishedUrl = persisted == null ? "" : persisted.path("publishedTweetUrl").asText("");
+        boolean isPublishedRewrite = "PUBLISHED".equals(persistedStatus);
+        boolean isCandidate = isPublishedRewrite || (pureText && highTraffic && withinWindow && !alreadyHandledAsRepost);
+
+        String ineligibleReason = "";
+        if (!isCandidate) {
+            if (!pureText) ineligibleReason = rewriteIneligibleReason(m);
+            else if (!withinWindow) ineligibleReason = "超出 30 天洗稿窗口";
+            else if (!highTraffic) ineligibleReason = "互动热度低于高流量洗稿阈值";
+            else if (alreadyHandledAsRepost) ineligibleReason = "该帖已触发引用转发";
+        }
+
+        String cacheKey = buildRewritePreviewCacheKey(
+                materialId, ctx.styleProfile(), ctx.preferencesText(),
+                ctx.postPolishEnabled(), ctx.postPolishPrompt(),
+                ctx.generationProvider(), ctx.generationModel());
+        ObjectNode cachedEntry = rewritePreviewCache.get(cacheKey);
+        if (cachedEntry != null && cachedEntry.has("rewrite")) {
+            ObjectNode cachedRw = cachedEntry.path("rewrite").deepCopy();
+            cachedRw.put("candidate", isCandidate)
+                    .put("pureText", pureText)
+                    .put("highTraffic", highTraffic)
+                    .put("withinWindow", withinWindow)
+                    .put("engagement", eng)
+                    .put("rankScore", rankScore)
+                    .put("rank", 0)
+                    .put("ineligibleReason", ineligibleReason)
+                    .put("cached", true);
+            if (isPublishedRewrite) {
+                cachedRw.put("persistedStatus", "PUBLISHED")
+                        .put("publishedTweetUrl", publishedUrl)
+                        .put("status", "PUBLISHED");
+            }
+            return cachedRw;
+        }
+
+        if (persisted != null && !persisted.path("rewrittenText").asText("").isBlank()) {
+            boolean suitable = isPublishedRewrite || persisted.path("suitabilityScore").asInt(0) >= 68;
+            return object()
+                    .put("candidate", isCandidate)
+                    .put("pureText", pureText)
+                    .put("highTraffic", highTraffic)
+                    .put("withinWindow", withinWindow)
+                    .put("engagement", eng)
+                    .put("rankScore", rankScore)
+                    .put("rank", 0)
+                    .put("ineligibleReason", ineligibleReason)
+                    .put("evaluated", true)
+                    .put("suitable", suitable)
+                    .put("suitabilityScore", persisted.path("suitabilityScore").asInt(0))
+                    .put("hookPattern", persisted.path("hookPattern").asText(""))
+                    .put("coreInsight", persisted.path("summary").asText(""))
+                    .put("reason", persisted.path("reason").asText(""))
+                    .put("rewrittenText", persisted.path("rewrittenText").asText(""))
+                    .put("publishedTweetUrl", publishedUrl)
+                    .put("persistedStatus", persistedStatus)
+                    .put("status", isPublishedRewrite ? "PUBLISHED" : ("SKIPPED".equals(persistedStatus) ? "SKIPPED" : "EVALUATED"))
+                    .put("cached", false);
+        }
+
+        String status = isCandidate
+                ? "READY"
+                : ("SKIPPED".equals(persistedStatus) ? "SKIPPED" : "INELIGIBLE");
+        return object()
+                .put("candidate", isCandidate)
+                .put("pureText", pureText)
+                .put("highTraffic", highTraffic)
+                .put("withinWindow", withinWindow)
+                .put("engagement", eng)
+                .put("rankScore", rankScore)
+                .put("rank", 0)
+                .put("ineligibleReason", ineligibleReason)
+                .put("evaluated", false)
+                .put("suitable", false)
+                .put("suitabilityScore", 0)
+                .put("hookPattern", "")
+                .put("coreInsight", "")
+                .put("reason", "")
+                .put("rewrittenText", "")
+                .put("publishedTweetUrl", publishedUrl)
+                .put("persistedStatus", persistedStatus)
+                .put("status", status)
+                .put("cached", false);
     }
 
     private static String truncatePreview(String raw, int maxCodePoints) {
@@ -3552,6 +3934,42 @@ public class AutoRepostService {
         return !extractPureRewriteSourceText(m).isBlank();
     }
 
+    static String rewriteIneligibleReason(ObjectNode m) {
+        if (m == null) return "素材为空";
+        if (m.path("hasMedia").asBoolean(false)) return "含图片或视频媒体";
+        String kind = m.path("kind").asText("POST");
+        if (!"POST".equalsIgnoreCase(kind)
+                || !m.path("quotedId").asText("").isBlank()
+                || !m.path("quotedText").asText("").isBlank()) {
+            return "含引用或非原创主帖";
+        }
+        String textStatus = m.path("textStatus").asText("");
+        if (Set.of("MEDIA_ONLY", "MEDIA_URL_ONLY").contains(textStatus)) return "仅媒体无纯文本";
+        if (!m.path("articleUrl").asText("").isBlank() || !AssistantTopics.links(m).isEmpty()) return "含外部链接";
+        String raw = !m.path("articleText").asText("").isBlank()
+                ? m.path("articleText").asText("").strip()
+                : m.path("text").asText("").strip();
+        if (EMBEDDED_URL_PATTERN.matcher(raw).find()) return "正文含链接";
+        if (THREAD_OR_VISUAL_DEPENDENCY_PATTERN.matcher(raw).find()) return "依赖看图或串帖上下文";
+        return "纯文本过短或结构不足以独立成篇";
+    }
+
+    /**
+     * Ranks pure-text rewrite candidates by recency first combined with author-relative heat.
+     */
+    static double computeRewriteRankScore(ObjectNode m, long nowMs, long medViews, long medEng) {
+        if (m == null) return 0.0;
+        long pubAt = m.path("publishedAt").asLong(0L);
+        double ageHours = pubAt > 0L ? Math.max(0.0, (nowMs - pubAt) / 3_600_000.0) : 720.0;
+        double recencyBoost = 48.0 / (1.0 + ageHours / 24.0);
+        long eng = computeWeightedEngagement(m);
+        long views = Math.max(0L, m.path("views").asLong(0L));
+        double ratioBoost = medEng > 0L ? Math.min(6.0, (double) eng / medEng) : 1.5;
+        double viewBoost = medViews > 0L ? Math.min(6.0, (double) views / medViews) : 1.5;
+        double raw = recencyBoost + Math.log1p(eng) * 10.0 + Math.log1p(views) * 3.5 + (ratioBoost + viewBoost) * 6.0;
+        return Math.round(raw * 10.0) / 10.0;
+    }
+
     static long computeWeightedEngagement(ObjectNode m) {
         if (m == null) return 0L;
         long views = Math.max(0L, m.path("views").asLong(0L));
@@ -3728,11 +4146,7 @@ public class AutoRepostService {
                 String tid = AssistantTopics.topicOf(tx, mid);
                 if (!tid.isBlank() && usedTopics.contains(tid)) continue;
                 String pureText = extractPureRewriteSourceText(m);
-                long eng = computeWeightedEngagement(m);
-                long views = Math.max(0L, m.path("views").asLong(0L));
-                double ratioBoost = medEng > 0L ? Math.min(8.0, (double) eng / medEng) : 1.5;
-                double viewBoost = medViews > 0L ? Math.min(8.0, (double) views / medViews) : 1.5;
-                double score = Math.log1p(eng) * 12.0 + Math.log1p(views) * 4.0 + (ratioBoost + viewBoost) * 10.0;
+                double score = computeRewriteRankScore(m, now, medViews, medEng);
                 ranked.add(new RankedRewriteCandidate(mid, tid, m.deepCopy(), pureText, score, medViews, medLikes));
             }
             if (ranked.isEmpty()) return null;

@@ -3314,9 +3314,11 @@
         items: [],
         overrides: {},
         evaluatingIds: new Set(),
+        rewritingIds: new Set(),
         publishingIds: new Set(),
         expandedIds: new Set(),
-        editedComments: new Map()
+        editedComments: new Map(),
+        editedRewrites: new Map()
     };
 
     const DEFAULT_GENERATION_TARGET_SPEC = "chatgpt|gpt-6.2-astra";
@@ -3677,6 +3679,15 @@
         return String(found?.decision?.commentText || "");
     }
 
+    function getRewriteItemText(materialId) {
+        const id = String(materialId || "");
+        if (repostPreviewState.editedRewrites.has(id)) {
+            return String(repostPreviewState.editedRewrites.get(id) || "");
+        }
+        const found = repostPreviewState.items.find((it) => String(it.material?.id || "") === id);
+        return String(found?.rewrite?.rewrittenText || "");
+    }
+
     function buildRepostItemComposedText(materialId) {
         const id = String(materialId || "");
         const found = repostPreviewState.items.find((it) => String(it.material?.id || "") === id);
@@ -3960,6 +3971,7 @@
         const items = repostPreviewState.items || [];
         let repostCount = 0;
         let skipCount = 0;
+        let rewriteCount = 0;
         let pendingCount = 0;
         for (const it of items) {
             const dec = it.decision || {};
@@ -3969,13 +3981,17 @@
             } else {
                 pendingCount++;
             }
+            if (it?.rewrite?.candidate) {
+                rewriteCount++;
+            }
         }
         const filterEl = $("repostPreviewFilterBar");
         if (filterEl) {
             const filters = [
                 { id: "ALL", label: `全部推文 ${items.length}` },
                 { id: "REPOST", label: `会转发 ${repostCount}` },
-                { id: "SKIP", label: `不转发 ${skipCount}` }
+                { id: "SKIP", label: `不转发 ${skipCount}` },
+                { id: "REWRITE", label: `会洗稿 ${rewriteCount}` }
             ];
             filterEl.innerHTML = filters.map((f) => {
                 const active = repostPreviewState.filterMode === f.id;
@@ -4002,7 +4018,115 @@
         }
     }
 
-    function renderRepostTimelineItemHtml(item) {
+    function renderRewriteTimelineItemHtml(item, displayRank = 0) {
+        const mat = item?.material || {};
+        const rw = item?.rewrite || {};
+        const id = String(mat.id || "");
+        const isRewriting = Boolean(repostPreviewState.rewritingIds?.has(id));
+        const isFocused = Boolean(id && id === repostPreviewState.focusedMaterialId);
+
+        const srcHandle = String(mat.username || repostPreviewState.source?.username || "").replace(/^@+/, "");
+        const srcName = String(mat.authorName || repostPreviewState.source?.displayName || srcHandle || "--").trim();
+        const srcAvatar = typeof avatarHtml === "function"
+            ? avatarHtml({ username: srcHandle || srcName, displayName: srcName, avatarUrl: mat.authorAvatarUrl || repostPreviewState.source?.avatarUrl || "" }, "sm")
+            : "";
+        const srcVer = typeof verifiedSvgHtml === "function"
+            ? verifiedSvgHtml(Boolean(mat.authorVerified ?? repostPreviewState.source?.verified))
+            : "";
+        const pubTime = Number(mat.publishedAt) > 0 && typeof formatAssistantDateTime === "function"
+            ? formatAssistantDateTime(Number(mat.publishedAt))
+            : "";
+        const sourceUrl = resolveRepostMaterialUrl(mat);
+        const pubTweetUrl = rw.publishedTweetUrl && typeof safeHttpUrl === "function"
+            ? safeHttpUrl(rw.publishedTweetUrl, "")
+            : String(rw.publishedTweetUrl || "");
+
+        const formatMetric = (n) => typeof fmtNum === "function" ? fmtNum(n) : String(n);
+        const metricParts = [];
+        if (Number(mat.views) > 0) metricParts.push(`浏览 ${formatMetric(Number(mat.views))}`);
+        if (Number(mat.reposts) > 0) metricParts.push(`转 ${formatMetric(Number(mat.reposts))}`);
+        if (Number(mat.replies) > 0) metricParts.push(`评 ${formatMetric(Number(mat.replies))}`);
+        if (Number(mat.likes) > 0) metricParts.push(`赞 ${formatMetric(Number(mat.likes))}`);
+
+        const mainText = String(mat.articleText || mat.text || "");
+        const rankNum = Number(rw.rank || displayRank || 0);
+        const isPublished = String(rw.persistedStatus || "").toUpperCase() === "PUBLISHED" || String(rw.status || "").toUpperCase() === "PUBLISHED";
+        const badgeMeta = isRewriting
+            ? { cls: "running", label: "生成中…" }
+            : (isPublished
+                ? { cls: "ok", label: "已洗稿" }
+                : (rw.evaluated ? { cls: rw.suitable ? "ok" : "running", label: rw.suitable ? "可洗稿" : "待调优" } : { cls: "ok", label: "会洗稿" }));
+        const scoreText = rw.evaluated && Number(rw.suitabilityScore) > 0 ? `适格 ${Number(rw.suitabilityScore)}` : "";
+        const reasonParts = [rw.hookPattern ? `切口：${rw.hookPattern}` : "", rw.reason || ""].filter(Boolean);
+        const reasonHtml = reasonParts.length
+            ? `<div class="author-timeline-reason is-pass">${escapeHtml(reasonParts.join(" · "))}</div>`
+            : "";
+
+        const owner = resolveRepostOwnerIdentity(repostPreviewState.owner);
+        const ownerAvatar = typeof avatarHtml === "function"
+            ? avatarHtml({ username: owner.username, displayName: owner.displayName, avatarUrl: owner.avatarUrl }, "sm")
+            : "";
+        const rewriteVal = getRewriteItemText(id);
+        const intentHref = buildRepostIntentHref(rewriteVal.trim());
+
+        let previewSectionHtml = "";
+        if (isRewriting && !rewriteVal) {
+            previewSectionHtml = `<div class="timeline-owner-quote-box">
+                <div class="repost-owner-row">
+                    <div class="repost-owner-identity">${ownerAvatar}<strong>${escapeHtml(owner.displayName)}</strong><span>@${escapeHtml(owner.username)}</span></div>
+                </div>
+                <textarea class="repost-preview-comment is-loading" rows="2" readonly>生成洗稿中…</textarea>
+            </div>`;
+        } else if (rewriteVal) {
+            previewSectionHtml = `<div class="timeline-owner-quote-box">
+                <div class="repost-owner-row">
+                    <div class="repost-owner-identity">${ownerAvatar}<strong>${escapeHtml(owner.displayName)}</strong><span>@${escapeHtml(owner.username)}</span></div>
+                    ${pubTweetUrl ? `<a class="link-inline-btn" href="${pubTweetUrl}" target="_blank" rel="noopener noreferrer">查看已发推文 ↗</a>` : ""}
+                </div>
+                <textarea class="repost-preview-comment${isRewriting ? " is-loading" : ""}" rows="6" maxlength="600" data-rewrite-text-input="${escapeHtml(id)}" aria-label="洗稿内容预览"${isRewriting ? " readonly" : ""}>${escapeHtml(rewriteVal)}</textarea>
+                <div class="repost-preview-actions">
+                    <button type="button" class="x-outline-pill sm" data-rewrite-regen-item="${escapeHtml(id)}"${isRewriting ? " disabled" : ""}>${isRewriting ? "生成中…" : "换一版"}</button>
+                    <div class="repost-preview-actions-right">
+                        <button type="button" class="x-outline-pill sm" data-rewrite-copy-item="${escapeHtml(id)}"${isRewriting ? " disabled" : ""}>复制正文</button>
+                        <a class="x-outline-pill sm" data-rewrite-intent-link="${escapeHtml(id)}" href="${intentHref}" target="_blank" rel="noopener noreferrer">去 X 发帖 ↗</a>
+                        <button type="button" class="x-blue-pill sm" data-rewrite-schedule-item="${escapeHtml(id)}"${isRewriting ? " disabled" : ""}>转入定时</button>
+                    </div>
+                </div>
+            </div>`;
+        } else {
+            previewSectionHtml = `<button type="button" class="timeline-skip-quote-toggle" data-rewrite-preview-item="${escapeHtml(id)}"${isRewriting ? " disabled" : ""}>
+                <span class="timeline-skip-quote-snippet">${isRewriting ? "生成中…" : "生成洗稿内容"}</span>
+                <span>${isRewriting ? "" : "▸"}</span>
+            </button>`;
+        }
+
+        return `<article class="author-timeline-item is-will-repost${isFocused ? " is-focused" : ""}" data-timeline-material="${escapeHtml(id)}">
+            <div class="author-timeline-head">
+                <div class="author-timeline-who">
+                    ${srcAvatar}
+                    <strong>${escapeHtml(srcName)}</strong>
+                    ${srcVer}
+                    <span>@${escapeHtml(srcHandle)}</span>
+                    ${pubTime ? `<span>· ${escapeHtml(pubTime)}</span>` : ""}
+                </div>
+                <div class="author-timeline-decision">
+                    ${rankNum > 0 ? `<span class="mini-tag blue">#${rankNum}</span>` : ""}
+                    <span class="assistant-state ${badgeMeta.cls}">${escapeHtml(badgeMeta.label)}</span>
+                    ${scoreText ? `<span class="timeline-dual-score">${escapeHtml(scoreText)}</span>` : ""}
+                    ${sourceUrl ? `<a class="link-inline-btn" href="${sourceUrl}" target="_blank" rel="noopener noreferrer">原帖 ↗</a>` : ""}
+                </div>
+            </div>
+            <div class="author-timeline-text">${escapeHtml(mainText)}</div>
+            ${metricParts.length ? `<div class="author-timeline-meta-row"><span>${escapeHtml(metricParts.join(" · "))}</span></div>` : ""}
+            ${reasonHtml}
+            ${previewSectionHtml}
+        </article>`;
+    }
+
+    function renderRepostTimelineItemHtml(item, displayRank = 0) {
+        if (repostPreviewState.filterMode === "REWRITE") {
+            return renderRewriteTimelineItemHtml(item, displayRank);
+        }
         const mat = item?.material || {};
         const dec = item?.decision || {};
         const id = String(mat.id || "");
@@ -4139,6 +4263,7 @@
         const settled = Boolean(item.decision?.evaluated || item.decision?.cdShortCircuited);
         if (mode === "REPOST") return Boolean(settled && item.decision?.wouldAutoRepost);
         if (mode === "SKIP") return Boolean(settled && !item.decision?.wouldAutoRepost);
+        if (mode === "REWRITE") return Boolean(item?.rewrite?.candidate);
         return true;
     }
 
@@ -4151,32 +4276,43 @@
         const listEl = $("repostPreviewTimelineList");
         if (!listEl) return;
 
-        if (singleMaterialId && repostPreviewState.filterMode === "ALL" && typeof listEl.querySelector === "function") {
+        let visibleItems = (repostPreviewState.items || []).filter(itemMatchesRepostFilter);
+        if (repostPreviewState.filterMode === "REWRITE") {
+            visibleItems = [...visibleItems].sort((a, b) =>
+                (Number(b?.rewrite?.rankScore || 0) - Number(a?.rewrite?.rankScore || 0))
+                || (Number(b?.material?.publishedAt || 0) - Number(a?.material?.publishedAt || 0))
+            );
+        }
+
+        if (singleMaterialId && (repostPreviewState.filterMode === "ALL" || repostPreviewState.filterMode === "REWRITE") && typeof listEl.querySelector === "function") {
             const escSel = typeof CSS !== "undefined" && typeof CSS.escape === "function"
                 ? CSS.escape(singleMaterialId)
                 : String(singleMaterialId).replace(/(["\\])/g, "\\$1");
             const existingRow = listEl.querySelector(`[data-timeline-material="${escSel}"]`);
             const activeInput = typeof document !== "undefined" ? document.activeElement : null;
-            const activeEditingOther = activeInput && activeInput.dataset?.repostCommentInput
-                && activeInput.dataset.repostCommentInput !== singleMaterialId;
+            const activeEditingOther = activeInput && (activeInput.dataset?.repostCommentInput || activeInput.dataset?.rewriteTextInput)
+                && (activeInput.dataset.repostCommentInput || activeInput.dataset.rewriteTextInput) !== singleMaterialId;
             if (existingRow && activeEditingOther) {
-                const targetItem = repostPreviewState.items.find((it) => String(it.material?.id || "") === singleMaterialId);
-                if (targetItem) {
-                    existingRow.outerHTML = renderRepostTimelineItemHtml(targetItem);
+                const idx = visibleItems.findIndex((it) => String(it.material?.id || "") === singleMaterialId);
+                if (idx >= 0) {
+                    existingRow.outerHTML = renderRepostTimelineItemHtml(visibleItems[idx], idx + 1);
                     return;
                 }
             }
         }
 
-        const visibleItems = (repostPreviewState.items || []).filter(itemMatchesRepostFilter);
         if (!visibleItems.length) {
             const emptyMsg = repostPreviewState.items.length
-                ? (repostPreviewState.filterMode === "REPOST" ? "当前已评估推文中暂无满足「会火且适合当前账号」的条目。" : "当前筛选下暂无推文。")
+                ? (repostPreviewState.filterMode === "REPOST"
+                    ? "当前已评估推文中暂无满足「会火且适合当前账号」的条目。"
+                    : (repostPreviewState.filterMode === "REWRITE"
+                        ? "当前暂无满足「纯文本（无图/视频/引用）且高热度」的洗稿候选推文。"
+                        : "当前筛选下暂无推文。"))
                 : "该监听作者暂无可预览的近期推文。";
             listEl.innerHTML = `<div class="assistant-empty compact" style="margin:16px;">${escapeHtml(emptyMsg)}</div>`;
             return;
         }
-        listEl.innerHTML = visibleItems.map(renderRepostTimelineItemHtml).join("");
+        listEl.innerHTML = visibleItems.map((it, idx) => renderRepostTimelineItemHtml(it, idx + 1)).join("");
     }
 
     async function evaluateSingleTimelineItem(materialId, forceRegenerate, token, expandOnFinish = false, forceWriteComment = false) {
@@ -4243,6 +4379,59 @@
         }
     }
 
+    async function previewSingleRewriteItem(materialId, forceRegenerate, token) {
+        const id = String(materialId || "").trim();
+        if (!id || token !== repostPreviewState.requestToken) return;
+        if (repostPreviewState.rewritingIds.has(id) && !forceRegenerate) return;
+        repostPreviewState.rewritingIds.add(id);
+        if (forceRegenerate) repostPreviewState.editedRewrites.delete(id);
+        renderRepostPreviewTimeline(id);
+        try {
+            const reqBody = {
+                ...(repostPreviewState.overrides || {}),
+                materialId: id
+            };
+            const modalChk = $("repostPolishEnabledCheck");
+            const modalPromptEl = $("repostPolishPromptInput");
+            if (modalChk && typeof modalChk.checked === "boolean") {
+                reqBody.postPolishEnabled = Boolean(modalChk.checked);
+            }
+            if (modalPromptEl && typeof modalPromptEl.value === "string" && modalPromptEl.value.trim()) {
+                reqBody.postPolishPrompt = modalPromptEl.value.trim();
+            }
+            const repostGenSel = $("repostGenTargetSelect");
+            const repostEffSel = $("repostGenEffortSelect");
+            const genTarget = parseGenerationTargetSpec(
+                repostGenSel?.value || state.assistantGenerationTargetSpec,
+                repostEffSel ? repostEffSel.value : state.assistantGenerationEffort
+            );
+            reqBody.generationProvider = genTarget.generationProvider;
+            reqBody.generationModel = genTarget.generationModel;
+            if (forceRegenerate) reqBody.forceRegenerate = true;
+            const res = await contentAssistantRequest(
+                `/sources/${encodeURIComponent(repostPreviewState.sourceKey)}/rewrite-preview`,
+                reqBody,
+                95000
+            );
+            if (token !== repostPreviewState.requestToken) return;
+            const target = repostPreviewState.items.find((it) => String(it.material?.id || "") === id);
+            if (target && res?.rewrite) {
+                target.rewrite = { ...(target.rewrite || {}), ...res.rewrite };
+                if (res.material) target.material = res.material;
+                repostPreviewState.editedRewrites.delete(id);
+            }
+        } catch (err) {
+            if (token === repostPreviewState.requestToken && typeof showToast === "function") {
+                showToast(formatLocalizedFetchError(err, "生成洗稿内容未完成，请稍后重试"));
+            }
+        } finally {
+            if (token === repostPreviewState.requestToken) {
+                repostPreviewState.rewritingIds.delete(id);
+                renderRepostPreviewTimeline(id);
+            }
+        }
+    }
+
     async function evaluateAuthorAccountOnceInModal(token, forceRegenerate = false) {
         if (!repostPreviewState.sourceKey || token !== repostPreviewState.requestToken) return;
         const dualCd = resolveDualCdView(repostPreviewState.source || {});
@@ -4303,9 +4492,11 @@
         repostPreviewState.evaluatingAccountOnce = false;
         repostPreviewState.cooldown = null;
         repostPreviewState.evaluatingIds.clear();
+        repostPreviewState.rewritingIds.clear();
         repostPreviewState.publishingIds.clear();
         repostPreviewState.expandedIds.clear();
         repostPreviewState.editedComments.clear();
+        repostPreviewState.editedRewrites.clear();
         repostPreviewState.items = [];
         repostPreviewState.filterMode = "ALL";
         if (repostPreviewState.focusedMaterialId) {
@@ -4388,6 +4579,7 @@
     function closeRepostPreviewModal(fromPopstate = false) {
         repostPreviewState.requestToken++;
         repostPreviewState.evaluatingIds.clear();
+        repostPreviewState.rewritingIds.clear();
         repostPreviewState.publishingIds.clear();
         const modal = document.getElementById("repostPreviewModal");
         if (modal) modal.hidden = true;
@@ -11587,6 +11779,18 @@
             void evaluateAuthorAccountOnceInModal(repostPreviewState.requestToken, true);
         });
         document.getElementById("repostPreviewTimelineList")?.addEventListener("input", (event) => {
+            const rwInput = event.target?.closest?.("[data-rewrite-text-input]");
+            if (rwInput) {
+                const id = rwInput.dataset.rewriteTextInput || "";
+                if (!id) return;
+                repostPreviewState.editedRewrites.set(id, rwInput.value);
+                const row = rwInput.closest("[data-timeline-material]");
+                const link = row?.querySelector?.("[data-rewrite-intent-link]");
+                if (link) {
+                    link.href = buildRepostIntentHref(rwInput.value.trim());
+                }
+                return;
+            }
             const input = event.target?.closest?.("[data-repost-comment-input]");
             if (!input) return;
             const id = input.dataset.repostCommentInput || "";
@@ -11599,6 +11803,49 @@
             }
         });
         document.getElementById("repostPreviewTimelineList")?.addEventListener("click", (event) => {
+            const rwPreviewBtn = event.target?.closest?.("[data-rewrite-preview-item]");
+            if (rwPreviewBtn) {
+                const id = rwPreviewBtn.dataset.rewritePreviewItem || "";
+                if (id) {
+                    void previewSingleRewriteItem(id, false, repostPreviewState.requestToken);
+                }
+                return;
+            }
+            const rwRegenBtn = event.target?.closest?.("[data-rewrite-regen-item]");
+            if (rwRegenBtn) {
+                const id = rwRegenBtn.dataset.rewriteRegenItem || "";
+                if (id) {
+                    void previewSingleRewriteItem(id, true, repostPreviewState.requestToken);
+                }
+                return;
+            }
+            const rwCopyBtn = event.target?.closest?.("[data-rewrite-copy-item]");
+            if (rwCopyBtn) {
+                const id = rwCopyBtn.dataset.rewriteCopyItem || "";
+                const text = getRewriteItemText(id).trim();
+                if (!text) {
+                    showToast("暂无可复制的洗稿正文");
+                    return;
+                }
+                copyTextWithFallback(text)
+                    .then(() => showToast("已复制洗稿正文"))
+                    .catch(() => showToast("复制未成功，请手动选中复制"));
+                return;
+            }
+            const rwSchedBtn = event.target?.closest?.("[data-rewrite-schedule-item]");
+            if (rwSchedBtn) {
+                const id = rwSchedBtn.dataset.rewriteScheduleItem || "";
+                const text = getRewriteItemText(id).trim();
+                if (!text) {
+                    showToast("暂无可转入定时的洗稿内容");
+                    return;
+                }
+                if (sendTextDraftToSchedule(text) !== false) {
+                    closeRepostPreviewModal();
+                    showToast("已转入定时发布");
+                }
+                return;
+            }
             const expandBtn = event.target?.closest?.("[data-repost-expand-item]");
             if (expandBtn) {
                 const id = expandBtn.dataset.repostExpandItem || "";

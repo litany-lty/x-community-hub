@@ -508,6 +508,14 @@ public final class AssistantController {
         return autoRepostService.previewRepost(sourceKey, body == null ? object() : body);
     }
 
+    @PostMapping("/sources/{sourceKey}/rewrite-preview")
+    public ObjectNode previewSourceRewrite(@PathVariable String sourceKey, @RequestBody(required = false) ObjectNode body) {
+        if (autoRepostService == null) {
+            throw new XDataProviderException(503, "洗稿预览服务未启用");
+        }
+        return autoRepostService.previewRewrite(sourceKey, body == null ? object() : body);
+    }
+
     @PostMapping("/sources/{sourceKey}/publish-quote")
     public ObjectNode publishManualQuote(
             @PathVariable String sourceKey,

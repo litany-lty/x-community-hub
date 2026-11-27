@@ -2380,6 +2380,10 @@ public class PiAgentViralJudge {
     ) { }
 
     public RewriteJudgment evaluateAndWriteRewrite(RewriteInput input) {
+        return evaluateAndWriteRewrite(input, false);
+    }
+
+    public RewriteJudgment evaluateAndWriteRewrite(RewriteInput input, boolean forceWritePreview) {
         if (input == null || input.sourceText() == null || input.sourceText().isBlank()) {
             throw new IllegalArgumentException("洗稿源文本不能为空");
         }
@@ -2414,7 +2418,7 @@ public class PiAgentViralJudge {
         String coreInsight = truncate(judgeJson.path("coreInsight").asText("").strip(), 240);
         String reason = truncate(judgeJson.path("reason").asText("").strip(), 140);
         boolean pass = rawSuitable && suitabilityScore >= 68;
-        if (!pass) {
+        if (!pass && !forceWritePreview) {
             return new RewriteJudgment(false, suitabilityScore, hookPattern, coreInsight,
                     reason.isBlank() ? "该纯文本推文不适合转化为独立原创帖" : reason, "");
         }
@@ -2462,8 +2466,11 @@ public class PiAgentViralJudge {
                 finalRewrite = cleanedPolished;
             }
         }
-        return new RewriteJudgment(true, suitabilityScore, hookPattern, coreInsight,
-                reason.isBlank() ? "高流量纯文本结构清晰，已完成学习与原创改写" : reason, finalRewrite);
+        return new RewriteJudgment(pass, suitabilityScore, hookPattern, coreInsight,
+                reason.isBlank()
+                        ? (pass ? "高流量纯文本结构清晰，已完成学习与原创改写" : "该纯文本推文洗稿适格分偏低，已生成预览改写供参考")
+                        : reason,
+                finalRewrite);
     }
 
     static String cleanStandaloneRewriteText(String raw) {

@@ -462,6 +462,71 @@ assert.deepEqual(
     { generationProvider: "minimax", generationModel: "MiniMax-M2.7" }
 );
 
+// Rewrite ("会洗稿") tab filtering, priority ordering, and interactive preview UI
+previewCtx.__repostPreviewState.items = [
+    {
+        material: {
+            id: "rw-older", username: "sama", authorName: "Sam Altman", authorVerified: true,
+            publishedAt: 1732400000000, kind: "POST", hasMedia: false,
+            text: "Older high-heat pure text post on team speed.",
+            sourceUrl: "https://x.com/sama/status/rw-older", views: 45000, likes: 920
+        },
+        decision: { evaluated: true, wouldAutoRepost: false, decisionCode: "SKIP_NOT_FIT" },
+        rewrite: { candidate: true, pureText: true, highTraffic: true, rank: 2, rankScore: 76.5, evaluated: false, rewrittenText: "" }
+    },
+    {
+        material: {
+            id: "rw-media", username: "sama", authorName: "Sam Altman", authorVerified: true,
+            publishedAt: 1732450000000, kind: "POST", hasMedia: true,
+            text: "Image attachment tweet should not appear under 会洗稿.",
+            sourceUrl: "https://x.com/sama/status/rw-media", views: 190000, likes: 4800
+        },
+        decision: { evaluated: true, wouldAutoRepost: true, decisionCode: "WOULD_REPOST", commentText: "转发附文" },
+        rewrite: { candidate: false, pureText: false, highTraffic: true, rank: 0, rankScore: 0, ineligibleReason: "含图片或视频媒体" }
+    },
+    {
+        material: {
+            id: "rw-top", username: "sama", authorName: "Sam Altman", authorVerified: true,
+            publishedAt: 1732445000000, kind: "POST", hasMedia: false,
+            text: "Recent pure-text high-traffic insight about inference economics.",
+            sourceUrl: "https://x.com/sama/status/rw-top", views: 60000, likes: 1400
+        },
+        decision: { evaluated: true, wouldAutoRepost: false, decisionCode: "SKIP_NOT_FIT" },
+        rewrite: { candidate: true, pureText: true, highTraffic: true, rank: 1, rankScore: 98.2, evaluated: false, rewrittenText: "" }
+    }
+];
+previewCtx.__repostPreviewState.filterMode = "ALL";
+previewCtx.renderRepostPreviewTimeline();
+assert.match(previewEls.repostPreviewFilterBar.innerHTML, /会洗稿 2/);
+
+previewCtx.__repostPreviewState.filterMode = "REWRITE";
+previewCtx.renderRepostPreviewTimeline();
+assert.match(previewEls.repostPreviewTimelineList.innerHTML, /#1/);
+assert.match(previewEls.repostPreviewTimelineList.innerHTML, /#2/);
+assert.doesNotMatch(previewEls.repostPreviewTimelineList.innerHTML, /rw-media/);
+assert.ok(
+    previewEls.repostPreviewTimelineList.innerHTML.indexOf("rw-top")
+    < previewEls.repostPreviewTimelineList.innerHTML.indexOf("rw-older")
+);
+assert.match(previewEls.repostPreviewTimelineList.innerHTML, /data-rewrite-preview-item="rw-top"/);
+
+previewCtx.__repostPreviewState.items[2].rewrite = {
+    ...previewCtx.__repostPreviewState.items[2].rewrite,
+    evaluated: true,
+    suitable: true,
+    suitabilityScore: 91,
+    hookPattern: "反直觉洞察",
+    reason: "高流量纯文本结构清晰",
+    rewrittenText: "算力成本一旦跌破临界点，过去不敢做的 Agent 全都成立了。\n\n真该重算一遍账了。"
+};
+previewCtx.renderRepostPreviewTimeline();
+assert.match(previewEls.repostPreviewTimelineList.innerHTML, /适格 91/);
+assert.match(previewEls.repostPreviewTimelineList.innerHTML, /data-rewrite-text-input="rw-top"/);
+assert.match(previewEls.repostPreviewTimelineList.innerHTML, /data-rewrite-regen-item="rw-top"/);
+assert.match(previewEls.repostPreviewTimelineList.innerHTML, /data-rewrite-copy-item="rw-top"/);
+assert.match(previewEls.repostPreviewTimelineList.innerHTML, /data-rewrite-schedule-item="rw-top"/);
+assert.doesNotMatch(previewEls.repostPreviewTimelineList.innerHTML, /x\.com\/sama\/status\/rw-top.*data-rewrite-intent-link/);
+
 // History archive status copy (completed backfill vs in-progress backfill)
 const historyCtx = createContext({
     fmtNum: (n) => String(n),

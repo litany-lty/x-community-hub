@@ -2284,4 +2284,135 @@ class AutoRepostAndTierTest {
         assertThat(publishModesObserved.get(4)).startsWith("REPOST:");
         collector.stop();
     }
+
+    @Test
+    void authorTimelineRanksPureTextRewriteCandidatesByRecencyAndHeatAndPreviewGeneratesWithoutPublishing() throws Exception {
+        ZoneId shanghai = ZoneId.of("Asia/Shanghai");
+        Instant now = ZonedDateTime.of(2026, 11, 27, 9, 30, 0, 0, shanghai).toInstant();
+        ObjectMapper mapper = new ObjectMapper();
+        AssistantStore store = new AssistantStore(tempDir.resolve("timeline-rewrite-preview-store"), mapper);
+        TwitterApiIoProvider mockProvider = mock(TwitterApiIoProvider.class);
+        CommunityHubService mockCommunity = mock(CommunityHubService.class);
+        when(mockCommunity.longHistoryCandidates()).thenReturn(List.of());
+        SourceCollector collector = new SourceCollector(store, mockProvider, mockCommunity, mapper, Clock.fixed(now, shanghai));
+        XOAuthService mockOauth = mock(XOAuthService.class);
+        XPublishClient mockPublish = mock(XPublishClient.class);
+
+        store.tx(tx -> {
+            tx.put("meta", "owner", mapper.createObjectNode().put("accountId", "owner-rw-p").put("username", "elidlicom"));
+            tx.put("meta", "settings", AssistantWorkflow.settings(tx)
+                    .put("enabled", true)
+                    .put("postPolishEnabled", false));
+            tx.put("source", "src-rw-prev", mapper.createObjectNode()
+                    .put("id", "src-rw-prev")
+                    .put("authorId", "src-rw-prev")
+                    .put("username", "paul_g")
+                    .put("displayName", "Paul G")
+                    .put("status", "ACTIVE")
+                    .put("intervalMinutes", 5)
+                    .put("autoRepostEnabled", true)
+                    .put("autoRewriteEnabled", true));
+            // #1 priority: recent (2h ago), high heat, pure text
+            AssistantWorkflow.ingest(tx, mapper.createObjectNode()
+                    .put("id", "8100001").put("authorId", "src-rw-prev").put("username", "paul_g")
+                    .put("text", "Why startups fail slowly when founders optimize optics before real user demand and iteration speed.")
+                    .put("textStatus", "TEXT_ONLY").put("kind", "POST").put("hasMedia", false)
+                    .put("views", 15_000L).put("likes", 240L).put("reposts", 28L).put("replies", 16L)
+                    .put("publishedAt", now.minusSeconds(2 * 3600L).toEpochMilli()));
+            // #2 priority: older (18d ago), same high heat, pure text -> ranked below recent #1
+            AssistantWorkflow.ingest(tx, mapper.createObjectNode()
+                    .put("id", "8100002").put("authorId", "src-rw-prev").put("username", "paul_g")
+                    .put("text", "Old long-form pure text observation on keeping small teams fast and avoiding premature layers.")
+                    .put("textStatus", "TEXT_ONLY").put("kind", "POST").put("hasMedia", false)
+                    .put("views", 15_000L).put("likes", 240L).put("reposts", 28L).put("replies", 16L)
+                    .put("publishedAt", now.minusSeconds(18L * 86_400L).toEpochMilli()));
+            // Ineligible #3: recent & viral but hasMedia = true
+            AssistantWorkflow.ingest(tx, mapper.createObjectNode()
+                    .put("id", "8100003").put("authorId", "src-rw-prev").put("username", "paul_g")
+                    .put("text", "Look at this viral chart of inference cost collapsing across generations over four quarters.")
+                    .put("textStatus", "TEXT_ONLY").put("kind", "POST").put("hasMedia", true)
+                    .put("views", 80_000L).put("likes", 1_600L).put("reposts", 210L)
+                    .put("publishedAt", now.minusSeconds(3600L).toEpochMilli()));
+            // Ineligible #4: recent & viral QUOTE post
+            AssistantWorkflow.ingest(tx, mapper.createObjectNode()
+                    .put("id", "8100004").put("authorId", "src-rw-prev").put("username", "paul_g")
+                    .put("text", "Totally agree with this breakdown on engineering taste versus over-engineered abstractions.")
+                    .put("quotedId", "999888").put("quotedText", "Simplicity wins.")
+                    .put("textStatus", "TEXT_ONLY").put("kind", "QUOTE").put("hasMedia", false)
+                    .put("views", 80_000L).put("likes", 1_600L).put("reposts", 210L)
+                    .put("publishedAt", now.minusSeconds(3600L).toEpochMilli()));
+            return null;
+        });
+
+        Path fakeCodex = Files.createFile(tempDir.resolve("fake-codex-rw-prev"),
+                PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rwxr-xr-x")));
+        MockEnvironment codexEnv = new MockEnvironment()
+                .withProperty(PiAgentViralJudge.CODEX_CLI_PATH_ENV, fakeCodex.toString())
+                .withProperty(PiAgentViralJudge.BACKEND_ENV, "codex");
+        PiAgentViralJudge judge = new PiAgentViralJudge(mapper, codexEnv, (cmd, stdin, timeout) -> {
+            if (cmd.contains("login") && cmd.contains("status")) {
+                return new PiAgentViralJudge.CliResult(0, "Logged in using ChatGPT", "");
+            }
+            int outIdx = cmd.indexOf("-o");
+            String body = cmd.contains("--output-schema")
+                    ? "{\"suitableForRewrite\":true,\"suitabilityScore\":91,\"hookPattern\":\"反直觉洞察\",\"coreInsight\":\"创始团队把精力花在表面功夫时就会慢下来\",\"reason\":\"高流量纯文本结构清晰\"}"
+                    : "很多团队走下坡路，往往是从沉迷面子工程而不是紧盯真实需求开始的。\n\n把反馈闭环跑短、把废话砍掉，效率一下就回来了。";
+            if (outIdx >= 0 && outIdx + 1 < cmd.size()) {
+                Files.writeString(Path.of(cmd.get(outIdx + 1)), body);
+            }
+            return new PiAgentViralJudge.CliResult(0, body, "");
+        });
+
+        AutoRepostService svc = new AutoRepostService(store, collector, judge, mockOauth, mockPublish, Clock.fixed(now, shanghai));
+        try {
+            ObjectNode timeline = svc.authorTimeline("paul_g", mapper.createObjectNode());
+            assertThat(timeline.path("summary").path("wouldRewriteCount").asInt()).isEqualTo(2);
+
+            java.util.Map<String, ObjectNode> byId = new java.util.HashMap<>();
+            for (var it : timeline.path("items")) {
+                byId.put(it.path("material").path("id").asText(), (ObjectNode) it);
+            }
+            assertThat(byId.get("8100001").path("rewrite").path("candidate").asBoolean()).isTrue();
+            assertThat(byId.get("8100001").path("rewrite").path("rank").asInt()).isEqualTo(1);
+            assertThat(byId.get("8100002").path("rewrite").path("candidate").asBoolean()).isTrue();
+            assertThat(byId.get("8100002").path("rewrite").path("rank").asInt()).isEqualTo(2);
+            assertThat(byId.get("8100001").path("rewrite").path("rankScore").asDouble())
+                    .isGreaterThan(byId.get("8100002").path("rewrite").path("rankScore").asDouble());
+            assertThat(byId.get("8100003").path("rewrite").path("candidate").asBoolean()).isFalse();
+            assertThat(byId.get("8100003").path("rewrite").path("pureText").asBoolean()).isFalse();
+            assertThat(byId.get("8100004").path("rewrite").path("candidate").asBoolean()).isFalse();
+            assertThat(byId.get("8100004").path("rewrite").path("pureText").asBoolean()).isFalse();
+
+            AssistantController controller = new AssistantController(
+                    store, collector, mock(AssistantWorker.class), mock(AssistantPublishing.class), mapper);
+            ReflectionTestUtils.setField(controller, "autoRepostService", svc);
+            var mvc = MockMvcBuilders.standaloneSetup(controller).setControllerAdvice(new ApiExceptionHandler()).build();
+            var session = new MockHttpSession();
+            session.setAttribute(XOAuthController.SESSION_AUTH_USER,
+                    new AuthenticatedXUser("owner-rw-p", "elidlicom", "elidlicom", "", false, now));
+
+            mvc.perform(post("/api/content-assistant/sources/paul_g/rewrite-preview")
+                            .session(session)
+                            .header("X-Requested-With", "XMLHttpRequest")
+                            .contentType(org.springframework.http.MediaType.APPLICATION_JSON)
+                            .content("{\"materialId\":\"8100001\"}"))
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.rewrite.evaluated").value(true))
+                    .andExpect(jsonPath("$.rewrite.suitabilityScore").value(91))
+                    .andExpect(jsonPath("$.rewrite.rewrittenText").value(
+                            "很多团队走下坡路，往往是从沉迷面子工程而不是紧盯真实需求开始的。\n\n把反馈闭环跑短、把废话砍掉，效率一下就回来了。"));
+
+            mvc.perform(post("/api/content-assistant/sources/paul_g/rewrite-preview")
+                            .session(session)
+                            .header("X-Requested-With", "XMLHttpRequest")
+                            .contentType(org.springframework.http.MediaType.APPLICATION_JSON)
+                            .content("{\"materialId\":\"8100003\"}"))
+                    .andExpect(status().isBadRequest());
+
+            verifyNoInteractions(mockPublish);
+        } finally {
+            svc.shutdown();
+            collector.stop();
+        }
+    }
 }
