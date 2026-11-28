@@ -1661,6 +1661,10 @@ a {
     gap: 10px;
     flex-wrap: wrap;
 }
+#repostRewriteScope {
+    flex-basis: 100%;
+    margin: 0;
+}
 .repost-polish-drawer {
     padding: 10px 16px 12px;
     border-bottom: 1px solid var(--border-color);

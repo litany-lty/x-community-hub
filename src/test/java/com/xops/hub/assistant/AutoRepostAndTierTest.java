@@ -1889,14 +1889,14 @@ class AutoRepostAndTierTest {
                     .put("text", "Visualizing attention heads in transformers over 100k context windows in detail.")
                     .put("textStatus", "TEXT_ONLY").put("kind", "POST").put("hasMedia", true)
                     .put("views", 120_000L).put("likes", 2_800L).put("reposts", 320L)
-                    .put("publishedAt", t1.minusSeconds(36_000).toEpochMilli()));
+                    .put("publishedAt", t1.minusSeconds(3_600).toEpochMilli()));
             // 2) High traffic but contains external link -> must NOT be selected
             AssistantWorkflow.ingest(tx, mapper.createObjectNode()
                     .put("id", "7100002").put("authorId", "src-karpathy").put("username", "karpathy")
                     .put("text", "My new 3-hour lecture on building LLM tokenizers from scratch is live: https://example.com/video")
                     .put("textStatus", "TEXT_ONLY").put("kind", "POST").put("hasMedia", false)
                     .put("views", 110_000L).put("likes", 2_500L).put("reposts", 290L)
-                    .put("publishedAt", t1.minusSeconds(40_000).toEpochMilli()));
+                    .put("publishedAt", t1.minusSeconds(3_000).toEpochMilli()));
             // 3) High traffic QUOTE post -> must NOT be selected
             AssistantWorkflow.ingest(tx, mapper.createObjectNode()
                     .put("id", "7100003").put("authorId", "src-karpathy").put("username", "karpathy")
@@ -1904,28 +1904,28 @@ class AutoRepostAndTierTest {
                     .put("quotedId", "999111").put("quotedText", "Memory wall is the real bottleneck.")
                     .put("textStatus", "TEXT_ONLY").put("kind", "QUOTE").put("hasMedia", false)
                     .put("views", 95_000L).put("likes", 1_900L).put("reposts", 180L)
-                    .put("publishedAt", t1.minusSeconds(45_000).toEpochMilli()));
+                    .put("publishedAt", t1.minusSeconds(2_400).toEpochMilli()));
             // 4) Pure text but LOW traffic relative to author baseline -> must NOT be selected
             AssistantWorkflow.ingest(tx, mapper.createObjectNode()
                     .put("id", "7100004").put("authorId", "src-karpathy").put("username", "karpathy")
                     .put("text", "Quick note on Python virtual environments when switching between local CUDA versions on Linux.")
                     .put("textStatus", "TEXT_ONLY").put("kind", "POST").put("hasMedia", false)
                     .put("views", 1_200L).put("likes", 18L).put("reposts", 1L)
-                    .put("publishedAt", t1.minusSeconds(50_000).toEpochMilli()));
+                    .put("publishedAt", t1.minusSeconds(1_800).toEpochMilli()));
             // 5) Pure text + HIGHEST traffic (#1) -> selected on Slot 1!
             AssistantWorkflow.ingest(tx, mapper.createObjectNode()
                     .put("id", "7100005").put("authorId", "src-karpathy").put("username", "karpathy")
                     .put("text", "The biggest mistake people make with coding agents is treating prompts like wishes instead of specs. Give tight verification loops and small diffs, and reliability jumps dramatically.")
                     .put("textStatus", "TEXT_ONLY").put("kind", "POST").put("hasMedia", false)
                     .put("views", 85_000L).put("likes", 2_100L).put("reposts", 260L).put("replies", 110L)
-                    .put("publishedAt", t1.minusSeconds(60_000).toEpochMilli()));
+                    .put("publishedAt", t1.minusSeconds(1_200).toEpochMilli()));
             // 6) Pure text + SECOND HIGHEST traffic (#2) -> selected on Slot 2!
             AssistantWorkflow.ingest(tx, mapper.createObjectNode()
                     .put("id", "7100006").put("authorId", "src-karpathy").put("username", "karpathy")
                     .put("text", "Context engineering is quietly replacing prompt engineering. Deciding what NOT to stuff into the context window matters more than clever wording.")
                     .put("textStatus", "TEXT_ONLY").put("kind", "POST").put("hasMedia", false)
                     .put("views", 62_000L).put("likes", 1_480L).put("reposts", 175L).put("replies", 80L)
-                    .put("publishedAt", t1.minusSeconds(80_000).toEpochMilli()));
+                    .put("publishedAt", t1.minusSeconds(600).toEpochMilli()));
             return null;
         });
 
@@ -2236,7 +2236,7 @@ class AutoRepostAndTierTest {
                         .put("text", "High-traffic pure text insight #" + j + " explaining why small verifiable diffs always beat giant speculative rewrites in engineering.")
                         .put("textStatus", "TEXT_ONLY").put("kind", "POST").put("hasMedia", false)
                         .put("views", (90_000L - j * 5_000L)).put("likes", (2_000L - j * 100L)).put("reposts", 200L)
-                        .put("publishedAt", baseTime.minusSeconds(3_600L * j).toEpochMilli()));
+                        .put("publishedAt", baseTime.minusSeconds(60L * j).toEpochMilli()));
             }
             return null;
         });
@@ -2300,7 +2300,7 @@ class AutoRepostAndTierTest {
     }
 
     @Test
-    void authorTimelineRanksPureTextRewriteCandidatesByRecencyAndHeatAndPreviewGeneratesWithoutPublishing() throws Exception {
+    void authorTimelineAndDefaultPreviewFavorTodaysHotPureTextWithTheHighestExposureRate() throws Exception {
         ZoneId shanghai = ZoneId.of("Asia/Shanghai");
         Instant now = ZonedDateTime.of(2026, 11, 27, 9, 30, 0, 0, shanghai).toInstant();
         ObjectMapper mapper = new ObjectMapper();
@@ -2326,19 +2326,17 @@ class AutoRepostAndTierTest {
                     .put("intervalMinutes", 5)
                     .put("autoRepostEnabled", true)
                     .put("autoRewriteEnabled", true));
-            // #1 priority: recent (2h ago), high heat, pure text
             AssistantWorkflow.ingest(tx, mapper.createObjectNode()
                     .put("id", "8100001").put("authorId", "src-rw-prev").put("username", "paul_g")
                     .put("text", "Why startups fail slowly when founders optimize optics before real user demand and iteration speed.")
                     .put("textStatus", "TEXT_ONLY").put("kind", "POST").put("hasMedia", false)
-                    .put("views", 15_000L).put("likes", 240L).put("reposts", 28L).put("replies", 16L)
+                    .put("views", 15_000L).put("authorFollowersCount", 1_000L).put("likes", 240L).put("reposts", 28L).put("replies", 16L)
                     .put("publishedAt", now.minusSeconds(2 * 3600L).toEpochMilli()));
-            // #2 priority: older (18d ago), same high heat, pure text -> ranked below recent #1
             AssistantWorkflow.ingest(tx, mapper.createObjectNode()
                     .put("id", "8100002").put("authorId", "src-rw-prev").put("username", "paul_g")
                     .put("text", "Old long-form pure text observation on keeping small teams fast and avoiding premature layers.")
                     .put("textStatus", "TEXT_ONLY").put("kind", "POST").put("hasMedia", false)
-                    .put("views", 15_000L).put("likes", 240L).put("reposts", 28L).put("replies", 16L)
+                    .put("views", 150_000L).put("authorFollowersCount", 100L).put("likes", 2_400L).put("reposts", 280L).put("replies", 160L)
                     .put("publishedAt", now.minusSeconds(18L * 86_400L).toEpochMilli()));
             // Ineligible #3: recent & viral but hasMedia = true
             AssistantWorkflow.ingest(tx, mapper.createObjectNode()
@@ -2355,6 +2353,12 @@ class AutoRepostAndTierTest {
                     .put("textStatus", "TEXT_ONLY").put("kind", "QUOTE").put("hasMedia", false)
                     .put("views", 80_000L).put("likes", 1_600L).put("reposts", 210L)
                     .put("publishedAt", now.minusSeconds(3600L).toEpochMilli()));
+            AssistantWorkflow.ingest(tx, mapper.createObjectNode()
+                    .put("id", "8100005").put("authorId", "src-rw-prev").put("username", "paul_g")
+                    .put("text", "Teams reduced delivery time by testing small changes under the same conditions across releases.")
+                    .put("textStatus", "TEXT_ONLY").put("kind", "POST").put("hasMedia", false)
+                    .put("views", 75_000L).put("authorFollowersCount", 50_000L).put("likes", 1_800L).put("reposts", 230L)
+                    .put("publishedAt", now.minusSeconds(600L).toEpochMilli()));
             return null;
         });
 
@@ -2380,18 +2384,19 @@ class AutoRepostAndTierTest {
         AutoRepostService svc = new AutoRepostService(store, collector, judge, mockOauth, mockPublish, Clock.fixed(now, shanghai));
         try {
             ObjectNode timeline = svc.authorTimeline("paul_g", mapper.createObjectNode());
-            assertThat(timeline.path("summary").path("wouldRewriteCount").asInt()).isEqualTo(2);
-
             java.util.Map<String, ObjectNode> byId = new java.util.HashMap<>();
             for (var it : timeline.path("items")) {
                 byId.put(it.path("material").path("id").asText(), (ObjectNode) it);
             }
             assertThat(byId.get("8100001").path("rewrite").path("candidate").asBoolean()).isTrue();
             assertThat(byId.get("8100001").path("rewrite").path("rank").asInt()).isEqualTo(1);
-            assertThat(byId.get("8100002").path("rewrite").path("candidate").asBoolean()).isTrue();
-            assertThat(byId.get("8100002").path("rewrite").path("rank").asInt()).isEqualTo(2);
-            assertThat(byId.get("8100001").path("rewrite").path("rankScore").asDouble())
-                    .isGreaterThan(byId.get("8100002").path("rewrite").path("rankScore").asDouble());
+            assertThat(byId.get("8100001").at("/rewrite/exposureRate").asDouble()).isEqualTo(15.0);
+            assertThat(byId.get("8100005").at("/rewrite/candidate").asBoolean()).isTrue();
+            assertThat(byId.get("8100005").at("/rewrite/rank").asInt()).isEqualTo(2);
+            assertThat(byId.get("8100005").at("/rewrite/exposureRate").asDouble()).isEqualTo(1.5);
+            assertThat(byId.get("8100002").at("/rewrite/candidate").asBoolean(true)).isFalse();
+            assertThat(byId.get("8100002").at("/rewrite/rank").asInt(-1)).isZero();
+            assertThat(timeline.at("/summary/wouldRewriteCount").asInt()).isEqualTo(2);
             assertThat(byId.get("8100003").path("rewrite").path("candidate").asBoolean()).isFalse();
             assertThat(byId.get("8100003").path("rewrite").path("pureText").asBoolean()).isFalse();
             assertThat(byId.get("8100004").path("rewrite").path("candidate").asBoolean()).isFalse();
@@ -2409,8 +2414,9 @@ class AutoRepostAndTierTest {
                             .session(session)
                             .header("X-Requested-With", "XMLHttpRequest")
                             .contentType(org.springframework.http.MediaType.APPLICATION_JSON)
-                            .content("{\"materialId\":\"8100001\"}"))
+                            .content("{}"))
                     .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.material.id").value("8100001"))
                     .andExpect(jsonPath("$.rewrite.evaluated").value(true))
                     .andExpect(jsonPath("$.rewrite.suitabilityScore").value(91))
                     .andExpect(jsonPath("$.rewrite.rewrittenText").value(
@@ -2422,6 +2428,16 @@ class AutoRepostAndTierTest {
                             .contentType(org.springframework.http.MediaType.APPLICATION_JSON)
                             .content("{\"materialId\":\"8100003\"}"))
                     .andExpect(status().isBadRequest());
+
+            mvc.perform(post("/api/content-assistant/sources/paul_g/rewrite-preview")
+                            .session(session)
+                            .header("X-Requested-With", "XMLHttpRequest")
+                            .contentType(org.springframework.http.MediaType.APPLICATION_JSON)
+                            .content("{\"materialId\":\"8100002\",\"forceRegenerate\":true}"))
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.material.id").value("8100002"))
+                    .andExpect(jsonPath("$.rewrite.candidate").value(false))
+                    .andExpect(jsonPath("$.rewrite.rewrittenText").isEmpty());
 
             verifyNoInteractions(mockPublish);
         } finally {

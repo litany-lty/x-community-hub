@@ -3520,6 +3520,9 @@
         sourceKey: "",
         focusedMaterialId: "",
         filterMode: "ALL",
+        timelineDayStart: 0,
+        rewriteTimelineLoaded: false,
+        rewriteDayTimer: null,
         polishDrawerOpen: false,
         evaluatingAccountOnce: false,
         cooldown: null,
@@ -3971,6 +3974,56 @@
         return String(found?.rewrite?.rewrittenText || "");
     }
 
+    function beijingRewriteDayStart(now) {
+        const beijingOffsetMs = 8 * 3_600_000;
+        return now - (now + beijingOffsetMs) % 86_400_000;
+    }
+
+    function isManualRewritePreview(rewrite) {
+        return rewrite?.manualReviewPreview === true && !rewrite.candidate && rewrite.status === "EVALUATED"
+            && !rewrite.unsentPreview && !["PUBLISHED", "SENDING", "UNCERTAIN", "EVALUATING"].includes(rewrite.persistedStatus);
+    }
+
+    function applyRankedRewritePreview(target, rewrite) {
+        const previousRank = target.rewrite?.candidate ? Number(target.rewrite.rank || 0) : 0;
+        const rank = rewrite.candidate ? Number(rewrite.rank || previousRank) : 0;
+        if (previousRank !== rank) {
+            for (const other of repostPreviewState.items) {
+                if (other === target || !other.rewrite?.candidate || !other.rewrite.rank) continue;
+                let position = other.rewrite.rank;
+                if (previousRank && position > previousRank) position--;
+                if (rank && position >= rank) position++;
+                if (position !== other.rewrite.rank) other.rewrite = {...other.rewrite, rank: position};
+            }
+        }
+        target.rewrite = {...rewrite, rank};
+    }
+
+    function isTodayRewriteItem(item, now = Date.now()) {
+        const publishedAt = Number(item?.material?.publishedAt);
+        return publishedAt >= beijingRewriteDayStart(now) && publishedAt <= now
+            && (item?.rewrite?.candidate === true || isManualRewritePreview(item?.rewrite));
+    }
+
+    function requireTodayRewrite(item) {
+        if (isTodayRewriteItem(item)) return true;
+        renderRepostPreviewTimeline();
+        showToast("这条原帖已不在今日洗稿候选中");
+        return false;
+    }
+
+    function previewGenerationOptions() {
+        const model = $("repostGenTargetSelect");
+        const effort = $("repostGenEffortSelect");
+        const options = parseGenerationTargetSpec(model?.value || state.assistantGenerationTargetSpec,
+            effort ? effort.value : state.assistantGenerationEffort);
+        const polish = $("repostPolishEnabledCheck");
+        const prompt = $("repostPolishPromptInput")?.value?.trim();
+        if (typeof polish?.checked === "boolean") options.postPolishEnabled = polish.checked;
+        if (prompt) options.postPolishPrompt = prompt;
+        return options;
+    }
+
     function buildRepostItemComposedText(materialId) {
         const id = String(materialId || "");
         const found = repostPreviewState.items.find((it) => String(it.material?.id || "") === id);
@@ -4100,6 +4153,10 @@
     function renderRepostDualCdBar(sourceInfo = {}) {
         const barEl = $("repostDualCdBar");
         if (!barEl) return;
+        if (repostPreviewState.filterMode === "REWRITE") {
+            barEl.hidden = true;
+            return;
+        }
         const cd = resolveDualCdView(sourceInfo);
         const globalText = cd.globalActive ? `全局 CD · 余 ${cd.globalRemMin}m` : "全局 CD · 就绪";
         const globalTitle = `距上一条推文需间隔 1h+${cd.globalJitter}m`;
@@ -4233,8 +4290,14 @@
             const modeText = autoOn && rewriteOn
                 ? "自动转推+洗稿"
                 : (autoOn ? "自动转推" : (rewriteOn ? "洗稿发送" : "仅预览"));
-            ruleEl.className = `assistant-state ${(autoOn || rewriteOn) ? "ok" : "muted"}`;
-            ruleEl.textContent = `${modeText} · 潜力≥${minScore}${isTpl ? " · 固定文案" : ""}`;
+            if (repostPreviewState.filterMode === "REWRITE") {
+                const active = String(sourceInfo.status || "ACTIVE").toUpperCase() === "ACTIVE" && sourceInfo.enabled !== false;
+                ruleEl.className = `assistant-state ${active && rewriteOn ? "ok" : "muted"}`;
+                ruleEl.textContent = active && rewriteOn ? "洗稿发送已开启" : "仅手动洗稿";
+            } else {
+                ruleEl.className = `assistant-state ${(autoOn || rewriteOn) ? "ok" : "muted"}`;
+                ruleEl.textContent = `${modeText} · 潜力≥${minScore}${isTpl ? " · 固定文案" : ""}`;
+            }
             ruleEl.hidden = false;
         }
         const profLink = $("repostPreviewProfileLink");
@@ -4255,11 +4318,12 @@
         }
     }
 
-    function renderRepostPreviewSubbar() {
+    function renderRepostPreviewSubbar(now = Date.now()) {
         const items = repostPreviewState.items || [];
         let repostCount = 0;
         let skipCount = 0;
         let rewriteCount = 0;
+        let reviewCount = 0;
         let pendingCount = 0;
         for (const it of items) {
             const dec = it.decision || {};
@@ -4269,8 +4333,9 @@
             } else {
                 pendingCount++;
             }
-            if (it?.rewrite?.candidate) {
-                rewriteCount++;
+            if (isTodayRewriteItem(it, now)) {
+                if (it.rewrite.candidate) rewriteCount++;
+                else reviewCount++;
             }
         }
         const filterEl = $("repostPreviewFilterBar");
@@ -4279,15 +4344,22 @@
                 { id: "ALL", label: `全部推文 ${items.length}` },
                 { id: "REPOST", label: `会转发 ${repostCount}` },
                 { id: "SKIP", label: `不转发 ${skipCount}` },
-                { id: "REWRITE", label: `会洗稿 ${rewriteCount}` }
+                { id: "REWRITE", label: reviewCount ? `今日洗稿 ${rewriteCount} · 待调优 ${reviewCount}` : `今日洗稿 ${rewriteCount}` }
             ];
             filterEl.innerHTML = filters.map((f) => {
                 const active = repostPreviewState.filterMode === f.id;
                 return `<button type="button" class="pill-chip sm${active ? " active" : ""}" data-repost-filter="${f.id}" aria-pressed="${active ? "true" : "false"}">${escapeHtml(f.label)}</button>`;
             }).join("");
         }
+        const rewriteMode = repostPreviewState.filterMode === "REWRITE";
+        const scopeEl = $("repostRewriteScope");
+        if (scopeEl) scopeEl.hidden = !rewriteMode;
         const evalRestBtn = $("repostPreviewEvalRestBtn");
         if (evalRestBtn) {
+            if (rewriteMode) {
+                evalRestBtn.hidden = true;
+                return;
+            }
             const unevaluated = items.filter((it) => !it.decision?.evaluated).length;
             const inFlight = repostPreviewState.evaluatingIds.size;
             if (repostPreviewState.evaluatingAccountOnce || inFlight > 0) {
@@ -4306,7 +4378,7 @@
         }
     }
 
-    function renderRewriteTimelineItemHtml(item, displayRank = 0) {
+    function renderRewriteTimelineItemHtml(item) {
         const mat = item?.material || {};
         const rw = item?.rewrite || {};
         const id = String(mat.id || "");
@@ -4322,7 +4394,7 @@
             ? verifiedSvgHtml(Boolean(mat.authorVerified ?? repostPreviewState.source?.verified))
             : "";
         const pubTime = Number(mat.publishedAt) > 0 && typeof formatAssistantDateTime === "function"
-            ? formatAssistantDateTime(Number(mat.publishedAt))
+            ? formatAssistantDateTime(Number(mat.publishedAt), "Asia/Shanghai")
             : "";
         const sourceUrl = resolveRepostMaterialUrl(mat);
         const pubTweetUrl = rw.publishedTweetUrl && typeof safeHttpUrl === "function"
@@ -4331,23 +4403,25 @@
 
         const formatMetric = (n) => typeof fmtNum === "function" ? fmtNum(n) : String(n);
         const metricParts = [];
+        if (Number.isFinite(rw.engagement)) metricParts.push(`热度 ${formatMetric(rw.engagement)}`);
+        if (Number.isFinite(rw.exposureRate)) metricParts.push(`曝光率 ${Number((rw.exposureRate * 100).toFixed(2))}%`);
         if (Number(mat.views) > 0) metricParts.push(`浏览 ${formatMetric(Number(mat.views))}`);
         if (Number(mat.reposts) > 0) metricParts.push(`转 ${formatMetric(Number(mat.reposts))}`);
         if (Number(mat.replies) > 0) metricParts.push(`评 ${formatMetric(Number(mat.replies))}`);
         if (Number(mat.likes) > 0) metricParts.push(`赞 ${formatMetric(Number(mat.likes))}`);
 
         const mainText = String(mat.articleText || mat.text || "");
-        const rankNum = Number(rw.rank || displayRank || 0);
+        const rankNum = Number(rw.rank || 0);
         const isPublished = !rw.unsentPreview && (rw.persistedStatus === "PUBLISHED" || rw.status === "PUBLISHED");
         const badgeMeta = isRewriting
             ? { cls: "running", label: "生成中…" }
             : rw.unsentPreview ? { cls: "muted", label: "未发送预览" } : (isPublished
                 ? { cls: "ok", label: "已洗稿" }
-                : (rw.evaluated ? { cls: rw.suitable ? "ok" : "running", label: rw.suitable ? "可洗稿" : "待调优" } : { cls: "ok", label: "会洗稿" }));
+                : (rw.evaluated ? { cls: rw.suitable ? "ok" : "running", label: rw.suitable ? "可洗稿" : "待调优" } : { cls: "muted", label: "洗稿候选" }));
         const scoreText = rw.evaluated && Number(rw.suitabilityScore) > 0 ? `适格 ${Number(rw.suitabilityScore)}` : "";
         const reasonParts = [rw.hookPattern ? `切口：${rw.hookPattern}` : "", rw.reason || ""].filter(Boolean);
         const reasonHtml = reasonParts.length
-            ? `<div class="author-timeline-reason is-pass">${escapeHtml(reasonParts.join(" · "))}</div>`
+            ? `<div class="author-timeline-reason is-pass" data-i18n-ignore>${escapeHtml(reasonParts.join(" · "))}</div>`
             : "";
 
         const owner = resolveRepostOwnerIdentity(repostPreviewState.owner);
@@ -4361,14 +4435,14 @@
         if (isRewriting && !rewriteVal) {
             previewSectionHtml = `<div class="timeline-owner-quote-box">
                 <div class="repost-owner-row">
-                    <div class="repost-owner-identity">${ownerAvatar}<strong>${escapeHtml(owner.displayName)}</strong><span>@${escapeHtml(owner.username)}</span></div>
+                    <div class="repost-owner-identity" data-i18n-ignore>${ownerAvatar}<strong>${escapeHtml(owner.displayName)}</strong><span>@${escapeHtml(owner.username)}</span></div>
                 </div>
                 <textarea class="repost-preview-comment is-loading" rows="2" readonly placeholder="生成洗稿中…"></textarea>
             </div>`;
         } else if (rewriteVal || repostPreviewState.editedRewrites.has(id)) {
             previewSectionHtml = `<div class="timeline-owner-quote-box">
                 <div class="repost-owner-row">
-                    <div class="repost-owner-identity">${ownerAvatar}<strong>${escapeHtml(owner.displayName)}</strong><span>@${escapeHtml(owner.username)}</span></div>
+                    <div class="repost-owner-identity" data-i18n-ignore>${ownerAvatar}<strong>${escapeHtml(owner.displayName)}</strong><span>@${escapeHtml(owner.username)}</span></div>
                     ${pubTweetUrl ? `<a class="link-inline-btn" href="${pubTweetUrl}" target="_blank" rel="noopener noreferrer">查看已发推文 ↗</a>` : ""}
                 </div>
                 <textarea class="repost-preview-comment${isRewriting ? " is-loading" : ""}" rows="6" maxlength="600" data-rewrite-text-input="${escapeHtml(id)}" aria-label="洗稿内容预览"${isRewriting || isPublished ? " readonly" : ""}>${escapeHtml(rewriteVal)}</textarea>
@@ -4390,7 +4464,7 @@
 
         return `<article class="author-timeline-item is-will-repost${isFocused ? " is-focused" : ""}" data-timeline-material="${escapeHtml(id)}">
             <div class="author-timeline-head">
-                <div class="author-timeline-who">
+                <div class="author-timeline-who" data-i18n-ignore>
                     ${srcAvatar}
                     <strong>${escapeHtml(srcName)}</strong>
                     ${srcVer}
@@ -4398,22 +4472,22 @@
                     ${pubTime ? `<span>· ${escapeHtml(pubTime)}</span>` : ""}
                 </div>
                 <div class="author-timeline-decision">
-                    ${rankNum > 0 ? `<span class="mini-tag blue">#${rankNum}</span>` : ""}
+                    ${rankNum > 0 ? `<span class="mini-tag blue" data-rewrite-rank>#${rankNum}</span>` : ""}
                     <span class="assistant-state ${badgeMeta.cls}">${escapeHtml(badgeMeta.label)}</span>
                     ${scoreText ? `<span class="timeline-dual-score">${escapeHtml(scoreText)}</span>` : ""}
                     ${sourceUrl ? `<a class="link-inline-btn" href="${sourceUrl}" target="_blank" rel="noopener noreferrer">原帖 ↗</a>` : ""}
                 </div>
             </div>
-            <div class="author-timeline-text">${escapeHtml(mainText)}</div>
-            ${metricParts.length ? `<div class="author-timeline-meta-row"><span>${escapeHtml(metricParts.join(" · "))}</span></div>` : ""}
+            <div class="author-timeline-text" data-i18n-ignore>${escapeHtml(mainText)}</div>
+            ${metricParts.length ? `<div class="author-timeline-meta-row"><span>${metricParts.map(part => `<span>${escapeHtml(part)}</span>`).join(" · ")}</span></div>` : ""}
             ${reasonHtml}
             ${previewSectionHtml}
         </article>`;
     }
 
-    function renderRepostTimelineItemHtml(item, displayRank = 0) {
+    function renderRepostTimelineItemHtml(item) {
         if (repostPreviewState.filterMode === "REWRITE") {
-            return renderRewriteTimelineItemHtml(item, displayRank);
+            return renderRewriteTimelineItemHtml(item);
         }
         const mat = item?.material || {};
         const dec = item?.decision || {};
@@ -4452,7 +4526,7 @@
 
         const mainText = String(mat.text || (!mat.quotedText && mat.articleText ? mat.articleText : "") || "（纯媒体或链接推文）");
         const quotedSubHtml = mat.quotedText
-            ? `<div class="author-timeline-quoted-sub">${escapeHtml(mat.quotedText)}</div>`
+            ? `<div class="author-timeline-quoted-sub" data-i18n-ignore>${escapeHtml(mat.quotedText)}</div>`
             : "";
 
         const code = String(dec.decisionCode || "");
@@ -4462,11 +4536,15 @@
         const reasonText = (isCdCode ? (dec.evaluated && !cdBaseIsCdText ? cdBase : "") : String(dec.reason || "")).trim();
         const reasonCls = willRepost ? " is-pass" : ((code === "SKIP_NOT_FIT" || code === "SKIP_LOW_HEAT") ? " is-mismatch" : "");
         const reasonHtml = reasonText
-            ? `<div class="author-timeline-reason${reasonCls}">${escapeHtml(reasonText)}</div>`
+            ? `<div class="author-timeline-reason${reasonCls}" data-i18n-ignore>${escapeHtml(reasonText)}</div>`
             : "";
 
         const rewrite = item.rewrite;
-        const rejectedRewrite = repostPreviewState.filterMode === "ALL" && rewrite?.evaluated && rewrite.status === "SKIPPED" && !rewrite.suitable;
+        const rejectedRewrite = repostPreviewState.filterMode === "ALL" && rewrite?.evaluated && !rewrite.candidate && !rewrite.manualReviewPreview
+                && !rewrite.suitable && ["SKIPPED", "EVALUATED"].includes(rewrite.status);
+        const receiptLabel = !rewrite?.unsentPreview && repostPreviewState.filterMode === "ALL"
+            && {PUBLISHED: "已洗稿发送", SENDING: "洗稿发送中", UNCERTAIN: "自动洗稿待核实"}[rewrite?.persistedStatus || rewrite?.status];
+        const receiptUrl = receiptLabel && rewrite.publishedTweetUrl ? safeHttpUrl(rewrite.publishedTweetUrl, "") : "";
         const owner = resolveRepostOwnerIdentity(repostPreviewState.owner);
         const ownerAvatar = typeof avatarHtml === "function"
             ? avatarHtml({ username: owner.username, displayName: owner.displayName, avatarUrl: owner.avatarUrl }, "sm")
@@ -4491,7 +4569,7 @@
         } else if (isEvaluating && !commentVal) {
             quoteSectionHtml = `<div class="timeline-owner-quote-box">
                 <div class="repost-owner-row">
-                    <div class="repost-owner-identity">${ownerAvatar}<strong>${escapeHtml(owner.displayName)}</strong><span>@${escapeHtml(owner.username)}</span></div>
+                    <div class="repost-owner-identity" data-i18n-ignore>${ownerAvatar}<strong>${escapeHtml(owner.displayName)}</strong><span>@${escapeHtml(owner.username)}</span></div>
                 </div>
                 <textarea class="repost-preview-comment is-loading" rows="2" readonly>生成中…</textarea>
             </div>`;
@@ -4504,7 +4582,7 @@
             if (isExpanded) {
                 quoteSectionHtml = `<div class="timeline-owner-quote-box">
                     <div class="repost-owner-row">
-                        <div class="repost-owner-identity">${ownerAvatar}<strong>${escapeHtml(owner.displayName)}</strong><span>@${escapeHtml(owner.username)}</span></div>
+                        <div class="repost-owner-identity" data-i18n-ignore>${ownerAvatar}<strong>${escapeHtml(owner.displayName)}</strong><span>@${escapeHtml(owner.username)}</span></div>
                     </div>
                     <textarea class="repost-preview-comment${isEvaluating ? " is-loading" : ""}" rows="6" maxlength="400" data-repost-comment-input="${escapeHtml(id)}" aria-label="转发附文预览"${isEvaluating ? " readonly" : ""}>${escapeHtml(commentVal)}</textarea>
                     <div class="repost-preview-actions">
@@ -4519,7 +4597,7 @@
                 </div>`;
             } else {
                 quoteSectionHtml = `<button type="button" class="timeline-skip-quote-toggle" data-repost-expand-item="${escapeHtml(id)}">
-                    <span class="timeline-skip-quote-snippet">${escapeHtml(commentVal)}</span>
+                    <span class="timeline-skip-quote-snippet" data-i18n-ignore>${escapeHtml(commentVal)}</span>
                     <span>▾</span>
                 </button>`;
             }
@@ -4537,7 +4615,7 @@
 
         return `<article class="author-timeline-item${willRepost ? " is-will-repost" : ""}${isFocused ? " is-focused" : ""}" data-timeline-material="${escapeHtml(id)}">
             <div class="author-timeline-head">
-                <div class="author-timeline-who">
+                <div class="author-timeline-who" data-i18n-ignore>
                     ${srcAvatar}
                     <strong>${escapeHtml(srcName)}</strong>
                     ${srcVer}
@@ -4553,23 +4631,27 @@
                     ${sourceUrl ? `<a class="link-inline-btn" href="${sourceUrl}" target="_blank" rel="noopener noreferrer">原帖 ↗</a>` : ""}
                 </div>
             </div>
-            <div class="author-timeline-text">${escapeHtml(mainText)}</div>
+            <div class="author-timeline-text" data-i18n-ignore>${escapeHtml(mainText)}</div>
             ${quotedSubHtml}
             ${metricParts.length ? `<div class="author-timeline-meta-row"><span>${escapeHtml(metricParts.join(" · "))}</span></div>` : ""}
             ${reasonHtml}
-            ${rejectedRewrite ? `<div class="author-timeline-reason is-mismatch">洗稿未通过 · ${escapeHtml(rewrite.reason || rewrite.ineligibleReason || "不符合洗稿条件")}</div>` : ""}
+            ${rejectedRewrite ? `<div class="author-timeline-reason is-mismatch" data-i18n-ignore>洗稿未通过 · ${escapeHtml(rewrite.reason || rewrite.ineligibleReason || "不符合洗稿条件")}</div>` : ""}
+            ${receiptLabel ? `<details class="timeline-owner-quote-box"><summary>${escapeHtml(receiptLabel)}</summary>
+                ${rewrite.rewrittenText ? `<p class="author-timeline-text" data-i18n-ignore>${escapeHtml(rewrite.rewrittenText)}</p>` : ""}
+                ${receiptUrl ? `<a class="link-inline-btn" href="${escapeHtml(receiptUrl)}" target="_blank" rel="noopener noreferrer">查看已发推文 ↗</a>` : ""}
+            </details>` : ""}
             ${!delivery && dec.publishedText && dec.publicationMode && dec.publishedText !== commentVal
                 ? `<div class="author-timeline-reason"><span>已发布正文</span> <span data-i18n-ignore>${escapeHtml(dec.publishedText)}</span></div>` : ""}
             ${quoteSectionHtml}
         </article>`;
     }
 
-    function itemMatchesRepostFilter(item) {
+    function itemMatchesRepostFilter(item, now = Date.now()) {
         const mode = repostPreviewState.filterMode;
         const settled = Boolean(item.decision?.evaluated || item.decision?.cdShortCircuited);
         if (mode === "REPOST") return Boolean(settled && item.decision?.wouldAutoRepost);
         if (mode === "SKIP") return Boolean(settled && !item.decision?.wouldAutoRepost);
-        if (mode === "REWRITE") return Boolean(item?.rewrite?.candidate);
+        if (mode === "REWRITE") return isTodayRewriteItem(item, now);
         return true;
     }
 
@@ -4585,16 +4667,14 @@
         if (repostPreviewState.source) {
             renderRepostPreviewHeader(repostPreviewState.source);
         }
-        renderRepostPreviewSubbar();
+        const now = Date.now();
+        renderRepostPreviewSubbar(now);
         const listEl = $("repostPreviewTimelineList");
         if (!listEl) return;
 
-        let visibleItems = (repostPreviewState.items || []).filter(itemMatchesRepostFilter);
+        const visibleItems = (repostPreviewState.items || []).filter(item => itemMatchesRepostFilter(item, now));
         if (repostPreviewState.filterMode === "REWRITE") {
-            visibleItems = [...visibleItems].sort((a, b) =>
-                (Number(b?.rewrite?.rankScore || 0) - Number(a?.rewrite?.rankScore || 0))
-                || (Number(b?.material?.publishedAt || 0) - Number(a?.material?.publishedAt || 0))
-            );
+            visibleItems.sort((a, b) => (a.rewrite.rank || Infinity) - (b.rewrite.rank || Infinity));
         }
 
         if (singleMaterialId && (repostPreviewState.filterMode === "ALL" || repostPreviewState.filterMode === "REWRITE") && typeof listEl.querySelector === "function") {
@@ -4605,27 +4685,37 @@
             const activeInput = typeof document !== "undefined" ? document.activeElement : null;
             const activeEditingOther = activeInput && (activeInput.dataset?.repostCommentInput || activeInput.dataset?.rewriteTextInput)
                 && (activeInput.dataset.repostCommentInput || activeInput.dataset.rewriteTextInput) !== singleMaterialId;
-            if (existingRow && activeEditingOther) {
+            if (existingRow && activeEditingOther && visibleItems.length) {
                 const idx = visibleItems.findIndex((it) => String(it.material?.id || "") === singleMaterialId);
+                if (repostPreviewState.filterMode === "REWRITE") {
+                    const rows = new Map(Array.from(listEl.children, node => [node.dataset.timelineMaterial, node]));
+                    for (const item of visibleItems) {
+                        const badge = rows.get(String(item.material.id))?.querySelector("[data-rewrite-rank]");
+                        if (badge && item.rewrite.rank) badge.textContent = `#${item.rewrite.rank}`;
+                    }
+                    if (idx < 0) {
+                        existingRow.remove();
+                        return;
+                    }
+                    const nextRow = rows.get(String(visibleItems[idx + 1]?.material.id)) || null;
+                    if (existingRow.nextElementSibling !== nextRow) listEl.insertBefore(existingRow, nextRow);
+                }
                 if (idx >= 0) {
-                    existingRow.outerHTML = renderRepostTimelineItemHtml(visibleItems[idx], idx + 1);
+                    existingRow.outerHTML = renderRepostTimelineItemHtml(visibleItems[idx]);
                     return;
                 }
             }
         }
 
         if (!visibleItems.length) {
-            const emptyMsg = repostPreviewState.items.length
-                ? (repostPreviewState.filterMode === "REPOST"
-                    ? "当前已评估推文中暂无满足「会火且适合当前账号」的条目。"
-                    : (repostPreviewState.filterMode === "REWRITE"
-                        ? "当前暂无满足「纯文本（无图/视频/引用）且高热度」的洗稿候选推文。"
-                        : "当前筛选下暂无推文。"))
-                : "该监听作者暂无可预览的近期推文。";
+            let emptyMsg = "当前筛选下暂无推文。";
+            if (repostPreviewState.filterMode === "REWRITE") emptyMsg = "这位作者今天暂无符合条件的洗稿原帖。";
+            else if (!repostPreviewState.items.length) emptyMsg = "该监听作者暂无可预览的近期推文。";
+            else if (repostPreviewState.filterMode === "REPOST") emptyMsg = "当前已评估推文中暂无满足「会火且适合当前账号」的条目。";
             listEl.innerHTML = `<div class="assistant-empty compact" style="margin:16px;">${escapeHtml(emptyMsg)}</div>`;
             return;
         }
-        listEl.innerHTML = visibleItems.map((it, idx) => renderRepostTimelineItemHtml(it, idx + 1)).join("");
+        listEl.innerHTML = visibleItems.map(renderRepostTimelineItemHtml).join("");
     }
 
     async function evaluateSingleTimelineItem(materialId, forceRegenerate, token, expandOnFinish = false, forceWriteComment = false) {
@@ -4641,26 +4731,7 @@
         if (expandOnFinish) repostPreviewState.expandedIds.add(id);
         renderRepostPreviewTimeline(id);
         try {
-            const reqBody = {
-                ...(repostPreviewState.overrides || {}),
-                materialId: id
-            };
-            const modalChk = $("repostPolishEnabledCheck");
-            const modalPromptEl = $("repostPolishPromptInput");
-            if (modalChk && typeof modalChk.checked === "boolean") {
-                reqBody.postPolishEnabled = Boolean(modalChk.checked);
-            }
-            if (modalPromptEl && typeof modalPromptEl.value === "string" && modalPromptEl.value.trim()) {
-                reqBody.postPolishPrompt = modalPromptEl.value.trim();
-            }
-            const repostGenSel = $("repostGenTargetSelect");
-            const repostEffSel = $("repostGenEffortSelect");
-            const genTarget = parseGenerationTargetSpec(
-                repostGenSel?.value || state.assistantGenerationTargetSpec,
-                repostEffSel ? repostEffSel.value : state.assistantGenerationEffort
-            );
-            reqBody.generationProvider = genTarget.generationProvider;
-            reqBody.generationModel = genTarget.generationModel;
+            const reqBody = { ...repostPreviewState.overrides, ...previewGenerationOptions(), materialId: id };
             if (forceRegenerate) reqBody.forceRegenerate = true;
             if (forceWriteComment || forceRegenerate || id === repostPreviewState.focusedMaterialId) {
                 reqBody.forceWriteComment = true;
@@ -4708,33 +4779,17 @@
         const id = String(materialId || "").trim();
         if (!id || token !== repostPreviewState.requestToken) return;
         if (repostPreviewState.rewritingIds.has(id)) return;
+        const row = repostPreviewState.items.find(item => String(item.material?.id || "") === id);
+        if (!requireTodayRewrite(row)) return;
         repostPreviewState.rewritingIds.add(id);
-        const initial = repostPreviewState.items.find((item) => String(item.material?.id || "") === id)?.rewrite;
+        const initial = row.rewrite;
+        const initialFingerprint = row.material.sourceFingerprint;
         const initialStatus = initial?.status;
         const initialVersion = Number(initial?.recordVersion || 0);
         const previousEdit = repostPreviewState.editedRewrites.get(id);
         renderRepostPreviewTimeline(id);
         try {
-            const reqBody = {
-                ...(repostPreviewState.overrides || {}),
-                materialId: id
-            };
-            const modalChk = $("repostPolishEnabledCheck");
-            const modalPromptEl = $("repostPolishPromptInput");
-            if (modalChk && typeof modalChk.checked === "boolean") {
-                reqBody.postPolishEnabled = Boolean(modalChk.checked);
-            }
-            if (modalPromptEl && typeof modalPromptEl.value === "string" && modalPromptEl.value.trim()) {
-                reqBody.postPolishPrompt = modalPromptEl.value.trim();
-            }
-            const repostGenSel = $("repostGenTargetSelect");
-            const repostEffSel = $("repostGenEffortSelect");
-            const genTarget = parseGenerationTargetSpec(
-                repostGenSel?.value || state.assistantGenerationTargetSpec,
-                repostEffSel ? repostEffSel.value : state.assistantGenerationEffort
-            );
-            reqBody.generationProvider = genTarget.generationProvider;
-            reqBody.generationModel = genTarget.generationModel;
+            const reqBody = { ...repostPreviewState.overrides, ...previewGenerationOptions(), materialId: id };
             if (forceRegenerate) reqBody.forceRegenerate = true;
             const res = await contentAssistantRequest(
                 `/sources/${encodeURIComponent(repostPreviewState.sourceKey)}/rewrite-preview`,
@@ -4745,6 +4800,8 @@
             const target = repostPreviewState.items.find((it) => String(it.material?.id || "") === id);
             if (String(res?.material?.id || "") !== id || !res?.rewrite) throw new Error("返回的素材与所选原帖不一致，请刷新重试");
             if (target) {
+                if (target.material?.sourceFingerprint !== initialFingerprint
+                        && res.material.sourceFingerprint !== target.material?.sourceFingerprint) return;
                 const current = target.rewrite;
                 const status = current?.status;
                 const currentVersion = Number(current?.recordVersion || 0);
@@ -4753,9 +4810,11 @@
                 if (currentVersion > Number(res.rewrite.recordVersion || 0)
                         || newerReceipt && status !== res.rewrite.status
                         && (status === "PUBLISHED" || !["PUBLISHED", "UNCERTAIN"].includes(res.rewrite.status))) return;
-                target.rewrite = { ...(target.rewrite || {}), ...res.rewrite };
+                applyRankedRewritePreview(target, res.rewrite);
                 target.material = res.material;
-                if (forceRegenerate && res.rewrite.rewrittenText?.trim() && repostPreviewState.editedRewrites.get(id) === previousEdit) {
+                if (!isTodayRewriteItem(target)) {
+                    showToast(res.rewrite.ineligibleReason || res.rewrite.reason || "这条原帖已不在今日洗稿候选中");
+                } else if (forceRegenerate && res.rewrite.rewrittenText?.trim() && repostPreviewState.editedRewrites.get(id) === previousEdit) {
                     repostPreviewState.editedRewrites.delete(id);
                 }
             }
@@ -4808,24 +4867,8 @@
             .filter(id => repostPreviewState.editedComments.has(id)).map(id => [id, repostPreviewState.editedComments.get(id)])) : null;
         renderRepostPreviewSubbar();
         try {
-            const reqBody = { ...(repostPreviewState.overrides || {}) };
+            const reqBody = { ...repostPreviewState.overrides, ...previewGenerationOptions() };
             if (repostPreviewState.focusedMaterialId) reqBody.materialId = repostPreviewState.focusedMaterialId;
-            const modalChk = $("repostPolishEnabledCheck");
-            const modalPromptEl = $("repostPolishPromptInput");
-            if (modalChk && typeof modalChk.checked === "boolean") {
-                reqBody.postPolishEnabled = Boolean(modalChk.checked);
-            }
-            if (modalPromptEl && typeof modalPromptEl.value === "string" && modalPromptEl.value.trim()) {
-                reqBody.postPolishPrompt = modalPromptEl.value.trim();
-            }
-            const repostGenSel = $("repostGenTargetSelect");
-            const repostEffSel = $("repostGenEffortSelect");
-            const genTarget = parseGenerationTargetSpec(
-                repostGenSel?.value || state.assistantGenerationTargetSpec,
-                repostEffSel ? repostEffSel.value : state.assistantGenerationEffort
-            );
-            reqBody.generationProvider = genTarget.generationProvider;
-            reqBody.generationModel = genTarget.generationModel;
             if (forceRegenerate) reqBody.forceRegenerate = true;
             const data = await contentAssistantRequest(
                 `/sources/${encodeURIComponent(repostPreviewState.sourceKey)}/evaluate-once`,
@@ -4884,13 +4927,17 @@
         if (!key) return;
         const token = ++repostPreviewState.requestToken;
         repostPreviewState.sourceKey = key;
+        repostPreviewState.timelineDayStart = beijingRewriteDayStart(Date.now());
         repostPreviewState.evaluatingAccountOnce = false;
         repostPreviewState.cooldown = null;
         repostPreviewState.evaluatingIds.clear();
         repostPreviewState.rewritingIds.clear();
         repostPreviewState.expandedIds.clear();
         repostPreviewState.items = [];
-        repostPreviewState.filterMode = options.filterMode === "REWRITE" ? "REWRITE" : "ALL";
+        const rewriteMode = options.filterMode === "REWRITE";
+        repostPreviewState.filterMode = rewriteMode ? "REWRITE" : "ALL";
+        repostPreviewState.rewriteTimelineLoaded = rewriteMode;
+        if (repostPreviewState.source) renderRepostPreviewHeader(repostPreviewState.source);
         if (repostPreviewState.focusedMaterialId) {
             repostPreviewState.expandedIds.add(repostPreviewState.focusedMaterialId);
         }
@@ -4902,10 +4949,12 @@
         renderRepostPreviewSubbar();
 
         try {
+            const reqBody = { ...repostPreviewState.overrides };
+            if (repostPreviewState.focusedMaterialId) reqBody.materialId = repostPreviewState.focusedMaterialId;
+            if (rewriteMode) Object.assign(reqBody, previewGenerationOptions(), {rewriteToday: true});
             const data = await contentAssistantRequest(
                 `/sources/${encodeURIComponent(key)}/timeline`,
-                { ...(repostPreviewState.overrides || {}), ...(repostPreviewState.focusedMaterialId
-                    ? { materialId: repostPreviewState.focusedMaterialId } : {}) },
+                reqBody,
                 35000
             );
             if (token !== repostPreviewState.requestToken) return;
@@ -4948,10 +4997,27 @@
             }
         } catch (err) {
             if (token !== repostPreviewState.requestToken) return;
+            repostPreviewState.rewriteTimelineLoaded = false;
             if (listEl) {
                 listEl.innerHTML = `<div class="assistant-empty compact" style="margin:18px;">${escapeHtml(formatLocalizedFetchError(err, "加载监听作者推文失败，请稍后重试"))}</div>`;
             }
         }
+    }
+
+    function refreshRewriteDay() {
+        const modal = $("repostPreviewModal");
+        if (!modal || modal.hidden) return false;
+        const now = Date.now();
+        const today = beijingRewriteDayStart(now);
+        clearTimeout(repostPreviewState.rewriteDayTimer);
+        repostPreviewState.rewriteDayTimer = setTimeout(refreshRewriteDay, today + 86_400_000 - now);
+        if (repostPreviewState.timelineDayStart === today && (repostPreviewState.filterMode !== "REWRITE" || repostPreviewState.rewriteTimelineLoaded)) return false;
+        if (repostPreviewState.filterMode === "REWRITE") {
+            void loadAuthorTimelinePreview(repostPreviewState.sourceKey, { filterMode: "REWRITE" });
+            return true;
+        }
+        renderRepostPreviewSubbar(now);
+        return false;
     }
 
     function openRepostPreviewModal(sourceKey, options = {}) {
@@ -4970,14 +5036,15 @@
             : {};
         repostPreviewState.focusedMaterialId = options.materialId ? String(options.materialId) : "";
         repostPreviewState.source = { ...knownSource, ...repostPreviewState.overrides };
-        renderRepostPreviewHeader(repostPreviewState.source);
         modal.hidden = false;
         syncBodyModalLock();
         onModalOpened("repostPreviewModal", modal);
         void loadAuthorTimelinePreview(key, options);
+        refreshRewriteDay();
     }
 
     function closeRepostPreviewModal(fromPopstate = false) {
+        clearTimeout(repostPreviewState.rewriteDayTimer);
         repostPreviewState.requestToken++;
         repostPreviewState.evaluatingIds.clear();
         repostPreviewState.rewritingIds.clear();
@@ -5153,10 +5220,10 @@
         return [material.text, material.quotedText, material.articleText].filter(Boolean).join("\n\n");
     }
 
-    function formatAssistantDateTime(value) {
+    function formatAssistantDateTime(value, timeZone) {
         const date = new Date(value);
         return Number.isFinite(date.getTime()) ? date.toLocaleString("zh-CN", {
-            month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit"
+            timeZone, month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit"
         }) : "";
     }
 
@@ -6042,6 +6109,16 @@
                 selectEl.value = currentVal;
             }
         }
+        const rewriteStatusEl = $("assistantRewriteStatus");
+        if (rewriteStatusEl) {
+            const sources = dashboard.sources || [];
+            const activeCount = sources.filter(source => source.autoRewriteEnabled === true && source.enabled !== false
+                && String(source.status || "ACTIVE").toUpperCase() === "ACTIVE").length;
+            rewriteStatusEl.hidden = !sources.length;
+            rewriteStatusEl.textContent = activeCount
+                ? `${activeCount} 位监听作者已开启自动洗稿。`
+                : "尚无监听作者开启自动洗稿。点作者旁的「今日洗稿」可手动生成，勾选「洗稿发送」可开启自动发送。";
+        }
         const sourcesListEl = $("assistantSourcesList");
         if (sourcesListEl && !sourcesListEl.contains(document.activeElement)) {
             sourcesListEl.innerHTML = (dashboard.sources || []).length
@@ -6090,7 +6167,7 @@
                                 </div>
                             </div>
                             <div class="assistant-source-controls">
-                                <button type="button" class="x-outline-pill sm" data-source-repost-preview="${esc(source.id)}" data-source-preview-mode="REWRITE">洗稿</button>
+                                <button type="button" class="x-outline-pill sm" data-source-repost-preview="${esc(source.id)}" data-source-preview-mode="REWRITE">今日洗稿</button>
                                 <label class="assistant-setting-toggle is-inline"><input type="checkbox" data-source-autorepost-toggle="${esc(source.id)}"${autoOn ? " checked" : ""} /><span>自动转推</span></label>
                                 <label class="assistant-setting-toggle is-inline" title="找出该账号高流量纯文本内容进行学习与改写，共用全局时间锁间隔发送（不引用原帖）"><input type="checkbox" data-source-autorewrite-toggle="${esc(source.id)}"${rewriteOn ? " checked" : ""} /><span>洗稿发送</span></label>
                                 <select class="x-select assistant-tier-select" data-assistant-source-tier="${esc(source.id)}" aria-label="采集档位">
@@ -11094,6 +11171,7 @@
         window.addEventListener("pagehide", () => { void persistScheduleDraftNow(); });
         document.addEventListener("visibilitychange", () => {
             if (document.hidden) void persistScheduleDraftNow();
+            else refreshRewriteDay();
             refreshSchedulePollingState();
             if (!document.hidden && isLoggedIn() && (state.activeTab === "schedule" || state.watchedResendIds.size > 0)) {
                 void loadScheduledTweets(true);
@@ -11506,13 +11584,16 @@
             if (rewriteToggle) {
                 const sourceId = rewriteToggle.dataset.sourceAutorewriteToggle;
                 const enabled = Boolean(rewriteToggle.checked);
+                rewriteToggle.disabled = true;
                 if (document.activeElement && $("assistantSourcesList")?.contains(document.activeElement)) {
                     document.activeElement.blur();
                 }
                 const updated = await runAssistantMutation("source-autorewrite",
                     `/sources/${encodeURIComponent(sourceId)}/config`,
                     { autoRewriteEnabled: enabled });
+                rewriteToggle.disabled = false;
                 if (updated) showToast(enabled ? "已开启高流量纯文本洗稿发送" : "已关闭洗稿发送");
+                else rewriteToggle.checked = (state.assistantDashboard?.sources || []).find(s => s.id === sourceId)?.autoRewriteEnabled === true;
                 return;
             }
             const modeSelect = event.target.closest("[data-source-autorepost-mode]");
@@ -12294,6 +12375,7 @@
             const nextMode = btn.dataset.repostFilter || "ALL";
             if (repostPreviewState.filterMode === nextMode) return;
             repostPreviewState.filterMode = nextMode;
+            if (nextMode === "REWRITE" && refreshRewriteDay()) return;
             renderRepostPreviewTimeline();
         });
         document.getElementById("repostPreviewEvalRestBtn")?.addEventListener("click", () => {
@@ -12385,6 +12467,12 @@
                 }
                 return;
             }
+            const rwIntent = event.target?.closest?.("[data-rewrite-intent-link]");
+            if (rwIntent) {
+                const row = repostPreviewState.items.find(item => String(item.material?.id || "") === rwIntent.dataset.rewriteIntentLink);
+                if (!requireTodayRewrite(row)) event.preventDefault();
+                return;
+            }
             const rwCopyBtn = event.target?.closest?.("[data-rewrite-copy-item]");
             if (rwCopyBtn) {
                 const id = rwCopyBtn.dataset.rewriteCopyItem || "";
@@ -12407,6 +12495,7 @@
                     showToast("发布账号已变更，请重新打开来源时间线");
                     return;
                 }
+                if (!requireTodayRewrite(row)) return;
                 const text = getRewriteItemText(id).trim();
                 if (!text) {
                     showToast("暂无可转入定时的洗稿内容");
@@ -12416,6 +12505,10 @@
                 const storedRef = !locked && repostPreviewState.editedRewrites.reference?.(id);
                 const rewriteSource = storedRef || { ownerAccountId: ownerId, materialId: id, recordVersion: Number(row.rewrite?.savedDraftVersion || 0) };
                 if (!storedRef && row.rewrite?.previewId) rewriteSource.previewId = row.rewrite.previewId;
+                if (isManualRewritePreview(row.rewrite) && !rewriteSource.previewId) {
+                    showToast("请先重新生成洗稿预览再转入排期");
+                    return;
+                }
                 if (sendTextDraftToSchedule(text, [], null, rewriteSource) !== false) {
                     closeRepostPreviewModal();
                     showToast("已转入排期草稿，请确认时间后加入队列");

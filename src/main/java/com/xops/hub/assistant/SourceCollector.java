@@ -377,8 +377,7 @@ public class SourceCollector {
     }
 
     /**
-     * Ensures recent posts and engagement metrics are synced for an account with pure-text wash-rewrite enabled,
-     * then returns all stored posts of this author within {@code maxAgeMs}.
+     * Refreshes the current Beijing day's source posts. Each day has its own pagination cursor.
      */
     List<ObjectNode> syncSourceMaterialsForRewrite(ObjectNode source, long maxAgeMs) {
         if (source == null) return List.of();
@@ -386,15 +385,22 @@ public class SourceCollector {
         String username = source.path("username").asText("").replaceFirst("^@+", "").strip();
         if (authorId.isBlank()) return List.of();
         long nowMs = clock.millis();
+        long dayStart = AutoRepostService.rewriteDayStart(nowMs);
+        long since = maxAgeMs > 0 ? Math.max(dayStart, nowMs - maxAgeMs) : dayStart;
         ObjectNode scan = provider == null || username.isBlank() ? null : store.tx(tx -> {
             ObjectNode live = tx.get("source", authorId);
             if (live == null || !"ACTIVE".equals(live.path("status").asText())
                     || !live.path("autoRewriteEnabled").asBoolean()
                     || !AssistantWorkflow.settings(tx).path("enabled").asBoolean(true)) return null;
-            long lastAttempt = live.path("rewriteLastAttemptAt").asLong();
-            if (live.path("rewriteBackfillComplete").asBoolean())
-                lastAttempt = Math.max(lastAttempt, live.path("lastSuccessAt").asLong());
-            if (lastAttempt > 0 && nowMs - lastAttempt < 10L * 60_000L) return null;
+            if (live.path("rewriteScanDayStart").asLong(-1) != dayStart) {
+                live.remove(List.of("rewriteCursor", "rewriteCursorFailures", "rewriteBackfillComplete"));
+                live.put("rewriteScanDayStart", dayStart);
+            } else {
+                long lastAttempt = live.path("rewriteLastAttemptAt").asLong();
+                if (live.path("rewriteBackfillComplete").asBoolean())
+                    lastAttempt = Math.max(lastAttempt, live.path("lastSuccessAt").asLong());
+                if (lastAttempt > 0 && nowMs - lastAttempt < 10L * 60_000L) return null;
+            }
             return tx.put("source", authorId, live.put("rewriteLastAttemptAt", nowMs));
         });
         if (scan != null) {
@@ -409,22 +415,22 @@ public class SourceCollector {
                 );
                 if (page != null) {
                     long completedAt = clock.millis();
-                    long commitCutoff = AssistantRetention.cutoffMillis(completedAt);
                     store.tx(tx -> {
                         ObjectNode live = tx.get("source", authorId);
                         if (live == null || !"ACTIVE".equals(live.path("status").asText())
                                 || !live.path("autoRewriteEnabled").asBoolean()
                                 || !scan.path("instanceId").equals(live.path("instanceId"))
-                                || live.path("rewriteLastAttemptAt").asLong() != nowMs) return null;
+                                || live.path("rewriteLastAttemptAt").asLong() != nowMs
+                                || AutoRepostService.rewriteDayStart(completedAt) != dayStart) return null;
                         for (TextPost post : page.posts()) {
-                            if (!authorId.equals(post.authorId()) || post.publishedAt().toEpochMilli() < commitCutoff
+                            if (!authorId.equals(post.authorId()) || post.publishedAt().toEpochMilli() < since
                                     || post.publishedAt().toEpochMilli() > completedAt) continue;
                             AssistantWorkflow.ingest(tx, toMaterial(post, page.author(), false));
                         }
                         cacheRewritePage(tx, authorId, page, completedAt);
                         boolean complete = scan.path("rewriteBackfillComplete").asBoolean() || page.exhausted()
                                 || page.nextCursor().isBlank() || page.nextCursor().equals(cursor)
-                                || crossedListenerBoundary(page.posts(), completedAt - AutoRepostService.REWRITE_MAX_AGE_MS);
+                                || crossedListenerBoundary(page.posts(), dayStart);
                         updateSourceProfile(live, authorId, page.author());
                         if (cursor.isBlank()) live.put("lastSuccessAt", completedAt);
                         tx.put("source", authorId, live.put("rewriteBackfillComplete", complete)
@@ -446,9 +452,8 @@ public class SourceCollector {
                 });
             }
         }
-        long maxAge = maxAgeMs > 0 ? Math.min(maxAgeMs, AutoRepostService.REWRITE_MAX_AGE_MS) : AutoRepostService.REWRITE_MAX_AGE_MS;
         long until = clock.millis();
-        return store.tx(tx -> tx.rewriteWindow(authorId, username, until - maxAge, until));
+        return store.tx(tx -> tx.rewriteWindow(authorId, username, Math.max(since, AutoRepostService.rewriteDayStart(until)), until));
     }
 
     private void cacheRewritePage(AssistantStore.Tx tx, String authorId, TextPostPage page, long nowMs) {
@@ -546,7 +551,7 @@ public class SourceCollector {
                 next.put("autoRewriteEnabled", rewriteEnabled);
                 if (rewriteEnabled && !wasRewriteEnabled) {
                     next.put("autoRewriteEnabledAt", now);
-                    next.remove(List.of("rewriteBackfillComplete", "rewriteCursor", "rewriteLastAttemptAt", "rewriteCursorFailures"));
+                    next.remove(List.of("rewriteBackfillComplete", "rewriteCursor", "rewriteLastAttemptAt", "rewriteCursorFailures", "rewriteScanDayStart"));
                 }
             }
             if (body.has("autoRepostTextMode")) {
@@ -610,7 +615,7 @@ public class SourceCollector {
                         .put("cursorFailures", 0).put("scanSince", resumeAnchor).put("error", "");
                 next.remove("anchorSince");
                 if (!"ACTIVE".equals(current.path("status").asText()))
-                    next.remove(List.of("rewriteBackfillComplete", "rewriteCursor", "rewriteLastAttemptAt", "rewriteCursorFailures"));
+                    next.remove(List.of("rewriteBackfillComplete", "rewriteCursor", "rewriteLastAttemptAt", "rewriteCursorFailures", "rewriteScanDayStart"));
             }
             return tx.put("source", id, next);
         });

@@ -285,6 +285,17 @@ previewCtx.renderAssistantMonitor({
     settings: { provider: "chatgpt", model: "gpt-6.2-astra low", version: 1 }
 });
 assert.match(previewEls.assistantSourcesList.innerHTML, /class="assistant-avatar-preview-btn" data-source-repost-preview="src-openai"/);
+assert.match(previewEls.assistantSourcesList.innerHTML, /data-source-preview-mode="REWRITE">今日洗稿</);
+assert.match(previewEls.assistantRewriteStatus.textContent, /尚无监听作者开启自动洗稿/);
+assert.match(previewEls.assistantRewriteStatus.textContent, /今日洗稿.*手动/);
+previewCtx.renderAssistantMonitor({
+    sources: [
+        { id: "src-openai", status: "ACTIVE", autoRewriteEnabled: true },
+        { id: "s2", status: "PAUSED", autoRewriteEnabled: true },
+        { id: "s3", status: "ACTIVE", autoRepostEnabled: true }
+    ]
+});
+assert.match(previewEls.assistantRewriteStatus.textContent, /1 位监听作者已开启自动洗稿/);
 
 previewCtx.__repostPreviewState.owner = { accountId: "42", username: "elidlicom", displayName: "Litany", avatarUrl: "/author-avatar.webp" };
 previewCtx.__repostPreviewState.source = {
@@ -493,22 +504,25 @@ assert.deepEqual(
     { generationProvider: "minimax", generationModel: "MiniMax-M2.7" }
 );
 
-// Rewrite ("会洗稿") tab filtering, priority ordering, and interactive preview UI
+// Beijing midnight is 16:00 UTC; the two neighboring posts share a UTC date.
+const beijingMidnight = Date.parse("2026-11-27T16:00:00Z");
+let rewriteClock = beijingMidnight + 3_600_000;
+previewCtx.Date = class extends Date { static now() { return rewriteClock; } };
 previewCtx.__repostPreviewState.items = [
     {
         material: {
             id: "rw-older", username: "sama", authorName: "Sam Altman", authorVerified: true,
-            publishedAt: 1732400000000, kind: "POST", hasMedia: false,
+            publishedAt: rewriteClock - 1000, kind: "POST", hasMedia: false,
             text: "Older high-heat pure text post on team speed.",
             sourceUrl: "https://x.com/sama/status/rw-older", views: 45000, likes: 920
         },
         decision: { evaluated: true, wouldAutoRepost: false, decisionCode: "SKIP_NOT_FIT" },
-        rewrite: { candidate: true, pureText: true, highTraffic: true, rank: 2, rankScore: 76.5, evaluated: false, rewrittenText: "" }
+        rewrite: { candidate: true, pureText: true, highTraffic: true, rank: 2, rankScore: 98.2, exposureRate: null, evaluated: false, rewrittenText: "" }
     },
     {
         material: {
             id: "rw-media", username: "sama", authorName: "Sam Altman", authorVerified: true,
-            publishedAt: 1732450000000, kind: "POST", hasMedia: true,
+            publishedAt: rewriteClock, kind: "POST", hasMedia: true,
             text: "Image attachment tweet should not appear under 会洗稿.",
             sourceUrl: "https://x.com/sama/status/rw-media", views: 190000, likes: 4800
         },
@@ -518,23 +532,35 @@ previewCtx.__repostPreviewState.items = [
     {
         material: {
             id: "rw-top", username: "sama", authorName: "Sam Altman", authorVerified: true,
-            publishedAt: 1732445000000, kind: "POST", hasMedia: false,
+            publishedAt: beijingMidnight, kind: "POST", hasMedia: false,
             text: "Recent pure-text high-traffic insight about inference economics.",
             sourceUrl: "https://x.com/sama/status/rw-top", views: 60000, likes: 1400
         },
         decision: { evaluated: true, wouldAutoRepost: false, decisionCode: "SKIP_NOT_FIT" },
-        rewrite: { candidate: true, pureText: true, highTraffic: true, rank: 1, rankScore: 98.2, evaluated: false, rewrittenText: "" }
-    }
+        rewrite: { candidate: true, pureText: true, highTraffic: true, rank: 1, rankScore: 98.2, engagement: 525, exposureRate: 1.254, evaluated: false, rewrittenText: "" }
+    },
+    { material: {id: "rw-yesterday", text: "历史原帖", publishedAt: beijingMidnight - 1}, decision: {},
+        rewrite: {candidate: true, rank: 3, status: "PUBLISHED", rewrittenText: "历史发送正文", publishedTweetUrl: "https://x.com/i/status/903"} },
+    { material: {id: "rw-future", publishedAt: rewriteClock + 1000}, decision: {}, rewrite: {candidate: true, rank: 4} },
+    { material: {id: "rw-undated"}, decision: {}, rewrite: {candidate: true, rank: 5} }
 ];
 previewCtx.__repostPreviewState.filterMode = "ALL";
 previewCtx.renderRepostPreviewTimeline();
-assert.match(previewEls.repostPreviewFilterBar.innerHTML, /会洗稿 2/);
+assert.match(previewEls.repostPreviewFilterBar.innerHTML, /今日洗稿 2/);
+assert.match(previewEls.repostPreviewTimelineList.innerHTML, /历史发送正文/);
+assert.match(previewEls.repostPreviewTimelineList.innerHTML, /href="https:\/\/x\.com\/i\/status\/903"/);
+assert.doesNotMatch(previewEls.repostPreviewTimelineList.innerHTML, /data-rewrite-schedule-item="rw-yesterday"/);
 
 previewCtx.__repostPreviewState.filterMode = "REWRITE";
 previewCtx.renderRepostPreviewTimeline();
 assert.match(previewEls.repostPreviewTimelineList.innerHTML, /#1/);
 assert.match(previewEls.repostPreviewTimelineList.innerHTML, /#2/);
-assert.doesNotMatch(previewEls.repostPreviewTimelineList.innerHTML, /rw-media/);
+assert.doesNotMatch(previewEls.repostPreviewTimelineList.innerHTML, /rw-media|rw-yesterday|rw-future|rw-undated/);
+assert.equal(previewEls.repostPreviewEvalRestBtn.hidden, true, "the quote batch action does not evaluate rewrite candidates");
+assert.equal(previewEls.repostDualCdBar.hidden, true, "the quote cooldown does not block manual rewrites");
+assert.match(previewEls.repostPreviewTimelineList.innerHTML, /热度 525/);
+assert.match(previewEls.repostPreviewTimelineList.innerHTML, /曝光率 125.4%/);
+assert.doesNotMatch(previewEls.repostPreviewTimelineList.innerHTML, /曝光率 0%/);
 assert.ok(
     previewEls.repostPreviewTimelineList.innerHTML.indexOf("rw-top")
     < previewEls.repostPreviewTimelineList.innerHTML.indexOf("rw-older")
@@ -557,6 +583,26 @@ assert.match(previewEls.repostPreviewTimelineList.innerHTML, /data-rewrite-regen
 assert.match(previewEls.repostPreviewTimelineList.innerHTML, /data-rewrite-copy-item="rw-top"/);
 assert.match(previewEls.repostPreviewTimelineList.innerHTML, /data-rewrite-schedule-item="rw-top"/);
 assert.doesNotMatch(previewEls.repostPreviewTimelineList.innerHTML, /x\.com\/sama\/status\/rw-top.*data-rewrite-intent-link/);
+
+// A server-confirmed manual draft can be edited after a low suitability judgment.
+const manual = previewCtx.__repostPreviewState.items[2];
+Object.assign(manual.rewrite, {candidate: false, rank: 0, status: "EVALUATED", suitable: false,
+    manualReviewPreview: true, previewId: "issued-for-today"});
+previewCtx.renderRepostPreviewTimeline();
+assert.match(previewEls.repostPreviewFilterBar.innerHTML, /今日洗稿 1 · 待调优 1/);
+assert.match(previewEls.repostPreviewTimelineList.innerHTML, /待调优/);
+assert.match(previewEls.repostPreviewTimelineList.innerHTML, /data-rewrite-text-input="rw-top"/);
+assert.ok(previewEls.repostPreviewTimelineList.innerHTML.indexOf("rw-older") < previewEls.repostPreviewTimelineList.innerHTML.indexOf("rw-top"));
+assert.doesNotMatch(previewCtx.renderRewriteTimelineItemHtml(manual, 3), /#3/);
+for (const status of ["PUBLISHED", "SENDING", "EVALUATING", "UNCERTAIN"]) {
+    manual.rewrite.persistedStatus = status;
+    previewCtx.renderRepostPreviewTimeline();
+    assert.doesNotMatch(previewEls.repostPreviewTimelineList.innerHTML, /rw-top/);
+}
+manual.rewrite.persistedStatus = "";
+manual.material.publishedAt = beijingMidnight - 1;
+previewCtx.renderRepostPreviewTimeline();
+assert.doesNotMatch(previewEls.repostPreviewTimelineList.innerHTML, /rw-top/);
 
 // History archive status copy (completed backfill vs in-progress backfill)
 const historyCtx = createContext({

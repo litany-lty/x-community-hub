@@ -17,6 +17,8 @@ import org.springframework.test.util.ReflectionTestUtils;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneId;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -27,6 +29,7 @@ import static org.mockito.Mockito.*;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
 
 class RewriteHandoffHttpTest extends LocalPublicationHttpFixture {
+    private static final ZoneId BEIJING = ZoneId.of("Asia/Shanghai");
     static final String MATERIAL = "10551";
     static final String PREVIEW = BASE + "/sources/7/rewrite-preview";
     static final String RETRY = BASE + "/auto-reposts/" + MATERIAL + "/retry?mode=REWRITE";
@@ -38,6 +41,8 @@ class RewriteHandoffHttpTest extends LocalPublicationHttpFixture {
     AutoRepostService service;
 
     @BeforeEach void assembleRewrite() {
+        clock.now = LocalDate.now(BEIJING).atTime(9, 0).atZone(BEIJING).toInstant();
+        due = clock.millis() + 60_000;
         store.tx(tx -> tx.put("source", "7", object().put("authorId", "7").put("username", "source")
                 .put("status", "ACTIVE").put("autoRewriteEnabled", true)));
         service = new AutoRepostService(store, collector, judge, oauth, client, clock);
@@ -99,6 +104,10 @@ class RewriteHandoffHttpTest extends LocalPublicationHttpFixture {
         scheduler.processDueJobsForAccount(account);
     }
 
+    private void advanceToBeijingMidnight() {
+        clock.now = clock.instant().atZone(BEIJING).toLocalDate().plusDays(1).atStartOfDay(BEIJING).toInstant();
+    }
+
     private AuthenticatedXUser restoreOwner() {
         store.tx(tx -> tx.put("meta", "owner", object().put("accountId", ACCOUNT).put("username", "former")));
         var nextOwner = new AuthenticatedXUser(AuthorIdentity.ARCHIVE_ACCOUNT_ID, "restored", "Restored", "", false, clock.instant());
@@ -145,7 +154,8 @@ class RewriteHandoffHttpTest extends LocalPublicationHttpFixture {
     @CsvSource({"true,false,false", "false,false,false", "true,true,false", "false,true,false",
                 "true,true,true", "false,true,true"})
     void correctedPreviewCannotEnterOrLeaveTheQueue(boolean correctBeforeCreate, boolean purge, boolean edited) throws Exception {
-        var original = original(AutoRepostService.REWRITE_MAX_AGE_MS - 30_000);
+        var original = original(60_000);
+        if (purge) due += Duration.ofDays(31).toMillis();
         cache(original);
         var preview = request(PREVIEW, object().put("materialId", MATERIAL), 200).path("rewrite");
         assertEquals(FINAL, preview.path("rewrittenText").asText());
@@ -155,7 +165,7 @@ class RewriteHandoffHttpTest extends LocalPublicationHttpFixture {
         if (!correctBeforeCreate) request(QUEUE, req, 200);
         cache(original.deepCopy().put("text", CORRECTED));
         if (purge) {
-            clock.now = clock.instant().plusSeconds(35);
+            clock.now = clock.instant().plus(Duration.ofDays(31));
             store.purgeExpiredContent(AssistantRetention.cutoffMillis(clock.millis()), clock.millis() - AutoRepostService.REWRITE_MAX_AGE_MS);
             assertNull(store.tx(tx -> tx.rewriteMaterial(MATERIAL, clock.millis())));
             scheduler.setAssistantStore(new AssistantStore(runtime.resolve("assistant"), json));
@@ -250,8 +260,7 @@ class RewriteHandoffHttpTest extends LocalPublicationHttpFixture {
 
     @ParameterizedTest @ValueSource(booleans = {true, false})
     void freshOwnerTimelineGuardsSavedRetriesAndLongRunningPatrols(boolean savedRetry) throws Exception {
-        clock.now = Instant.parse("2026-11-27T01:00:00Z");
-        var material = original(Duration.ofDays(1).toMillis());
+        var material = original(savedRetry ? Duration.ofDays(1).toMillis() : 60_000);
         cache(material);
         var latest = new AtomicLong(savedRetry ? clock.millis() - 60_000 : 0);
         when(collector.fetchLatestAccountPostEpochMs("elidlicom", ACCOUNT)).thenAnswer(call -> latest.get());
@@ -274,7 +283,8 @@ class RewriteHandoffHttpTest extends LocalPublicationHttpFixture {
         assertTrue(captured.isEmpty());
     }
     @Test void correctionFromAnOlderCollectorIsRecoveredBeforeTheOnlyPreviewSourceExpires() throws Exception {
-        var material = original(AutoRepostService.REWRITE_MAX_AGE_MS - 30_000);
+        var material = original(60_000);
+        due += Duration.ofDays(31).toMillis();
         cache(material);
         var preview = request(PREVIEW, object().put("materialId", MATERIAL), 200).path("rewrite");
         request(QUEUE, schedule(FINAL, "restored-preview", reference(preview, false)), 200);
@@ -286,7 +296,7 @@ class RewriteHandoffHttpTest extends LocalPublicationHttpFixture {
             assertEquals(1, update.executeUpdate());
         }
         store = new AssistantStore(database.getParent(), json);
-        clock.now = clock.instant().plusSeconds(35);
+        clock.now = clock.instant().plus(Duration.ofDays(31));
         store.purgeExpiredContent(AssistantRetention.cutoffMillis(clock.millis()), clock.millis() - AutoRepostService.REWRITE_MAX_AGE_MS);
         assertNull(store.tx(tx -> tx.rewriteMaterial(MATERIAL, clock.millis())));
         scheduler.setAssistantStore(store);
@@ -404,14 +414,14 @@ class RewriteHandoffHttpTest extends LocalPublicationHttpFixture {
 
     @ParameterizedTest @ValueSource(strings = {"traffic", "expiry", "automatic-quote", "manual-quote"})
     void latePreviewReportsTheCurrentSourceAndCandidateStatus(String change) throws Exception {
-        var material = original(AutoRepostService.REWRITE_MAX_AGE_MS - 5_000);
+        var material = original(60_000);
         if (change.equals("expiry"))
             store.tx(tx -> { AssistantWorkflow.ingest(tx, material.deepCopy().put("ownerImportedAt", clock.millis())); return null; });
         cache(material);
         when(judge.evaluateAndWriteRewrite(any(), eq(true))).thenAnswer(call -> {
             switch (change) {
                 case "traffic" -> cache(material.deepCopy().put("views", 1));
-                case "expiry" -> clock.now = clock.instant().plusSeconds(8);
+                case "expiry" -> advanceToBeijingMidnight();
                 case "automatic-quote", "manual-quote" -> {
                     var receipt = object().put("ownerAccountId", ACCOUNT).put("materialId", MATERIAL).put("authorId", "7")
                             .put("status", "PUBLISHED").put("publishedTweetId", "109998").put("publishedAt", clock.millis());
@@ -429,18 +439,23 @@ class RewriteHandoffHttpTest extends LocalPublicationHttpFixture {
         assertFalse(result.at("/rewrite/candidate").asBoolean(true));
         assertEquals(item.at("/rewrite/ineligibleReason"), result.at("/rewrite/ineligibleReason"));
         assertEquals(item.at("/material/views"), result.at("/material/views"));
-        if (change.equals("expiry")) assertFalse(result.at("/rewrite/withinWindow").asBoolean(true));
+        if (change.equals("expiry")) {
+            assertFalse(result.at("/rewrite/withinWindow").asBoolean(true));
+            assertTrue(result.at("/rewrite/rewrittenText").asText().isBlank());
+            assertTrue(result.at("/rewrite/previewId").asText().isBlank());
+            verify(judge).evaluateAndWriteRewrite(any(), eq(true));
+        }
         if (change.equals("traffic")) assertFalse(result.at("/rewrite/highTraffic").asBoolean(true));
         assertTrue(captured.isEmpty());
     }
 
     @ParameterizedTest @CsvSource({"true,true", "true,false", "false,true", "false,false"})
     void losingEligibilityDuringReassessmentKeepsThePriorApprovedRetry(boolean expires, boolean positiveVerdict) throws Exception {
-        var material = original(expires ? AutoRepostService.REWRITE_MAX_AGE_MS - 5_000 : Duration.ofDays(1).toMillis());
+        var material = original(60_000);
         cache(material);
         retained(material, "FAILED");
         when(judge.evaluateAndWriteRewrite(any())).thenAnswer(call -> {
-            if (expires) clock.now = clock.instant().plusSeconds(8);
+            if (expires) advanceToBeijingMidnight();
             else cache(material.deepCopy().put("views", 1));
             return positiveVerdict ? approved(NEW_FINAL) : new PiAgentViralJudge.RewriteJudgment(false, 15, "", "", "rejected", "");
         });

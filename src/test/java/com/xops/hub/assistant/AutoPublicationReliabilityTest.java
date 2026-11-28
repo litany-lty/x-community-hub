@@ -1461,7 +1461,7 @@ class AutoPublicationReliabilityTest {
             boolean newer = id.equals("202");
             put("material", id, object().put("authorId", "7").put("username", "source").put("kind", "POST")
                     .put("text", "A verifiable observation about how ordinary writing decisions affect a published article. Candidate " + id)
-                    .put("publishedAt", clock.millis() - (newer ? 3_600_000L : 86_400_000L))
+                    .put("publishedAt", clock.millis() - Duration.ofHours(newer ? 1 : 2).toMillis())
                     .put("views", newer ? 90000 : 10000).put("likes", newer ? 800 : 80));
         }
         put("auto_rewrite", TARGET, object().put("materialId", TARGET).put("authorId", "7").put("status", "JUDGE_FAILED"));

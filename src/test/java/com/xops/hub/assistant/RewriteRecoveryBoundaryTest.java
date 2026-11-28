@@ -101,7 +101,7 @@ class RewriteRecoveryBoundaryTest {
 
     @ParameterizedTest @ValueSource(booleans = {false, true})
     void correctedSourcesRequireExplicitReassessmentEvenForUnversionedLegacyBackfills(boolean modern) throws Exception {
-        ObjectNode first = sourcePost(9, 30000);
+        ObjectNode first = sourcePost(0, 30000);
         cache(first);
         ObjectNode saved = finalRecord("FAILED");
         if (modern) saved.put("rewriteSourceFingerprint", AutoRepostService.rewriteSourceFingerprint(first));
@@ -120,6 +120,7 @@ class RewriteRecoveryBoundaryTest {
         cache(original);
         save("auto_rewrite", MATERIAL, finalRecord("FAILED").put("rewriteSourceFingerprint", AutoRepostService.rewriteSourceFingerprint(original)));
         cache(original.deepCopy().put("text", CORRECTION));
+        assertEquals(409, assertThrows(XDataProviderException.class, () -> service.retry(MATERIAL, REWRITE, true)).getStatusCode());
         clock.advance(Duration.ofDays(31));
         assertNull(store.tx(tx -> tx.rewriteMaterial(MATERIAL, clock.millis())));
         assertEquals(409, assertThrows(XDataProviderException.class, () -> service.retry(MATERIAL, REWRITE)).getStatusCode());
@@ -198,7 +199,10 @@ class RewriteRecoveryBoundaryTest {
         assertEquals(50000, get("material", MATERIAL).path("views").asInt());
         cache(moreViews.deepCopy().put("text", CORRECTION));
         when(model.evaluateAndWriteRewrite(any(), eq(true))).thenReturn(approved(NEW_DRAFT));
-        assertEquals(CORRECTION, service.previewRewrite("7", object().put("materialId", MATERIAL)).at("/material/text").asText());
+        var archived = service.previewRewrite("7", object().put("materialId", MATERIAL));
+        assertEquals(CORRECTION, archived.at("/material/text").asText());
+        assertFalse(archived.at("/rewrite/candidate").asBoolean(true));
+        verifyNoInteractions(model);
         store.purgeExpiredContent(clock.millis(), clock.millis() - Duration.ofDays(30).toMillis());
         assertNull(get("material", MATERIAL));
         ObjectNode retained = store.tx(tx -> tx.rewriteMaterial(MATERIAL, clock.millis()));
@@ -206,7 +210,7 @@ class RewriteRecoveryBoundaryTest {
         assertEquals(50000, retained.path("views").asInt());
     }
 
-    @Test void aLaterRegularIngestUpdatesTheExistingThirtyDaySnapshotForReadsAndRanking() {
+    @Test void aLaterRegularIngestUpdatesTheExistingThirtyDaySnapshotForHistoricalReads() {
         ObjectNode first = sourcePost(9, 300);
         cache(first);
         store.tx(tx -> { AssistantWorkflow.ingest(tx, first); return null; });
@@ -215,9 +219,9 @@ class RewriteRecoveryBoundaryTest {
         ObjectNode retained = store.tx(tx -> tx.rewriteMaterial(MATERIAL, clock.millis()));
         assertEquals(CORRECTION, retained.path("text").asText());
         assertEquals(54000, retained.path("views").asInt());
-        List<ObjectNode> candidates = store.tx(tx -> tx.rewriteWindow("7", "source", clock.millis() - AutoRepostService.REWRITE_MAX_AGE_MS, clock.millis()));
-        assertEquals(1, candidates.size());
-        assertEquals(CORRECTION, candidates.get(0).path("text").asText());
+        List<ObjectNode> history = store.tx(tx -> tx.rewriteWindow("7", "source", clock.millis() - AutoRepostService.REWRITE_MAX_AGE_MS, clock.millis()));
+        assertEquals(1, history.size());
+        assertEquals(CORRECTION, history.get(0).path("text").asText());
         cache(corrected.deepCopy().put("text", "The most recent observation separately revises the field methodology and its reported results."));
         save("material", MATERIAL, get("material", MATERIAL).put("ownerImportedAt", clock.millis()));
         assertTrue(store.tx(tx -> tx.rewriteMaterial(MATERIAL, clock.millis())).path("text").asText().startsWith("The most recent"));
@@ -244,10 +248,10 @@ class RewriteRecoveryBoundaryTest {
 
     @ParameterizedTest @ValueSource(strings = {"media", "expired", "views"})
     void automaticGenerationMustStillQualifyWhenItsModelReturns(String change) {
-        ObjectNode post = sourcePost(1, 30000).put("publishedAt", clock.millis() - AutoRepostService.REWRITE_MAX_AGE_MS + 5000);
+        ObjectNode post = sourcePost(0, 30000);
         cache(post);
         when(model.evaluateAndWriteRewrite(any())).thenAnswer(call -> {
-            if (change.equals("expired")) clock.advance(Duration.ofSeconds(10));
+            if (change.equals("expired")) clock.now = Instant.parse("2026-11-27T16:00:00Z");
             else if (change.equals("media")) cache(post.deepCopy().put("hasMedia", true));
             else cache(post.deepCopy().put("views", 1));
             return approved(NEW_DRAFT);
@@ -272,7 +276,7 @@ class RewriteRecoveryBoundaryTest {
         ReflectionTestUtils.setField(real, "httpClient", http);
         var queued = new AutoRepostService(store, mock(SourceCollector.class), model, oauth, real, clock);
         try {
-            cache(sourcePost(1, 30000));
+            cache(sourcePost(0, 30000));
             assertEquals("", queued.processAuthorRewriteOnce(source(), OWNER, "owner"));
             assertEquals("SKIPPED_COOLDOWN", record().path("status").asText());
             assertEquals(NEW_DRAFT, record().path("rewrittenText").asText());
@@ -339,7 +343,7 @@ class RewriteRecoveryBoundaryTest {
     }
 
     @Test void publishedTimelineAndPreviewShowTheDeliveredTextAndManualVariantsHaveTheirOwnLabel() {
-        cache(sourcePost(1, 30000));
+        cache(sourcePost(0, 30000));
         when(model.evaluateAndWriteRewrite(any(), eq(true))).thenReturn(approved(FINAL));
         ObjectNode request = object().put("materialId", MATERIAL);
         assertEquals(FINAL, service.previewRewrite("7", request).at("/rewrite/rewrittenText").asText());
@@ -349,10 +353,18 @@ class RewriteRecoveryBoundaryTest {
         var variant = service.previewRewrite("7", request.put("forceRegenerate", true)).path("rewrite");
         assertTrue(variant.path("unsentPreview").asBoolean());
         assertTrue(variant.path("publishedTweetUrl").asText().isBlank());
+        clock.advance(Duration.ofDays(1));
+        var historical = service.previewRewrite("7", request).path("rewrite");
+        assertEquals("PUBLISHED", historical.path("status").asText());
+        assertEquals(NEW_DRAFT, historical.path("rewrittenText").asText());
+        assertFalse(historical.path("publishedTweetUrl").asText().isBlank());
+        assertFalse(historical.path("candidate").asBoolean(true));
+        verify(model, times(2)).evaluateAndWriteRewrite(any(), eq(true));
+        verify(publisher).createTweet("local-only", NEW_DRAFT, List.of(), null);
     }
 
     @Test void definitiveModelFailuresAreExcludedFromTheWouldRewriteFilter() {
-        cache(sourcePost(1, 30000));
+        cache(sourcePost(0, 30000));
         when(model.evaluateAndWriteRewrite(any())).thenThrow(new IllegalStateException("model unavailable"));
         assertEquals("", service.processAuthorRewriteOnce(source(), OWNER, "owner"));
         var timeline = service.authorTimeline("7", object());

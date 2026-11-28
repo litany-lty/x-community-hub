@@ -96,7 +96,7 @@ class RewriteContinuityTest {
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
     void correctionSurvivesUncertainDeliveryOrAuthorizationFailureAndSourceExpiry(boolean uncertain) {
-        var original = sourcePost(29, 30_000);
+        var original = sourcePost(0, 30_000);
         cache(original);
         if (uncertain) {
             when(publisher.createTweet(anyString(), anyString(), eq(List.of()), isNull()))
@@ -111,7 +111,8 @@ class RewriteContinuityTest {
         if (uncertain) cache(original.deepCopy().put("text", CORRECTION));
         assertTrue(record().path("rewriteSourceNeedsReview").asBoolean());
         assertEquals(uncertain ? "UNCERTAIN" : "AUTH_REQUIRED", record().path("status").asText());
-        clock.advance(Duration.ofDays(2));
+        assertEquals(NEW_DRAFT, record().path("rewrittenText").asText());
+        clock.advance(Duration.ofDays(31));
         store.purgeExpiredContent(clock.millis(), clock.millis() - AutoRepostService.REWRITE_MAX_AGE_MS);
         assertNull(store.tx(tx -> tx.rewriteMaterial(MATERIAL, clock.millis())));
         if (uncertain) service.verifyAutomaticPublication(OWNER, MATERIAL, REWRITE,
@@ -217,7 +218,7 @@ class RewriteContinuityTest {
     @ParameterizedTest
     @ValueSource(strings = {"PUBLISHED","UNCERTAIN","FAILED","OWNER_REVIEW_REQUIRED","SKIPPED_LIMIT","SKIPPED_QUIET_HOURS","SKIPPED_COOLDOWN"})
     void restoredOwnerCannotReadPreviouslyRetainedDrafts(String status) {
-        var original = sourcePost(1, 30_000);
+        var original = sourcePost(0, 30_000);
         cache(original);
         save("auto_rewrite", MATERIAL, finalRecord(status).put("previewMaterialFingerprint", AutoRepostService.previewMaterialFingerprint(original)));
         String nextOwner = restoreToNewOwner();
@@ -228,6 +229,12 @@ class RewriteContinuityTest {
         assertEquals(NEW_DRAFT, service.previewRewrite("7", object().put("materialId", MATERIAL)).at("/rewrite/rewrittenText").asText());
         assertEquals(OWNER, record().path("ownerAccountId").asText());
         assertThrows(XDataProviderException.class, () -> service.retry(MATERIAL, REWRITE));
+        clock.advance(Duration.ofDays(1));
+        var historical = service.previewRewrite("7", object().put("materialId", MATERIAL).put("forceRegenerate", true));
+        assertEquals(SOURCE, historical.at("/material/text").asText());
+        assertFalse(historical.at("/rewrite/candidate").asBoolean(true));
+        assertTrue(historical.at("/rewrite/rewrittenText").asText().isBlank());
+        verify(model, times(1)).evaluateAndWriteRewrite(any(), eq(true));
         verifyNoInteractions(publisher);
     }
 
@@ -289,13 +296,13 @@ class RewriteContinuityTest {
         verifyNoInteractions(model);
     }
 
-    @Test void automaticResumeAtThirtyDayBoundaryKeepsFinalForExplicitRetry() throws Exception {
-        var original = sourcePost(1, 30_000).put("publishedAt", clock.millis() - AutoRepostService.REWRITE_MAX_AGE_MS + 5_000);
+    @Test void automaticResumeCrossingBeijingMidnightKeepsFinalForExplicitRetry() throws Exception {
+        var original = sourcePost(0, 30_000);
         cache(original);
         save("auto_rewrite", MATERIAL, finalRecord("SKIPPED_COOLDOWN")
                 .put("rewriteSourceFingerprint", AutoRepostService.rewriteSourceFingerprint(original)));
         when(oauth.getValidWriteAccessToken(OWNER, false)).thenAnswer(call -> {
-            clock.advance(Duration.ofSeconds(10));
+            clock.now = Instant.parse("2026-11-27T16:00:00Z");
             return "local-only";
         });
         assertEquals("", service.processAuthorRewriteOnce(source(), OWNER, "owner"));
@@ -334,14 +341,18 @@ class RewriteContinuityTest {
         clock.advance(Duration.ofHours(2));
         store.purgeExpiredContent(AssistantRetention.cutoffMillis(clock.millis()), clock.millis() - AutoRepostService.REWRITE_MAX_AGE_MS);
         when(model.evaluateAndWriteRewrite(any(), eq(true))).thenReturn(approved(NEW_DRAFT));
-        assertEquals(CORRECTION, service.previewRewrite("7", object().put("materialId", MATERIAL)).at("/material/text").asText());
+        var archived = service.previewRewrite("7", object().put("materialId", MATERIAL));
+        assertEquals(CORRECTION, archived.at("/material/text").asText());
+        assertFalse(archived.at("/rewrite/candidate").asBoolean(true));
+        assertTrue(archived.at("/rewrite/rewrittenText").asText().isBlank());
+        verifyNoInteractions(model);
         assertEquals(CORRECTION, service.authorTimeline("7", object()).at("/items/0/material/text").asText());
     }
 
     @ParameterizedTest
     @ValueSource(strings = {"EVALUATING","SENDING","UNCERTAIN","JUDGE_FAILED"})
     void singleCachedPreviewUsesCurrentTimelineState(String status) {
-        cache(sourcePost(1, 30_000));
+        cache(sourcePost(0, 30_000));
         when(model.evaluateAndWriteRewrite(any(),eq(true))).thenReturn(approved(NEW_DRAFT));
         service.previewRewrite("7", object().put("materialId", MATERIAL));
         save("auto_rewrite", MATERIAL, finalRecord(status));
@@ -358,7 +369,7 @@ class RewriteContinuityTest {
     @ParameterizedTest
     @ValueSource(booleans = {false,true})
     void latePreviewUsesActualPublishedOrUncertainFinal(boolean uncertain) {
-        cache(sourcePost(1, 30_000));
+        cache(sourcePost(0, 30_000));
         if (uncertain) when(publisher.createTweet(anyString(),anyString(),eq(List.of()),isNull()))
                 .thenThrow(new XPublishClient.XPublishException(504, "simulated timeout", true));
         when(model.evaluateAndWriteRewrite(any(),eq(true))).thenAnswer(call -> {
@@ -368,20 +379,22 @@ class RewriteContinuityTest {
         var detail = service.previewRewrite("7", object().put("materialId", MATERIAL)).path("rewrite");
         assertEquals(uncertain ? "UNCERTAIN" : "PUBLISHED", detail.path("status").asText());
         assertEquals(NEW_DRAFT, detail.path("rewrittenText").asText());
-        assertEquals(!uncertain, detail.path("candidate").asBoolean());
+        assertFalse(detail.path("candidate").asBoolean(true));
         assertEquals(!uncertain, !detail.path("publishedTweetUrl").asText().isBlank());
     }
 
     @Test void lowerTrafficDisablesReassessmentAndKeepsTheSameOwnersFrozenRetry() throws Exception {
-        var original = sourcePost(1, 30_000);
+        clock.now = Instant.now();
+        var original = sourcePost(0, 30_000);
         cache(original);
         save("auto_rewrite", MATERIAL, finalRecord("FAILED").put("rewriteSourceFingerprint", AutoRepostService.rewriteSourceFingerprint(original)));
-        cache(original.deepCopy().put("views", 1));
         var collector = mock(SourceCollector.class);
         when(collector.styleSamples()).thenReturn(object());
         var controller = new AssistantController(store, collector, mock(AssistantWorker.class), mock(AssistantPublishing.class), new ObjectMapper());
         var request = new MockHttpServletRequest();
         request.setAttribute("assistantOwner", new AuthenticatedXUser(OWNER,"owner","Owner","",false,clock.instant()));
+        assertTrue(controller.dashboard(20,0,null,"","","","","score", request).at("/retryableAutoPublications/0/canReassess").asBoolean());
+        cache(original.deepCopy().put("views", 1));
         var actions = controller.dashboard(20,0,null,"","","","","score", request).path("retryableAutoPublications");
         assertEquals(1, actions.size());
         assertFalse(actions.get(0).path("canReassess").asBoolean(true));

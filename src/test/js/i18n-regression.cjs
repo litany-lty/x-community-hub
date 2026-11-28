@@ -307,13 +307,13 @@ assert.match(page.api.translate("你与作者的互动排名第 3，已解锁全
 assert.equal(page.api.translate("待核实作者"), "Owner verification required");
 assert.match(page.api.translate("因为每次使用这个网站服务，我都是真实付费调用 API 的。感谢你已经关注 @renamed 结下这份善缘，后续更新都会第一时间在 X 分享！"), /following @renamed/);
 const rewriteStatusTranslations = {
-    en: ["Rewrite published", "Evaluating rewrite", "Posting permission required", "Rewrite candidates 3"],
-    ja: ["リライトを投稿済み", "リライトを判定中", "投稿の許可が必要", "リライト候補 3"],
-    ko: ["재작성 게시 완료", "재작성 적합성 평가 중", "게시 권한 필요", "재작성 후보 3"]
+    en: ["Rewrite published", "Evaluating rewrite", "Posting permission required", "Today’s rewrites 3", "Exposure rate 125.4%"],
+    ja: ["リライトを投稿済み", "リライトを判定中", "投稿の許可が必要", "今日のリライト 3", "露出率 125.4%"],
+    ko: ["재작성 게시 완료", "재작성 적합성 평가 중", "게시 권한 필요", "오늘의 재작성 3", "노출률 125.4%"]
 };
 for (const [locale, expected] of Object.entries(rewriteStatusTranslations)) {
     page.api.setLocale(locale);
-    assert.deepEqual(["已洗稿发送", "洗稿判定中", "需发推授权", "会洗稿 3"].map(text => page.api.translate(text)), expected);
+    assert.deepEqual(["已洗稿发送", "洗稿判定中", "需发推授权", "今日洗稿 3", "曝光率 125.4%"].map(text => page.api.translate(text)), expected);
 }
 page.api.setLocale("en");
 const originalSnippet = '新建定时推文 <script>alert(1)</script> · 日均 2.0';

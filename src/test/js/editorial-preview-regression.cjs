@@ -66,7 +66,7 @@ test("the activity panel registers a verified scheduled delivery without request
 });
 
 function modal(request) {
-    const item = { material: { id: "202" }, decision: { commentText: "模型附文" }, rewrite: { rewrittenText: "模型改写" } };
+    const item = { material: { id: "202", publishedAt: Date.now() }, decision: { commentText: "模型附文" }, rewrite: { candidate: true, rewrittenText: "模型改写" } };
     const preview = {
         requestToken: 3, sourceKey: "writer", items: [item],
         evaluatingIds: new Set(), rewritingIds: new Set(), expandedIds: new Set(),
@@ -77,7 +77,8 @@ function modal(request) {
         parseGenerationTargetSpec: () => ({}), formatLocalizedFetchError: (_err, label) => label, showToast() {},
         contentAssistantRequest: request
     });
-    vm.runInContext(functionsBetween("function resolveAssistantDraftSourcePost(", "function assistantDraftNumberChangesText(")
+    vm.runInContext(functionsBetween("function getRewriteItemText(", "function buildRepostItemComposedText(")
+        + functionsBetween("function resolveAssistantDraftSourcePost(", "function assistantDraftNumberChangesText(")
         + functionsBetween("async function evaluateSingleTimelineItem(", "async function evaluateAuthorAccountOnceInModal("), ui);
     return { ui, preview, item };
 }
@@ -96,7 +97,7 @@ for (const kind of ["quote", "rewrite"]) {
     const editKey = kind === "quote" ? "editedComments" : "editedRewrites";
     const original = kind === "quote" ? "手改附文" : "手改正文";
     const generate = ui => kind === "quote" ? ui.evaluateSingleTimelineItem("202", true, 3) : ui.previewSingleRewriteItem("202", true, 3);
-    const response = id => ({ material: { id }, preview: { commentText: "新附文" }, rewrite: { rewrittenText: "新正文" } });
+    const response = id => ({ material: { id, publishedAt: Date.now() }, preview: { commentText: "新附文" }, rewrite: { candidate: true, rewrittenText: "新正文" } });
 
     test(kind + " preserves edits after timeouts and ignores a response for a different source", async () => {
         const fixture = modal(async () => { throw Error("timeout"); });
@@ -134,7 +135,8 @@ test("a rejected rewrite is excluded from rewrite candidates and its reason stay
         repostDualScoreText: () => "", repostScoreBreakdownText: () => "", resolveRepostMaterialUrl: () => "",
         resolveRepostOwnerIdentity: () => ({}), getRepostItemCommentText: () => "", buildRepostIntentHref: () => ""
     });
-    vm.runInContext(functionsBetween("function quoteDeliveryStatus(", "function preservePublishedQuote(")
+    vm.runInContext(functionsBetween("function getRewriteItemText(", "function buildRepostItemComposedText(")
+        + functionsBetween("function quoteDeliveryStatus(", "function preservePublishedQuote(")
         + functionsBetween("function renderRepostTimelineItemHtml(", "function renderRepostPreviewTimeline("), ui);
     assert.match(ui.renderRepostTimelineItemHtml(row), /洗稿未通过 · 缺少可核实的独立观点/);
     preview.filterMode = "REWRITE";

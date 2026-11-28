@@ -22,7 +22,7 @@
             }
         } catch (_) {}
     </script>
-    <link rel="stylesheet" href="/styles.css?v=20261128o" />
+    <link rel="stylesheet" href="/styles.css?v=20261128p" />
 </head>
 <body>
 <div class="x-shell">
@@ -610,6 +610,7 @@
                                 </form>
                                 <div id="assistantPiAgentBar" class="assistant-pi-bar" hidden></div>
                                 <div id="assistantSuggestedPeers" class="assistant-suggested-peers" hidden></div>
+                                <p id="assistantRewriteStatus" class="section-desc" hidden></p>
                                 <div id="assistantSourcesList" class="assistant-source-list"></div>
                                 <div id="assistantAutoRepostFeed" class="assistant-autorepost-feed" hidden></div>
                             </section>
@@ -1144,13 +1145,13 @@
 <div id="repostPreviewModal" class="author-modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="repostPreviewTitle" hidden>
     <div class="author-modal-card repost-preview-card">
         <div class="repost-preview-topbar">
-            <div class="repost-preview-author-head" data-i18n-ignore>
+            <div class="repost-preview-author-head">
                 <div id="repostPreviewSourceAvatar"></div>
                 <div class="repost-preview-author-meta">
                     <div class="repost-preview-title-row">
-                        <span class="repost-preview-title" id="repostPreviewTitle">监听作者推文页</span>
+                        <span class="repost-preview-title" id="repostPreviewTitle" data-i18n-ignore>监听作者推文页</span>
                         <span id="repostPreviewSourceVerified"></span>
-                        <span class="repost-preview-handle" id="repostPreviewSourceHandle"></span>
+                        <span class="repost-preview-handle" id="repostPreviewSourceHandle" data-i18n-ignore></span>
                         <span class="assistant-state muted" id="repostPreviewRuleBadge" hidden></span>
                     </div>
                 </div>
@@ -1204,6 +1205,7 @@
                 <button type="button" class="x-outline-pill sm" id="repostPolishPromptToggleBtn" aria-expanded="false">二次改写提示词</button>
                 <button type="button" class="link-inline-btn" id="repostPreviewEvalRestBtn" hidden>单次判定本账号</button>
             </div>
+            <p id="repostRewriteScope" class="section-desc" hidden>只看北京时间今天发布的纯文本原帖，热度和曝光率（浏览量 ÷ 作者粉丝数）高的优先。</p>
         </div>
         <div class="repost-polish-drawer" id="repostPolishPromptDrawer" hidden>
             <div class="repost-polish-drawer-head">
@@ -1215,14 +1217,14 @@
             </div>
             <textarea id="repostPolishPromptInput" class="repost-preview-comment" rows="4" maxlength="3000" placeholder="输入初稿生成后的二次改写提示词…" aria-label="二次改写提示词"></textarea>
         </div>
-        <div class="repost-preview-timeline" id="repostPreviewTimelineList" data-i18n-ignore></div>
+        <div class="repost-preview-timeline" id="repostPreviewTimelineList"></div>
     </div>
 </div>
 
 <div id="tapInfoPopover" class="tap-info-popover" role="tooltip" hidden></div>
 <div id="copyToast" class="bottom-toast" role="status" aria-live="polite" hidden>已复制到剪贴板</div>
-<script src="/i18n-messages.js?v=20261128o"></script>
+<script src="/i18n-messages.js?v=20261128p"></script>
 <script src="/i18n.js?v=20261116e"></script>
-<script src="/app.js?v=20261128o"></script>
+<script src="/app.js?v=20261128p"></script>
 </body>
 </html>

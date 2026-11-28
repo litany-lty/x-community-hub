@@ -9,6 +9,7 @@ import com.xops.hub.provider.SharedApiExecutor;
 import com.xops.hub.provider.TwitterApiIoProvider;
 import com.xops.hub.provider.TwitterApiIoProvider.TextPost;
 import com.xops.hub.provider.TwitterApiIoProvider.TextPostPage;
+import com.xops.hub.provider.XDataProviderException;
 import com.xops.hub.provider.XPublishClient;
 import com.xops.hub.service.XOAuthService;
 import org.junit.jupiter.api.Test;
@@ -49,8 +50,9 @@ class CollectedRewriteWindowTest {
 
     @Test void realTimelineResponseKeepsItsPermalinkAndReachesPreviewAndPatrol() throws Exception {
         var store = new AssistantStore(data.resolve("assistant"), mapper);
-        Instant posted = LocalDate.now(ZONE).minusDays(1).atTime(8, 0).atZone(ZONE).toInstant();
-        var serviceTime = Clock.fixed(posted.plusSeconds(3600), ZONE);
+        var collectionTime = Clock.fixed(Instant.now(), ZONE);
+        Instant posted = LocalDate.now(collectionTime).atStartOfDay(ZONE).toInstant();
+        var serviceTime = Clock.fixed(posted.plus(Duration.ofHours(9)), ZONE);
         var server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/", exchange -> {
             String path = exchange.getRequestURI().getPath();
@@ -75,7 +77,7 @@ class CollectedRewriteWindowTest {
         properties.setTwitterapiIoBaseUrl("http://127.0.0.1:" + server.getAddress().getPort());
         properties.setTwitterapiIoKey("local-fixture");
         var executor = new SharedApiExecutor(properties);
-        var collector = new SourceCollector(store, new TwitterApiIoProvider(properties, mapper, executor), null, mapper, Clock.systemUTC());
+        var collector = new SourceCollector(store, new TwitterApiIoProvider(properties, mapper, executor), null, mapper, collectionTime);
         var judge = mock(PiAgentViralJudge.class);
         var publisher = mock(XPublishClient.class);
         var auth = mock(XOAuthService.class);
@@ -141,7 +143,7 @@ class CollectedRewriteWindowTest {
         return post;
     }
 
-    @Test void listenerAndBackfillKeepThirtyDaysBeyondNormalRetentionAndDeleteExpiredSnapshots() throws Exception {
+    @Test void listenerRetainsThirtyDayHistoryWhileRewriteDiscoveryReturnsOnlyTodaysPosts() throws Exception {
         var store = new AssistantStore(data, mapper);
         var clock = new MutableClock();
         var provider = mock(TwitterApiIoProvider.class);
@@ -156,7 +158,7 @@ class CollectedRewriteWindowTest {
             var expired = post("404", clock.instant().minus(Duration.ofDays(31)));
             var src = registerSource(store);
             when(provider.fetchTextPostsPage(eq("source"), eq("7"), eq(""), eq(100), any()))
-                    .thenReturn(new TextPostPage(null, List.of(recent, old, expired), "", true));
+                    .thenReturn(new TextPostPage(null, List.of(recent, old, older, expired), "", true));
             ReflectionTestUtils.invokeMethod(collector, "collectSourcePage", src);
             assertNull(store.tx(tx -> tx.get("material", "202")));
             assertEquals(BODY + " 202", store.tx(tx -> tx.rewriteMaterial("202", clock.millis())).path("text").asText());
@@ -171,23 +173,26 @@ class CollectedRewriteWindowTest {
             collector.syncSourceMaterialsForRewrite(src, WINDOW);
             clock.advance(Duration.ofMinutes(11));
             List<ObjectNode> rows = collector.syncSourceMaterialsForRewrite(src, WINDOW);
-            assertEquals(3, rows.size());
-            assertEquals(Set.of("101", "202", "303"), rows.stream().map(row -> row.path("id").asText()).collect(Collectors.toSet()));
+            assertEquals(List.of("101"), rows.stream().map(row -> row.path("id").asText()).toList());
             verify(provider).fetchTextPostsPage(eq("source"), eq("7"), eq("next-page"), eq(40), any());
             assertNull(store.tx(tx -> tx.get("material", "303")));
+            List<ObjectNode> history = store.tx(tx -> tx.rewriteWindow("7", "source", clock.millis() - WINDOW, clock.millis()));
+            assertEquals(Set.of("101", "202", "303"), history.stream().map(row -> row.path("id").asText()).collect(Collectors.toSet()));
 
             clock.advance(Duration.ofDays(3));
             collector.purgeExpired();
             assertNull(store.tx(tx -> tx.get("material", "101")));
             assertNull(store.tx(tx -> tx.get("topic", topic)));
             assertEquals(topic, store.tx(tx -> tx.rewriteMaterial("101", clock.millis())).path("rewriteTopicId").asText());
-            assertEquals(3, service.authorTimeline("7", object()).path("summary").path("wouldRewriteCount").asInt());
-            when(judge.evaluateAndWriteRewrite(any(), eq(true))).thenReturn(new PiAgentViralJudge.RewriteJudgment(true, 88, "", "", "", "独立稿件"));
-            assertEquals("303", service.previewRewrite("7", object().put("materialId", "303")).path("material").path("id").asText());
-            when(judge.evaluateAndWriteRewrite(any())).thenReturn(new PiAgentViralJudge.RewriteJudgment(false, 30, "", "", "不适合", ""));
-            service.processAuthorRewriteOnce(src, "42", "owner");
-            verify(judge, times(3)).evaluateAndWriteRewrite(any());
-            verifyNoInteractions(publish);
+            assertEquals(0, service.authorTimeline("7", object()).at("/summary/wouldRewriteCount").asInt());
+            var archived = service.previewRewrite("7", object().put("materialId", "303"));
+            assertEquals(BODY + " 303", archived.at("/material/text").asText());
+            assertFalse(archived.at("/rewrite/candidate").asBoolean(true));
+            assertTrue(archived.at("/rewrite/rewrittenText").asText().isBlank());
+            assertTrue(archived.at("/rewrite/previewId").asText().isBlank());
+            assertEquals(404, assertThrows(XDataProviderException.class, () -> service.previewRewrite("7", object())).getStatusCode());
+            assertEquals("", service.processAuthorRewriteOnce(src, "42", "owner"));
+            verifyNoInteractions(judge, publish);
 
             clock.advance(Duration.ofDays(30));
             collector.purgeExpired();
