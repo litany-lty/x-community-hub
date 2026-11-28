@@ -27,6 +27,201 @@ import static org.mockito.Mockito.*;
 class SourceCollectorBoundaryTest {
     @TempDir Path tempDir;
 
+    @Test void sparseInboundPageKeepsRestoredBodyAndHistoryUsesOnlyVerifiedOwnerCounts() {
+        var mapper = new ObjectMapper();
+        var store = new AssistantStore(tempDir, mapper);
+        var provider = mock(TwitterApiIoProvider.class);
+        var hub = mock(CommunityHubService.class);
+        var at = Instant.parse("2026-11-25T08:00:00Z");
+        var owner = new XUserSummary(com.xops.hub.model.AuthorIdentity.ARCHIVE_ACCOUNT_ID, "renamed", "Author",
+                "", "", false, 0, 0, 0, "");
+        store.tx(tx -> {
+            tx.put("meta", "owner", mapper.createObjectNode().put("accountId", owner.id()).put("username", owner.username()));
+            tx.put("history_source", owner.id(), mapper.createObjectNode().put("authorId", owner.id())
+                    .put("username", owner.username()).put("eligible", true).put("timelineSavedCount", 90));
+            tx.put("history_material", "unverified", mapper.createObjectNode().put("username", "elidlicom"));
+            tx.put("history_material", "verified", mapper.createObjectNode().put("authorId", owner.id()));
+            tx.put("history_interaction", owner.id() + ":reply", mapper.createObjectNode().put("targetAuthorId", owner.id())
+                    .put("peerId", "peer").put("text", "complete archived reply").put("sourceUrl", "archived-url"));
+            return null;
+        });
+        when(hub.isSilentHistoryEnabled()).thenReturn(true);
+        when(provider.isFreeInboundConfigured()).thenReturn(true);
+        when(provider.canReadInboundForFree("")).thenReturn(true);
+        var reply = new TwitterApiIoProvider.TextInteraction("reply", owner.id(), owner.username(), "peer", "visitor",
+                at, com.xops.hub.model.RawSnapshotModels.InboundKind.REPLY_TO_ME, "complete", "");
+        when(provider.fetchInboundTextPage(eq(owner.username()), eq(owner.id()), anyString(), eq(100), any(), eq(true)))
+                .thenReturn(new TwitterApiIoProvider.TextInteractionPage(owner, List.of(reply), "", true));
+        var collector = new SourceCollector(store, provider, hub, mapper, Clock.fixed(at, ZoneId.of("UTC")));
+        try {
+            assertThat(collector.history().path("materials").asLong()).isOne();
+            assertThat(collector.history().path("sources").get(0).path("timelineSavedCount").asLong()).isOne();
+            collector.tick();
+            verify(provider).fetchInboundTextPage(eq(owner.username()), eq(owner.id()), anyString(), eq(100), any(), eq(true));
+            var row = record(store, "history_interaction", owner.id() + ":reply");
+            assertThat(row.path("text").asText()).isEqualTo("complete archived reply");
+            assertThat(row.path("sourceUrl").asText()).isEqualTo("archived-url");
+        } finally { collector.stop(); }
+    }
+
+    @Test void overlappingArchivePagesMergeTextSourcesAndOnlyReplaceMeasuredMetrics() {
+        var mapper = new ObjectMapper();
+        var store = new AssistantStore(tempDir, mapper);
+        var provider = mock(TwitterApiIoProvider.class);
+        var community = mock(CommunityHubService.class);
+        var owner = new XUserSummary("101", "author", "Archive Author", "https://example.test/avatar", "bio", true, 517, 0, 0, "");
+        var at = Instant.parse("2026-11-25T08:00:00Z");
+        store.tx(tx -> tx.put("meta", "owner", mapper.createObjectNode().put("bindingSource", "EXPLICIT").put("accountId", owner.id()).put("username", owner.username())));
+        store.tx(tx -> tx.put("history_material", "post", mapper.createObjectNode().put("username", "former")
+                .put("text", "a longer unverified text that must remain separate").put("likes", 9999)));
+        when(community.isSilentHistoryEnabled()).thenReturn(true);
+        when(community.longHistoryCandidates()).thenReturn(List.of(
+                new CommunityHubService.LongHistoryCandidate(owner, 0, true, 30, false, at.toEpochMilli())));
+        when(provider.isFreeInboundConfigured()).thenReturn(true);
+        when(provider.canReadTimelineForFree(anyString())).thenReturn(true);
+        var full = new TextPost("post", "101", "author", at, TweetKind.QUOTE, "完整的作者正文", "q", "完整的引用正文",
+                "peer", "quoted", "a", "https://example.test/article", "完整的长文内容", "QUOTED", "",
+                "FULL", "FULL", "FULL", "ARTICLE_FULL", true, "https://x.com/author/status/post", "",
+                false, true, "ROW_ID_VERIFIED", 471L, 10L, null, 2L, 9L);
+        var preview = new TextPost("post", "101", "author", at, TweetKind.QUOTE, "摘要", "q", "",
+                "", "", "a", "", "预览", "QUOTED", "", "PREVIEW", "MISSING", "PREVIEW", "QUOTE_TEXT_MISSING",
+                false, "", "", false, false, "ROW_ID_VERIFIED", null, 0L, 3L, null, null);
+        var changedTarget = new TextPost("post", "101", "author", at, TweetKind.QUOTE, "", "q2", "",
+                "", "", "a2", "", "新预览", "QUOTED", "", "MISSING", "MISSING", "PREVIEW", "QUOTE_TEXT_MISSING",
+                false, "", "", false, false, "ROW_ID_VERIFIED", null, null, null, null, null);
+        when(provider.fetchHistoryPostsPage(eq("author"), eq("101"), anyString(), eq(100), any(), eq(true)))
+                .thenReturn(new TextPostPage(owner, List.of(full), "fx:1", false),
+                        new TextPostPage(null, List.of(preview), "fx:2", false),
+                        new TextPostPage(null, List.of(preview), "fx:3", false),
+                        new TextPostPage(null, List.of(changedTarget), "", true));
+        var clock = mock(Clock.class, CALLS_REAL_METHODS);
+        var observed = new AtomicReference<>(at);
+        when(clock.instant()).thenAnswer(call -> observed.get());
+        when(clock.getZone()).thenReturn(ZoneId.of("UTC"));
+        var collector = new SourceCollector(store, provider, community, mapper, clock);
+        try {
+            collector.tick();
+            var original = record(store, "history_material", "post");
+            assertThat(original.path("version").asInt()).isEqualTo(2);
+            assertThat(original.path("text").asText()).isEqualTo(full.text());
+            assertThat(record(store, "history_material_unverified", "post").path("likes").asLong()).isEqualTo(9999);
+            collector.tick();
+            var merged = record(store, "history_material", "post");
+            for (String field : List.of("text", "authorTextStatus", "quotedText", "quotedTextStatus", "quotedId",
+                    "quotedAuthorId", "quotedUsername", "articleText", "articleTextStatus", "articleId", "articleRole",
+                    "articleUrl", "textStatus", "sourceUrl", "hasMedia", "views", "reposts", "bookmarks")) {
+                assertThat(merged.get(field)).as(field).isEqualTo(original.get(field));
+            }
+            assertThat(merged.path("authorName").asText()).isEqualTo(owner.displayName());
+            assertThat(merged.path("authorFollowersCount").asInt()).isEqualTo(517);
+            assertThat(merged.path("likes").asLong(-1)).isZero();
+            assertThat(merged.path("replies").asLong(-1)).isEqualTo(3);
+            assertThat(merged.path("pinned").asBoolean()).isFalse();
+            observed.set(at.plusSeconds(3600));
+            collector.tick();
+            var confirmed = record(store, "history_material", "post");
+            assertThat(confirmed.path("seedEvidenceAt").asLong()).isEqualTo(observed.get().toEpochMilli());
+            assertThat(confirmed.path("likes").asLong(-1)).isZero();
+            assertThat(confirmed.path("seedMetricTimes").path("views").asLong()).isEqualTo(at.toEpochMilli());
+            assertThat(record(store, "history_source", "101").path("timelineSavedCount").asInt()).isOne();
+            collector.tick();
+            var changed = record(store, "history_material", "post");
+            assertThat(changed.path("quotedText").asText()).isEmpty();
+            assertThat(changed.path("quotedAuthorId").asText()).isEmpty();
+            assertThat(changed.path("articleUrl").asText()).isEmpty();
+            assertThat(changed.path("articleText").asText()).isEqualTo("新预览");
+            assertThat(changed.path("articleTextStatus").asText()).isEqualTo("PREVIEW");
+        } finally { collector.stop(); }
+    }
+
+    @Test void authorSourceLookupAndBackgroundStyleUseBoundIdentityAndBudget() throws Exception {
+        var mapper = new ObjectMapper();
+        var store = new AssistantStore(tempDir.resolve("assistant"), mapper);
+        store.tx(tx -> tx.put("meta","owner",mapper.createObjectNode().put("bindingSource", "EXPLICIT").put("accountId","101").put("username","elidlicom")));
+        var props = new com.xops.hub.config.XOpsProperties();
+        props.setDiskCacheDir(tempDir.resolve("budget").toString());
+        props.setHourlyUpstreamApiBudget(1);
+        var guard = new UpstreamBudgetGuard(props, true);
+        var provider = mock(TwitterApiIoProvider.class);
+        var account = new XUserSummary("202","source","Source","","",false,1,1,1,"");
+        when(provider.resolvePublicAuthor("source")).thenAnswer(call -> {
+            guard.acquirePermit("https://api.twitterapi.io/twitter/user/info?userName=source", "twitterapi_io_read");
+            return account;
+        });
+        var checked = new java.util.concurrent.CompletableFuture<Integer>();
+        when(provider.fetchTextPostsPage(eq("elidlicom"),eq("101"),eq(""),eq(100),any())).thenAnswer(call -> {
+            try {
+                guard.acquirePermit("https://api.twitterapi.io/twitter/user/last_tweets?userName=elidlicom","twitterapi_io_read");
+                checked.complete(200);
+                return new TextPostPage(account,List.of(),"",true);
+            } catch (XDataProviderException e) {
+                checked.complete(e.getStatusCode());
+                throw e;
+            }
+        });
+        var collector = new SourceCollector(store,provider,mock(CommunityHubService.class),mapper);
+        try {
+            assertThat(collector.add("source").path("authorId").asText()).isEqualTo("202");
+            collector.refreshStyleSamples();
+            assertThat(checked.get(5,java.util.concurrent.TimeUnit.SECONDS)).isEqualTo(429);
+            org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(5))
+                    .until(() -> !collector.styleSamples().at("/coverage/running").asBoolean());
+            assertThat(guard.snapshotMetrics().get("totalBillableCalls")).isEqualTo(1L);
+        } finally { collector.stop(); }
+    }
+
+    @Test
+    void localCollectionRequiresUserActionEvenWithAnEnabledOwner() {
+        var mapper = new ObjectMapper();
+        var store = new AssistantStore(tempDir, mapper);
+        store.tx(tx -> tx.put("meta", "owner", mapper.createObjectNode().put("bindingSource", "EXPLICIT").put("accountId", "101")
+                .put("username", "elidlicom")));
+        var provider = mock(TwitterApiIoProvider.class);
+        when(provider.fetchHistoryPostsPage(eq("elidlicom"), eq("101"), eq(""), eq(100), any()))
+                .thenReturn(new TextPostPage(null, List.of(), "", true));
+        var community = mock(CommunityHubService.class);
+        var collector = new SourceCollector(store, provider, community, mapper);
+        try {
+            org.springframework.test.util.ReflectionTestUtils.setField(collector, "backgroundCollectionEnabled", false);
+            collector.tick();
+            collector.scheduledStyleRefresh();
+            verifyNoInteractions(provider, community);
+            collector.retryHistoryNow();
+            verify(provider, timeout(2500).times(1))
+                    .fetchHistoryPostsPage(eq("elidlicom"), eq("101"), eq(""), eq(100), any());
+        } finally { collector.stop(); }
+    }
+
+    @Test
+    void restartRecoversHistoryRetryAtStoredCursorWithoutStartingAnotherRetryCycle() {
+        Clock now = Clock.fixed(Instant.parse("2026-11-28T02:00:00Z"), ZoneId.of("UTC"));
+        long lastAttempt = now.millis() - SourceCollector.HISTORY_FAILURE_BACKOFF_MS - 1;
+        var mapper = new ObjectMapper();
+        var store = new AssistantStore(tempDir, mapper);
+        store.tx(tx -> {
+            tx.put("meta", "owner", mapper.createObjectNode().put("bindingSource", "EXPLICIT").put("accountId", "101").put("username", "elidlicom"));
+            return tx.put("history_source", "101", mapper.createObjectNode().put("timelineRetryCount", 2)
+                    .put("timelineError", "模拟超时").put("timelineRetryExhausted", false)
+                    .put("timelineCursor", "fx:next").put("timelineLastAttemptAt", lastAttempt).put("eligible", true));
+        });
+        var provider = mock(TwitterApiIoProvider.class);
+        when(provider.isFreeInboundConfigured()).thenReturn(true);
+        when(provider.canReadTimelineForFree(anyString())).thenReturn(true);
+        when(provider.fetchHistoryPostsPage(eq("elidlicom"), eq("101"), eq("fx:next"), eq(100), any(), eq(true)))
+                .thenReturn(new TextPostPage(null, List.of(), "", true));
+        var reopened = new AssistantStore(tempDir, mapper);
+        var collector = new SourceCollector(reopened, provider, mock(CommunityHubService.class), mapper, now);
+        collector.setPaidCapabilityGate(new com.xops.hub.provider.PaidCapabilityGate(now));
+        try {
+            collector.tick();
+            collector.tick();
+            verify(provider, times(1)).fetchHistoryPostsPage(eq("elidlicom"), eq("101"), eq("fx:next"), eq(100), any(), eq(true));
+            var recovered = record(reopened, "history_source", "101");
+            assertThat(recovered.path("timelineRetryCount").asInt()).isZero();
+            assertThat(recovered.path("timelineBackfillComplete").asBoolean()).isTrue();
+        } finally { collector.stop(); }
+    }
+
     @Test
     void scanUsesThirtyMinuteOverlapWithoutLettingAnOldPinnedPostStopPagination() {
         long enabledAt = 1_000_000L;
@@ -72,7 +267,7 @@ class SourceCollectorBoundaryTest {
         SourceCollector collector = new SourceCollector(store, provider, community, mapper);
         try {
             store.tx(tx -> {
-                tx.put("meta", "owner", mapper.createObjectNode().put("accountId", "owner-1").put("username", "elidlicom"));
+                tx.put("meta", "owner", mapper.createObjectNode().put("bindingSource", "EXPLICIT").put("accountId", "owner-1").put("username", "elidlicom"));
                 tx.put("meta", "settings", AssistantWorkflow.settings(tx).put("enabled", true).put("collectionEnabled", true));
                 return null;
             });
@@ -140,7 +335,7 @@ class SourceCollectorBoundaryTest {
         SourceCollector collector = new SourceCollector(store, provider, community, mapper);
         try {
             store.tx(tx -> {
-                tx.put("meta", "owner", mapper.createObjectNode().put("accountId", "owner-1").put("username", "elidlicom"));
+                tx.put("meta", "owner", mapper.createObjectNode().put("bindingSource", "EXPLICIT").put("accountId", "owner-1").put("username", "elidlicom"));
                 tx.put("meta", "settings", AssistantWorkflow.settings(tx).put("enabled", true).put("collectionEnabled", true));
                 tx.put("source", "817386", mapper.createObjectNode()
                         .put("authorId", "817386").put("username", "Techmeme").put("status", "ACTIVE")
@@ -186,7 +381,7 @@ class SourceCollectorBoundaryTest {
         AssistantWorker worker = new AssistantWorker(store, mock(AssistantIntelligence.class), collector);
         try {
             store.tx(tx -> {
-                tx.put("meta", "owner", mapper.createObjectNode().put("accountId", "owner-1").put("username", "elidlicom"));
+                tx.put("meta", "owner", mapper.createObjectNode().put("bindingSource", "EXPLICIT").put("accountId", "owner-1").put("username", "elidlicom"));
                 tx.put("meta", "settings", AssistantWorkflow.settings(tx).put("enabled", true).put("collectionEnabled", true).put("modelEnabled", false));
                 tx.put("style_sample", "style-old", mapper.createObjectNode().put("textRole", "AUTHOR").put("text", "本人早期原创").put("publishedAt", 1_000_000L));
                 tx.put("history_material", "hist-old", mapper.createObjectNode().put("id", "hist-old").put("publishedAt", 1_000_000L));
@@ -321,9 +516,13 @@ class SourceCollectorBoundaryTest {
     }
 
     private static TextPost post(String id, String text, long publishedAt, boolean pinned) {
-        return new TextPost(id, "author-id", "author", Instant.ofEpochMilli(publishedAt), TweetKind.POST,
+        return post(id, text, publishedAt, pinned, "author-id", "author");
+    }
+
+    private static TextPost post(String id, String text, long publishedAt, boolean pinned, String authorId, String username) {
+        return new TextPost(id, authorId, username, Instant.ofEpochMilli(publishedAt), TweetKind.POST,
                 text, "", "", "", "", "", "", "", "", text, "FULL", "NOT_PRESENT", "NOT_PRESENT", "TEXT_ONLY", false,
-                "https://x.com/author/status/" + id, id, false, pinned, "ROW_ID_VERIFIED",
+                "https://x.com/" + username + "/status/" + id, id, false, pinned, "ROW_ID_VERIFIED",
                 null, null, null, null, null);
     }
 
@@ -363,7 +562,8 @@ class SourceCollectorBoundaryTest {
                     if (timelineFails.get()) {
                         throw new XDataProviderException(503, "免费公开动态暂不可用，已保留当前进度");
                     }
-                    return new TextPostPage(owner, List.of(post("p-revived", "恢复采集成功", nowRef.get().toEpochMilli(), false)), "", true);
+                    return new TextPostPage(owner, List.of(post("p-revived", "恢复采集成功", nowRef.get().toEpochMilli(),
+                            false, owner.id(), owner.username())), "", true);
                 });
 
         SourceCollector collector = new SourceCollector(store, provider, community, mapper, mutableClock);

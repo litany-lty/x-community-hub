@@ -250,11 +250,13 @@ class FxTwitterParityTest {
             try (ProviderRun run = new ProviderRun(paid, free, false)) {
                 original = run.provider.syncStoreByHours("self", scenario.base(), 720, false, false, null, "100");
             }
+            long paidEnd = Instant.now().getEpochSecond();
             int beforeFree = paidCalls.get();
+            long freeStart = Instant.now().getEpochSecond();
             try (ProviderRun run = new ProviderRun(paid, free, true)) {
                 replacement = run.provider.syncStoreByHours("self", scenario.base(), 720, false, false, null, "100");
             }
-            return new Result(original, replacement, observationStart, freeCalls.get(),
+            return new Result(original, replacement, observationStart, paidEnd, freeStart, Instant.now().getEpochSecond(), freeCalls.get(),
                     List.copyOf(paidRequests.subList(beforeFree, paidRequests.size())));
         }
     }
@@ -262,8 +264,8 @@ class FxTwitterParityTest {
     private void verifyParity(Result result, Scenario scenario, SoftAssertions soft) {
         soft.assertThat(result.paid().degraded()).as("paid control is complete").isFalse();
         soft.assertThat(result.free().degraded()).as("free-first result is complete").isFalse();
-        soft.assertThat(differences(normalizeStore(result.paid().store(), result.observationStart()),
-                normalizeStore(result.free().store(), result.observationStart())))
+        soft.assertThat(differences(normalizeStore(result.paid().store(), result.paidStart(), result.paidEnd()),
+                normalizeStore(result.free().store(), result.freeStart(), result.freeEnd())))
                 .as("Stored business values (only actual observation instants are normalized)").isEmpty();
         CommunityAnalyticsEngine engine = new CommunityAnalyticsEngine();
         var paidSnapshot = TwitterApiIoProvider.snapshotOf(result.paid().store(), "", result.paid().degraded());
@@ -276,17 +278,27 @@ class FxTwitterParityTest {
         }
     }
 
-    private JsonNode normalizeStore(AccountStore.StoredAccount store, long observationStart) {
+    private JsonNode normalizeStore(AccountStore.StoredAccount store, long start, long end) {
         JsonNode node = JSON.valueToTree(store);
-        for (JsonNode tweet : node.path("t")) for (String field : List.of("mt", "ma")) {
-            if (tweet.path(field).isIntegralNumber() && tweet.path(field).asLong() >= observationStart)
-                ((ObjectNode) tweet).put(field, observationStart);
+        // Only times observed by this request may differ across providers. Keep historic evidence exact.
+        for (JsonNode tweet : node.path("t")) {
+            for (String field : List.of("mt", "ma")) {
+                if (observedDuring(tweet.path(field), start, end)) ((ObjectNode) tweet).put(field, -1L);
+            }
+            if (tweet.path("ms") instanceof ArrayNode evidence) {
+                for (int i = 0; i < evidence.size(); i++) {
+                    if (observedDuring(evidence.get(i), start, end)) evidence.set(i, evidence.numberNode(-1L));
+                }
+            }
         }
         node.path("u").elements().forEachRemaining(user -> {
-            if (user.path("va").isIntegralNumber() && user.path("va").asLong() >= observationStart)
-                ((ObjectNode) user).put("va", observationStart);
+            if (observedDuring(user.path("va"), start, end)) ((ObjectNode) user).put("va", -1L);
         });
         return node;
+    }
+
+    private static boolean observedDuring(JsonNode value, long start, long end) {
+        return value.isIntegralNumber() && value.asLong() >= start && value.asLong() <= end;
     }
 
     private List<String> differences(JsonNode expected, JsonNode actual) {
@@ -373,7 +385,8 @@ class FxTwitterParityTest {
 
     private record WirePair(ObjectNode paid, ObjectNode free) { }
     private record Scenario(Instant anchor, List<WirePair> own, List<WirePair> inbound, AccountStore.StoredAccount base) { }
-    private record Result(TwitterApiIoProvider.SyncOutcome paid, TwitterApiIoProvider.SyncOutcome free, long observationStart,
+    private record Result(TwitterApiIoProvider.SyncOutcome paid, TwitterApiIoProvider.SyncOutcome free,
+                          long paidStart, long paidEnd, long freeStart, long freeEnd,
                           int freeCalls, List<URI> freeRunPaidRequests) { }
 
     private static final class MockServer implements AutoCloseable {

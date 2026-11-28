@@ -62,7 +62,8 @@ class HealthIdentityCoverageTest {
         var requests = new AtomicInteger();
         var pool = new SharedApiExecutor(p);
         var provider = new OfficialXApiV2Provider(p, mapper, pool) {
-            @Override public RawAccountSnapshot fetchSnapshot(String handle, String token) {
+            @Override public RawAccountSnapshot fetchSnapshot(String handle, String token, String expectedAccountId) {
+                assertThat(expectedAccountId).isEqualTo(current.get().id());
                 requests.incrementAndGet();
                 return new RawAccountSnapshot(ProviderMode.X_OFFICIAL_V2, true, "", Instant.now(),
                         current.get(), List.of(), List.of(), List.of());
@@ -157,11 +158,14 @@ class HealthIdentityCoverageTest {
         catch (Exception e) { throw new IllegalStateException(e); }
     }
 
-    @Test void sameIdRenameRefusesOldHistoryWithAnActionableMessage() {
+    @Test void sameIdRenameKeepsHistoryWhileDifferentIdsCannotMerge() {
         var old = stored("stable-id", "old_handle");
-        assertThatThrownBy(() -> AccountStore.merge(old, user("stable-id", "new_handle"), Instant.now(),
+        var renamed = AccountStore.merge(old, user("stable-id", "new_handle"), Instant.now(),
+                List.of(), List.of(), List.of(), List.of(), null);
+        assertThat(renamed.profile().username()).isEqualTo("new_handle");
+        assertThatThrownBy(() -> AccountStore.merge(old, user("other-id", "old_handle"), Instant.now(),
                 List.of(), List.of(), List.of(), List.of(), null))
-                .isInstanceOf(IllegalStateException.class).hasMessageContaining("用户名已变更").hasMessageContaining("重新登录");
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("账号 ID");
     }
 
     @Test void missingCoverageMetadataDoesNotClaimACompleteWindow() throws Exception {

@@ -193,7 +193,7 @@ async function testUnknownCreateChecksWithoutResubmitting() {
     assert.equal(reads, 1, 'the existing request identity is reconciled using a read');
     assert.equal(ctx.clears, 0, 'queue confirmation cannot discard newer input');
     assert.equal(ctx.state.scheduleDraftItems[0].text, 'new unsent text');
-    assert.equal(ctx.toasts.at(-1), '已确认加入定时队列');
+    assert.equal(ctx.toasts.at(-1), '已加入队列');
     assert.equal(ctx.state.scheduleMutations.size, 0);
 }
 async function testJsonFastPathAndPreExecutionBusyRejection() {

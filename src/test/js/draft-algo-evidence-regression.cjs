@@ -79,11 +79,12 @@ const fmtNum = (n) => String(n ?? 0);
 const getQueuedScheduledEpochsMs = () => (state.scheduleJobs || []).map((j) => Number(j.scheduledAtEpochMs));
 const parseDraftItemEpochMs = (it) => Number(it.epochMs || NaN);
 ${escapeHtmlSlice}
+${sliceBetween(appJs, "    function representativePostCards(", "    function legacyRepresentativePosts(")}
 ${draftAnalyzerSlice}
 this.__exports = { analyzeDraftByXAlgo, computeUpstreamDiversityMult, buildCalibrationShingleArray, DEFAULT_ALGO_PROFILE };
 `;
 
-const sandbox = { __state: mockState };
+const sandbox = { __state: mockState, URL };
 vm.createContext(sandbox);
 vm.runInContext(harnessCode, sandbox);
 const { analyzeDraftByXAlgo, computeUpstreamDiversityMult, buildCalibrationShingleArray, DEFAULT_ALGO_PROFILE } = sandbox.__exports;
@@ -109,6 +110,19 @@ assert.ok(cleanWithGithub.checks.every((c) => !/OONRetweetReplyFilter|BBQDuplica
 const shortenerRes = analyzeDraftByXAlgo("这篇干货总结放在这里 https://bit.ly/3xyzabc");
 assert.equal(shortenerRes.finalScore, 88);
 assert.equal(shortenerRes.dimensions.find((d) => d.key === "safety").valLabel, "短链风险");
+
+for (const [url, media, external] of [
+    ["https://help.twitter.com./status/123", false, false],
+    ["https://x.com.example.org/abc", false, true],
+    ["https://t.co/opaque", false, null],
+    ["https://t.co/media", true, false],
+    ["https://t.co/media https://t.co/other", true, null],
+    ["https://t.co/opaque https://example.com", false, true]
+]) {
+    const draft = analyzeDraftByXAlgo("一次排查的结果 " + url, {hasMedia: media});
+    assert.equal(draft.hasExtLink, external, url);
+    if (external === null) assert.match(draft.dimensions.find(d => d.key === "safety").valLabel, /待确认/);
+}
 
 // 4. Unlock empirical predictor with 6 calibrated historical samples -> verify percentile range, nearest neighbors, and pipeline discount!
 mockState.report.algorithmHealth.calibration.samplePostCount = 6;
@@ -197,5 +211,23 @@ mockState.report.algorithmHealth.latestMainPostAt = new Date(Date.now() - 25 * 6
 const rapidRes = analyzeDraftByXAlgo("刚发完上一条紧接着再发一条全新的独立思考");
 assert.equal(rapidRes.finalScore, 74);
 assert.ok(rapidRes.checks.some((c) => c.includes("63%")));
+
+mockState.report.contentTiming.postRankings = {additionalPosts: [
+    {id: "media-winner", text: "完整复刻了上周已经发布的媒体长帖内容，这条记录只出现在媒体浏览榜"}
+]};
+const fromMedia = analyzeDraftByXAlgo(mockState.report.contentTiming.postRankings.additionalPosts[0].text);
+assert.equal(fromMedia.dimensions.find(d => d.key === "dedup").valLabel, "内容重复");
+mockState.report.contentTiming.postRankings.additionalPosts.push({id: "short", text: "今天收工"});
+assert.equal(analyzeDraftByXAlgo("今天收工").dimensions.find(d => d.key === "dedup").valLabel, "内容重复");
+assert.equal(analyzeDraftByXAlgo("今天开工").dimensions.find(d => d.key === "dedup").valLabel, "原创");
+
+const earlier = new Date(Date.now() - 30 * 3600_000).toISOString();
+mockState.report.algorithmHealth.recentMainPostTimes = [mockState.report.algorithmHealth.latestMainPostAt, earlier];
+for (const topPosts of [[], [{id: "older", text: "旧的帖子", createdAt: earlier}]]) {
+    mockState.report.contentTiming.topPosts = topPosts;
+    const simulated = analyzeDraftByXAlgo("排期草稿应以已采集的发帖时间估算连续发帖次数");
+    assert.equal(simulated.dimensions.find(d => d.key === "diversity").score, 44);
+    assert.ok(simulated.checks.some(c => c.includes("44%")));
+}
 
 console.log("draft-algo-evidence-regression: passed");

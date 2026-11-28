@@ -113,6 +113,7 @@ class FxTwitterRecoveryParityTest {
              var f = new Fixture(paid, free, false)) {
             long observationStart = Instant.now().getEpochSecond();
             var result = f.provider.syncStoreByHours("self", old, 24, true, true, null, "100");
+            long observationEnd = Instant.now().getEpochSecond();
             assertThat(paidReads).singleElement().satisfies(uri -> {
                 assertThat(uri.getPath()).isEqualTo("/twitter/tweets");
                 assertThat(query(uri).get("tweet_ids")).isEqualTo("102");
@@ -127,14 +128,14 @@ class FxTwitterRecoveryParityTest {
             int freeReadsBeforeControl = freeReads.get();
             try (var original = new Fixture(paid, free, false)) {
                 original.properties.setFxtwitterEnabled(false);
+                long controlStart = Instant.now().getEpochSecond();
                 var control = original.provider.syncStoreByHours("self", old, 24, true, true, null, "100");
+                long controlEnd = Instant.now().getEpochSecond();
                 assertThat(freeReads.get()).isEqualTo(freeReadsBeforeControl);
                 assertThat(control.degraded()).isFalse();
                 assertThat(control.dailyDataComplete()).isTrue();
-                assertThat(tweet(result.store(), "101").metricsFetchedAt()).isGreaterThanOrEqualTo(observationStart);
-                assertThat(tweet(control.store(), "101").metricsFetchedAt()).isGreaterThanOrEqualTo(observationStart);
-                assertThat(normalizeObservedTimes(result.store().tweets(), observationStart))
-                        .isEqualTo(normalizeObservedTimes(control.store().tweets(), observationStart));
+                assertThat(factsObservedDuring(result.store().tweets(), observationStart, observationEnd))
+                        .isEqualTo(factsObservedDuring(control.store().tweets(), controlStart, controlEnd));
             }
         }
     }
@@ -338,14 +339,18 @@ class FxTwitterRecoveryParityTest {
         assertThat(after.metricsFetchedAt()).isEqualTo(before.metricsFetchedAt());
     }
 
-    private static JsonNode normalizeObservedTimes(List<AccountStore.StoredTweet> tweets, long observationStart) {
-        JsonNode rows = MAPPER.valueToTree(tweets);
-        for (JsonNode row : rows) {
-            for (String field : List.of("mt", "ma")) {
-                if (row.path(field).isIntegralNumber() && row.path(field).asLong() >= observationStart) {
-                    ((ObjectNode) row).put(field, observationStart);
-                }
+    private static ArrayNode factsObservedDuring(List<AccountStore.StoredTweet> tweets, long start, long end) {
+        ArrayNode rows = MAPPER.createArrayNode();
+        for (var tweet : tweets) {
+            assertThat(tweet.metricsFetchedAt()).isBetween(start, end);
+            assertThat(tweet.metricsAttemptedAt()).isBetween(start, end);
+            assertThat(tweet.metricEvidenceAt()).hasSize(5);
+            for (long observedAt : tweet.metricEvidenceAt()) {
+                assertThat(observedAt).as("metric observation for tweet %s", tweet.id()).isBetween(start, end);
             }
+            ObjectNode facts = MAPPER.valueToTree(tweet);
+            facts.remove(List.of("mt", "ma", "ms"));
+            rows.add(facts);
         }
         return rows;
     }

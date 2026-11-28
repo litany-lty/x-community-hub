@@ -2440,10 +2440,7 @@ public class PiAgentViralJudge {
                     ? runPiGenericWriter(REWRITE_WRITER_SYSTEM_PROMPT, writerPrompt, writerTarget.model(), resolveHumanizerSkillFiles())
                     : runCodexGenericWriter(REWRITE_WRITER_SYSTEM_PROMPT, writerPrompt, writerTarget.model());
         }
-        String cleanedDraft = cleanStandaloneRewriteText(rawDraft);
-        if (cleanedDraft.isBlank()) {
-            throw new IllegalStateException("洗稿初稿生成返回为空，请重试");
-        }
+        String cleanedDraft = validatedRewriteText(rawDraft, input.sourceText());
         String finalRewrite = cleanedDraft;
         String customPolish = input.postPolishPrompt() == null ? "" : input.postPolishPrompt().strip();
         if (!customPolish.isBlank()) {
@@ -2461,10 +2458,8 @@ public class PiAgentViralJudge {
                         ? runPiGenericWriter(REWRITE_POLISHER_SYSTEM_PROMPT, polishUserPrompt, writerTarget.model(), resolveHumanizerSkillFiles())
                         : runCodexGenericWriter(REWRITE_POLISHER_SYSTEM_PROMPT, polishUserPrompt, writerTarget.model());
             }
-            String cleanedPolished = cleanStandaloneRewriteText(rawPolished);
-            if (!cleanedPolished.isBlank()) {
-                finalRewrite = cleanedPolished;
-            }
+            if (rawPolished != null && !rawPolished.isBlank())
+                finalRewrite = validatedRewriteText(rawPolished, input.sourceText());
         }
         return new RewriteJudgment(pass, suitabilityScore, hookPattern, coreInsight,
                 reason.isBlank()
@@ -2473,19 +2468,47 @@ public class PiAgentViralJudge {
                 finalRewrite);
     }
 
+    static String validatedRewriteText(String raw, String source) {
+        String body = cleanStandaloneRewriteText(raw);
+        String written = comparableRewriteText(body);
+        if (written.isEmpty()) throw new IllegalStateException("洗稿正文为空或格式无效，请重新生成");
+        String original = comparableRewriteText(source);
+        if (!original.isEmpty()) {
+            if (original.contains(written) || written.contains(original))
+                throw new IllegalStateException("洗稿正文直接沿用了原文，请重新生成独立改写");
+            // Overlapping phrases catch cosmetic edits across both Latin and CJK text.
+            int phrases = written.length() - 7;
+            if (phrases > 0) {
+                int copied = 0;
+                for (int i = 0; i < phrases; i++) {
+                    if (original.contains(written.substring(i, i + 8))) copied++;
+                }
+                if (copied >= phrases * 0.85)
+                    throw new IllegalStateException("洗稿正文与原文过于相似，请重新生成独立改写");
+            }
+        }
+        return body;
+    }
+
+    private static String comparableRewriteText(String text) {
+        if (text == null) return "";
+        return java.text.Normalizer.normalize(text, java.text.Normalizer.Form.NFKC)
+                .toLowerCase(Locale.ROOT).replaceAll("[^\\p{L}\\p{N}]+", "");
+    }
+
     static String cleanStandaloneRewriteText(String raw) {
         if (raw == null || raw.isBlank()) return "";
         String trimmed = OwnerQuoteStyleDistiller.stripWrappingQuotesOrFences(raw);
-        if (trimmed.startsWith("{")) {
-            // Guard against accidental JSON wrapper
-            int idx = trimmed.indexOf("\"text\"");
-            if (idx < 0) idx = trimmed.indexOf("\"rewrittenText\"");
-            if (idx >= 0) {
-                try {
-                    JsonNode node = new ObjectMapper().readTree(trimmed);
-                    String extracted = node.path("rewrittenText").asText(node.path("text").asText("")).strip();
-                    if (!extracted.isBlank()) trimmed = extracted;
-                } catch (Exception ignored) { }
+        if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+            try {
+                JsonNode node = new ObjectMapper().reader()
+                        .with(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_TRAILING_TOKENS).readTree(trimmed);
+                JsonNode body = node.has("rewrittenText") ? node.get("rewrittenText") : node.path("text");
+                if (!body.isTextual()) return "";
+                trimmed = body.textValue().strip();
+                if (trimmed.startsWith("{") || trimmed.startsWith("[")) return "";
+            } catch (java.io.IOException malformed) {
+                return "";
             }
         }
         String withoutUrls = trimmed.replaceAll("https?://\\S+", "").strip();

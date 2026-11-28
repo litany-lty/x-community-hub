@@ -79,10 +79,10 @@ public class CommunityApiController {
         CommunityAnalyticsEngine.ReportPeriod resolvedPeriod = parseReportPeriod(
                 period, days, CommunityAnalyticsEngine.ReportPeriod.HOURS_24);
         String clientIp = extractClientIp(request);
+        String accountId = resolveAuthorizedAccountId(authorizedUsername, request);
         CommunityDashboardReport report = hubService.analyzeWorkspaceReport(
-                authorizedUsername, resolvedPeriod, provider, refresh, clientIp,
-                resolveAuthorizedAccountId(authorizedUsername, request));
-        verifyReportAccountIsolation(authorizedUsername, report);
+                authorizedUsername, resolvedPeriod, provider, refresh, clientIp, accountId);
+        verifyReportAccountIsolation(authorizedUsername, accountId, report);
         return report;
     }
 
@@ -109,10 +109,10 @@ public class CommunityApiController {
                 ? hubService.analyzeStoredAccountBundle(authorizedUsername, accountId)
                 : hubService.analyzeWorkspaceBundle(authorizedUsername, resolvedPeriod, provider, refresh,
                         clientIp, accountId, continueRelations, preferStored);
-        if (bundle.hours24() != null) verifyReportAccountIsolation(authorizedUsername, bundle.hours24());
-        if (bundle.day() != null) verifyReportAccountIsolation(authorizedUsername, bundle.day());
-        if (bundle.week() != null) verifyReportAccountIsolation(authorizedUsername, bundle.week());
-        if (bundle.month() != null) verifyReportAccountIsolation(authorizedUsername, bundle.month());
+        if (bundle.hours24() != null) verifyReportAccountIsolation(authorizedUsername, accountId, bundle.hours24());
+        if (bundle.day() != null) verifyReportAccountIsolation(authorizedUsername, accountId, bundle.day());
+        if (bundle.week() != null) verifyReportAccountIsolation(authorizedUsername, accountId, bundle.week());
+        if (bundle.month() != null) verifyReportAccountIsolation(authorizedUsername, accountId, bundle.month());
         return bundle;
     }
 
@@ -188,9 +188,9 @@ public class CommunityApiController {
         response.setHeader("Vary", "Cookie");
     }
 
-    private static void verifyReportAccountIsolation(String expectedUsername, CommunityDashboardReport report) {
-        if (report == null || report.profile() == null || report.profile().username() == null
-                || !report.profile().username().equalsIgnoreCase(expectedUsername)) {
+    private static void verifyReportAccountIsolation(String expectedUsername, String accountId, CommunityDashboardReport report) {
+        if (report == null || report.profile() == null || !(accountId == null
+                ? expectedUsername.equalsIgnoreCase(report.profile().username()) : accountId.equals(report.profile().id()))) {
             throw new XDataProviderException(500, "账号数据隔离校验未通过，已阻断响应");
         }
     }

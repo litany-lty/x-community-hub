@@ -117,7 +117,7 @@ class OfficialProxySupportTest {
 
             ObjectMapper mapper = new ObjectMapper();
             XPublishClient publishClient = new XPublishClient(props, mapper);
-            PaidCapabilityGate.withCaller("elidlicom", "proxy-test-1", () -> {
+            PaidCapabilityGate.withCaller("elidlicom", "proxy-test-1", true, () -> {
                 assertThrows(XPublishClient.XPublishException.class,
                         () -> publishClient.uploadMedia("acc_jp", new byte[]{1, 2, 3, 4}, "image/png", "cover.png"));
                 assertThrows(XPublishClient.XPublishException.class,
@@ -167,7 +167,7 @@ class OfficialProxySupportTest {
 
         ObjectMapper mapper = new ObjectMapper();
         XPublishClient publishClient = new XPublishClient(props, mapper);
-        XPublishClient.XPublishException publishEx = PaidCapabilityGate.withCaller("elidlicom", "proxy-test-2", () -> assertThrows(
+        XPublishClient.XPublishException publishEx = PaidCapabilityGate.withCaller("elidlicom", "proxy-test-2", true, () -> assertThrows(
                 XPublishClient.XPublishException.class,
                 () -> publishClient.createTweet("acc_jp", "Should fail closed", List.of())
         ));
@@ -204,22 +204,26 @@ class OfficialProxySupportTest {
             ObjectMapper mapper = new ObjectMapper();
             XPublishClient client = new XPublishClient(props, mapper);
 
-            String tweetId = XPublishClient.withQuoteTweetUrl(
+            String text = "🎉 Tibo 说，Banked reset 已经上线。对照 https://status.example/status/2125853628250599730 与 https://x.com/beta/status/21258536282505997301 以及 https://x.com/archive/status/2125853628250599730.json";
+            String quoteId = "2125853628250599730";
+            var receipt = XPublishClient.withPublicationReceipt(text, quoteId, () -> XPublishClient.withQuoteTweetUrl(
                     "https://x.com/thsottiaux/status/2125853628250599730?s=20",
-                    () -> client.createTweet("tok_quote", "🎉 Tibo 说，Banked reset 已经上线。", List.of(), "2125853628250599730")
-            );
-            assertEquals("fallback_published_1", tweetId);
+                    () -> client.createTweet("tok_quote", text, List.of(), quoteId)));
+            assertEquals("fallback_published_1", receipt.tweetId());
+            assertEquals(XPublishClient.PublicationMode.QUOTE_LINK, receipt.mode());
+            assertNull(receipt.quoteTweetId());
             assertEquals(2, requestBodies.size());
 
             var firstJson = mapper.readTree(requestBodies.get(0));
             assertEquals("2125853628250599730", firstJson.path("quote_tweet_id").asText());
-            assertEquals("🎉 Tibo 说，Banked reset 已经上线。", firstJson.path("text").asText());
+            assertEquals(text, firstJson.path("text").asText());
 
             var secondJson = mapper.readTree(requestBodies.get(1));
+            assertEquals(secondJson.path("text").asText(), receipt.text());
             assertTrue(secondJson.path("quote_tweet_id").isMissingNode(),
                     "Fallback request must omit quote_tweet_id");
             assertEquals(
-                    "🎉 Tibo 说，Banked reset 已经上线。\n\nhttps://x.com/thsottiaux/status/2125853628250599730",
+                    text + "\n\nhttps://x.com/thsottiaux/status/2125853628250599730",
                     secondJson.path("text").asText()
             );
         } finally {
@@ -245,14 +249,22 @@ class OfficialProxySupportTest {
             ObjectMapper mapper = new ObjectMapper();
             XPublishClient client = new XPublishClient(props, mapper);
 
-            String tweetId = XPublishClient.withQuoteTweetUrl(
+            String text = "🎉 Antigravity 正在重置所有用户的 Gemini 额度。"
+                    + " 资料:https://twitter.com/i/web/status/2125851902009311306?s=20，另见 https://x.com/beta/status/22222，样本只覆盖工作日。";
+            String quoteId = "2125851902009311306";
+            var receipt = XPublishClient.withPublicationReceipt(text, quoteId, () -> XPublishClient.withQuoteTweetUrl(
                     "https://x.com/_mohansolo/status/2125851902009311306",
-                    () -> client.createTweet("tok_quote", "🎉 Antigravity 正在重置所有用户的 Gemini 额度。", List.of(), "2125851902009311306")
-            );
-            assertEquals("standalone_published_3", tweetId);
+                    () -> client.createTweet("tok_quote", text, List.of(), quoteId)));
+            assertEquals("standalone_published_3", receipt.tweetId());
+            assertEquals(XPublishClient.PublicationMode.STANDALONE_FALLBACK, receipt.mode());
+            assertNull(receipt.quoteTweetId());
             assertEquals(3, doubleBlockedBodies.size());
+            assertEquals(text, mapper.readTree(doubleBlockedBodies.get(1)).path("text").asText(),
+                    "The existing permalink after a colon already identifies this source");
             var thirdJson = mapper.readTree(doubleBlockedBodies.get(2));
+            assertEquals(thirdJson.path("text").asText(), receipt.text());
             assertTrue(thirdJson.path("quote_tweet_id").isMissingNode());
+            assertTrue(receipt.text().contains("，另见 https://x.com/beta/status/22222，样本只覆盖工作日。"));
             assertTrue(!thirdJson.path("text").asText().contains("/status/2125851902009311306"));
             assertTrue(thirdJson.path("text").asText().contains("（消息源：_mohansolo）"));
         } finally {

@@ -174,7 +174,12 @@ final class AssistantTopics {
         var snap=object().put("topicId",topicId).put("topicVersion",topic.path("version").asInt()).put("selectedMaterialId",selected);
         snap.set("topic",topic);
         var materials=snap.putArray("materials");
-        topic.path("materialIds").forEach(id->materials.add(required(tx,"material",id.asText())));
+        topic.path("materialIds").forEach(id -> {
+            ObjectNode member = required(tx,"material",id.asText());
+            var link = AssistantPublishing.materialPost(id.asText(), member);
+            if (link != null) member.put("sourceUrl", link.url());
+            materials.add(member);
+        });
         return snap;
     }
 
@@ -197,17 +202,28 @@ final class AssistantTopics {
         }
         var moved=dest.withArray("materialIds");
         for(String id:ids) {
-            String from=topicOf(tx,id);
+            var membership = required(tx, "membership", id);
+            String from = membership.path("topicId").asText();
             if(target.equals(from)) continue;
             var old=affected.get(from).withArray("materialIds");
             for(int i=old.size()-1;i>=0;i--) if(id.equals(old.get(i).asText())) old.remove(i);
             moved.add(id);
-            tx.put("membership",id,object().put("topicId",target).put("fromTopic",from).put("actor",actor));
+            if ("OWNER_LINK".equals(membership.path("actor").asText())) {
+                var material = required(tx, "material", id);
+                var importedAt = material.path("ownerImportedAt");
+                if (!importedAt.isIntegralNumber() || importedAt.asLong() <= 0) {
+                    // Older links use collectedAt (or the head timestamp) until their membership actor changes.
+                    long originalImport = material.path("collectedAt").asLong(material.path("updatedAt").asLong());
+                    if (originalImport > 0) tx.put("material", id, material.put("ownerImportedAt", originalImport));
+                }
+            }
+            tx.put("membership",id,membership.put("topicId",target).put("fromTopic",from).put("actor",actor));
         }
         for(var e:affected.entrySet()) {
             var t=e.getValue();
             if(t.path("materialIds").isEmpty()) t.put("mergedInto",target);
             else {
+                t.remove("mergedInto");
                 String lead=t.path("materialIds").get(0).asText();
                 t.put("title",fresh(e.getKey(),required(tx,"material",lead)).path("title").asText())
                         .put("summary","").put("status","PENDING");

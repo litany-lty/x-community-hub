@@ -272,7 +272,7 @@ class BackendStorageSafetyTest {
     }
 
     @Test
-    void successfulRemotePostWithFailedLocalCheckpointRequiresUncertainDeliveryConfirmation() {
+    void aReturnedPlatformReceiptRestoresTheQueueAfterItsFirstCheckpointFails() {
         XOpsProperties props = properties();
         MutableClock clock = new MutableClock();
         AtomicBoolean failOnce = new AtomicBoolean(true);
@@ -294,8 +294,10 @@ class BackendStorageSafetyTest {
             clock.advance(21_000);
             service.processDueJobsForAccount("1001");
             var job = service.listJobs("1001", "alice").items().get(0);
-            assertEquals(ScheduledTweetStatus.OVERDUE_CONFIRM_REQUIRED, job.status());
-            assertTrue(job.uncertainDelivery());
+            assertFalse(failOnce.get());
+            assertEquals(ScheduledTweetStatus.PUBLISHED, job.status());
+            assertEquals("tweet-1", job.publishedTweetId());
+            assertFalse(job.uncertainDelivery());
             service.processDueJobsForAccount("1001");
             verify(client, times(1)).createTweet(anyString(), anyString(), anyList());
         } finally { service.shutdown(); }

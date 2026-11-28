@@ -46,6 +46,23 @@ class FunctionalBusinessGapTest {
     }
 
     @Test
+    void accumulatedWindowsKeepObservedVisitsWithoutSuggestingUnfollowAcrossCoverageGaps() {
+        var snapshot = new RawAccountSnapshot(ProviderMode.TWITTERAPI_IO, true, "", NOW, SELF,
+                List.of(tweet("visited", NOW.minusSeconds(4 * 3600), TweetKind.REPLY, "external-root", 10)),
+                List.of(), List.of(new RelationshipEntry(PEER, true, false),
+                        new RelationshipEntry(user("quiet"), true, false)), false, true, 0,
+                NOW.minusSeconds(86400), "", false, NOW.minusSeconds(7200), "", false, false);
+        var report = new CommunityAnalyticsEngine().analyze(snapshot, CommunityAnalyticsEngine.ReportPeriod.HOURS_24,
+                true, ZoneId.of("Asia/Shanghai"), false, 0, NOW);
+
+        assertThat(report.interactions().totalOutboundActions()).isEqualTo(1);
+        assertThat(report.followAudit().suggestedUnfollowCount()).isZero();
+        assertThat(report.followAudit().notFollowingBackList()).hasSize(2)
+                .allSatisfy(item -> assertThat(item.auditCategory()).isEqualTo("ACTIVITY_INCOMPLETE"));
+        assertThat(report.interactions().peerStats().get(0).relationshipPortrait()).doesNotContain("建议减少单向消耗");
+    }
+
+    @Test
     void pendingCommentRemainsInWarmupEvenWhenMyVisitsAreMoreNumerous() {
         var result = report(List.of(
                 tweet("out-a", NOW.minusSeconds(500), TweetKind.REPLY, "peer-root-a", 10),

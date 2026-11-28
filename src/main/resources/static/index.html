@@ -22,7 +22,7 @@
             }
         } catch (_) {}
     </script>
-    <link rel="stylesheet" href="/styles.css?v=20261127b" />
+    <link rel="stylesheet" href="/styles.css?v=20261128o" />
 </head>
 <body>
 <div class="x-shell">
@@ -139,7 +139,7 @@
                 </div>
 
                 <div class="auth-gate-footer">
-                    <button type="button" class="gate-author-btn" id="gateAuthorBtn">@elidlicom · 开源仓库</button>
+                    <button type="button" class="gate-author-btn" id="gateAuthorBtn">作者 · 开源仓库</button>
                 </div>
 
                 <!-- 若服务端 application.yml 尚未填写 oauth-client-id，向站长展示纯只读指引 -->
@@ -613,8 +613,9 @@
                                 <div id="assistantSourcesList" class="assistant-source-list"></div>
                                 <div id="assistantAutoRepostFeed" class="assistant-autorepost-feed" hidden></div>
                             </section>
-                            <section class="assistant-pane">
+                            <section class="assistant-pane" aria-describedby="assistantHistoryScope">
                                 <div class="assistant-pane-head"><h3>存储与历史</h3></div>
+                                <p class="section-desc" id="assistantHistoryScope">仅作者账号有长期历史归档。普通账号保留近 30 天数据。</p>
                                 <div id="assistantStorageStatus" class="assistant-storage-status"></div>
                                 <div id="assistantBudgetStatus" class="assistant-storage-status"></div>
                                 <div id="assistantHistoryStatus" class="assistant-history-status"></div>
@@ -772,7 +773,7 @@
 
                 <div class="x-section-card" id="contentAssistantAccessNotice" hidden>
                     <h2 class="section-title">内容助手</h2>
-                    <p class="section-desc" id="contentAssistantAccessDesc">此私人功能仅向已验证的 @elidlicom 账号开放。</p>
+                    <p class="section-desc" id="contentAssistantAccessDesc">此私人功能仅向已验证的作者账号开放。</p>
                 </div>
 
                 <div class="x-section-card" data-content-report hidden>
@@ -914,14 +915,12 @@
 
             <!-- ==================== 模块 6：图文定时发布与逾期二次确认 ==================== -->
             <section class="tab-panel" id="panel-schedule">
-                <div class="x-section-card schedule-lock-card" id="scheduleEligibilityCard" hidden>
+                <div class="x-section-card schedule-lock-card" id="scheduleEligibilityCard" aria-describedby="scheduleEligibilityDesc" hidden>
                     <div class="section-head wrap-gap">
                         <div>
-                            <h2 class="section-title">仅限与 @elidlicom 互动前 100 可用</h2>
-                            <p class="section-desc" id="scheduleEligibilityDesc"></p>
-                            <div class="schedule-eligibility-meta" id="scheduleEligibilityMeta"></div>
+                            <h2 class="section-title">定时发布</h2>
+                            <p class="section-desc" id="scheduleEligibilityDesc">定时发布仅向已验证的作者账号开放。</p>
                         </div>
-                        <a class="x-blue-pill sm" id="scheduleEligibilityActionLink" href="https://x.com/elidlicom" target="_blank" rel="noopener noreferrer">去互动 ↗</a>
                     </div>
                 </div>
 
@@ -1045,13 +1044,13 @@
             <div class="author-profile-row">
                 <div id="authorModalAvatarSlot" data-i18n-ignore>
                     <div class="avatar-circle xl" id="authorModalAvatar">
-                        <img src="/author-avatar.webp" alt="elidlicom" />
+                        <img src="/author-avatar.webp" alt="作者" />
                     </div>
                 </div>
                 <div class="author-profile-tags">
                     <span class="mini-tag blue" id="authorModalSelfTag" hidden>作者本人</span>
                     <span class="mini-tag green" id="authorModalFollowedTag" hidden>✓ 已关注</span>
-                    <a id="authorModalHeaderLink" data-i18n-ignore class="x-outline-pill sm" href="https://x.com/elidlicom" target="_blank" rel="noopener noreferrer">@elidlicom ↗</a>
+                    <a id="authorModalHeaderLink" data-i18n-ignore class="x-outline-pill sm" href="https://x.com/i/user/2095392916734976000" target="_blank" rel="noopener noreferrer">作者主页 ↗</a>
                 </div>
             </div>
             <div class="author-ident-block">
@@ -1059,7 +1058,7 @@
                     <span id="authorModalDisplayName" data-i18n-ignore>Litany（李丰一）</span>
                     <span id="authorModalVerified" hidden></span>
                 </div>
-                <div class="author-handle-line" id="authorModalHandle" data-i18n-ignore>@elidlicom</div>
+                <div class="author-handle-line" id="authorModalHandle" data-i18n-ignore></div>
             </div>
             <p class="author-bio-text" id="authorModalBio" data-i18n-ignore>Java Dev &amp; AI | Studying Chinese Metaphysics(Dao·道) ䷊</p>
             <div class="author-stats-row" id="authorModalStatsRow" hidden>
@@ -1068,16 +1067,16 @@
                 <span><strong id="authorModalPosts">0</strong> 推文</span>
             </div>
             <div class="author-note-box">
-                <h2 class="author-note-title" id="authorModalTitle">你好，我是作者 @elidlicom</h2>
+                <h2 class="author-note-title" id="authorModalTitle">你好，我是作者</h2>
                 <div class="author-note-msg" id="authorModalMessage"></div>
             </div>
             <div class="author-modal-actions">
-                <a id="authorModalFollowBtn" class="auth-gate-login-btn author-follow-cta" href="https://x.com/intent/follow?screen_name=elidlicom" target="_blank" rel="noopener noreferrer">
+                <a id="authorModalFollowBtn" class="auth-gate-login-btn author-follow-cta" href="https://x.com/intent/follow?user_id=2095392916734976000" target="_blank" rel="noopener noreferrer">
                     <svg viewBox="0 0 24 24" class="oauth-x-icon" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"></path></svg>
-                    <span id="authorModalFollowBtnText">关注 @elidlicom ↗</span>
+                    <span id="authorModalFollowBtnText">关注作者 ↗</span>
                 </a>
                 <div class="author-modal-sub-actions">
-                    <a id="authorModalProfileLink" class="x-outline-pill sm" href="https://x.com/elidlicom" target="_blank" rel="noopener noreferrer">X 主页 ↗</a>
+                    <a id="authorModalProfileLink" class="x-outline-pill sm" href="https://x.com/i/user/2095392916734976000" target="_blank" rel="noopener noreferrer">X 主页 ↗</a>
                     <a id="authorModalRepoLink" class="x-outline-pill sm" href="https://github.com/litany-lty/x-community-hub" target="_blank" rel="noopener noreferrer">开源仓库 ↗</a>
                     <button type="button" id="authorModalLaterBtn" class="x-outline-pill sm">稍后再说</button>
                 </div>
@@ -1097,8 +1096,8 @@
             <div class="unlock-focus-strip" id="unlockGuideFocusMsg" hidden></div>
             <ul class="unlock-rule-list" id="unlockGuideRules">
                 <li><strong>24小时：</strong>默认选中，单次仅加载最近 24 小时数据。</li>
-                <li><strong>48小时 / 7天 / 30天：</strong>每日物理落盘并动态保留 30 天窗口，累计满 <strong>2 / 7 / 30 天</strong>自动解锁。</li>
-                <li><strong>互动特权：</strong>与 @elidlicom 互动<strong>前 5</strong> 全维度免等待；<strong>前 50</strong> 每日自动同步落盘。</li>
+                <li><strong>48小时 / 7天 / 30天：</strong>近 30 天内完成同步的天数达到 <strong>2 / 7 / 30 天</strong>时解锁对应周期。</li>
+                <li><strong>互动特权：</strong>与作者互动排名前 5 可直接查看全部周期。站点开启每日同步时，前 50 名中已登录且有快照的账号会自动同步最近 24 小时。</li>
                 <li><strong>刷新：</strong>每次检查服务端缓存与最近 24 小时覆盖；完整更新未满 <strong>1 小时</strong>时复用，满 1 小时后更新。有进展时自动分批补齐；失败或无进展时停止，可点击继续。</li>
             </ul>
             <div class="author-note-box">
@@ -1106,9 +1105,9 @@
                 <p class="author-note-msg" id="unlockGuideAuthorStory">我目前负债十几个、失业、每个月靠贷款交房租。确实承担不起每个月过多的API费用。现在希望通过X平台解决人生危机。也希望朋友们可以谅解。如果限制让你感到不爽，可以到git仓库看开源代码，本地部署与线上效果一致。</p>
             </div>
             <div class="author-modal-actions">
-                <a id="unlockGuideFollowLink" class="auth-gate-login-btn author-follow-cta" href="https://x.com/intent/follow?screen_name=elidlicom" target="_blank" rel="noopener noreferrer">
+                <a id="unlockGuideFollowLink" class="auth-gate-login-btn author-follow-cta" href="https://x.com/intent/follow?user_id=2095392916734976000" target="_blank" rel="noopener noreferrer">
                     <svg viewBox="0 0 24 24" class="oauth-x-icon" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"></path></svg>
-                    <span id="unlockGuideFollowText">关注 @elidlicom ↗</span>
+                    <span id="unlockGuideFollowText">关注作者 ↗</span>
                 </a>
                 <div class="author-modal-sub-actions">
                     <a id="unlockGuideRepoLink" class="x-outline-pill sm" href="https://github.com/litany-lty/x-community-hub" target="_blank" rel="noopener noreferrer">开源仓库 ↗</a>
@@ -1222,8 +1221,8 @@
 
 <div id="tapInfoPopover" class="tap-info-popover" role="tooltip" hidden></div>
 <div id="copyToast" class="bottom-toast" role="status" aria-live="polite" hidden>已复制到剪贴板</div>
-<script src="/i18n-messages.js?v=20261125a"></script>
+<script src="/i18n-messages.js?v=20261128o"></script>
 <script src="/i18n.js?v=20261116e"></script>
-<script src="/app.js?v=20261127b"></script>
+<script src="/app.js?v=20261128o"></script>
 </body>
 </html>

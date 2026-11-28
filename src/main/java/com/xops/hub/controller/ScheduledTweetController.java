@@ -11,6 +11,7 @@ import com.xops.hub.model.ScheduledTweetModels.BatchCreateJsonRequest;
 import com.xops.hub.model.ScheduledTweetModels.BatchCreateResponse;
 import com.xops.hub.model.ScheduledTweetModels.ConfirmResendRequest;
 import com.xops.hub.model.ScheduledTweetModels.CreateScheduledTweetJsonRequest;
+import com.xops.hub.model.ScheduledTweetModels.RewriteSource;
 import com.xops.hub.model.ScheduledTweetModels.RescheduleRequest;
 import com.xops.hub.model.ScheduledTweetModels.ScheduledTweetJob;
 import com.xops.hub.model.ScheduledTweetModels.ScheduledTweetListResponse;
@@ -101,9 +102,11 @@ public class ScheduledTweetController {
         }
         String quoteTweetId = request.getParameter("quoteTweetId");
         String quoteTweetUrl = request.getParameter("quoteTweetUrl");
+        String rawRewrite = request.getParameter("rewriteSource");
+        RewriteSource rewrite = rawRewrite == null ? null : objectMapper.readValue(rawRewrite, RewriteSource.class);
         boolean quoteSource = "true".equalsIgnoreCase(request.getParameter("quoteSource"));
         return createScheduledTweetInternal(user, text, scheduledAtEpochMs, clientRequestId, uploads,
-                draftId, version, quoteTweetId, quoteTweetUrl, quoteSource);
+                draftId, version, quoteTweetId, quoteTweetUrl, quoteSource, rewrite);
     }
 
     @PostMapping(consumes = MediaType.APPLICATION_JSON_VALUE)
@@ -128,7 +131,7 @@ public class ScheduledTweetController {
                 body.assistantDraftVersion(),
                 body.quoteTweetId(),
                 body.quoteTweetUrl(),
-                body.quoteTweetId() != null && !body.quoteTweetId().isBlank()
+                body.quoteTweetId() != null && !body.quoteTweetId().isBlank(), body.rewriteSource()
         );
     }
 
@@ -142,23 +145,25 @@ public class ScheduledTweetController {
             Integer version,
             String quoteTweetId,
             String quoteTweetUrl,
-            boolean quoteSource
+            boolean quoteSource, RewriteSource rewrite
     ) {
-        if (draftId == null && version == null) {
-            return scheduledTweetService.createScheduledTweet(
-                    user.id(), user.username(), text, scheduledAtEpochMs, clientRequestId, uploads,
-                    null, quoteTweetId, quoteTweetUrl);
-        }
-        var source = publishing.prepare(user.id(), draftId, version, clientRequestId, text,
-                scheduledAtEpochMs, uploads, quoteSource, quoteTweetId);
-        String resolvedQuoteId = (source != null && source.quoteTweetId() != null && !source.quoteTweetId().isBlank())
-                ? source.quoteTweetId()
-                : quoteTweetId;
+        var source = schedulingSource(user.id(), draftId, version, clientRequestId, text,
+                scheduledAtEpochMs, uploads, quoteSource, quoteTweetId, quoteTweetUrl, rewrite);
         var job = scheduledTweetService.createScheduledTweet(
                 user.id(), user.username(), text, scheduledAtEpochMs, clientRequestId, uploads,
-                source, resolvedQuoteId, quoteTweetUrl);
-        publishing.record(job);
+                source.source(), source.quoteId(), source.quoteUrl());
+        if (source.source() != null) publishing.record(job);
         return job;
+    }
+
+    private AssistantPublishing.ScheduleSource schedulingSource(String owner, String draftId, Integer version, String intent, String text,
+                                              long time, List<MediaUploadInput> uploads, boolean quote, String quoteId, String url, RewriteSource rewrite) {
+        if (rewrite != null) {
+            if (draftId != null || version != null) throw new IllegalArgumentException("排期不能同时关联洗稿和创作稿件");
+            return new AssistantPublishing.ScheduleSource(publishing.prepareRewrite(owner, rewrite, intent, text, time, uploads, quoteId), quoteId, url);
+        }
+        return draftId == null && version == null ? new AssistantPublishing.ScheduleSource(null, quoteId, url)
+                : publishing.prepareDraftSchedule(owner, draftId, version, intent, text, time, uploads, quote, quoteId);
     }
 
     @PostMapping(value = "/batch", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
@@ -220,18 +225,14 @@ public class ScheduledTweetController {
                 }
             }
             boolean metaQuoteSource = meta.quoteTweetId() != null && !meta.quoteTweetId().isBlank();
-            var source = meta.assistantDraftId() == null && meta.assistantDraftVersion() == null ? null
-                    : publishing.prepare(user.id(), meta.assistantDraftId(), meta.assistantDraftVersion(),
-                            meta.clientRequestId(), meta.text(), meta.scheduledAtEpochMs(), uploads,
-                            metaQuoteSource, meta.quoteTweetId());
-            String resolvedQuoteId = (source != null && source.quoteTweetId() != null && !source.quoteTweetId().isBlank())
-                    ? source.quoteTweetId()
-                    : meta.quoteTweetId();
+            var source = schedulingSource(user.id(), meta.assistantDraftId(), meta.assistantDraftVersion(),
+                    meta.clientRequestId(), meta.text(), meta.scheduledAtEpochMs(), uploads,
+                    metaQuoteSource, meta.quoteTweetId(), meta.quoteTweetUrl(), meta.rewriteSource());
             drafts.add(new BatchTweetDraftInput(
                     meta.text(),
                     meta.scheduledAtEpochMs(),
                     meta.clientRequestId(),
-                    uploads, source, resolvedQuoteId, meta.quoteTweetUrl()
+                    uploads, source.source(), source.quoteId(), source.quoteUrl()
             ));
         }
 

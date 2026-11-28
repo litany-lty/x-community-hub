@@ -146,7 +146,8 @@ function fixture(shared = {}) {
         };
         return action(store)?.result;
     };
-    ctx.state.authStatus = { loggedIn: true, user: { id: '101' }, oauthConfigured: true, writeAuthorized: true, mediaWriteAuthorized: true };
+    ctx.state.authStatus = { loggedIn: true, ownerAllPermissions: true, user: { id: '101', username: 'elidlicom' },
+        oauthConfigured: true, writeAuthorized: true, mediaWriteAuthorized: true };
     ctx.state.authConnectionState = 'ready';
     ctx.state.scheduleDraftPersistenceReady = true;
     ctx.state.composerClientRequestId = 'initial-request';
@@ -154,6 +155,40 @@ function fixture(shared = {}) {
     ctx.media = (name = 'image.png', contents = 'png-content') => ctx.validateAndMergeScheduleFiles([], [new File([contents], name, { type: 'image/png' })]).files;
     ctx.shared = { session, database, clock };
     return ctx;
+}
+
+async function testQuoteTransferReplacesTheClearedDraftSource() {
+    const c = fixture(), payloads = [];
+    c.state.scheduleDraftItems = [c.draft('', [], false)];
+    const due = c.parseDraftItemEpochMs(c.state.scheduleDraftItems[0]);
+    Object.assign(c, {
+        $: id => id === 'createScheduleBtn' ? {} : c.document.getElementById(id),
+        saveAssistantDraftEditor: async () => ({id: 'draft-a', topicId: 'A', version: 3, text: '稿件 A'}),
+        getQueuedScheduledEpochsMs: () => [], getRequiredScheduleIntervalMs: () => 0,
+        validateBatchScheduleEpochs: () => ({ok: true}), beginScheduleMutation: () => ({finish: noop, isCurrent: () => true}),
+        requestJsonWithin: async (url, request) => {
+            assert.equal(url, '/api/scheduled-tweets');
+            payloads.push(JSON.parse(request.body));
+            return {resp: {ok: true}, body: {}};
+        },
+        loadScheduledTweets: async () => true, clearScheduleComposerDraft: noop
+    });
+    vm.runInContext(section('    async function sendAssistantDraftToSchedule(', '    function renderTimingPanel(')
+        + section('    const MAX_SCHEDULE_TEXT_LENGTH =', '    function syncConfirmResendSubmitState(')
+        + 'function editScheduleText(e) {' + section('                const ta = e.target && e.target.matches && e.target.matches("[data-draft-textarea]")',
+            '            });') + '}', c);
+    await c.sendAssistantDraftToSchedule('draft-a');
+    assert.equal(c.state.scheduleDraftItems[0].sourceRef.assistantDraftId, 'draft-a');
+    c.state.scheduleDraftItems[0].timeTouched = true;
+    const editor = c.document.querySelector('[data-draft-textarea="0"]');
+    editor.matches = () => true;
+    editor.value = '';
+    c.editScheduleText({target: editor});
+    assert.equal(c.sendTextDraftToSchedule('来源 B 的附文', [], {quoteTweetId: '202', quoteTweetUrl: 'https://x.com/b/status/202'}), true);
+    await c.submitCreateScheduledTweet();
+    assert.equal(payloads.length, 1);
+    assert.deepEqual(payloads[0], {text: '来源 B 的附文', scheduledAtEpochMs: due, clientRequestId: c.state.composerClientRequestId,
+        quoteTweetId: '202', quoteTweetUrl: 'https://x.com/b/status/202'});
 }
 
 async function testNonDestructiveTransfer() {
@@ -333,8 +368,37 @@ async function testStaleRecoveryAndAuthorizationEdits() {
     assert.match(auth.session.get('xops_stepup_schedule_draft:101'), /typed while saving/);
 }
 
+async function testAssistantTransferDuringImageRestoration() {
+    const owner = fixture();
+    owner.state.scheduleDraftItems = [owner.draft("有图的原排期", owner.media("existing.png","original-bytes"))];
+    await owner.persistScheduleDraftNow();
+    const live = fixture(owner.shared);
+    live.state.scheduleDraftPersistenceReady = false;
+    live.storeGate = deferred();
+    const restore = live.restoreScheduleDraftAfterStepUpAuth();
+    await settle();
+    assert.equal(live.state.scheduleDraftRestoring,true);
+    Object.assign(live, {MAX_SCHEDULE_TEXT_LENGTH:25000, captureUserScope:()=>()=>true,
+        saveAssistantDraftEditor:async()=>({id:"d",version:1,text:"新创作稿",topicId:"t"})});
+    vm.runInContext(section("    async function sendAssistantDraftToSchedule(","    function renderTimingPanel("), live);
+    const transfer = live.sendAssistantDraftToSchedule("d",false);
+    await settle();
+    live.storeGate.resolve();
+    await Promise.all([restore,transfer]);
+    assert.equal(live.state.scheduleDraftItems[0].files.length,1);
+    assert.equal(live.state.scheduleDraftItems[1].text,"新创作稿");
+    assert.equal(live.state.scheduleDraftItems[1].sourceRef.assistantDraftId,"d");
+    await live.persistScheduleDraftNow();
+    const reload = fixture(live.shared);
+    reload.state.scheduleDraftPersistenceReady=false;
+    await reload.restoreScheduleDraftAfterStepUpAuth();
+    assert.equal(reload.state.scheduleDraftItems[0].files.length,1);
+    assert.equal(await reload.state.scheduleDraftItems[0].files[0].file.text(),"original-bytes");
+    assert.equal(reload.state.scheduleDraftItems[1].text,"新创作稿");
+}
+
 (async () => {
-    const tests = [testNonDestructiveTransfer, testStableNodesAndDestructiveConfirmation,
+    const tests = [testAssistantTransferDuringImageRestoration, testNonDestructiveTransfer, testQuoteTransferReplacesTheClearedDraftSource, testStableNodesAndDestructiveConfirmation,
         testRecoveryIsolationAndRetention, testPendingImagesAndLeaveProtection,
         testStorageFailuresPreserveInput, testStaleRecoveryAndAuthorizationEdits];
     for (const test of tests) await test();

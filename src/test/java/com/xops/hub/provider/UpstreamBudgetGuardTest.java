@@ -1,8 +1,16 @@
 package com.xops.hub.provider;
 import com.xops.hub.config.XOpsProperties;
+import com.xops.hub.service.XOAuthService;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+import org.springframework.test.util.ReflectionTestUtils;
 import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Clock;
@@ -11,8 +19,10 @@ import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
 import static org.assertj.core.api.Assertions.*;
+import static org.mockito.Mockito.*;
 
 class UpstreamBudgetGuardTest {
     @TempDir Path directory;
@@ -24,6 +34,38 @@ class UpstreamBudgetGuardTest {
         p.setHourlyUpstreamApiBudget(1000);
         p.setDailyUpstreamApiBudget(2000);
         return p;
+    }
+
+    @ParameterizedTest @ValueSource(booleans = {true, false})
+    void hourlyBudgetRollsAtLocalHourEvenAfterRestart(boolean countCap) {
+        var p = properties();
+        p.setTimezone("Asia/Kolkata");
+        if (countCap) p.setHourlyUpstreamApiBudget(1);
+        else p.setHourlyUpstreamUsdBudget("0.000180");
+        var first = new UpstreamBudgetGuard(p, true, clock("2026-11-28T06:50:00Z"));
+        first.acquirePermit(PROFILE, "twitterapi_io_read");
+        var sameHour = new UpstreamBudgetGuard(p, true, clock("2026-11-28T07:05:00Z"));
+        assertThatThrownBy(() -> sameHour.acquirePermit(PROFILE, "twitterapi_io_read"))
+                .isInstanceOf(XDataProviderException.class);
+        var next = new UpstreamBudgetGuard(p, true, clock("2026-11-28T07:30:00Z"));
+        next.acquirePermit(PROFILE, "twitterapi_io_read");
+        assertThat(next.snapshotMetrics().get("totalBillableCalls")).isEqualTo(2L);
+    }
+
+    @Test void oldUtcBucketKeepsItsReservationsWhenTheLocalHourOverlaps() throws Exception {
+        var p = properties();
+        p.setTimezone("Asia/Kolkata");
+        p.setHourlyUpstreamApiBudget(1);
+        var at = Instant.parse("2026-11-28T06:50:00Z");
+        new UpstreamBudgetGuard(p, true, Clock.fixed(at, ZoneOffset.UTC)).acquirePermit(PROFILE, "twitterapi_io_read");
+        var file = directory.resolve("upstream-budget.json");
+        var json = new ObjectMapper();
+        var old = (com.fasterxml.jackson.databind.node.ObjectNode) json.readTree(file.toFile());
+        json.writeValue(file.toFile(), old.put("version", 1).put("hour", at.getEpochSecond() / 3600));
+        assertThatThrownBy(() -> new UpstreamBudgetGuard(p, true, clock("2026-11-28T07:05:00Z"))
+                .acquirePermit(PROFILE, "twitterapi_io_read")).isInstanceOf(XDataProviderException.class);
+        new UpstreamBudgetGuard(p, true, clock("2026-11-28T07:30:00Z")).acquirePermit(PROFILE, "twitterapi_io_read");
+        assertThat(json.readTree(file.toFile()).path("totalCalls").asLong()).isEqualTo(2);
     }
     @Test void concurrentGuardInstancesShareDurableAdmissionAndCannotOverspend() throws Exception {
         XOpsProperties p = properties();
@@ -97,10 +139,146 @@ class UpstreamBudgetGuardTest {
             .isInstanceOf(XDataProviderException.class);
         assertThatThrownBy(() -> new UpstreamBudgetGuard(p).acquirePermit(EXTERNAL_PAID_PROFILE, "twitterapi_io_read"))
             .isInstanceOfSatisfying(XDataProviderException.class, ex -> assertThat(ex.getStatusCode()).isEqualTo(403));
-        PaidCapabilityGate.withCaller("elidlicom", "budget-test-owner", () -> {
-            new UpstreamBudgetGuard(p).acquirePermit(EXTERNAL_PAID_PROFILE, "twitterapi_io_read");
+        PaidCapabilityGate.withCaller("elidlicom", "budget-test-owner", true, () -> {
+            assertThatThrownBy(() -> new UpstreamBudgetGuard(p).acquirePermit(EXTERNAL_PAID_PROFILE, "twitterapi_io_read"))
+                    .isInstanceOf(XDataProviderException.class).hasMessageContaining("预算");
             return null;
         });
+    }
+
+    @ParameterizedTest @ValueSource(strings = {"hourCalls","dayCalls","hourUsd","dayUsd","monthUsd"})
+    void anyZeroLimitClosesOwnerAdmissionAndPreflight(String zero) {
+        XOpsProperties p = properties();
+        switch (zero) {
+            case "hourCalls" -> p.setHourlyUpstreamApiBudget(0);
+            case "dayCalls" -> p.setDailyUpstreamApiBudget(0);
+            case "hourUsd" -> p.setHourlyUpstreamUsdBudget("0");
+            case "dayUsd" -> p.setDailyUpstreamUsdBudget("0");
+            case "monthUsd" -> p.setMonthlyUpstreamUsdBudget("0");
+        }
+        var guard = new UpstreamBudgetGuard(p, true);
+        PaidCapabilityGate.runWithCaller("elidlicom","101", true,() -> {
+            assertThat(guard.canAfford(PROFILE.toString(),"twitterapi_io_read")).isFalse();
+            assertThat(guard.canAffordRequests(PROFILE.toString(),"twitterapi_io_read",2)).isFalse();
+            assertThat(guard.canAffordBackground(PROFILE.toString(),"twitterapi_io_read")).isFalse();
+            assertThatThrownBy(() -> guard.acquirePermit(PROFILE,"twitterapi_io_read")).isInstanceOf(XDataProviderException.class)
+                    .hasMessageContaining("预算");
+            assertThat(guard.snapshotMetrics().get("totalBillableCalls")).isEqualTo(0L);
+        });
+    }
+
+    @Test void oauthSpendsSharedBudgetAndRestartedOwnerCannotDispatchTweetOrUpload() throws Exception {
+        var p = properties();
+        p.setHourlyUpstreamApiBudget(2);
+        p.setOauthClientId("local-client");
+        p.setOfficialBaseUrl("http://127.0.0.1:9999/2");
+        var mapper = new ObjectMapper().findAndRegisterModules();
+        var transport = mock(HttpClient.class);
+        var paths = new java.util.concurrent.CopyOnWriteArrayList<String>();
+        when(transport.send(any(HttpRequest.class), org.mockito.ArgumentMatchers.<HttpResponse.BodyHandler<String>>any())).thenAnswer(call -> {
+            URI endpoint = ((HttpRequest)call.getArgument(0)).uri();
+            assertThat(endpoint.getHost()).isEqualTo("127.0.0.1");
+            paths.add(endpoint.getPath());
+            HttpResponse<String> response = mock(HttpResponse.class);
+            when(response.statusCode()).thenReturn(200);
+            String body = switch (endpoint.getPath()) {
+                case "/2/oauth2/token" -> "{\"access_token\":\"synthetic\",\"token_type\":\"bearer\",\"refresh_token\":\"refresh\",\"expires_in\":3600,\"scope\":\"users.read tweet.read tweet.write media.write offline.access\"}";
+                case "/2/users/me" -> "{\"data\":{\"id\":\"101\",\"username\":\"elidlicom\",\"name\":\"Owner\"}}";
+                default -> "{\"data\":{\"id\":\"999\"}}";
+            };
+            when(response.body()).thenReturn(body);
+            return response;
+        });
+        var pool = new SharedApiExecutor(p);
+        try {
+            var guard = new UpstreamBudgetGuard(p, true);
+            var oauth = new XOAuthService(p,mapper,pool,guard);
+            ReflectionTestUtils.setField(oauth,"httpClient",transport);
+            var request = oauth.createPublishAuthorizationRequest("http://localhost:8080","101");
+            PaidCapabilityGate.runWithCaller("elidlicom","101", true, () -> oauth.handleCallbackResult("local-code",request.state()));
+            assertThat(paths).containsExactly("/2/oauth2/token","/2/users/me");
+            var restarted = new UpstreamBudgetGuard(p,true);
+            var restartedOauth = new XOAuthService(p,mapper,pool,restarted);
+            ReflectionTestUtils.setField(restartedOauth,"httpClient",transport);
+            var publisher = new XPublishClient(p,mapper,pool,restarted);
+            ReflectionTestUtils.setField(publisher,"httpClient",transport);
+            var started = new java.util.concurrent.atomic.AtomicBoolean();
+            PaidCapabilityGate.runWithCaller("elidlicom","101", true,() -> {
+                assertThat(restartedOauth.getValidWriteAccessToken("101",true)).isEqualTo("synthetic");
+                assertThatThrownBy(() -> XPublishClient.withPublicationReceipt("text",null,() -> started.set(true),
+                        () -> publisher.createTweet("synthetic","text",List.of())))
+                        .isInstanceOfSatisfying(XPublishClient.XPublishException.class, e -> assertThat(e.isDeliveryUncertain()).isFalse());
+                assertThatThrownBy(() -> publisher.uploadMedia("synthetic", new byte[]{1}, "image/png","file.png"))
+                        .isInstanceOfSatisfying(XPublishClient.XPublishException.class, e -> assertThat(e.isDeliveryUncertain()).isFalse());
+                assertThat(started).isFalse();
+                var tokens = new com.xops.hub.store.XOAuthTokenStore(p,mapper);
+                tokens.save(new com.xops.hub.store.XOAuthTokenStore.StoredOAuthToken("101","elidlicom","expired","refresh",
+                        1L,XOAuthService.PUBLISH_OAUTH_SCOPE,1L));
+                assertThatThrownBy(() -> restartedOauth.getValidWriteAccessToken("101",true)).isInstanceOf(XDataProviderException.class)
+                        .hasMessageContaining("预算");
+                assertThat(tokens.load("101").refreshToken()).isEqualTo("refresh");
+            });
+            assertThat(paths).containsExactly("/2/oauth2/token","/2/users/me");
+            assertThat(restarted.snapshotMetrics().get("totalBillableCalls")).isEqualTo(2L);
+        } finally { pool.shutdown(); }
+    }
+
+    @Test void backgroundMediaRetryIsChargedPerTransmittedStepAndStopsMidUpload() throws Exception {
+        var p = properties();
+        p.setHourlyUpstreamApiBudget(2);
+        p.setOfficialBaseUrl("http://127.0.0.1:9999/2");
+        var guard = new UpstreamBudgetGuard(p,true);
+        PaidCapabilityGate.runWithCaller("elidlicom","101", true,() -> {
+            guard.requireAffordable(p.getOfficialBaseUrl()+"/media/upload/initialize","x_media_upload");
+            guard.requireAffordable(p.getOfficialBaseUrl()+"/media/upload/initialize","x_media_upload");
+        });
+        assertThat(guard.snapshotMetrics().get("totalBillableCalls")).isEqualTo(0L);
+        var clock = mock(Clock.class);
+        when(clock.millis()).thenReturn(1L);
+        var retries = new PaidCapabilityGate(clock);
+        var pool = new SharedApiExecutor(p);
+        try {
+            var publisher = new XPublishClient(p,new ObjectMapper(),pool,guard);
+            var paths = new java.util.concurrent.CopyOnWriteArrayList<String>();
+            var http = mock(HttpClient.class);
+            when(http.send(any(HttpRequest.class),org.mockito.ArgumentMatchers.<HttpResponse.BodyHandler<String>>any())).thenAnswer(call -> {
+                var uri = ((HttpRequest)call.getArgument(0)).uri();
+                assertThat(uri.getHost()).isEqualTo("127.0.0.1");
+                paths.add(uri.getPath());
+                HttpResponse<String> response = mock(HttpResponse.class);
+                when(response.statusCode()).thenReturn(200);
+                when(response.body()).thenReturn("{\"data\":{\"id\":\"99\"}}");
+                return response;
+            });
+            ReflectionTestUtils.setField(publisher,"httpClient",http);
+            retries.scheduleIdempotentRetry("upload-retry","x_media_upload","elidlicom","101","local fixture",
+                    () -> publisher.uploadMedia("synthetic",new byte[]{1},"image/png","image.png"), false, true);
+            when(clock.millis()).thenReturn(1L+PaidCapabilityGate.RETRY_INTERVAL_MS);
+            retries.runDueRetries();
+            assertThat(paths).containsExactly("/2/media/upload/initialize","/2/media/upload/99/append");
+            assertThat(retries.getRetrySnapshot("upload-retry").retryCount()).isEqualTo(1);
+            when(clock.millis()).thenReturn(1L+2*PaidCapabilityGate.RETRY_INTERVAL_MS);
+            retries.runDueRetries();
+            assertThat(paths).hasSize(2);
+            assertThat(guard.snapshotMetrics().get("totalBillableCalls")).isEqualTo(2L);
+            assertThat(guard.snapshotMetrics().get("callsByCategory")).isEqualTo(java.util.Map.of("x_media_upload",2L));
+        } finally { pool.shutdown(); }
+    }
+
+    @Test void paidFallbackKeepsItsOriginalCallerWhenAFreeRequestCompletesOnAnotherThread() {
+        var guard = new UpstreamBudgetGuard(properties(), true);
+        var freeRequest = new CompletableFuture<String>();
+        var fallback = PaidCapabilityGate.withCaller("elidlicom","101", true, () ->
+                TwitterApiIoProvider.handleComposeCancellable(freeRequest, (response, error) -> {
+                    guard.acquirePermit(EXTERNAL_PAID_PROFILE,"twitterapi_io_read");
+                    return CompletableFuture.completedFuture(PaidCapabilityGate.currentScope().accountId());
+                }));
+        PaidCapabilityGate.runWithCaller("reader","202",() -> {
+            freeRequest.complete("fallback");
+            assertThat(PaidCapabilityGate.currentScope().accountId()).isEqualTo("202");
+        });
+        assertThat(fallback.join()).isEqualTo("101");
+        assertThat(guard.snapshotMetrics().get("totalBillableCalls")).isEqualTo(1L);
     }
     @Test void estimatesUseResourceCountsAndUnknownEndpointsCannotBypassAccounting() {
         assertThat(UpstreamBudgetGuard.estimateMicros(URI.create("https://api.twitterapi.io/twitter/article?tweet_id=1"),

@@ -30,7 +30,9 @@ class DetailedRecheckTest {
     }
     static CommunityHubService hub(XOpsProperties p,RawAccountSnapshot snapshot,SharedApiExecutor pool) {
         var official=new OfficialXApiV2Provider(p,MAPPER,pool) {
-            @Override public RawAccountSnapshot fetchSnapshot(String username,String token) {return snapshot;}
+            @Override public RawAccountSnapshot fetchSnapshot(String username, String token, String expectedAccountId) {
+                return snapshot;
+            }
         };
         return new CommunityHubService(p,new DemoXDataProvider(),null,official,MAPPER);
     }
@@ -57,7 +59,8 @@ class DetailedRecheckTest {
             session.setAttribute(XOAuthController.SESSION_AUTH_USER,new AuthenticatedXUser("old-owner-id","same_handle","Old owner","",false,NOW));
             request.setSession(session);request.setRemoteAddr("127.0.0.1");
             assertThatThrownBy(()->controller.analyze(null,"WEEK",7,null,false,request,new MockHttpServletResponse()))
-                    .as("same username no longer establishes the same X account").isInstanceOf(XDataProviderException.class);
+                    .as("same username no longer establishes the same X account")
+                    .isInstanceOfSatisfying(XDataProviderException.class, ex -> assertThat(ex.getStatusCode()).isEqualTo(409));
         } finally {pool.shutdown();}
     }
     @Test void persistedHistoryMustNotMergeAcrossDifferentIdsSharingAHandle() {

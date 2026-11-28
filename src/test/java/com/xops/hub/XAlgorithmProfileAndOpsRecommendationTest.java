@@ -241,7 +241,7 @@ class XAlgorithmProfileAndOpsRecommendationTest {
         adminReq.setRemoteAddr("10.0.0.9");
         adminReq.getSession(true).setAttribute(
                 XOAuthController.SESSION_AUTH_USER,
-                new AuthenticatedXUser("1", "elidlicom", "Author", "", true, NOW)
+                new AuthenticatedXUser(com.xops.hub.model.AuthorIdentity.ARCHIVE_ACCOUNT_ID, "elidlicom", "Author", "", true, NOW)
         );
         var adminRead = controller.getProfile(adminReq, new MockHttpServletResponse());
         assertThat(adminRead.canManage()).isTrue();

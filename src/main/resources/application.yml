@@ -111,10 +111,10 @@ xops:
   scheduler-poll-ms: ${X_SCHEDULER_POLL_MS:15000}
   schedule-grace-window-seconds: ${X_SCHEDULE_GRACE_WINDOW_SECONDS:300}
 
-  # 与 @elidlicom 互动前 50 名活跃已登录用户每日自动同步配置
+  # 互动前 50 名中，已登录且已有本地快照的账号每日自动同步最近 24 小时
   top50-auto-sync-enabled: ${X_TOP50_AUTO_SYNC_ENABLED:true}
   top50-auto-sync-cron: "${X_TOP50_AUTO_SYNC_CRON:0 20 23 * * *}"
-  # @elidlicom 本人及互动排名前 10 账号后台低优静默历史缓存（前台有请求时自动让路）
+  # 仅补齐作者本人的长期历史，前台优先。保留已有配置名以兼容现有实例。
   top10-silent-history-enabled: ${X_TOP10_SILENT_HISTORY_ENABLED:true}
   top10-silent-history-poll-ms: ${X_TOP10_SILENT_HISTORY_POLL_MS:45000}
   # @elidlicom 最近发推巡检间隔（默认 30 分钟一次；超 1小时+N[1-20]分钟未发新推时从自动引用转发配置账号择优发布）

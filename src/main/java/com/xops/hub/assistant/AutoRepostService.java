@@ -1,9 +1,13 @@
 package com.xops.hub.assistant;
 
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.xops.hub.model.XPostLink;
+import com.xops.hub.provider.PaidCapabilityGate;
+import com.xops.hub.provider.UpstreamBudgetGuard;
 import com.xops.hub.provider.XDataProviderException;
 import com.xops.hub.provider.XPublishClient;
 import com.xops.hub.provider.XPublishClient.XPublishException;
+import com.xops.hub.provider.XPublishClient.PublicationReceipt;
 import com.xops.hub.service.XOAuthService;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
@@ -21,7 +25,9 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -32,6 +38,7 @@ public class AutoRepostService {
     private static final Logger log = LoggerFactory.getLogger(AutoRepostService.class);
     static final long MAX_FRESHNESS_AGE_MS = 4L * 60L * 60_000L;
     static final long PATROL_MAX_FRESHNESS_AGE_MS = 48L * 60L * 60_000L;
+    private static final long OWNER_TIMELINE_MAX_AGE_MS = 5L * 60_000L;
     static final long RECENT_REPOST_FALLBACK_MAX_AGE_MS = 30L * 24L * 60L * 60_000L;
     static final long REWRITE_MAX_AGE_MS = 30L * 24L * 60L * 60_000L;
     public static final long SAME_AUTHOR_COOLDOWN_MS = 16L * 60L * 60_000L;
@@ -39,7 +46,8 @@ public class AutoRepostService {
     public static final int OWNER_TWEET_MIN_JITTER_MINUTES = 1;
     public static final int OWNER_TWEET_MAX_JITTER_MINUTES = 20;
     private static final long HOT_CONTEXT_WINDOW_MS = 48L * 60L * 60_000L;
-    private static final java.util.regex.Pattern EMBEDDED_URL_PATTERN = java.util.regex.Pattern.compile("(?i)https?://\\S+");
+    private static final java.util.regex.Pattern EMBEDDED_URL_PATTERN = java.util.regex.Pattern.compile(
+            "(?i)(?:https?://|\\bwww\\.|\\b(?:t\\.co|x\\.com|twitter\\.com)/)\\S+");
     private static final java.util.regex.Pattern THREAD_OR_VISUAL_DEPENDENCY_PATTERN = java.util.regex.Pattern.compile(
             "(?is)(?:^\\s*(?:1\\s*/\\s*\\d*|🧵)|[👇⬇]|(?:如下图|见下图|配图|看图|视频里|评论区见|link\\s+in\\s+bio|see\\s+(?:below|thread)))");
     private static final java.util.regex.Pattern QUANT_FACT_PATTERN = java.util.regex.Pattern.compile(
@@ -67,6 +75,8 @@ public class AutoRepostService {
     private static final Set<String> RETRYABLE_STATUSES = Set.of(
             "AUTH_REQUIRED", "JUDGE_FAILED", "FAILED", "SKIPPED_COOLDOWN", "SKIPPED_AUTHOR_COOLDOWN", "SKIPPED_QUIET_HOURS"
     );
+    private static final Set<String> WAITING_FOR_WINDOW = Set.of("SKIPPED_COOLDOWN", "SKIPPED_AUTHOR_COOLDOWN", "SKIPPED_QUIET_HOURS");
+    private static final Set<String> QUOTE_DELIVERY_STATUSES = Set.of("SENDING", "UNCERTAIN", "PUBLISHED");
 
     private final AssistantStore store;
     private final SourceCollector sources;
@@ -74,6 +84,7 @@ public class AutoRepostService {
     private final XOAuthService oauthService;
     private final XPublishClient publishClient;
     private final Clock clock;
+    private final Map<String,ObjectNode> pendingAcceptedReceipts = new java.util.concurrent.ConcurrentHashMap<>();
     @Autowired(required = false)
     private com.xops.hub.provider.PaidCapabilityGate paidGate;
     @Autowired(required = false)
@@ -170,10 +181,12 @@ public class AutoRepostService {
         history.sort(Comparator.comparingLong(TimedMode::publishedAtMs).reversed());
         return history.stream().limit(Math.max(1, limit)).map(TimedMode::mode).toList();
     }
-    private final Map<String, ObjectNode> previewCache = java.util.Collections.synchronizedMap(
+    private record QuotePreview(long requestOrder, ObjectNode result) { }
+    private final java.util.concurrent.atomic.AtomicLong quotePreviewOrder = new java.util.concurrent.atomic.AtomicLong();
+    private final Map<String, QuotePreview> previewCache = java.util.Collections.synchronizedMap(
             new LinkedHashMap<>(64, 0.75f, true) {
                 @Override
-                protected boolean removeEldestEntry(Map.Entry<String, ObjectNode> eldest) {
+                protected boolean removeEldestEntry(Map.Entry<String, QuotePreview> eldest) {
                     return size() > 128;
                 }
             }
@@ -245,37 +258,21 @@ public class AutoRepostService {
     @PostConstruct
     void bindHook() {
         if (!isAutoRepostRuntimeEnabled()) {
+            reconcileAcceptedReceipts();
             log.info("Local/non-production runtime detected; auto-repost background ingest hooks and startup retries are disabled (preview remains available).");
             return;
         }
-        List<String> startupRetryIds = recoverStaleRecords();
+        recoverStaleRecords();
         sources.setIngestHook(this::enqueue);
         sources.setBatchIngestHook(this::enqueueAuthorBatch);
         long bootNowMs = clock.millis();
         if (isInAutoRepostQuietWindow(bootNowMs)) {
             scheduleQuietWindowEndWakeup(bootNowMs);
         }
-        if (!startupRetryIds.isEmpty()) {
-            deferredScheduler.schedule(() -> {
-                long retryNow = clock.millis();
-                if (isInAutoRepostQuietWindow(retryNow)) {
-                    log.info("Skipping {} startup auto-repost retries during quiet window ({}).",
-                            startupRetryIds.size(), quietWindowReason());
-                    scheduleQuietWindowEndWakeup(retryNow);
-                    return;
-                }
-                for (String id : startupRetryIds) {
-                    try {
-                        retry(id);
-                    } catch (Exception e) {
-                        log.warn("Startup queued retry failed for {}: {}", id, e.getMessage());
-                    }
-                }
-            }, 3, java.util.concurrent.TimeUnit.SECONDS);
-        }
     }
 
     List<String> recoverStaleRecords() {
+        reconcileAcceptedReceipts();
         List<String> startupRetryIds = new ArrayList<>();
         store.tx(tx -> {
             for (String table : List.of("auto_repost", "auto_rewrite")) {
@@ -283,37 +280,239 @@ public class AutoRepostService {
                     String id = rec.path("materialId").asText(rec.path("id").asText("")).strip();
                     if (id.isBlank()) continue;
                     String status = rec.path("status").asText("");
-                    if ("EVALUATING".equals(status)) {
+                    boolean pendingRetry = "auto_repost".equals(table) && rec.path("autoRetryAt").asLong() > 0L;
+                    boolean oldBudgetRejection = "auto_repost".equals(table) && Set.of("AUTH_REQUIRED", "FAILED").contains(status)
+                            && UpstreamBudgetGuard.isBudgetBlockMessage(rec.path("error").asText())
+                            && !rec.path("budgetDeferred").asBoolean();
+                    if ("RETRY_QUEUED".equals(status) || oldBudgetRejection || pendingRetry
+                            && (Set.of("EVALUATING", "FAILED").contains(status) || WAITING_FOR_WINDOW.contains(status))) {
+                        ObjectNode pending = rec.deepCopy().put("status", WAITING_FOR_WINDOW.contains(status) ? status : "FAILED");
+                        if (oldBudgetRejection) {
+                            pending.put("budgetDeferred", true).put("autoRetryAttempts", nonBudgetRetryAttempts(tx, id, rec));
+                        }
+                        if ("auto_repost".equals(table) && !pendingRetry) pending.put("autoRetryAt", clock.millis() + 3_000L);
+                        if (!pending.equals(rec)) tx.put(table, id, pending);
+                        if ("auto_repost".equals(table)) startupRetryIds.add(id);
+                    } else if ("EVALUATING".equals(status)) {
                         tx.put(table, id, rec.deepCopy()
-                                .put("status", "JUDGE_FAILED")
+                                .put("status", interruptedEvaluationStatus(tx, table, id, rec))
                                 .put("error", "服务重启中断判定，可手动重试"));
                     } else if ("SENDING".equals(status)) {
                         tx.put(table, id, rec.deepCopy()
                                 .put("status", "UNCERTAIN")
                                 .put("error", "发送途中服务重启，请先核实线上时间线避免重复发送"));
-                    } else if ("RETRY_QUEUED".equals(status)) {
-                        tx.put(table, id, rec.deepCopy()
-                                .put("status", "FAILED")
-                                .put("error", "等待重启后重发"));
-                        if ("auto_repost".equals(table)) {
-                            startupRetryIds.add(id);
-                        }
                     }
                 }
             }
             return null;
         });
+        String owner = store.boundOwnerId();
+        if (paidGate != null && !owner.isBlank()) {
+            for (String id : startupRetryIds) {
+                ObjectNode row = store.tx(tx -> {
+                    var pending = tx.get("auto_repost", id);
+                    if (repostAuthorized(tx, pending, owner)) return pending;
+                    if (pending != null && pending.has("autoRetryAt")) {
+                        pending.remove("autoRetryAt");
+                        tx.put("auto_repost", id, pending);
+                    }
+                    return null;
+                });
+                if (row == null) continue;
+                paidGate.restorePendingRetry("auto-repost:" + id, "x_tweet_create", PaidCapabilityGate.PRIVILEGED_USERNAME,
+                        owner, row.path("autoRetryAttempts").asInt(), row.path("autoRetryAt").asLong(), row.path("error").asText(),
+                        () -> runAutomaticRepostRetry(id), true);
+            }
+        }
         return startupRetryIds;
     }
 
+    private static int nonBudgetRetryAttempts(AssistantStore.Tx tx, String id, ObjectNode row) {
+        int attempts = row.path("autoRetryAttempts").asInt();
+        if (attempts == 0) return 0;
+        var revisions = tx.versions("auto_repost", id);
+        for (int i = 0; i + 1 < revisions.size(); i++) {
+            var after = revisions.get(i);
+            var before = revisions.get(i + 1);
+            if ("EVALUATING".equals(after.path("status").asText()) && !after.path("automaticRetryRunning").asBoolean()) break;
+            if ("FAILED".equals(after.path("status").asText()) && "SENDING".equals(before.path("status").asText())
+                    && before.path("automaticRetryRunning").asBoolean() && UpstreamBudgetGuard.isBudgetBlockMessage(after.path("error").asText())
+                    && after.path("autoRetryAttempts").asInt() > before.path("autoRetryAttempts").asInt()) attempts--;
+        }
+        // A legacy export may contain just the last revision of an exhausted local rejection.
+        return Math.max(0, Math.min(attempts, PaidCapabilityGate.MAX_IDEMPOTENT_RETRIES - 1));
+    }
+
     public ObjectNode retry(String materialId) {
+        return retry(materialId, null);
+    }
+
+    public ObjectNode verifyAutomaticPublication(String ownerId, String materialId, AutoPublishMode mode, ObjectNode decision) {
+        if (mode == null) throw new IllegalArgumentException("请选择需要核实的自动发布记录");
+        boolean rewrite = mode == AutoPublishMode.REWRITE;
+        String table = rewrite ? "auto_rewrite" : "auto_repost";
+        String receiptId = (rewrite ? "auto-rewrite-" : "auto-repost-") + materialId;
+        requireReceiptReady(receiptId);
+        ObjectNode verified = store.tx(tx -> {
+            ObjectNode row = AssistantTopics.required(tx, table, materialId);
+            if (ownerId == null || ownerId.isBlank() || !boundPublisherMatches(tx, row, ownerId))
+                throw new XDataProviderException(403, "该记录不属于当前发布账号");
+            if (row.path("manual").asBoolean()) throw new XDataProviderException(409, "请从手动引用回执核实该记录");
+            if (!AssistantPublishing.applyVerification(tx, table, row, decision, clock.millis())) return row;
+            ObjectNode existing = tx.get("publication", receiptId);
+            if (existing != null && "PUBLISHED".equals(existing.path("status").asText())
+                    && !("PUBLISHED".equals(row.path("status").asText())
+                        && existing.path("publishedTweetId").equals(row.path("publishedTweetId"))))
+                throw new XDataProviderException(409, "已有不同的成功回执，请刷新后核对");
+            row.remove(List.of("autoRetryAt", "autoRetryAttempts", "automaticRetryRunning", "deferredPendingEval"));
+            if ("PUBLISHED".equals(row.path("status").asText())) {
+                if (!rewrite && !row.hasNonNull("requestedQuoteTweetId") && row.hasNonNull("quoteTweetId"))
+                    row.put("requestedQuoteTweetId", row.path("quoteTweetId").asText());
+                if (!row.hasNonNull("publicationMode")) row.remove(List.of("quoteTweetId", "quotedTweetId"));
+                if (existing == null || !"PUBLISHED".equals(existing.path("status").asText())) {
+                    ObjectNode receipt = object().put("source", rewrite ? "AUTO_REWRITE_POST" : row.path("source").asText("AUTO_REPOST_VERIFIED"))
+                            .put("ownerAccountId", ownerId).put("materialId", materialId)
+                            .put("requestedText", row.path(rewrite ? "rewrittenText" : "commentText").asText());
+                    for (String field : List.of("topicId", "authorId", "username", "status", "requestedQuoteTweetId",
+                            "text", "publicationMode", "quoteTweetId", "quotedTweetId", "publishedTweetId", "publishedTweetUrl", "publishedAt", "verifiedAt")) {
+                        if (row.hasNonNull(field)) receipt.set(field, row.get(field));
+                    }
+                    tx.put("publication", receiptId, receipt);
+                }
+            }
+            return tx.put(table, materialId, row);
+        });
+        clearPreviewCache();
+        return verified;
+    }
+
+    private void runAutomaticRepostRetry(String id) {
+        // The ledger counts the outcome of the actual send on the serial publisher.
+        CompletableFuture.runAsync(() -> {
+            if (!isAutoRepostRuntimeEnabled()) return;
+            reconcileAcceptedReceipts();
+            ObjectNode eligible = store.tx(tx -> {
+                ObjectNode rec = tx.get("auto_repost", id);
+                if (rec == null || rec.path("autoRetryAt").asLong() <= 0L) return null;
+                if (("FAILED".equals(rec.path("status").asText()) || WAITING_FOR_WINDOW.contains(rec.path("status").asText()))
+                        && repostAuthorized(tx, rec, null)) return rec;
+                rec.remove("autoRetryAt");
+                tx.put("auto_repost", id, rec);
+                return null;
+            });
+            if (eligible == null) return;
+            if (deferQuietRetry(id)) return;
+            var owner = store.tx(AssistantStore.Tx::ownerBinding);
+            if (owner == null) return;
+            String ownerId = owner.path("accountId").asText();
+            if (refreshOwnerTimeline(ownerId, owner.path("username").asText("").replaceFirst("^@+", "")) < 0L) {
+                deferRepostRetry(id, eligible.path("status").asText(), clock.millis() + PaidCapabilityGate.RETRY_INTERVAL_MS,
+                        "暂时无法核实发布账号的最新发帖时间，稍后重查");
+                return;
+            }
+            try {
+                retryRepost(id, ownerId);
+            } catch (RepostCooldown cooldown) {
+                deferRepostRetry(id, cooldown.status, cooldown.readyAt, cooldown.getMessage());
+                return;
+            } catch (RuntimeException interrupted) {
+                store.tx(tx -> {
+                    var row = tx.get("auto_repost", id);
+                    if (row != null && "FAILED".equals(row.path("status").asText())) {
+                        scheduleNextAttempt(row, row.path("autoRetryAttempts").asInt() + 1);
+                        tx.put("auto_repost", id, row);
+                    }
+                    return null;
+                });
+                throw interrupted;
+            }
+            ObjectNode result = store.tx(tx -> tx.get("auto_repost", id));
+            if (result != null && WAITING_FOR_WINDOW.contains(result.path("status").asText()))
+                deferRepostRetry(id, result.path("status").asText(), result.path("autoRetryAt").asLong(), result.path("reason").asText());
+        }, executor).join();
+    }
+
+    private boolean deferQuietRetry(String id) {
+        long now = clock.millis();
+        if (!isInAutoRepostQuietWindow(now)) return false;
+        long next = com.xops.hub.config.XOpsProperties.nextQuietWindowEndEpochMs(
+                now, AssistantRetention.ZONE, quietStartHour(), quietEndHour());
+        deferRepostRetry(id, "SKIPPED_QUIET_HOURS", next, quietWindowReason());
+        return true;
+    }
+
+    private void deferRepostRetry(String id, String status, long readyAt, String reason) {
+        long now = clock.millis();
+        long next = Math.max(now + 1L, readyAt);
+        boolean pending = store.tx(tx -> {
+            var row = tx.get("auto_repost", id);
+            if (row == null || !("FAILED".equals(row.path("status").asText()) || WAITING_FOR_WINDOW.contains(row.path("status").asText()))) return false;
+            row.remove("automaticRetryRunning");
+            tx.put("auto_repost", id, row.put("status", status).put("autoRetryAt", next).put("reason", reason));
+            return true;
+        });
+        if (pending && (paidGate == null || !paidGate.deferRunningRetry("auto-repost:" + id, next))) {
+            deferredScheduler.schedule(() -> runAutomaticRepostRetry(id), Math.max(1L, next - now),
+                    java.util.concurrent.TimeUnit.MILLISECONDS);
+        }
+    }
+
+    private static final class RepostCooldown extends XDataProviderException {
+        final String status;
+        final long readyAt;
+        RepostCooldown(String status, long readyAt, String reason) {
+            super(409, reason);
+            this.status = status;
+            this.readyAt = readyAt;
+        }
+    }
+
+    private static boolean strictRepostAuthorLock(ObjectNode row) {
+        return row != null && row.path("strictSixteenHourAuthorLock")
+                .asBoolean(row.path("candidateWindowMs").asLong() >= PATROL_MAX_FRESHNESS_AGE_MS);
+    }
+
+    private RepostCooldown repostCooldown(AssistantStore.Tx tx, ObjectNode rec, String ownerId, String ownerUsername,
+                                         String materialId, boolean exemptAuthor, long now) {
+        String username = rec.path("username").asText("").replaceFirst("^@+", "");
+        DualCooldown cd = computeLiveDualCooldown(tx, AssistantWorkflow.settings(tx), ownerId, ownerUsername,
+                rec.path("authorId").asText(), username, materialId, now);
+        if ((!exemptAuthor || strictRepostAuthorLock(rec)) && cd.authorCdActive())
+            return new RepostCooldown("SKIPPED_AUTHOR_COOLDOWN", Math.max(cd.authorReadyAtMs(), cd.globalReadyAtMs()),
+                    "16 小时内已转发过 @" + username + "，避免连续转发同一人");
+        if (cd.globalCdActive())
+            return new RepostCooldown("SKIPPED_COOLDOWN", cd.globalReadyAtMs(), "距我账号上一条推文未满 "
+                    + cd.globalRequiredMinutes() + " 分钟（还差约 " + cd.globalRemainingMinutes() + " 分钟），暂不引用转发");
+        return null;
+    }
+
+    public ObjectNode retry(String materialId, AutoPublishMode requestedMode) {
+        return retry(materialId, requestedMode, false);
+    }
+
+    public ObjectNode retry(String materialId, AutoPublishMode requestedMode, boolean reassess) {
+        reconcileAcceptedReceipts();
         String id = materialId == null ? "" : materialId.strip();
         if (id.isBlank()) throw new IllegalArgumentException("缺少 materialId");
-        boolean isRewriteOnly = store.tx(tx -> tx.get("auto_repost", id) == null && tx.get("auto_rewrite", id) != null);
-        if (isRewriteOnly) {
-            return retryRewrite(id);
-        }
+        AutoPublishMode mode = requestedMode != null ? requestedMode : store.tx(tx -> {
+            boolean quote = tx.get("auto_repost", id) != null;
+            boolean rewrite = tx.get("auto_rewrite", id) != null;
+            if (quote && rewrite) throw new XDataProviderException(409, "此素材有两种发布记录，请选择要重试的记录");
+            return rewrite ? AutoPublishMode.REWRITE : AutoPublishMode.REPOST;
+        });
+        if (reassess && mode != AutoPublishMode.REWRITE) throw new IllegalArgumentException("请指定要重新评估的洗稿");
+        return mode == AutoPublishMode.REWRITE ? retryRewrite(id, reassess) : retryRepost(id, null);
+    }
 
+    private ObjectNode retryRepost(String id, String checkedOwnerId) {
+        boolean automatic = checkedOwnerId != null;
+        ObjectNode checkedOwner = store.tx(tx -> {
+            requireRetryableRepost(tx, id, checkedOwnerId);
+            return tx.ownerBinding();
+        });
+        String checkedId = checkedOwner.path("accountId").asText();
+        if (!automatic && refreshOwnerTimeline(checkedId, checkedOwner.path("username").asText().replaceFirst("^@+", "")) < 0L)
+            throw new XDataProviderException(503, "暂时无法核实发布账号的最新发帖时间，请稍后重试");
         record RetryPlan(
                 ObjectNode updated,
                 boolean reuseComment,
@@ -328,67 +527,41 @@ public class AutoRepostService {
         ) { }
 
         RetryPlan plan = store.tx(tx -> {
-            ObjectNode existing = tx.get("auto_repost", id);
-            if (existing == null) {
-                throw new XDataProviderException(404, "自动转发记录不存在");
-            }
+            ObjectNode existing = requireRetryableRepost(tx, id, checkedId);
             String status = existing.path("status").asText("");
-            if (!RETRYABLE_STATUSES.contains(status)) {
-                throw new XDataProviderException(409, "当前状态不允许重发，请先核实线上回执");
-            }
-            String topicId = existing.path("topicId").asText("");
-            if (topicId.isBlank()) topicId = AssistantTopics.topicOf(tx, id);
-            String targetAuthorId = existing.path("authorId").asText("");
-            String targetUsername = existing.path("username").asText("").replaceFirst("^@+", "");
             long nowMs = clock.millis();
-            boolean exemptAuthorCd = PiAgentViralJudge.isDirectPassCategory(existing.path("category").asText(""));
-            ObjectNode recentSameAuthor = exemptAuthorCd
-                    ? null
-                    : findRecentSameAuthorRepost(tx.all("auto_repost"), targetAuthorId, targetUsername, id, nowMs);
-            if (recentSameAuthor != null) {
-                throw new XDataProviderException(409, "16 小时内已转发过 @" + targetUsername + "，避免连续转发同一人");
-            }
-            for (ObjectNode rec : tx.all("auto_repost")) {
-                String otherId = rec.path("materialId").asText(rec.path("id").asText(""));
-                if (id.equals(otherId)) continue;
-                if (!topicId.isBlank() && topicId.equals(rec.path("topicId").asText(""))
-                        && Set.of("PUBLISHED", "SENDING", "UNCERTAIN").contains(rec.path("status").asText(""))) {
-                    throw new XDataProviderException(409, "同一事件选题已有发布或待确认记录，禁止重复发送");
-                }
-            }
-            ObjectNode owner = tx.get("meta", "owner");
-            if (owner == null || owner.path("accountId").asText("").isBlank()) {
-                throw new XDataProviderException(400, "缺少内容助手所有者信息");
-            }
+            String topicId = tx.publicationTopic(existing, id);
+            ObjectNode owner = tx.ownerBinding();
             String ownerAccountId = owner.path("accountId").asText("");
+            ObjectNode conflict = repostConflict(tx, id, topicId);
+            if (conflict != null) {
+                if (!automatic) throw new XDataProviderException(409, "该素材或选题已发送或回执待确认");
+                if (!"PUBLISHED".equals(conflict.path("status").asText()))
+                    throw new RepostCooldown("SKIPPED_COOLDOWN", nowMs + PaidCapabilityGate.RETRY_INTERVAL_MS, "同一原帖或选题的发布回执待核实，稍后重查");
+                existing.remove(List.of("autoRetryAt", "automaticRetryRunning"));
+                tx.put("auto_repost", id, existing.put("status", "SKIPPED_DUPLICATE").put("reason", "该素材或选题已有发布回执"));
+                return null;
+            }
             String ownerUsername = owner.path("username").asText("i");
-            ObjectNode settings = AssistantWorkflow.settings(tx);
-            long latestOwnerTweetAt = resolveLatestOwnerTweetEpochMs(tx, ownerAccountId, ownerUsername, id, nowMs);
-            long requiredOwnerGapMs = resolveEffectiveOwnerGapMs(settings, latestOwnerTweetAt);
-            if (requiredOwnerGapMs > 0L && latestOwnerTweetAt > 0L
-                    && nowMs - latestOwnerTweetAt >= 0L && nowMs - latestOwnerTweetAt < requiredOwnerGapMs) {
-                int jitterMin = resolveOwnerTweetJitterMinutes(latestOwnerTweetAt);
-                long remMin = Math.max(1L, (requiredOwnerGapMs - (nowMs - latestOwnerTweetAt) + 59_999L) / 60_000L);
-                throw new XDataProviderException(409,
-                        "距我账号上一条推文未满 1小时+" + jitterMin + "分钟（还差约 " + remMin + " 分钟），暂不引用转发");
-            }
+            boolean exemptAuthorCd = PiAgentViralJudge.isDirectPassCategory(existing.path("category").asText(""));
+            RepostCooldown cooldown = repostCooldown(tx, existing, ownerAccountId, ownerUsername, id, exemptAuthorCd, nowMs);
+            if (cooldown != null) throw cooldown;
             String existingComment = existing.path("commentText").asText("").strip();
-            boolean reuseComment = Set.of("AUTH_REQUIRED", "FAILED").contains(status) && !existingComment.isBlank();
-            ObjectNode liveMaterial = tx.get("material", id);
-            String authorId = existing.path("authorId").asText(liveMaterial == null ? "" : liveMaterial.path("authorId").asText(""));
-            ObjectNode liveSource = authorId.isBlank() ? null : tx.get("source", authorId);
-            if (liveSource == null) {
-                liveSource = object()
-                        .put("authorId", authorId)
-                        .put("username", existing.path("username").asText(""))
-                        .put("displayName", existing.path("authorName").asText(""))
-                        .put("autoRepostTextMode", "AI")
-                        .put("autoRepostMinScore", 82);
-            }
+            ObjectNode liveMaterial = tx.rewriteMaterial(id, nowMs);
+            boolean reuseComment = (Set.of("AUTH_REQUIRED", "FAILED").contains(status) || WAITING_FOR_WINDOW.contains(status))
+                    && !existingComment.isBlank() && matchesEvaluatedQuote(tx, existing, liveMaterial);
+            ObjectNode liveSource = tx.get("source", existing.path("authorId").asText());
             ObjectNode prefs = AssistantWorkflow.preferences(tx);
-            ObjectNode updated = tx.put("auto_repost", id, existing.deepCopy()
-                    .put("status", "EVALUATING")
-                    .put("error", ""));
+            ObjectNode evaluating = existing.deepCopy().put("topicId", topicId).put("ownerAccountId", ownerAccountId).put("automaticRetryRunning", automatic);
+            if (liveMaterial != null) evaluating.put("quoteSourceFingerprint", quoteSourceFingerprint(liveMaterial));
+            if (!reuseComment) {
+                evaluating.remove(List.of("commentText", "quoteSourceNeedsReview"));
+                if (liveMaterial != null) evaluating.put("quoteAuthorFollowers", quoteAuthorFollowers(liveSource, liveMaterial))
+                        .put("previewMaterialFingerprint", previewMaterialFingerprint(liveMaterial));
+            }
+            evaluating.remove("budgetDeferred");
+            if (!automatic) evaluating.remove(List.of("autoRetryAttempts", "autoRetryAt"));
+            ObjectNode updated = tx.put("auto_repost", id, evaluating.put("status", "EVALUATING").put("error", ""));
             return new RetryPlan(
                     updated,
                     reuseComment,
@@ -403,7 +576,8 @@ public class AutoRepostService {
             );
         });
 
-        executor.submit(() -> {
+        if (plan == null) return store.tx(tx -> tx.get("auto_repost", id));
+        Runnable attempt = () -> {
             try {
                 if (plan.reuseComment()) {
                     dispatchCommentAndPublish(
@@ -414,7 +588,7 @@ public class AutoRepostService {
                             plan.existingComment(),
                             null,
                             0L,
-                            false
+                            automatic
                     );
                 } else if (plan.material() == null) {
                     store.tx(tx -> {
@@ -438,14 +612,59 @@ public class AutoRepostService {
                             plan.preferencesText(),
                             clock.millis(),
                             false,
-                            false
+                            automatic
                     );
                 }
-            } catch (Exception ex) {
+            } catch (RuntimeException ex) {
+                markEvaluationFailed("auto_repost", id, safeError(ex));
+                if (automatic) throw ex;
                 log.warn("Auto-repost retry failed for material {}: {}", id, ex.getMessage());
             }
-        });
+        };
+        if (automatic) attempt.run();
+        else executor.submit(attempt);
         return plan.updated();
+    }
+
+    private static boolean correctedQuoteVerdict(ObjectNode row) {
+        return row.path("quoteSourceNeedsReview").asBoolean()
+                && Set.of("SKIPPED", "JUDGE_FAILED").contains(row.path("status").asText());
+    }
+
+    private ObjectNode requireRetryableRepost(AssistantStore.Tx tx, String id, String checkedOwnerId) {
+        ObjectNode existing = tx.get("auto_repost", id);
+        if (existing == null) throw new XDataProviderException(404, "自动转发记录不存在");
+        if (!RETRYABLE_STATUSES.contains(existing.path("status").asText()) && !correctedQuoteVerdict(existing))
+            throw new XDataProviderException(409, "当前状态不允许重发，请先核实线上回执");
+        if (tx.ownerBinding() == null) throw new XDataProviderException(400, "缺少内容助手所有者信息");
+        if (!repostAuthorized(tx, existing, checkedOwnerId))
+            throw new XDataProviderException(409, "原始素材与当前获准自动引用的来源或作者不一致");
+        if (existing.path("quoteSourceNeedsReview").asBoolean() && tx.rewriteMaterial(id, clock.millis()) == null)
+            throw new XDataProviderException(409, "原帖已更正且素材已过期，重新获取原帖后才能评估附文");
+        return existing;
+    }
+
+    private void markEvaluationFailed(String table, String materialId, String reason) {
+        store.tx(tx -> {
+            ObjectNode rec = tx.get(table, materialId);
+            if (rec != null && "EVALUATING".equals(rec.path("status").asText())) {
+                tx.put(table, materialId, rec.put("status", interruptedEvaluationStatus(tx, table, materialId, rec)).put("error", reason));
+            }
+            return null;
+        });
+    }
+
+    private static String interruptedEvaluationStatus(AssistantStore.Tx tx, String table, String id, ObjectNode row) {
+        if ("auto_rewrite".equals(table) && !row.path("rewrittenText").asText().isBlank()) {
+            for (ObjectNode previous : tx.versions(table, id)) {
+                String status = previous.path("status").asText();
+                if ("EVALUATING".equals(status)) continue;
+                if (rewriteRetryable(status) && previous.path("rewrittenText").equals(row.path("rewrittenText"))
+                        && tx.publicationOwnerMatches(previous, row.path("ownerAccountId").asText())) return status;
+                break;
+            }
+        }
+        return "JUDGE_FAILED";
     }
 
     public void clearPreviewCache() {
@@ -582,7 +801,7 @@ public class AutoRepostService {
         long globalReadyAt = globalActive ? (latestOwnerAt + requiredOwnerGapMs) : 0L;
 
         ObjectNode recentSameAuthor = findRecentSameAuthorRepost(
-                tx.all("auto_repost"), candidateAuthorId, candidateUsername, excludeMaterialId, nowMs);
+                tx.repostActivityForCooldown(nowMs - SAME_AUTHOR_COOLDOWN_MS), candidateAuthorId, candidateUsername, excludeMaterialId, nowMs);
         long latestAuthorAt = recentSameAuthor == null ? 0L : recentSameAuthor.path("publishedAt").asLong(
                 recentSameAuthor.path("dispatchedAt").asLong(recentSameAuthor.path("createdAt").asLong(0)));
         boolean authorActive = recentSameAuthor != null && latestAuthorAt > 0L
@@ -609,6 +828,7 @@ public class AutoRepostService {
     }
 
     private record AuthorPreviewContext(
+            String ownerAccountId,
             String ownerUsername,
             ObjectNode storedSource,
             ObjectNode effectiveSource,
@@ -659,22 +879,21 @@ public class AutoRepostService {
         String cleanExclude = excludeMaterialId == null ? "" : excludeMaterialId.strip();
         String excludePubId = cleanExclude.isBlank() ? "" : ("auto-repost-" + cleanExclude);
         String excludeRewritePubId = cleanExclude.isBlank() ? "" : ("auto-rewrite-" + cleanExclude);
-        for (ObjectNode rec : tx.all("auto_repost")) {
+        for (ObjectNode rec : tx.ownerActivity("auto_repost", ownerAccountId, -1)) {
             String recId = rec.path("materialId").asText(rec.path("id").asText("")).strip();
             if (!cleanExclude.isBlank() && cleanExclude.equals(recId)) continue;
             if (!Set.of("PUBLISHED", "SENDING", "UNCERTAIN").contains(rec.path("status").asText(""))) continue;
             long recAt = rec.path("publishedAt").asLong(rec.path("dispatchedAt").asLong(rec.path("createdAt").asLong(0)));
             if (recAt > 0L && recAt <= nowMs) latest = Math.max(latest, recAt);
         }
-        for (ObjectNode rec : tx.all("auto_rewrite")) {
+        for (ObjectNode rec : tx.ownerActivity("auto_rewrite", ownerAccountId, -1)) {
             String recId = rec.path("materialId").asText(rec.path("id").asText("")).strip();
             if (!cleanExclude.isBlank() && cleanExclude.equals(recId)) continue;
             if (!Set.of("PUBLISHED", "SENDING", "UNCERTAIN").contains(rec.path("status").asText(""))) continue;
             long recAt = rec.path("publishedAt").asLong(rec.path("dispatchedAt").asLong(rec.path("createdAt").asLong(0)));
             if (recAt > 0L && recAt <= nowMs) latest = Math.max(latest, recAt);
         }
-        for (ObjectNode pub : tx.all("publication")) {
-            if (pub.path("deleted").asBoolean(false)) continue;
+        for (ObjectNode pub : tx.ownerActivity("publication", ownerAccountId, -1)) {
             String pubMatId = pub.path("materialId").asText("").strip();
             String pubId = pub.path("id").asText("");
             if (!cleanExclude.isBlank() && (cleanExclude.equals(pubMatId)
@@ -686,6 +905,7 @@ public class AutoRepostService {
             long pubAt = pub.path("publishedAt").asLong(pub.path("queueUpdatedAt").asLong(pub.path("updatedAt").asLong(0)));
             if (pubAt > 0L && pubAt <= nowMs) latest = Math.max(latest, pubAt);
         }
+        latest = Math.max(latest, tx.lastConfirmedSchedule(ownerAccountId, nowMs));
         if (scheduledTweetService != null && ownerAccountId != null && !ownerAccountId.isBlank()) {
             long schedAt = scheduledTweetService.latestAccountPublishEpochMs(ownerAccountId, ownerUsername);
             if (schedAt > 0L && schedAt <= nowMs) latest = Math.max(latest, schedAt);
@@ -694,24 +914,25 @@ public class AutoRepostService {
             long selfPostAt = communityHubService.latestCachedOwnerPostEpochMs(ownerAccountId, ownerUsername);
             if (selfPostAt > 0L && selfPostAt <= nowMs) latest = Math.max(latest, selfPostAt);
         }
-        ObjectNode liveObserved = tx.get("meta", "owner_latest_tweet");
+        ObjectNode liveObserved = latestOwnerObservation(tx, ownerAccountId);
         if (liveObserved != null) {
             long observedAt = liveObserved.path("latestTweetAt").asLong(0L);
             if (observedAt > 0L && observedAt <= nowMs) latest = Math.max(latest, observedAt);
         }
-        String normOwnerUser = (ownerUsername == null || ownerUsername.isBlank())
-                ? "elidlicom" : ownerUsername.replaceFirst("^@+", "").strip();
         for (ObjectNode hm : tx.all("history_material")) {
             if (hm.path("selfThreadReply").asBoolean(false)) continue;
             String kind = hm.path("kind").asText("POST");
             if (!Set.of("POST", "QUOTE").contains(kind)) continue;
-            boolean sameOwner = (ownerAccountId != null && !ownerAccountId.isBlank() && ownerAccountId.equals(hm.path("authorId").asText("")))
-                    || normOwnerUser.equalsIgnoreCase(hm.path("username").asText("").replaceFirst("^@+", ""));
-            if (!sameOwner) continue;
+            if (ownerAccountId == null || ownerAccountId.isBlank() || !ownerAccountId.equals(hm.path("authorId").asText(""))) continue;
             long hmAt = hm.path("publishedAt").asLong(0L);
             if (hmAt > 0L && hmAt <= nowMs) latest = Math.max(latest, hmAt);
         }
         return latest;
+    }
+
+    private static boolean sameSourceIdentity(String firstId, String firstHandle, String secondId, String secondHandle) {
+        if (!firstId.isBlank() && !secondId.isBlank()) return firstId.equals(secondId);
+        return !firstHandle.isBlank() && firstHandle.equalsIgnoreCase(secondHandle);
     }
 
     static ObjectNode findRecentSameAuthorRepost(
@@ -732,8 +953,7 @@ public class AutoRepostService {
             if (!Set.of("PUBLISHED", "SENDING", "UNCERTAIN").contains(recStatus)) continue;
             String recAuthorId = rec.path("authorId").asText("").strip();
             String recUname = rec.path("username").asText("").replaceFirst("^@+", "").strip();
-            boolean samePerson = (!cleanAuthorId.isBlank() && cleanAuthorId.equals(recAuthorId))
-                    || (!cleanUname.isBlank() && cleanUname.equalsIgnoreCase(recUname));
+            boolean samePerson = sameSourceIdentity(cleanAuthorId, cleanUname, recAuthorId, recUname);
             if (!samePerson) continue;
             long recAt = rec.path("publishedAt").asLong(
                     rec.path("dispatchedAt").asLong(rec.path("createdAt").asLong(0)));
@@ -842,8 +1062,8 @@ public class AutoRepostService {
             List<Long> histLikes = new ArrayList<>();
             for (ObjectNode m : tx.all("material")) {
                 if (materialId.equals(m.path("id").asText(""))) continue;
-                boolean same = (!authorId.isBlank() && authorId.equals(m.path("authorId").asText("")))
-                        || (!username.isBlank() && username.equalsIgnoreCase(m.path("username").asText("").replaceFirst("^@+", "")));
+                boolean same = sameSourceIdentity(authorId, username, m.path("authorId").asText(""),
+                        m.path("username").asText("").replaceFirst("^@+", ""));
                 if (!same) continue;
                 if (m.path("views").isIntegralNumber() && m.path("views").asLong() > 0) {
                     histViews.add(m.path("views").asLong());
@@ -854,9 +1074,7 @@ public class AutoRepostService {
             }
             long medianViews = medianOf(histViews);
             long medianLikes = medianOf(histLikes);
-            long followers = Math.max(
-                    source.path("followersCount").asLong(0),
-                    material.path("authorFollowersCount").asLong(0));
+            long followers = quoteAuthorFollowers(source, material);
             long pubAt = material.path("publishedAt").asLong(0);
             long ageMin = pubAt > 0 ? Math.max(0L, (nowMs - pubAt) / 60_000L) : 0L;
             long curViews = material.path("views").asLong(0);
@@ -897,22 +1115,28 @@ public class AutoRepostService {
         return sorted.get(sorted.size() / 2);
     }
 
+    private static long quoteAuthorFollowers(ObjectNode source, ObjectNode material) {
+        return source.path("followersCount").asLong(material.path("authorFollowersCount").asLong(0L));
+    }
+
     private static String composeOwnerQuoteVoiceProfile(AssistantStore.Tx tx) {
         OwnerQuoteStyleDistiller.resolveOrDistillQuoteStyle(tx);
         return OwnerQuoteStyleDistiller.composeOwnerDistilledPersona(tx);
     }
 
     private AuthorPreviewContext loadAuthorPreviewContext(String rawSourceKey, ObjectNode req, int limit) {
+        reconcileAcceptedReceipts();
         String key = rawSourceKey == null ? "" : rawSourceKey.replaceFirst("^@+", "").strip();
         if (key.isBlank()) throw new IllegalArgumentException("缺少监听对象标识");
 
         AuthorPreviewContext initial = store.tx(tx -> {
-            ObjectNode owner = tx.get("meta", "owner");
+            ObjectNode owner = tx.ownerBinding();
             String ownerUname = owner != null && !owner.path("username").asText("").isBlank()
                     ? owner.path("username").asText() : "elidlicom";
 
             ObjectNode foundSource = tx.get("source", key);
             if (foundSource == null || "REMOVED".equals(foundSource.path("status").asText())) {
+                foundSource = null;
                 for (ObjectNode s : tx.all("source")) {
                     if ("REMOVED".equals(s.path("status").asText())) continue;
                     if (key.equalsIgnoreCase(s.path("username").asText("").replaceFirst("^@+", ""))
@@ -922,25 +1146,35 @@ public class AutoRepostService {
                     }
                 }
             }
+            if (foundSource != null && foundSource.path("authorId").asText("").isBlank())
+                foundSource.put("authorId", foundSource.path("id").asText(""));
 
+            String requestedId = req.path("materialId").asText("").strip();
+            long now = clock.millis();
+            ObjectNode requested = requestedId.isBlank() ? null : tx.rewriteMaterial(requestedId, now);
+            boolean matchesRequestedAuthor = requested != null && (key.equals(requested.path("authorId").asText())
+                    || key.equalsIgnoreCase(requested.path("username").asText().replaceFirst("^@+", "")));
             String targetAuthorId = foundSource != null
                     ? foundSource.path("authorId").asText(foundSource.path("id").asText(""))
-                    : "";
+                    : matchesRequestedAuthor ? requested.path("authorId").asText() : "";
             String targetUsername = foundSource != null
                     ? foundSource.path("username").asText("").replaceFirst("^@+", "")
                     : key;
 
-            List<ObjectNode> matchingMaterials = new ArrayList<>();
+            Map<String,ObjectNode> authorMaterials = new LinkedHashMap<>();
             for (ObjectNode m : tx.all("material")) {
                 String mAuthorId = m.path("authorId").asText("");
                 String mUname = m.path("username").asText("").replaceFirst("^@+", "");
-                boolean match = (!targetAuthorId.isBlank() && targetAuthorId.equals(mAuthorId))
-                        || (!targetUsername.isBlank() && targetUsername.equalsIgnoreCase(mUname));
+                boolean match = targetAuthorId.isBlank() ? key.equals(mAuthorId) || targetUsername.equalsIgnoreCase(mUname) : targetAuthorId.equals(mAuthorId);
                 if (!match) continue;
-                String combined = AssistantTopics.text(m);
-                if (combined == null || combined.isBlank()) continue;
-                matchingMaterials.add(m.deepCopy());
+                authorMaterials.put(m.path("id").asText(), m);
             }
+            for (ObjectNode m : tx.rewriteWindow(targetAuthorId, targetUsername, now - REWRITE_MAX_AGE_MS, now))
+                authorMaterials.replace(m.path("id").asText(), m);
+            if (matchesRequestedAuthor && (targetAuthorId.isBlank() || SourceCollector.belongsToSource(requested, targetAuthorId)))
+                authorMaterials.put(requestedId, requested);
+            List<ObjectNode> matchingMaterials = new ArrayList<>(authorMaterials.values());
+            matchingMaterials.removeIf(m -> AssistantTopics.text(m).isBlank());
             matchingMaterials.sort(Comparator.comparingLong((ObjectNode m) -> m.path("publishedAt").asLong(0)).reversed());
 
             if (foundSource == null) {
@@ -963,34 +1197,32 @@ public class AutoRepostService {
                 }
             }
 
-            List<ObjectNode> topMaterials = matchingMaterials.stream().limit(limit).toList();
-            java.util.Map<String, ObjectNode> byMat = new java.util.HashMap<>();
-            for (ObjectNode m : topMaterials) {
-                String mid = m.path("id").asText("");
-                if (!mid.isBlank()) {
-                    ObjectNode rec = tx.get("auto_repost", mid);
-                    if (rec != null) byMat.put(mid, rec.deepCopy());
-                }
+            String previewAuthorId = foundSource.path("authorId").asText("");
+            if (!previewAuthorId.isBlank()) matchingMaterials.removeIf(m -> !SourceCollector.belongsToSource(m, previewAuthorId));
+            List<ObjectNode> topMaterials = new ArrayList<>(matchingMaterials.stream().limit(limit).toList());
+            if (!requestedId.isBlank() && topMaterials.stream().noneMatch(m -> requestedId.equals(m.path("id").asText()))) {
+                ObjectNode exact = tx.rewriteMaterial(requestedId, clock.millis());
+                if (matchesPreviewSource(foundSource, exact) && !AssistantTopics.text(exact).isBlank()) topMaterials.add(exact);
             }
+            String ownerAccountId = owner != null ? owner.path("accountId").asText("") : "";
+            Map<String, ObjectNode> byMat = quoteTimelineRecords(tx, topMaterials, ownerAccountId);
             java.util.Map<String, Long> activeTimes = new java.util.HashMap<>();
-            for (ObjectNode rec : tx.all("auto_repost")) {
+            for (ObjectNode rec : tx.repostActivityForCooldown(clock.millis() - SAME_AUTHOR_COOLDOWN_MS)) {
                 String recStatus = rec.path("status").asText("");
                 if (!Set.of("PUBLISHED", "SENDING", "UNCERTAIN").contains(recStatus)) continue;
                 String recAid = rec.path("authorId").asText("");
                 String recUname = rec.path("username").asText("").replaceFirst("^@+", "");
-                boolean same = (!targetAuthorId.isBlank() && targetAuthorId.equals(recAid))
-                        || (!targetUsername.isBlank() && targetUsername.equalsIgnoreCase(recUname));
+                boolean same = sameSourceIdentity(targetAuthorId, targetUsername, recAid, recUname);
                 if (!same) continue;
                 String recMid = rec.path("materialId").asText(rec.path("id").asText(""));
                 long recAt = rec.path("publishedAt").asLong(rec.path("dispatchedAt").asLong(rec.path("sourcePublishedAt").asLong(0)));
-                if (!recMid.isBlank() && recAt > 0) activeTimes.put(recMid, recAt);
+                if (!recMid.isBlank() && recAt > 0) activeTimes.merge(recMid, recAt, Math::max);
             }
 
             ObjectNode normalizedSource = foundSource.deepCopy();
             normalizedSource.put("autoRepostMinScore", SourceCollector.resolveAutoRepostMinScore(normalizedSource));
             ObjectNode prefs = AssistantWorkflow.preferences(tx);
             ObjectNode settings = AssistantWorkflow.settings(tx);
-            String ownerAccountId = owner != null ? owner.path("accountId").asText("") : "";
             long previewNowMs = clock.millis();
             long latestOwnerTweetAtMs = resolveLatestOwnerTweetEpochMs(tx, ownerAccountId, ownerUname, "", previewNowMs);
             long ownerRequiredGapMs = resolveEffectiveOwnerGapMs(settings, latestOwnerTweetAtMs);
@@ -1006,6 +1238,7 @@ public class AutoRepostService {
                 defaultRepostModel = AssistantConnection.defaultModelForProvider(defaultRepostProv);
             }
             return new AuthorPreviewContext(
+                    ownerAccountId,
                     ownerUname,
                     normalizedSource.deepCopy(),
                     normalizedSource,
@@ -1068,14 +1301,16 @@ public class AutoRepostService {
         }
 
         List<ObjectNode> candidates = new ArrayList<>(initial.materials());
-        if (candidates.isEmpty()) {
+        if (candidates.isEmpty() && sources != null) {
             List<ObjectNode> fetched = sources.fetchOnDemandPreviewMaterials(effectiveSource);
             for (ObjectNode m : fetched) {
                 if (candidates.size() >= limit) break;
-                candidates.add(m);
+                if (matchesPreviewSource(effectiveSource, m)) candidates.add(m);
             }
+            initial.autoRepostsByMaterialId().putAll(store.tx(tx -> quoteTimelineRecords(tx, candidates, initial.ownerAccountId())));
         }
         return new AuthorPreviewContext(
+                initial.ownerAccountId(),
                 initial.ownerUsername(),
                 initial.storedSource(),
                 effectiveSource,
@@ -1093,29 +1328,202 @@ public class AutoRepostService {
         );
     }
 
-    private String buildPreviewCacheKey(
-            String materialId,
-            ObjectNode effectiveSource,
-            String styleProfile,
-            String preferencesText,
-            boolean postPolishEnabled,
-            String postPolishPrompt,
-            String generationProvider,
-            String generationModel
-    ) {
-        String textMode = effectiveSource.path("autoRepostTextMode").asText("AI").toUpperCase(Locale.ROOT);
-        int minScore = SourceCollector.resolveAutoRepostMinScore(effectiveSource);
-        String tpl = effectiveSource.path("autoRepostTemplate").asText("").strip();
-        String ruleHint = effectiveSource.path("autoRepostRuleHint").asText("").strip();
-        String activePolish = postPolishEnabled ? (postPolishPrompt == null ? "" : postPolishPrompt.strip()) : "";
-        String genKey = (generationProvider == null || generationProvider.isBlank() ? "chatgpt" : generationProvider)
-                + ":" + (generationModel == null ? "" : generationModel.strip());
-        return "v10-pi-distill|" + materialId + "|" + textMode + "|" + minScore + "|" + tpl + "|" + ruleHint + "|"
-                + genKey + "|" + styleProfile.hashCode() + "|" + preferencesText.hashCode() + "|" + activePolish.hashCode();
+    private static boolean matchesPreviewSource(ObjectNode source, ObjectNode material) {
+        if (source == null || material == null) return false;
+        String authorId = source.path("authorId").asText("");
+        if (!authorId.isBlank()) return SourceCollector.belongsToSource(material, authorId);
+        String handle = source.path("username").asText("").replaceFirst("^@+", "");
+        return !handle.isBlank() && handle.equalsIgnoreCase(material.path("username").asText("").replaceFirst("^@+", ""));
+    }
+
+    private Map<String,ObjectNode> quoteTimelineRecords(AssistantStore.Tx tx, List<ObjectNode> materials, String ownerId) {
+        Map<String,ObjectNode> records = new java.util.HashMap<>();
+        List<ObjectNode> rows = quoteRows(tx, materials, ownerId);
+        for (ObjectNode material : materials) {
+            ObjectNode record = quoteTimelineRecord(material, rows);
+            if (record != null) records.put(material.path("id").asText(), record);
+        }
+        return records;
+    }
+
+    private List<ObjectNode> quoteRows(AssistantStore.Tx tx, List<ObjectNode> materials, String ownerId) {
+        Set<String> keys = new java.util.HashSet<>();
+        for (ObjectNode material : materials) {
+            keys.add(material.path("id").asText());
+            String original = originalQuoteId(material);
+            if (original != null) keys.add(original);
+        }
+        List<ObjectNode> rows = new ArrayList<>(tx.sourceQuoteRows(keys, ownerId));
+        for (ObjectNode accepted : pendingAcceptedReceipts.values()) {
+            if ((keys.contains(accepted.path("materialId").asText()) || keys.contains(accepted.path("requestedQuoteTweetId").asText()))
+                    && !accepted.path("source").asText("").startsWith("AUTO_REWRITE") && tx.publicationOwnerMatches(accepted, ownerId))
+                rows.add(accepted);
+        }
+        return rows;
+    }
+
+    private static String originalQuoteId(ObjectNode material) {
+        String id = material.path("id").asText();
+        return id.matches("[0-9]{2,20}") ? id : extractStatusIdFromUrl(material.path("sourceUrl").asText(""));
+    }
+
+    private static boolean quoteMatchesMaterial(ObjectNode row, ObjectNode material, String originalId) {
+        String author = material.path("authorId").asText("");
+        String recordedAuthor = row.path("authorId").asText("");
+        if (!author.isBlank() && !recordedAuthor.isBlank() && !author.equals(recordedAuthor)) return false;
+        String requested = AssistantStore.Tx.firstField(row, "requestedQuoteTweetId", "quoteTweetId", "quotedTweetId");
+        if (originalId != null && !requested.isBlank()) return originalId.equals(requested);
+        String id = row.path("id").asText();
+        String recordedMaterial = row.path("materialId").asText("");
+        if (recordedMaterial.isBlank() && row.path("quoteProjection").asBoolean()) recordedMaterial = id;
+        if (recordedMaterial.isBlank() && id.startsWith("auto-repost-")) recordedMaterial = id.substring("auto-repost-".length());
+        return material.path("id").asText().equals(recordedMaterial) || recordedMaterial.equals(originalId);
+    }
+
+    private static long quoteAttemptTime(ObjectNode row) {
+        long at = Math.max(row.path("dispatchedAt").asLong(), row.path("publishedAt").asLong());
+        return at > 0 ? at : row.path("createdAt").asLong(row.path("updatedAt").asLong());
+    }
+
+    private static ObjectNode quoteTimelineRecord(ObjectNode material, List<ObjectNode> rows) {
+        String original = originalQuoteId(material);
+        ObjectNode evaluation = null, delivery = null, released = null;
+        long revision = 0;
+        // Heads arrive in database write order. A failed attempt only releases that attempt's lock.
+        for (ObjectNode row : rows) {
+            if (!quoteMatchesMaterial(row, material, original)) continue;
+            boolean projection = row.path("quoteProjection").asBoolean();
+            if (projection && material.path("id").equals(row.path("id"))) evaluation = row;
+            String status = row.path("status").asText("");
+            if (row.path("uncertainDelivery").asBoolean() && !"PUBLISHED".equals(status)) status = "UNCERTAIN";
+            if (QUOTE_DELIVERY_STATUSES.contains(status)) {
+                if (delivery == null || quoteAttemptTime(row) >= quoteAttemptTime(delivery))
+                    delivery = row.deepCopy().put("status", status);
+            } else if (!projection || row.hasNonNull("verifiedAt") || row.hasNonNull("dispatchedAt")) {
+                released = row;
+            } else continue;
+            revision = Math.max(revision, row.path("receiptRevision").asLong());
+        }
+        if (evaluation == null && delivery == null && released == null) return null;
+        ObjectNode record = evaluation == null ? object() : evaluation.deepCopy();
+        record.put("receiptRevision", revision);
+        if (delivery != null) {
+            record.put("status", delivery.path("status").asText())
+                    .put("publishedTweetUrl", delivery.path("publishedTweetUrl").asText(""))
+                    .put("publishedAt", delivery.path("publishedAt").asLong())
+                    .put("publicationMode", delivery.path("publicationMode").asText(""))
+                    .put("text", AssistantStore.Tx.firstField(delivery, "text", "requestedText", "commentText"))
+                    .put("receiptComment", AssistantStore.Tx.firstField(delivery, "requestedText", "commentText", "text"));
+        } else if (evaluation == null) {
+            record.put("status", released.path("status").asText());
+        }
+        return record;
+    }
+
+    static String previewMaterialFingerprint(ObjectNode material) {
+        ObjectNode inputs = object();
+        for (String field : List.of("id", "authorId", "username", "authorName", "authorBio", "authorAvatarUrl", "authorVerified",
+                "kind", "text", "quotedText", "articleText", "textStatus", "authorTextStatus", "quotedTextStatus", "articleTextStatus",
+                "quotedId", "quotedAuthorId", "quotedUsername", "articleId", "articleUrl", "articleRole", "sourceUrl",
+                "hasMedia", "media", "links", "publishedAt", "views", "likes", "reposts", "replies", "bookmarks", "authorFollowersCount")) {
+            if (material.has(field)) inputs.set(field, material.get(field));
+        }
+        return AssistantWorkflow.digest(inputs);
+    }
+
+    static boolean previewMatchesMaterial(ObjectNode decision, ObjectNode material) {
+        String fingerprint = decision.path("previewMaterialFingerprint").asText("");
+        return fingerprint.isEmpty() ? material.path("version").asInt(1) <= 1
+                : fingerprint.equals(previewMaterialFingerprint(material));
+    }
+
+    static boolean legacyPreviewMaterialFingerprintMatches(String fingerprint, ObjectNode material) {
+        var previousInputs = material.deepCopy();
+        previousInputs.remove(List.of("bookmarks", "authorFollowersCount"));
+        return previewMaterialFingerprint(previousInputs).equals(fingerprint);
+    }
+
+    static String quoteSourceFingerprint(ObjectNode material) {
+        ObjectNode inputs = object();
+        for (String field : List.of("id", "authorId", "kind", "text", "quotedId", "quotedText", "quotedAuthorId",
+                "articleId", "articleText", "articleRole", "selfThreadReply", "links", "hasMedia", "media")) {
+            if (material.has(field)) inputs.set(field, material.get(field));
+        }
+        return AssistantWorkflow.digest(inputs);
+    }
+
+    static boolean matchesEvaluatedQuote(AssistantStore.Tx tx, ObjectNode record, ObjectNode material) {
+        if (record.path("quoteSourceNeedsReview").asBoolean()) return false;
+        if (material == null) return true;
+        String current = quoteSourceFingerprint(material);
+        String saved = record.path("quoteSourceFingerprint").asText();
+        if (!saved.isBlank()) return saved.equals(current);
+        String legacy = record.path("previewMaterialFingerprint").asText();
+        return legacy.isBlank() || sameSavedPreviewInput(legacy, material)
+                || tx.versions("material", material.path("id").asText()).stream()
+                        .anyMatch(old -> sameSavedPreviewInput(legacy, old) && current.equals(quoteSourceFingerprint(old)));
+    }
+
+    static String rewriteSourceFingerprint(ObjectNode material) {
+        return AssistantWorkflow.digest(object().put("id", material.path("id").asText())
+                .put("authorId", material.path("authorId").asText()).put("text", extractPureRewriteSourceText(material)));
+    }
+
+    static boolean matchesFinalRewriteSource(AssistantStore.Tx tx, ObjectNode record, ObjectNode material) {
+        if (!isPureTextRewriteCandidate(material)) return false;
+        String current = rewriteSourceFingerprint(material);
+        String saved = record.path("rewriteSourceFingerprint").asText();
+        if (!saved.isBlank()) return saved.equals(current);
+        String previous = record.path("previewMaterialFingerprint").asText();
+        if (sameSavedPreviewInput(previous, material)) return true;
+        List<ObjectNode> versions = tx.versions("material", material.path("id").asText());
+        if (previous.isBlank()) {
+            if (versions.isEmpty()) return false;
+            List<ObjectNode> drafts = tx.versions("auto_rewrite", material.path("id").asText());
+            if (drafts.isEmpty()) return false;
+            ObjectNode firstDraft = drafts.get(drafts.size() - 1);
+            long draftedAt = firstDraft.path("createdAt").asLong(firstDraft.path("updatedAt").asLong());
+            return versions.get(versions.size() - 1).path("updatedAt").asLong(Long.MAX_VALUE) <= draftedAt
+                    && versions.stream().allMatch(v -> current.equals(rewriteSourceFingerprint(v)));
+        }
+        return versions.stream().anyMatch(v -> sameSavedPreviewInput(previous, v) && current.equals(rewriteSourceFingerprint(v)));
+    }
+
+    static boolean sameSavedPreviewInput(String saved, ObjectNode material) {
+        return !saved.isBlank() && (saved.equals(previewMaterialFingerprint(material)) || legacyPreviewMaterialFingerprintMatches(saved, material));
+    }
+
+    private static String buildPreviewCacheKey(ObjectNode material, AuthorPreviewContext ctx) {
+        ObjectNode source = ctx.effectiveSource();
+        String textMode = source.path("autoRepostTextMode").asText("AI").toUpperCase(Locale.ROOT);
+        int minScore = SourceCollector.resolveAutoRepostMinScore(source);
+        String tpl = source.path("autoRepostTemplate").asText("").strip();
+        String ruleHint = source.path("autoRepostRuleHint").asText("").strip();
+        String activePolish = ctx.postPolishEnabled() ? ctx.postPolishPrompt().strip() : "";
+        return ctx.ownerAccountId() + "|" + previewMaterialFingerprint(material) + "|" + quoteAuthorFollowers(source, material)
+                + "|" + textMode + "|" + minScore + "|" + tpl + "|" + ruleHint + "|"
+                + ctx.generationProvider() + ":" + ctx.generationModel() + "|" + ctx.styleProfile().hashCode()
+                + "|" + ctx.preferencesText().hashCode() + "|" + activePolish.hashCode();
+    }
+
+    private ObjectNode cachedQuotePreview(String key) {
+        QuotePreview cached = previewCache.get(key);
+        return cached == null ? null : cached.result();
+    }
+
+    private void beginQuotePreview(String key, long requestOrder) {
+        previewCache.compute(key, (ignored, previous) -> previous != null && previous.requestOrder() > requestOrder
+                ? previous : new QuotePreview(requestOrder, previous == null ? null : previous.result()));
+    }
+
+    private boolean saveQuotePreview(String key, long requestOrder, ObjectNode result) {
+        var replacement = new QuotePreview(requestOrder, result);
+        return previewCache.computeIfPresent(key, (ignored, reserved) ->
+                reserved.requestOrder() == requestOrder ? replacement : reserved) == replacement;
     }
 
     private String buildRewritePreviewCacheKey(
-            String materialId,
+            ObjectNode material,
             String styleProfile,
             String preferencesText,
             boolean postPolishEnabled,
@@ -1126,7 +1534,7 @@ public class AutoRepostService {
         String activePolish = postPolishEnabled ? (postPolishPrompt == null ? "" : postPolishPrompt.strip()) : "";
         String genKey = (generationProvider == null || generationProvider.isBlank() ? "chatgpt" : generationProvider)
                 + ":" + (generationModel == null ? "" : generationModel.strip());
-        return "rw-v1|" + materialId + "|" + genKey + "|"
+        return "rw-v2|" + rewriteSourceFingerprint(material) + "|" + previewMaterialFingerprint(material) + "|" + genKey + "|"
                 + styleProfile.hashCode() + "|" + preferencesText.hashCode() + "|" + activePolish.hashCode();
     }
 
@@ -1137,7 +1545,7 @@ public class AutoRepostService {
             boolean viralPass,
             boolean accountFit
     ) {
-        if ("PUBLISHED".equals(persistedStatus)) return "PUBLISHED";
+        if (persistedStatus != null && QUOTE_DELIVERY_STATUSES.contains(persistedStatus)) return persistedStatus;
         if ("SKIPPED_AUTHOR_COOLDOWN".equals(persistedStatus) || authorCooldownBlocked) return "SKIP_AUTHOR_COOLDOWN";
         if ("SKIPPED_DUPLICATE".equals(persistedStatus)) return "SKIP_DUPLICATE";
         if ("SKIPPED_LIMIT".equals(persistedStatus)) return "SKIP_LIMIT";
@@ -1195,20 +1603,43 @@ public class AutoRepostService {
                 .put("repostModel", ctx == null ? AssistantConnection.DEFAULT_REPOST_MODEL : ctx.generationModel());
     }
 
+    private static ObjectNode applyQuoteReceipt(ObjectNode out, ObjectNode record) {
+        String status = record == null ? "" : record.path("status").asText("");
+        out.put("persistedStatus", status).put("receiptRevision", record == null ? 0 : record.path("receiptRevision").asLong());
+        if (!QUOTE_DELIVERY_STATUSES.contains(status)) return out;
+        boolean published = "PUBLISHED".equals(status);
+        String requestedText = record.path("receiptComment").asText("");
+        if (!published || out.path("commentText").asText("").isBlank()) out.put("commentText", requestedText);
+        return out.put("decisionCode", status).put("wouldAutoRepost", published).put("evaluated", true)
+                .put("cdShortCircuited", false).put("authorCooldownBlocked", false).put("ownerCooldownBlocked", false)
+                .put("publishedTweetUrl", published ? record.path("publishedTweetUrl").asText("") : "")
+                .put("publicationMode", record.path("publicationMode").asText(""))
+                .put("publishedText", record.path("text").asText(""))
+                .put("reason", switch (status) {
+                    case "SENDING" -> "引用转发正在发送";
+                    case "UNCERTAIN" -> "引用转发回执待核实，请在活动记录核对后登记结果";
+                    default -> "";
+                });
+    }
+
     private ObjectNode applySingleItemAuthorCooldownOverlay(
             ObjectNode decision,
             String materialId,
             long materialPublishedAt,
             AuthorPreviewContext ctx
     ) {
-        ObjectNode out = decision.deepCopy();
+        ObjectNode publication = ctx.autoRepostsByMaterialId().get(materialId);
+        ObjectNode out = applyQuoteReceipt(decision.deepCopy(), publication);
         String persisted = out.path("persistedStatus").asText("");
-        if ("PUBLISHED".equals(persisted)) return out;
+        if (QUOTE_DELIVERY_STATUSES.contains(persisted)) return out;
+        boolean strictAuthorLock = strictRepostAuthorLock(publication);
+        out.put("strictSixteenHourAuthorLock", strictAuthorLock);
         boolean contentPass = out.path("contentPass").asBoolean(
                 out.path("viralPass").asBoolean(false) && out.path("accountFit").asBoolean(false));
-        boolean exemptAuthorCd = PiAgentViralJudge.isDirectPassCategory(out.path("category").asText(""));
-        out.put("contentPass", contentPass)
-                .put("directPass", exemptAuthorCd && contentPass);
+        boolean directPass = PiAgentViralJudge.isDirectPassCategory(out.path("category").asText(""));
+        boolean exemptAuthorCd = directPass && !strictAuthorLock;
+        out.put("contentPass", contentPass).put("directPass", directPass && contentPass)
+                .put("authorCooldownExempt", false);
         boolean genuinelyEvaluated = out.path("evaluated").asBoolean(false) && out.path("viralScore").asInt(0) > 0;
         if (!contentPass && (genuinelyEvaluated || (!"SKIPPED_AUTHOR_COOLDOWN".equals(persisted) && !"SKIPPED_COOLDOWN".equals(persisted)))) {
             return out;
@@ -1268,6 +1699,8 @@ public class AutoRepostService {
     private ObjectNode buildMaterialSummaryNode(ObjectNode m, ObjectNode effectiveSource) {
         ObjectNode matNode = object()
                 .put("id", m.path("id").asText(""))
+                .put("authorId", m.path("authorId").asText(effectiveSource.path("authorId").asText("")))
+                .put("sourceFingerprint", quoteSourceFingerprint(m))
                 .put("username", m.path("username").asText(effectiveSource.path("username").asText("")))
                 .put("authorName", m.path("authorName").asText(effectiveSource.path("displayName").asText("")))
                 .put("authorAvatarUrl", m.path("authorAvatarUrl").asText(effectiveSource.path("avatarUrl").asText("")))
@@ -1297,12 +1730,9 @@ public class AutoRepostService {
         boolean useTemplate = "TEMPLATE".equals(textMode);
         int minScore = SourceCollector.resolveAutoRepostMinScore(effectiveSource);
         String ruleHint = effectiveSource.path("autoRepostRuleHint").asText("").strip();
-        String cacheKey = buildPreviewCacheKey(
-                materialId, effectiveSource, ctx.styleProfile(), ctx.preferencesText(),
-                ctx.postPolishEnabled(), ctx.postPolishPrompt(),
-                ctx.generationProvider(), ctx.generationModel());
+        String cacheKey = buildPreviewCacheKey(m, ctx);
 
-        ObjectNode cached = previewCache.get(cacheKey);
+        ObjectNode cached = cachedQuotePreview(cacheKey);
         if (cached != null && cached.has("preview")) {
             ObjectNode decision = cached.path("preview").deepCopy();
             decision.put("evaluated", true).put("cached", true);
@@ -1312,7 +1742,8 @@ public class AutoRepostService {
         boolean sameRuleHint = ruleHint.equals(ctx.storedSource().path("autoRepostRuleHint").asText("").strip());
         boolean customGenRequested = !ctx.generationProvider().isBlank() && !"chatgpt".equalsIgnoreCase(ctx.generationProvider());
         ObjectNode rec = ctx.autoRepostsByMaterialId().get(materialId);
-        if (rec != null && sameRuleHint && !customGenRequested) {
+        if (rec != null && sameRuleHint && !customGenRequested && previewMatchesMaterial(rec, m)
+                && rec.path("quoteAuthorFollowers").asLong(m.path("authorFollowersCount").asLong()) == quoteAuthorFollowers(effectiveSource, m)) {
             String recStatus = rec.path("status").asText("");
             boolean hasScores = rec.has("viralScore") && rec.path("viralScore").asInt(0) > 0;
             boolean deferredWithoutEval = rec.path("deferredPendingEval").asBoolean(false)
@@ -1338,8 +1769,9 @@ public class AutoRepostService {
                 boolean viralPass = directPass || (viralScore >= minScore && factScore >= 55 && credibility >= 60);
                 boolean fitPass = accountFit && (directPass ? fitScore >= 65 : fitScore >= 68);
                 boolean contentPass = viralPass && fitPass;
-                boolean authorCooldown = !directPass && "SKIPPED_AUTHOR_COOLDOWN".equals(recStatus);
-                boolean effectiveGuardSkip = isGuardSkip && !(directPass && "SKIPPED_AUTHOR_COOLDOWN".equals(recStatus));
+                boolean exemptAuthor = directPass && !strictRepostAuthorLock(rec);
+                boolean authorCooldown = !exemptAuthor && "SKIPPED_AUTHOR_COOLDOWN".equals(recStatus);
+                boolean effectiveGuardSkip = isGuardSkip && !(exemptAuthor && "SKIPPED_AUTHOR_COOLDOWN".equals(recStatus));
                 boolean wouldRepost = "PUBLISHED".equals(recStatus) || (contentPass && !effectiveGuardSkip);
                 String summary = rec.path("summary").asText("");
                 boolean voiceV7 = rec.path("quoteVoiceVersion").asInt(0) >= 7 || "PUBLISHED".equals(recStatus);
@@ -1358,7 +1790,7 @@ public class AutoRepostService {
                     }
                 }
                 String decisionCode = classifyDecisionCode(
-                        directPass && "SKIPPED_AUTHOR_COOLDOWN".equals(recStatus) ? "" : recStatus,
+                        exemptAuthor && "SKIPPED_AUTHOR_COOLDOWN".equals(recStatus) ? "" : recStatus,
                         authorCooldown, wouldRepost, viralPass, fitPass);
                 ObjectNode built = object()
                         .put("evaluated", true)
@@ -1389,7 +1821,10 @@ public class AutoRepostService {
             }
         }
 
-        return object()
+        String recordedStatus = rec == null ? "" : rec.path("status").asText("");
+        ObjectNode pending = object()
+                .put("persistedStatus", recordedStatus)
+                .put("publishedTweetUrl", rec == null ? "" : rec.path("publishedTweetUrl").asText(""))
                 .put("evaluated", false)
                 .put("wouldAutoRepost", false)
                 .put("contentPass", false)
@@ -1402,10 +1837,11 @@ public class AutoRepostService {
                 .put("attentionScore", 0)
                 .put("minScore", minScore)
                 .put("fitScore", 0)
-                .put("decisionCode", "PENDING_EVAL")
+                .put("decisionCode", "PUBLISHED".equals(recordedStatus) ? "PUBLISHED" : "PENDING_EVAL")
                 .put("reason", "")
                 .put("commentText", "")
                 .put("textMode", textMode);
+        return applySingleItemAuthorCooldownOverlay(pending, materialId, m.path("publishedAt").asLong(), ctx);
     }
 
     public ObjectNode authorTimeline(String rawSourceKey, ObjectNode body) {
@@ -1415,6 +1851,7 @@ public class AutoRepostService {
 
         ObjectNode out = object();
         out.putObject("owner")
+                .put("accountId", ctx.ownerAccountId())
                 .put("username", ctx.ownerUsername())
                 .put("displayName", ctx.ownerUsername())
                 .put("avatarUrl", "/author-avatar.webp");
@@ -1426,10 +1863,14 @@ public class AutoRepostService {
         out.set("cooldown", dualCd.toJsonNode());
 
         AuthorRewriteBaseline rwBaseline = loadAuthorRewriteBaseline(
+                ctx.ownerAccountId(),
                 effectiveSource.path("authorId").asText(effectiveSource.path("id").asText("")),
                 effectiveSource.path("username").asText(""),
                 nowMs);
-        List<ObjectNode> timelineMaterials = new ArrayList<>(ctx.materials());
+        Map<String, ObjectNode> latestMaterials = new java.util.HashMap<>();
+        for (ObjectNode material : rwBaseline.windowMaterials()) latestMaterials.put(material.path("id").asText(), material);
+        List<ObjectNode> timelineMaterials = new ArrayList<>();
+        for (ObjectNode material : ctx.materials()) timelineMaterials.add(latestMaterials.getOrDefault(material.path("id").asText(), material));
         Set<String> existingMatIds = new java.util.HashSet<>();
         for (ObjectNode m : timelineMaterials) {
             String mid = m.path("id").asText("").strip();
@@ -1452,12 +1893,16 @@ public class AutoRepostService {
             timelineMaterials.add(extra);
             existingMatIds.add(extra.path("id").asText("").strip());
         }
+        if (timelineMaterials.size() > ctx.materials().size()) {
+            var extra = timelineMaterials.subList(ctx.materials().size(), timelineMaterials.size());
+            ctx.autoRepostsByMaterialId().putAll(store.tx(tx -> quoteTimelineRecords(tx, extra, ctx.ownerAccountId())));
+        }
 
         record RawTimelineRow(ObjectNode rawMaterial, ObjectNode materialNode, ObjectNode decisionNode, ObjectNode rewriteNode, long publishedAt, String id) { }
         List<RawTimelineRow> rows = new ArrayList<>();
         for (ObjectNode m : timelineMaterials) {
             ObjectNode decision = resolveStoredDecisionIfAvailable(m, ctx);
-            if (!"PUBLISHED".equals(decision.path("persistedStatus").asText(""))) {
+            if (!QUOTE_DELIVERY_STATUSES.contains(decision.path("persistedStatus").asText(""))) {
                 if (dualCd.globalCdActive()) {
                     boolean alreadyEvaluated = decision.path("evaluated").asBoolean(false);
                     String baseReason = decision.path("baseReason").asText(decision.path("reason").asText("")).strip();
@@ -1478,7 +1923,7 @@ public class AutoRepostService {
                         decision.put("reason", dualCd.blockingReasonText());
                     }
                 } else if (dualCd.authorCdActive() && decision.path("evaluated").asBoolean(false)) {
-                    boolean exemptAuthorCd = PiAgentViralJudge.isDirectPassCategory(decision.path("category").asText(""));
+                    boolean exemptAuthorCd = !strictRepostAuthorLock(decision) && PiAgentViralJudge.isDirectPassCategory(decision.path("category").asText(""));
                     if (exemptAuthorCd && decision.path("contentPass").asBoolean(false)) {
                         decision.put("authorCooldownExempt", true);
                     } else if (!exemptAuthorCd) {
@@ -1489,7 +1934,7 @@ public class AutoRepostService {
                     }
                 }
             }
-            ObjectNode rewriteNode = buildRewriteStatusNode(m, decision, ctx, rwBaseline, nowMs);
+            ObjectNode rewriteNode = buildRewriteStatusNode(m, decision, ctx, rwBaseline, nowMs, true);
             rows.add(new RawTimelineRow(
                     m,
                     buildMaterialSummaryNode(m, effectiveSource),
@@ -1520,10 +1965,10 @@ public class AutoRepostService {
                 RawTimelineRow row = rows.get(i);
                 ObjectNode dec = row.decisionNode();
                 if (!dec.path("evaluated").asBoolean(false)) continue;
-                if ("PUBLISHED".equals(dec.path("persistedStatus").asText(""))) continue;
+                if (QUOTE_DELIVERY_STATUSES.contains(dec.path("persistedStatus").asText(""))) continue;
                 if (!dec.path("wouldAutoRepost").asBoolean(false)) continue;
                 long ts = row.publishedAt() > 0 ? row.publishedAt() : clock.millis();
-                boolean exemptAuthorCd = PiAgentViralJudge.isDirectPassCategory(dec.path("category").asText(""));
+                boolean exemptAuthorCd = !strictRepostAuthorLock(dec) && PiAgentViralJudge.isDirectPassCategory(dec.path("category").asText(""));
                 boolean within16h = occupiedSlots.stream().anyMatch(prev -> Math.abs(ts - prev) < SAME_AUTHOR_COOLDOWN_MS);
                 if (within16h && !exemptAuthorCd) {
                     String baseReason = dec.path("baseReason").asText(dec.path("reason").asText(""));
@@ -1584,6 +2029,7 @@ public class AutoRepostService {
     }
 
     public ObjectNode evaluateAuthorOnce(String rawSourceKey, ObjectNode body) {
+        long requestOrder = quotePreviewOrder.incrementAndGet();
         ObjectNode req = body == null ? object() : body;
         boolean forceRegenerate = req.path("forceRegenerate").asBoolean(false);
         AuthorPreviewContext base = loadAuthorPreviewContext(rawSourceKey, req, 20);
@@ -1608,6 +2054,8 @@ public class AutoRepostService {
 
         List<ObjectNode> toEvaluate = new ArrayList<>();
         for (ObjectNode m : windowCandidates) {
+            ObjectNode recorded = base.autoRepostsByMaterialId().get(m.path("id").asText());
+            if (recorded != null && QUOTE_DELIVERY_STATUSES.contains(recorded.path("status").asText(""))) continue;
             if (forceRegenerate) {
                 toEvaluate.add(m);
             } else {
@@ -1635,6 +2083,7 @@ public class AutoRepostService {
         List<PiAgentViralJudge.BatchCandidateItem> batchItems = new ArrayList<>();
         ObjectNode sharedHotContext = null;
         for (ObjectNode m : toEvaluate) {
+            beginQuotePreview(buildPreviewCacheKey(m, base), requestOrder);
             String mid = m.path("id").asText("");
             long pubAt = m.path("publishedAt").asLong(0);
             long ageMin = pubAt > 0 ? Math.max(0L, (nowMs - pubAt) / 60_000L) : 0L;
@@ -1694,29 +2143,26 @@ public class AutoRepostService {
             throw new XDataProviderException(502, "账号单次合并判定未完成：" + safeError(ex));
         }
 
+        Map<String, String> regeneratedComments = new LinkedHashMap<>();
         for (ObjectNode m : toEvaluate) {
             String mid = m.path("id").asText("");
             PiAgentViralJudge.ViralJudgment j = batchJudgment.byMaterialId().get(mid);
             if (j == null) continue;
-            ObjectNode existingRec = base.autoRepostsByMaterialId().get(mid);
-            String persistedStatus = existingRec == null ? "" : existingRec.path("status").asText("");
             boolean directPass = PiAgentViralJudge.isDirectPassCategory(j.category())
                     && j.accountFit() && j.fitScore() >= 65 && j.credibility() >= 55 && j.factScore() >= 50;
             boolean viralPass = directPass || (j.viralScore() >= minScore && j.factScore() >= 55 && j.credibility() >= 60);
             boolean fitPass = j.accountFit() && (directPass ? j.fitScore() >= 65 : j.fitScore() >= 68);
             boolean contentPass = j.shouldRepost();
-            boolean rawWouldRepost = "PUBLISHED".equals(persistedStatus) || contentPass;
             String commentText = contentPass ? buildCommentText(useTemplate, effectiveSource, m, j) : "";
-            String rawDecisionCode = classifyDecisionCode(
-                    directPass && "SKIPPED_AUTHOR_COOLDOWN".equals(persistedStatus) ? "" : persistedStatus,
-                    false, rawWouldRepost, viralPass, fitPass);
+            ObjectNode existingRec = base.autoRepostsByMaterialId().get(mid);
+            String persistedStatus = existingRec == null ? "" : existingRec.path("status").asText("");
+            String rawDecisionCode = classifyDecisionCode(directPass && "SKIPPED_AUTHOR_COOLDOWN".equals(persistedStatus)
+                    ? "" : persistedStatus, false, contentPass, viralPass, fitPass);
 
-            String cacheKey = buildPreviewCacheKey(
-                    mid, effectiveSource, base.styleProfile(), base.preferencesText(),
-                    base.postPolishEnabled(), base.postPolishPrompt(),
-                    base.generationProvider(), base.generationModel());
+            String cacheKey = buildPreviewCacheKey(m, base);
             ObjectNode cachedEntry = object();
             cachedEntry.putObject("owner")
+                    .put("accountId", base.ownerAccountId())
                     .put("username", base.ownerUsername())
                     .put("displayName", base.ownerUsername())
                     .put("avatarUrl", "/author-avatar.webp");
@@ -1725,7 +2171,7 @@ public class AutoRepostService {
             cachedEntry.putObject("preview")
                     .put("evaluated", true)
                     .put("commentText", commentText)
-                    .put("wouldAutoRepost", rawWouldRepost)
+                    .put("wouldAutoRepost", contentPass)
                     .put("contentPass", contentPass)
                     .put("directPass", directPass)
                     .put("authorCooldownBlocked", false)
@@ -1748,17 +2194,91 @@ public class AutoRepostService {
                     .put("cached", false)
                     .put("fallbackUsed", false)
                     .put("fallbackReason", "");
-            previewCache.put(cacheKey, cachedEntry);
+            if (saveQuotePreview(cacheKey, requestOrder, cachedEntry) && !commentText.isBlank()) regeneratedComments.put(mid, commentText);
         }
 
-        return authorTimeline(rawSourceKey, req)
+        ObjectNode timeline = authorTimeline(rawSourceKey, req)
                 .put("evaluatedAccountOnce", true)
                 .put("selectedMaterialId", batchJudgment.selectedMaterialId());
+        var regenerated = timeline.putArray("regeneratedCommentIds");
+        for (var item : timeline.path("items")) {
+            String id = item.path("material").path("id").asText();
+            var decision = item.path("decision");
+            if (!QUOTE_DELIVERY_STATUSES.contains(decision.path("persistedStatus").asText(""))
+                    && decision.path("commentText").asText("").equals(regeneratedComments.get(id))) regenerated.add(id);
+        }
+        return timeline;
+    }
+
+    private ObjectNode quoteReceiptPreview(String sourceKey, String materialId, String clientRequestId) {
+        String key = sourceKey == null ? "" : sourceKey.replaceFirst("^@+", "").strip();
+        if (key.isBlank() || materialId.isBlank()) throw new IllegalArgumentException("缺少来源或素材标识");
+        if (clientRequestId.length() > 128) throw new IllegalArgumentException("请求标识过长");
+        reconcileAcceptedReceipts();
+        return store.tx(tx -> {
+            ObjectNode owner = tx.ownerBinding();
+            if (owner == null) throw new XDataProviderException(403, "当前发布账号未绑定");
+            String ownerId = owner.path("accountId").asText();
+            ObjectNode out = object();
+            out.putObject("owner").put("accountId", ownerId).put("username", owner.path("username").asText(""));
+            ObjectNode material = tx.rewriteMaterial(materialId, clock.millis());
+            var rows = quoteRows(tx, List.of(material == null ? object().put("id", materialId) : material), ownerId);
+            if (material == null) {
+                // On-demand source cards need not have a collected material. The send reservation retains its author.
+                ObjectNode source = tx.get("source", key);
+                for (ObjectNode receipt : rows) {
+                    boolean sameAuthor = source != null ? matchesPreviewSource(source, receipt)
+                            : key.equals(receipt.path("authorId").asText()) || key.equalsIgnoreCase(receipt.path("username").asText());
+                    if (!sameAuthor) continue;
+                    material = object().put("id", materialId).put("authorId", receipt.path("authorId").asText(""))
+                            .put("username", receipt.path("username").asText("")).put("sourceUrl", receipt.path("sourceUrl").asText(""));
+                    break;
+                }
+                if (material == null && !rows.isEmpty()) throw new XDataProviderException(404, "该来源没有指定素材的回执");
+                if (material != null && originalQuoteId(material) != null && !materialId.equals(originalQuoteId(material)))
+                    rows = quoteRows(tx, List.of(material), ownerId);
+                out.putObject("material").put("id", materialId);
+            } else {
+                verifyManualQuoteAuthor(tx, key, material, null);
+                out.set("material", buildMaterialSummaryNode(material, material));
+            }
+            ObjectNode row = material == null ? null : quoteTimelineRecord(material, rows);
+            var preview = applyQuoteReceipt(object().put("decisionCode", "PENDING_EVAL").put("reason", "")
+                    .put("publishedText", "").put("publishedTweetUrl", "").put("publicationMode", ""), row);
+            if (!clientRequestId.isBlank()) {
+                long matched = 0;
+                for (ObjectNode attempt : rows) {
+                    if (material != null && ("manual-quote-" + clientRequestId).equals(attempt.path("id").asText())
+                            && quoteMatchesMaterial(attempt, material, originalQuoteId(material)))
+                        matched = Math.max(matched, attempt.path("receiptRevision").asLong());
+                }
+                preview.put("requestReceiptRevision", matched);
+            }
+            out.set("preview", preview);
+            return out;
+        });
+    }
+
+    private ObjectNode quotePreviewEnvelope(AuthorPreviewContext ctx, ObjectNode material) {
+        ObjectNode out = object();
+        out.putObject("owner").put("accountId", ctx.ownerAccountId()).put("username", ctx.ownerUsername())
+                .put("displayName", ctx.ownerUsername()).put("avatarUrl", "/author-avatar.webp");
+        out.set("source", buildSourceSummaryNode(ctx.effectiveSource(), ctx));
+        out.set("material", buildMaterialSummaryNode(material, ctx.effectiveSource()));
+        var recent = out.putArray("recentMaterials");
+        for (ObjectNode candidate : ctx.materials().stream().limit(8).toList()) {
+            recent.addObject().put("id", candidate.path("id").asText(""))
+                    .put("publishedAt", candidate.path("publishedAt").asLong())
+                    .put("snippet", truncatePreview(AssistantTopics.text(candidate), 44));
+        }
+        return out;
     }
 
     public ObjectNode previewRepost(String rawSourceKey, ObjectNode body) {
+        long requestOrder = quotePreviewOrder.incrementAndGet();
         ObjectNode req = body == null ? object() : body;
         String requestedMaterialId = req.path("materialId").asText("").strip();
+        if (req.path("receiptOnly").asBoolean()) return quoteReceiptPreview(rawSourceKey, requestedMaterialId, req.path("clientRequestId").asText(""));
         boolean forceRegenerate = req.path("forceRegenerate").asBoolean(false);
         boolean forceWriteComment = req.path("forceWriteComment").asBoolean(false) || forceRegenerate;
         AuthorPreviewContext base = loadAuthorPreviewContext(rawSourceKey, req, 20);
@@ -1769,15 +2289,9 @@ public class AutoRepostService {
             throw new XDataProviderException(404, "@" + effectiveSource.path("username").asText(key) + " 暂无可预览的近期推文");
         }
 
-        ObjectNode selectedMaterial = candidates.get(0);
-        if (!requestedMaterialId.isBlank()) {
-            for (ObjectNode c : candidates) {
-                if (requestedMaterialId.equals(c.path("id").asText(""))) {
-                    selectedMaterial = c;
-                    break;
-                }
-            }
-        }
+        ObjectNode selectedMaterial = requestedMaterialId.isBlank() ? candidates.get(0) : candidates.stream()
+                .filter(m -> requestedMaterialId.equals(m.path("id").asText()))
+                .findFirst().orElseThrow(() -> new XDataProviderException(404, "该作者没有指定的推文素材：" + requestedMaterialId));
 
         String materialId = selectedMaterial.path("id").asText("");
         long publishedAt = selectedMaterial.path("publishedAt").asLong(0);
@@ -1786,13 +2300,15 @@ public class AutoRepostService {
         int minScore = SourceCollector.resolveAutoRepostMinScore(effectiveSource);
         String tpl = effectiveSource.path("autoRepostTemplate").asText("").strip();
         String ruleHint = effectiveSource.path("autoRepostRuleHint").asText("").strip();
-        String cacheKey = buildPreviewCacheKey(
-                materialId, effectiveSource, base.styleProfile(), base.preferencesText(),
-                base.postPolishEnabled(), base.postPolishPrompt(),
-                base.generationProvider(), base.generationModel());
+        String cacheKey = buildPreviewCacheKey(selectedMaterial, base);
+        ObjectNode existingRec = base.autoRepostsByMaterialId().get(materialId);
+        String persistedStatus = existingRec == null ? "" : existingRec.path("status").asText("");
+        if (QUOTE_DELIVERY_STATUSES.contains(persistedStatus) && (!forceRegenerate || !"PUBLISHED".equals(persistedStatus))) {
+            return quotePreviewEnvelope(base, selectedMaterial).set("preview", resolveStoredDecisionIfAvailable(selectedMaterial, base));
+        }
 
         if (!forceRegenerate) {
-            ObjectNode cached = previewCache.get(cacheKey);
+            ObjectNode cached = cachedQuotePreview(cacheKey);
             if (cached != null && (!forceWriteComment || !cached.path("preview").path("commentText").asText("").isBlank())) {
                 ObjectNode copy = cached.deepCopy();
                 ObjectNode overlaid = applySingleItemAuthorCooldownOverlay(
@@ -1806,25 +2322,11 @@ public class AutoRepostService {
             boolean storedHasRequiredComment = (!storedDecision.path("wouldAutoRepost").asBoolean(false) && !forceWriteComment)
                     || !storedDecision.path("commentText").asText("").isBlank();
             if (storedDecision.path("evaluated").asBoolean(false) && storedHasRequiredComment) {
-                ObjectNode out = object();
-                out.putObject("owner")
-                        .put("username", base.ownerUsername())
-                        .put("displayName", base.ownerUsername())
-                        .put("avatarUrl", "/author-avatar.webp");
-                out.set("source", buildSourceSummaryNode(effectiveSource, base));
-                out.set("material", buildMaterialSummaryNode(selectedMaterial, effectiveSource));
-                var recentArr = out.putArray("recentMaterials");
-                for (ObjectNode c : candidates.stream().limit(8).toList()) {
-                    recentArr.addObject()
-                            .put("id", c.path("id").asText(""))
-                            .put("publishedAt", c.path("publishedAt").asLong(0))
-                            .put("snippet", truncatePreview(AssistantTopics.text(c), 44));
-                }
-                out.set("preview", storedDecision);
-                return out;
+                return quotePreviewEnvelope(base, selectedMaterial).set("preview", storedDecision);
             }
         }
 
+        beginQuotePreview(cacheKey, requestOrder);
         String commentText = "";
         boolean contentPass = false;
         boolean viralPass = false;
@@ -1837,8 +2339,6 @@ public class AutoRepostService {
         String category = "ROUTINE";
         String summary = "";
         String baseReason = "";
-        ObjectNode existingRec = base.autoRepostsByMaterialId().get(materialId);
-        String persistedStatus = existingRec == null ? "" : existingRec.path("status").asText("");
 
         long now = clock.millis();
         long ageMinutes = publishedAt > 0 ? Math.max(0L, (now - publishedAt) / 60_000L) : 0L;
@@ -1909,31 +2409,17 @@ public class AutoRepostService {
         }
 
         boolean directPassPreview = PiAgentViralJudge.isDirectPassCategory(category) && contentPass;
-        boolean rawWouldRepost = "PUBLISHED".equals(persistedStatus) || contentPass;
+        String evaluationStatus = QUOTE_DELIVERY_STATUSES.contains(persistedStatus) ? "" : persistedStatus;
         String rawDecisionCode = classifyDecisionCode(
-                directPassPreview && "SKIPPED_AUTHOR_COOLDOWN".equals(persistedStatus) ? "" : persistedStatus,
-                false, rawWouldRepost, viralPass, accountFit);
+                directPassPreview && "SKIPPED_AUTHOR_COOLDOWN".equals(evaluationStatus) ? "" : evaluationStatus,
+                false, contentPass, viralPass, accountFit);
 
-        ObjectNode baseOut = object();
-        baseOut.putObject("owner")
-                .put("username", base.ownerUsername())
-                .put("displayName", base.ownerUsername())
-                .put("avatarUrl", "/author-avatar.webp");
-        baseOut.set("source", buildSourceSummaryNode(effectiveSource, base));
-        baseOut.set("material", buildMaterialSummaryNode(selectedMaterial, effectiveSource));
-
-        var recentArr = baseOut.putArray("recentMaterials");
-        for (ObjectNode c : candidates.stream().limit(8).toList()) {
-            recentArr.addObject()
-                    .put("id", c.path("id").asText(""))
-                    .put("publishedAt", c.path("publishedAt").asLong(0))
-                    .put("snippet", truncatePreview(AssistantTopics.text(c), 44));
-        }
+        ObjectNode baseOut = quotePreviewEnvelope(base, selectedMaterial);
 
         ObjectNode rawPreviewNode = baseOut.putObject("preview")
                 .put("evaluated", true)
                 .put("commentText", commentText)
-                .put("wouldAutoRepost", rawWouldRepost)
+                .put("wouldAutoRepost", contentPass)
                 .put("contentPass", contentPass)
                 .put("directPass", directPassPreview)
                 .put("authorCooldownBlocked", false)
@@ -1946,8 +2432,8 @@ public class AutoRepostService {
                 .put("minScore", minScore)
                 .put("fitScore", fitScore)
                 .put("decisionCode", rawDecisionCode)
-                .put("persistedStatus", persistedStatus)
-                .put("publishedTweetUrl", existingRec == null ? "" : existingRec.path("publishedTweetUrl").asText(""))
+                .put("persistedStatus", evaluationStatus)
+                .put("publishedTweetUrl", "")
                 .put("category", category)
                 .put("summary", summary)
                 .put("baseReason", baseReason)
@@ -1957,8 +2443,17 @@ public class AutoRepostService {
                 .put("fallbackUsed", false)
                 .put("fallbackReason", "");
 
-        previewCache.put(cacheKey, baseOut.deepCopy());
+        if (!saveQuotePreview(cacheKey, requestOrder, baseOut.deepCopy())) {
+            ObjectNode newer = cachedQuotePreview(cacheKey);
+            if (newer != null) {
+                baseOut = newer.deepCopy();
+                rawPreviewNode = baseOut.withObject("/preview");
+            }
+        }
         ObjectNode out = baseOut.deepCopy();
+        // A write or a manual verification can complete during a model call.
+        var current = store.tx(tx -> quoteTimelineRecords(tx, List.of(selectedMaterial), base.ownerAccountId()));
+        base.autoRepostsByMaterialId().put(materialId, current.get(materialId));
         out.set("preview", applySingleItemAuthorCooldownOverlay(rawPreviewNode, materialId, publishedAt, base));
         return out;
     }
@@ -1972,15 +2467,15 @@ public class AutoRepostService {
         long nowMs = clock.millis();
         String aid = effectiveSource.path("authorId").asText(effectiveSource.path("id").asText("")).strip();
         String uname = effectiveSource.path("username").asText("").replaceFirst("^@+", "").strip();
-        AuthorRewriteBaseline rwBaseline = loadAuthorRewriteBaseline(aid, uname, nowMs);
+        AuthorRewriteBaseline rwBaseline = loadAuthorRewriteBaseline(base.ownerAccountId(), aid, uname, nowMs);
 
         List<ObjectNode> pool = new ArrayList<>();
         Set<String> seen = new java.util.HashSet<>();
-        for (ObjectNode m : base.materials()) {
+        for (ObjectNode m : rwBaseline.windowMaterials()) {
             String mid = m.path("id").asText("").strip();
             if (!mid.isBlank() && seen.add(mid)) pool.add(m);
         }
-        for (ObjectNode m : rwBaseline.windowMaterials()) {
+        for (ObjectNode m : base.materials()) {
             String mid = m.path("id").asText("").strip();
             if (!mid.isBlank() && seen.add(mid)) pool.add(m);
         }
@@ -1996,13 +2491,7 @@ public class AutoRepostService {
                     break;
                 }
             }
-            if (selectedMaterial == null) {
-                selectedMaterial = store.tx(tx -> {
-                    ObjectNode m = tx.get("material", requestedMaterialId);
-                    return m == null ? null : m.deepCopy();
-                });
-            }
-            if (selectedMaterial == null) {
+            if (!matchesPreviewSource(effectiveSource, selectedMaterial)) {
                 throw new XDataProviderException(404, "未找到指定推文素材：" + requestedMaterialId);
             }
         } else {
@@ -2018,25 +2507,37 @@ public class AutoRepostService {
                             .orElse(pool.get(0)));
         }
 
+        String materialId = selectedMaterial.path("id").asText("");
+        String cacheKey = base.ownerAccountId() + "|" + buildRewritePreviewCacheKey(
+                selectedMaterial, base.styleProfile(), base.preferencesText(),
+                base.postPolishEnabled(), base.postPolishPrompt(),
+                base.generationProvider(), base.generationModel());
+        ObjectNode existingRewriteRec = rwBaseline.rewriteRecordsByMaterialId().get(materialId);
+        String persistedStatus = existingRewriteRec == null ? "" : existingRewriteRec.path("status").asText("");
+        boolean published = "PUBLISHED".equals(persistedStatus);
+        ObjectNode quote = base.autoRepostsByMaterialId().get(materialId);
+        ObjectNode quoteDecision = object().put("persistedStatus", quote == null ? "" : quote.path("status").asText());
+        ObjectNode status = buildRewriteStatusNode(selectedMaterial, quoteDecision, base, rwBaseline, nowMs, true);
+        ObjectNode out = object();
+        out.putObject("owner").put("accountId", base.ownerAccountId()).put("username", base.ownerUsername())
+                .put("displayName", base.ownerUsername()).put("avatarUrl", "/author-avatar.webp");
+        out.set("source", buildSourceSummaryNode(effectiveSource, base));
+        out.set("material", buildMaterialSummaryNode(selectedMaterial, effectiveSource));
+        out.set("rewrite", status);
+        if (needsManualRewriteAction(persistedStatus) || Set.of("EVALUATING", "SENDING", "UNCERTAIN").contains(persistedStatus)
+                || !forceRegenerate && (published || "SKIPPED".equals(status.path("status").asText())
+                || !status.path("rewrittenText").asText().isBlank())) return out;
         String pureText = extractPureRewriteSourceText(selectedMaterial);
         if (pureText.isBlank()) {
             throw new XDataProviderException(400, "该推文不满足纯文本洗稿条件（" + rewriteIneligibleReason(selectedMaterial) + "）");
         }
-
-        String materialId = selectedMaterial.path("id").asText("");
-        String cacheKey = buildRewritePreviewCacheKey(
-                materialId, base.styleProfile(), base.preferencesText(),
-                base.postPolishEnabled(), base.postPolishPrompt(),
-                base.generationProvider(), base.generationModel());
-        if (!forceRegenerate) {
-            ObjectNode cached = rewritePreviewCache.get(cacheKey);
-            if (cached != null && !cached.path("rewrite").path("rewrittenText").asText("").isBlank()) {
-                ObjectNode copy = cached.deepCopy();
-                copy.withObject("/rewrite").put("cached", true);
-                copy.set("source", buildSourceSummaryNode(effectiveSource, base));
-                return copy;
-            }
-        }
+        String selectedFingerprint = rewriteSourceFingerprint(selectedMaterial);
+        int sourceVersion = store.tx(tx -> {
+            var state = tx.rewriteSourceState(materialId);
+            if (state == null || !selectedFingerprint.equals(state.path("fingerprint").asText()))
+                throw new XDataProviderException(409, "原素材已变更，请重新生成洗稿预览");
+            return state.path("version").asInt();
+        });
 
         String authorUname = selectedMaterial.path("username").asText(uname);
         String authorBio = resolveAuthorBio(effectiveSource, List.of(selectedMaterial));
@@ -2072,44 +2573,37 @@ public class AutoRepostService {
             throw new XDataProviderException(502, "洗稿生成返回内容为空，请重试");
         }
 
-        ObjectNode existingRewriteRec = rwBaseline.rewriteRecordsByMaterialId().get(materialId);
-        String persistedStatus = existingRewriteRec == null ? "" : existingRewriteRec.path("status").asText("");
-        String publishedTweetUrl = existingRewriteRec == null ? "" : existingRewriteRec.path("publishedTweetUrl").asText("");
-        double rankScore = computeRewriteRankScore(selectedMaterial, nowMs, rwBaseline.medViews(), rwBaseline.medEng());
-        boolean highTraffic = isHighTrafficForAuthor(
-                selectedMaterial, rwBaseline.medViews(), rwBaseline.medLikes(), rwBaseline.medEng(), rwBaseline.sampleCount());
+        ObjectNode evaluatedMaterial = selectedMaterial;
+        return store.tx(tx -> {
+            long finishedAt = clock.millis();
+            var latest = authorRewriteBaseline(tx, base.ownerAccountId(), aid, uname, finishedAt);
+            var state = tx.rewriteSourceState(materialId);
+            if (state == null || sourceVersion != state.path("version").asInt())
+                throw new XDataProviderException(409, "原素材已变更，请重新生成洗稿预览");
+            var current = tx.rewriteMaterial(materialId, finishedAt);
+            if (current == null) {
+                if (withinRewriteWindow(evaluatedMaterial, finishedAt))
+                    throw new XDataProviderException(409, "原素材已不可用，请重新打开来源时间线");
+                current = evaluatedMaterial;
+            }
+            var quoteRecord = quoteTimelineRecords(tx, List.of(current), base.ownerAccountId()).get(materialId);
+            var decision = object().put("persistedStatus", quoteRecord == null ? "" : quoteRecord.path("status").asText());
+            var result = buildRewriteStatusNode(current, decision, base, latest, finishedAt, false);
+            out.set("material", buildMaterialSummaryNode(current, effectiveSource));
+            out.set("rewrite", result);
+            if (!Objects.equals(existingRewriteRec, latest.rewriteRecordsByMaterialId().get(materialId))) return out;
 
-        ObjectNode rewriteNode = object()
-                .put("candidate", true)
-                .put("pureText", true)
-                .put("highTraffic", highTraffic)
-                .put("withinWindow", selectedMaterial.path("publishedAt").asLong(0L) > 0L
-                        && nowMs - selectedMaterial.path("publishedAt").asLong(0L) <= REWRITE_MAX_AGE_MS)
-                .put("engagement", computeWeightedEngagement(selectedMaterial))
-                .put("rankScore", rankScore)
-                .put("ineligibleReason", "")
-                .put("evaluated", true)
-                .put("suitable", rwJudgment.suitable())
-                .put("suitabilityScore", rwJudgment.suitabilityScore())
-                .put("hookPattern", rwJudgment.hookPattern())
-                .put("coreInsight", rwJudgment.coreInsight())
-                .put("reason", rwJudgment.reason())
-                .put("rewrittenText", rwJudgment.rewrittenText())
-                .put("publishedTweetUrl", publishedTweetUrl)
-                .put("persistedStatus", persistedStatus)
-                .put("status", "PUBLISHED".equals(persistedStatus) ? "PUBLISHED" : "EVALUATED")
-                .put("cached", false);
-
-        ObjectNode out = object();
-        out.putObject("owner")
-                .put("username", base.ownerUsername())
-                .put("displayName", base.ownerUsername())
-                .put("avatarUrl", "/author-avatar.webp");
-        out.set("source", buildSourceSummaryNode(effectiveSource, base));
-        out.set("material", buildMaterialSummaryNode(selectedMaterial, effectiveSource));
-        out.set("rewrite", rewriteNode);
-        rewritePreviewCache.put(cacheKey, out.deepCopy());
-        return out;
+            String previewId = tx.rememberRewritePreview(base.ownerAccountId(), materialId, rwJudgment.rewrittenText(), sourceVersion);
+            result.put("candidate", published || result.path("candidate").asBoolean() && rwJudgment.suitable())
+                    .put("evaluated", true).put("suitable", rwJudgment.suitable())
+                    .put("suitabilityScore", rwJudgment.suitabilityScore()).put("hookPattern", rwJudgment.hookPattern())
+                    .put("coreInsight", rwJudgment.coreInsight()).put("reason", rwJudgment.reason())
+                    .put("rewrittenText", rwJudgment.rewrittenText()).put("publishedTweetUrl", "").put("unsentPreview", published)
+                    .put("savedDraftVersion", 0).put("previewId", previewId)
+                    .put("status", "SKIPPED".equals(result.path("status").asText()) ? "SKIPPED" : "EVALUATED").put("cached", false);
+            rewritePreviewCache.put(cacheKey, out.deepCopy());
+            return out;
+        });
     }
 
     private record AuthorRewriteBaseline(
@@ -2121,47 +2615,61 @@ public class AutoRepostService {
             int sampleCount
     ) { }
 
-    private AuthorRewriteBaseline loadAuthorRewriteBaseline(String authorId, String username, long nowMs) {
+    private record RewriteTraffic(long views, long likes, long engagement, int sampleCount) {
+        static RewriteTraffic of(List<ObjectNode> materials) {
+            List<Long> views = new ArrayList<>();
+            List<Long> likes = new ArrayList<>();
+            List<Long> engagement = new ArrayList<>();
+            for (ObjectNode material : materials) {
+                long v = material.path("views").asLong();
+                long l = material.path("likes").asLong();
+                long e = computeWeightedEngagement(material);
+                if (v > 0) views.add(v);
+                if (l > 0) likes.add(l);
+                if (e > 0) engagement.add(e);
+            }
+            return new RewriteTraffic(medianOf(views), medianOf(likes), medianOf(engagement), Math.max(views.size(), engagement.size()));
+        }
+
+        boolean qualifies(ObjectNode material) {
+            return isHighTrafficForAuthor(material, views, likes, engagement, sampleCount);
+        }
+    }
+
+    private AuthorRewriteBaseline loadAuthorRewriteBaseline(String ownerId, String authorId, String username, long nowMs) {
+        return store.tx(tx -> authorRewriteBaseline(tx, ownerId, authorId, username, nowMs));
+    }
+
+    private AuthorRewriteBaseline authorRewriteBaseline(AssistantStore.Tx tx, String ownerId, String authorId, String username, long nowMs) {
         String aid = authorId == null ? "" : authorId.strip();
         String uname = username == null ? "" : username.replaceFirst("^@+", "").strip();
-        return store.tx(tx -> {
-            List<ObjectNode> windowMats = new ArrayList<>();
-            List<Long> allViews = new ArrayList<>();
-            List<Long> allLikes = new ArrayList<>();
-            List<Long> allEng = new ArrayList<>();
-            for (ObjectNode m : tx.all("material")) {
-                boolean same = (!aid.isBlank() && aid.equals(m.path("authorId").asText("")))
-                        || (!uname.isBlank() && uname.equalsIgnoreCase(m.path("username").asText("").replaceFirst("^@+", "")));
-                if (!same) continue;
-                long pubAt = m.path("publishedAt").asLong(0L);
-                if (pubAt <= 0L || nowMs - pubAt > REWRITE_MAX_AGE_MS) continue;
-                windowMats.add(m.deepCopy());
-                long v = m.path("views").asLong(0L);
-                long l = m.path("likes").asLong(0L);
-                long e = computeWeightedEngagement(m);
-                if (v > 0L) allViews.add(v);
-                if (l > 0L) allLikes.add(l);
-                if (e > 0L) allEng.add(e);
-            }
-            java.util.Map<String, ObjectNode> rwByMat = new java.util.HashMap<>();
-            for (ObjectNode rec : tx.all("auto_rewrite")) {
-                String recAid = rec.path("authorId").asText("");
-                String recUname = rec.path("username").asText("").replaceFirst("^@+", "");
-                boolean same = (!aid.isBlank() && aid.equals(recAid))
-                        || (!uname.isBlank() && uname.equalsIgnoreCase(recUname));
-                if (!same) continue;
-                String mid = rec.path("materialId").asText(rec.path("id").asText("")).strip();
-                if (!mid.isBlank()) rwByMat.put(mid, rec.deepCopy());
-            }
-            return new AuthorRewriteBaseline(
-                    windowMats,
-                    rwByMat,
-                    medianOf(allViews),
-                    medianOf(allLikes),
-                    medianOf(allEng),
-                    Math.max(allViews.size(), allEng.size())
-            );
-        });
+        var owner = tx.ownerBinding();
+        if (!ownerId.equals(owner == null ? "" : owner.path("accountId").asText()))
+            throw new XDataProviderException(409, "发布账号已变更，请重新打开来源时间线");
+        List<ObjectNode> windowMats = tx.rewriteWindow(aid, uname, nowMs - REWRITE_MAX_AGE_MS, nowMs);
+        RewriteTraffic traffic = RewriteTraffic.of(windowMats);
+        java.util.Map<String, ObjectNode> rwByMat = new java.util.HashMap<>();
+        for (ObjectNode rec : tx.ownerActivity("auto_rewrite", ownerId, -1)) {
+            String recAid = rec.path("authorId").asText("");
+            String recUname = rec.path("username").asText("").replaceFirst("^@+", "");
+            boolean same = sameSourceIdentity(aid, uname, recAid, recUname);
+            if (!same) continue;
+            String mid = rec.path("materialId").asText(rec.path("id").asText("")).strip();
+            if (!mid.isBlank()) rwByMat.put(mid, rec.deepCopy());
+        }
+        return new AuthorRewriteBaseline(
+                windowMats,
+                rwByMat,
+                traffic.views(), traffic.likes(), traffic.engagement(), traffic.sampleCount()
+        );
+    }
+
+    private static boolean needsManualRewriteAction(String status) {
+        return Set.of("AUTH_REQUIRED", "FAILED", "JUDGE_FAILED", "SKIPPED_DUPLICATE", "OWNER_REVIEW_REQUIRED").contains(status);
+    }
+
+    private static boolean dispatchRecordHasFinal(String status) {
+        return Set.of("SENDING", "UNCERTAIN", "SKIPPED_LIMIT", "SKIPPED_QUIET_HOURS", "SKIPPED_COOLDOWN").contains(status);
     }
 
     private ObjectNode buildRewriteStatusNode(
@@ -2169,11 +2677,12 @@ public class AutoRepostService {
             ObjectNode repostDecision,
             AuthorPreviewContext ctx,
             AuthorRewriteBaseline baseline,
-            long nowMs
+            long nowMs,
+            boolean usePreviewCache
     ) {
         String materialId = m.path("id").asText("").strip();
         long pubAt = m.path("publishedAt").asLong(0L);
-        boolean withinWindow = pubAt > 0L && nowMs - pubAt <= REWRITE_MAX_AGE_MS;
+        boolean withinWindow = pubAt > 0L && pubAt <= nowMs && nowMs - pubAt <= REWRITE_MAX_AGE_MS;
         boolean pureText = isPureTextRewriteCandidate(m);
         boolean highTraffic = isHighTrafficForAuthor(m, baseline.medViews(), baseline.medLikes(), baseline.medEng(), baseline.sampleCount());
         long eng = computeWeightedEngagement(m);
@@ -2185,42 +2694,50 @@ public class AutoRepostService {
         String persistedStatus = persisted == null ? "" : persisted.path("status").asText("");
         String publishedUrl = persisted == null ? "" : persisted.path("publishedTweetUrl").asText("");
         boolean isPublishedRewrite = "PUBLISHED".equals(persistedStatus);
-        boolean isCandidate = isPublishedRewrite || (pureText && highTraffic && withinWindow && !alreadyHandledAsRepost);
+        boolean currentEvaluation = persisted != null && previewMatchesMaterial(persisted, m);
+        boolean retainedFinal = persisted != null && !persisted.path("rewrittenText").asText().isBlank()
+                && (currentEvaluation || dispatchRecordHasFinal(persistedStatus));
+        boolean rejected = currentEvaluation && "SKIPPED".equals(persistedStatus);
+        boolean dispatchPending = Set.of("EVALUATING", "SENDING", "UNCERTAIN").contains(persistedStatus);
+        boolean corrected = persisted != null && persisted.path("rewriteSourceNeedsReview").asBoolean();
+        boolean isCandidate = isPublishedRewrite || (pureText && highTraffic && withinWindow && !alreadyHandledAsRepost && !rejected
+                && !corrected && !dispatchPending && !needsManualRewriteAction(persistedStatus));
 
         String ineligibleReason = "";
         if (!isCandidate) {
-            if (!pureText) ineligibleReason = rewriteIneligibleReason(m);
+            if (corrected) ineligibleReason = "原素材已更正，请重新评估定稿";
+            else if (rejected) ineligibleReason = persisted.path("reason").asText("未通过洗稿适格判定");
+            else if (needsManualRewriteAction(persistedStatus)) ineligibleReason = persisted.path("error").asText(persisted.path("reason").asText("需在活动记录中处理"));
+            else if (dispatchPending) ineligibleReason = "该素材已有处理中或待核实的洗稿记录";
+            else if (!pureText) ineligibleReason = rewriteIneligibleReason(m);
             else if (!withinWindow) ineligibleReason = "超出 30 天洗稿窗口";
             else if (!highTraffic) ineligibleReason = "互动热度低于高流量洗稿阈值";
             else if (alreadyHandledAsRepost) ineligibleReason = "该帖已触发引用转发";
         }
 
-        String cacheKey = buildRewritePreviewCacheKey(
-                materialId, ctx.styleProfile(), ctx.preferencesText(),
+        String cacheKey = ctx.ownerAccountId() + "|" + buildRewritePreviewCacheKey(
+                m, ctx.styleProfile(), ctx.preferencesText(),
                 ctx.postPolishEnabled(), ctx.postPolishPrompt(),
                 ctx.generationProvider(), ctx.generationModel());
         ObjectNode cachedEntry = rewritePreviewCache.get(cacheKey);
-        if (cachedEntry != null && cachedEntry.has("rewrite")) {
+        if (usePreviewCache && !retainedFinal && !isPublishedRewrite && !dispatchPending && !needsManualRewriteAction(persistedStatus) && !rejected && cachedEntry != null && cachedEntry.has("rewrite")) {
             ObjectNode cachedRw = cachedEntry.path("rewrite").deepCopy();
-            cachedRw.put("candidate", isCandidate)
+            cachedRw.put("candidate", isPublishedRewrite || (isCandidate && cachedRw.path("suitable").asBoolean()))
                     .put("pureText", pureText)
                     .put("highTraffic", highTraffic)
                     .put("withinWindow", withinWindow)
                     .put("engagement", eng)
                     .put("rankScore", rankScore)
                     .put("rank", 0)
+                    .put("persistedStatus", persistedStatus)
+                    .put("recordVersion", persisted == null ? 0 : persisted.path("version").asInt())
                     .put("ineligibleReason", ineligibleReason)
                     .put("cached", true);
-            if (isPublishedRewrite) {
-                cachedRw.put("persistedStatus", "PUBLISHED")
-                        .put("publishedTweetUrl", publishedUrl)
-                        .put("status", "PUBLISHED");
-            }
             return cachedRw;
         }
 
-        if (persisted != null && !persisted.path("rewrittenText").asText("").isBlank()) {
-            boolean suitable = isPublishedRewrite || persisted.path("suitabilityScore").asInt(0) >= 68;
+        if (isPublishedRewrite || rejected || retainedFinal) {
+            boolean suitable = !rejected && (isPublishedRewrite || persisted.path("suitabilityScore").asInt(0) >= 68);
             return object()
                     .put("candidate", isCandidate)
                     .put("pureText", pureText)
@@ -2230,22 +2747,23 @@ public class AutoRepostService {
                     .put("rankScore", rankScore)
                     .put("rank", 0)
                     .put("ineligibleReason", ineligibleReason)
-                    .put("evaluated", true)
+                    .put("evaluated", !Set.of("EVALUATING", "JUDGE_FAILED").contains(persistedStatus))
                     .put("suitable", suitable)
                     .put("suitabilityScore", persisted.path("suitabilityScore").asInt(0))
                     .put("hookPattern", persisted.path("hookPattern").asText(""))
                     .put("coreInsight", persisted.path("summary").asText(""))
                     .put("reason", persisted.path("reason").asText(""))
-                    .put("rewrittenText", persisted.path("rewrittenText").asText(""))
+                    .put("rewrittenText", isPublishedRewrite ? persisted.path("text").asText(persisted.path("rewrittenText").asText()) : persisted.path("rewrittenText").asText())
+                    .put("savedDraftVersion", persisted.path("version").asInt())
                     .put("publishedTweetUrl", publishedUrl)
                     .put("persistedStatus", persistedStatus)
-                    .put("status", isPublishedRewrite ? "PUBLISHED" : ("SKIPPED".equals(persistedStatus) ? "SKIPPED" : "EVALUATED"))
+                    .put("recordVersion", persisted == null ? 0 : persisted.path("version").asInt())
+                    .put("status", isPublishedRewrite || dispatchPending || needsManualRewriteAction(persistedStatus) || rejected ? persistedStatus : "EVALUATED")
+                    .put("unsentPreview", false)
                     .put("cached", false);
         }
 
-        String status = isCandidate
-                ? "READY"
-                : ("SKIPPED".equals(persistedStatus) ? "SKIPPED" : "INELIGIBLE");
+        String status = isPublishedRewrite || dispatchPending || needsManualRewriteAction(persistedStatus) ? persistedStatus : (isCandidate ? "READY" : "INELIGIBLE");
         return object()
                 .put("candidate", isCandidate)
                 .put("pureText", pureText)
@@ -2264,6 +2782,7 @@ public class AutoRepostService {
                 .put("rewrittenText", "")
                 .put("publishedTweetUrl", publishedUrl)
                 .put("persistedStatus", persistedStatus)
+                .put("recordVersion", persisted == null ? 0 : persisted.path("version").asInt())
                 .put("status", status)
                 .put("cached", false);
     }
@@ -2356,12 +2875,48 @@ public class AutoRepostService {
         }
     }
 
-    private void recordOwnerPublishAndScheduleNextSlot(long publishedAtMs) {
+    private static ObjectNode latestOwnerObservation(AssistantStore.Tx tx, String ownerId) {
+        var observation = tx.get("meta", "owner_latest_tweet");
+        return observation != null && ownerId != null && ownerId.equals(observation.path("accountId").asText())
+                ? observation : null;
+    }
+
+    private static boolean recentOwnerTimelineCheck(AssistantStore.Tx tx, String ownerId, String username, long now) {
+        var observed = latestOwnerObservation(tx, ownerId);
+        long at = observed == null ? 0L : observed.path("checkedAt").asLong();
+        return at > 0L && now >= at && now - at < OWNER_TIMELINE_MAX_AGE_MS
+                && username.replaceFirst("^@+", "").equalsIgnoreCase(observed.path("username").asText());
+    }
+
+    private long refreshOwnerTimeline(String ownerId, String username) {
+        if (sources == null || ownerId.isBlank() || username.isBlank()) return -1L;
+        try {
+            long observed = sources.fetchLatestAccountPostEpochMs(username, ownerId);
+            if (observed < 0L) return -1L;
+            return store.tx(tx -> {
+                ObjectNode owner = tx.ownerBinding();
+                if (owner == null || !ownerId.equals(owner.path("accountId").asText())
+                        || !username.equalsIgnoreCase(owner.path("username").asText("").replaceFirst("^@+", ""))) return -1L;
+                ObjectNode prev = latestOwnerObservation(tx, ownerId);
+                long latest = prev == null ? observed : Math.max(observed, prev.path("latestTweetAt").asLong());
+                tx.put("meta", "owner_latest_tweet", object().put("accountId", ownerId).put("username", username)
+                        .put("latestTweetAt", latest).put("checkedAt", clock.millis()));
+                return latest;
+            });
+        } catch (RuntimeException ex) {
+            log.warn("Could not refresh the owner's latest post: {}", ex.getMessage());
+            return -1L;
+        }
+    }
+
+    private void recordOwnerPublishAndScheduleNextSlot(String ownerId, String username, long publishedAtMs) {
         long nextGapMs = store.tx(tx -> {
-            ObjectNode prev = tx.get("meta", "owner_latest_tweet");
+            ObjectNode owner = tx.ownerBinding();
+            if (owner == null || !ownerId.equals(owner.path("accountId").asText())) return 0L;
+            ObjectNode prev = latestOwnerObservation(tx, ownerId);
             long merged = prev == null ? publishedAtMs : Math.max(publishedAtMs, prev.path("latestTweetAt").asLong(0L));
             tx.put("meta", "owner_latest_tweet", object()
-                    .put("username", "elidlicom")
+                    .put("accountId", ownerId).put("username", username)
                     .put("latestTweetAt", merged)
                     .put("checkedAt", publishedAtMs));
             ObjectNode settings = AssistantWorkflow.settings(tx);
@@ -2411,7 +2966,7 @@ public class AutoRepostService {
                 long untilMs = rec.path("deferredUntilMs").asLong(0L);
                 if (untilMs > 0L && now >= untilMs) {
                     String aid = rec.path("authorId").asText("").strip();
-                    if (!aid.isBlank()) targetIds.add(aid);
+                    if (!aid.isBlank() && now >= deferredSourceReadyAtMs.getOrDefault(aid, 0L)) targetIds.add(aid);
                 }
             }
             List<ObjectNode> found = new ArrayList<>();
@@ -2431,14 +2986,8 @@ public class AutoRepostService {
             String sid = src.path("authorId").asText(src.path("id").asText(""));
             deferredSourceReadyAtMs.remove(sid);
             List<ObjectNode> eligibleMaterials = store.tx(tx -> {
-                String uname = src.path("username").asText("").replaceFirst("^@+", "");
                 List<ObjectNode> list = new ArrayList<>();
-                for (ObjectNode m : tx.all("material")) {
-                    boolean same = (!sid.isBlank() && sid.equals(m.path("authorId").asText("")))
-                            || (!uname.isBlank() && uname.equalsIgnoreCase(m.path("username").asText("").replaceFirst("^@+", "")));
-                    if (!same) continue;
-                    long pubAt = m.path("publishedAt").asLong(0L);
-                    if (pubAt <= 0L || now - pubAt > MAX_FRESHNESS_AGE_MS) continue;
+                for (ObjectNode m : tx.rewriteWindow(sid, "", now - MAX_FRESHNESS_AGE_MS, now)) {
                     ObjectNode rec = tx.get("auto_repost", m.path("id").asText(""));
                     if (rec == null || (rec.path("deferredPendingEval").asBoolean(false)
                             && now >= rec.path("deferredUntilMs").asLong(0L))) {
@@ -2449,7 +2998,7 @@ public class AutoRepostService {
                 return list.stream().limit(8).toList();
             });
             if (!eligibleMaterials.isEmpty()) {
-                processAuthorBatch(src, eligibleMaterials);
+                processAuthorBatchInternal(src, eligibleMaterials, false, false, true, null);
             }
         }
     }
@@ -2509,7 +3058,7 @@ public class AutoRepostService {
         ) { }
 
         PatrolSnapshot snapshot = store.tx(tx -> {
-            ObjectNode owner = tx.get("meta", "owner");
+            ObjectNode owner = tx.ownerBinding();
             ObjectNode settings = AssistantWorkflow.settings(tx);
             if (owner == null || owner.path("accountId").asText("").isBlank()) {
                 return new PatrolSnapshot("NO_OWNER", "", "elidlicom", settings, 0L, 0L, 0L, List.of(), List.of(), false, List.of());
@@ -2518,41 +3067,33 @@ public class AutoRepostService {
                 return new PatrolSnapshot("DISABLED", "", "elidlicom", settings, 0L, 0L, 0L, List.of(), List.of(), false, List.of());
             }
             String ownerAccountId = owner.path("accountId").asText("");
-            String rawOwnerUser = owner.path("username").asText("").replaceFirst("^@+", "").strip();
-            String ownerUsername = rawOwnerUser.isBlank() ? "elidlicom" : rawOwnerUser;
+            String ownerUsername = owner.path("username").asText("").replaceFirst("^@+", "").strip();
+            if (ownerUsername.isBlank()) {
+                return new PatrolSnapshot("OWNER_CHECK_FAILED", ownerAccountId, "", settings, 0L, 0L, 0L, List.of(), List.of(), false, List.of());
+            }
 
             int dailyLimit = Math.max(1, settings.path("autoRepostDailyLimit").asInt(DEFAULT_DAILY_LIMIT));
-            LocalDate today = Instant.ofEpochMilli(nowMs).atZone(AssistantRetention.ZONE).toLocalDate();
-            long todayStart = today.atStartOfDay(AssistantRetention.ZONE).toInstant().toEpochMilli();
-            int publishedToday = 0;
+            int publishedToday = autoPublicationsToday(tx, nowMs);
             Map<String, Long> latestRepostByAuthorKey = new java.util.HashMap<>();
             Map<String, Long> latestRewriteByAuthorKey = new java.util.HashMap<>();
-            for (ObjectNode rec : tx.all("auto_repost")) {
+            for (ObjectNode rec : tx.repostActivityForCooldown(nowMs - SAME_AUTHOR_COOLDOWN_MS)) {
                 String recStatus = rec.path("status").asText("");
-                if (!rec.path("manual").asBoolean(false) && Set.of("PUBLISHED", "UNCERTAIN").contains(recStatus)) {
-                    long recPubAt = rec.path("publishedAt").asLong(rec.path("dispatchedAt").asLong(0L));
-                    if (recPubAt >= todayStart) publishedToday++;
-                }
                 if (Set.of("PUBLISHED", "SENDING", "UNCERTAIN").contains(recStatus)) {
                     long recAt = rec.path("publishedAt").asLong(rec.path("dispatchedAt").asLong(rec.path("createdAt").asLong(0L)));
                     String aid = rec.path("authorId").asText("").strip();
                     String uname = rec.path("username").asText("").replaceFirst("^@+", "").toLowerCase(Locale.ROOT);
                     if (!aid.isBlank() && recAt > 0L) latestRepostByAuthorKey.merge("id:" + aid, recAt, Math::max);
-                    if (!uname.isBlank() && recAt > 0L) latestRepostByAuthorKey.merge("u:" + uname, recAt, Math::max);
+                    else if (!uname.isBlank() && recAt > 0L) latestRepostByAuthorKey.merge("u:" + uname, recAt, Math::max);
                 }
             }
             for (ObjectNode rec : tx.all("auto_rewrite")) {
                 String recStatus = rec.path("status").asText("");
-                if (Set.of("PUBLISHED", "UNCERTAIN").contains(recStatus)) {
-                    long recPubAt = rec.path("publishedAt").asLong(rec.path("dispatchedAt").asLong(0L));
-                    if (recPubAt >= todayStart) publishedToday++;
-                }
                 if (Set.of("PUBLISHED", "SENDING", "UNCERTAIN").contains(recStatus)) {
                     long recAt = rec.path("publishedAt").asLong(rec.path("dispatchedAt").asLong(rec.path("createdAt").asLong(0L)));
                     String aid = rec.path("authorId").asText("").strip();
                     String uname = rec.path("username").asText("").replaceFirst("^@+", "").toLowerCase(Locale.ROOT);
                     if (!aid.isBlank() && recAt > 0L) latestRewriteByAuthorKey.merge("id:" + aid, recAt, Math::max);
-                    if (!uname.isBlank() && recAt > 0L) latestRewriteByAuthorKey.merge("u:" + uname, recAt, Math::max);
+                    else if (!uname.isBlank() && recAt > 0L) latestRewriteByAuthorKey.merge("u:" + uname, recAt, Math::max);
                 }
             }
             if (publishedToday >= dailyLimit) {
@@ -2596,13 +3137,11 @@ public class AutoRepostService {
             rewriteEntries.sort(Comparator.comparingLong(SourceOrderEntry::lastActionAtMs)
                     .thenComparingInt(SourceOrderEntry::tierMinutes));
 
-            long localLatest = resolveLatestOwnerTweetEpochMs(tx, ownerAccountId, "elidlicom", "", nowMs);
-            if (!"elidlicom".equalsIgnoreCase(ownerUsername)) {
-                localLatest = Math.max(localLatest, resolveLatestOwnerTweetEpochMs(tx, ownerAccountId, ownerUsername, "", nowMs));
-            }
-            ObjectNode observedNode = tx.get("meta", "owner_latest_tweet");
+            long localLatest = resolveLatestOwnerTweetEpochMs(tx, ownerAccountId, ownerUsername, "", nowMs);
+            ObjectNode observedNode = latestOwnerObservation(tx, ownerAccountId);
             long cachedLiveTs = observedNode == null ? 0L : observedNode.path("latestTweetAt").asLong(0L);
-            long cachedCheckedAt = observedNode == null ? 0L : observedNode.path("checkedAt").asLong(0L);
+            long cachedCheckedAt = observedNode != null && ownerUsername.equalsIgnoreCase(observedNode.path("username").asText())
+                    ? observedNode.path("checkedAt").asLong(0L) : 0L;
             List<AutoPublishMode> recentAutoModes = collectRecentAutoPublishModesNewestFirst(tx, 2);
             return new PatrolSnapshot(
                     "READY",
@@ -2624,35 +3163,15 @@ public class AutoRepostService {
         }
 
         long liveLatest = snapshot.cachedLiveTweetAtMs();
-        boolean liveCheckFailed = false;
         boolean recentlyCheckedLive = snapshot.cachedLiveCheckedAtMs() > 0L
                 && nowMs - snapshot.cachedLiveCheckedAtMs() >= 0L
-                && nowMs - snapshot.cachedLiveCheckedAtMs() < 5L * 60_000L;
-        if (sources != null && !recentlyCheckedLive) {
-            try {
-                liveLatest = sources.fetchLatestAccountPostEpochMs("elidlicom", snapshot.ownerAccountId());
-            } catch (Exception ex) {
-                liveCheckFailed = true;
-                log.warn("Patrol failed to fetch live @elidlicom timeline: {}", ex.getMessage());
-            }
-            if (liveLatest > 0L) {
-                long observedTs = liveLatest;
-                store.tx(tx -> {
-                    ObjectNode prev = tx.get("meta", "owner_latest_tweet");
-                    long merged = prev == null ? observedTs : Math.max(observedTs, prev.path("latestTweetAt").asLong(0L));
-                    tx.put("meta", "owner_latest_tweet", object()
-                            .put("username", "elidlicom")
-                            .put("latestTweetAt", merged)
-                            .put("checkedAt", clock.millis()));
-                    return null;
-                });
-            }
+                && nowMs - snapshot.cachedLiveCheckedAtMs() < OWNER_TIMELINE_MAX_AGE_MS;
+        if (!recentlyCheckedLive) {
+            liveLatest = refreshOwnerTimeline(snapshot.ownerAccountId(), snapshot.ownerUsername());
+            if (liveLatest < 0L) return object().put("status", "OWNER_CHECK_FAILED");
         }
 
         long latestOwnerAt = Math.max(snapshot.localLatestOwnerTweetAtMs(), Math.max(0L, liveLatest));
-        if (liveCheckFailed && latestOwnerAt <= 0L) {
-            return object().put("status", "OWNER_CHECK_FAILED");
-        }
 
         long checkNowMs = clock.millis();
         long requiredGapMs = resolveEffectiveOwnerGapMs(snapshot.settings(), latestOwnerAt);
@@ -2683,7 +3202,7 @@ public class AutoRepostService {
 
         // Only one mode has eligible sources configured -> run that mode directly without consuming a random draw
         if (hasRepostPool && !hasRewritePool) {
-            ObjectNode rpOnly = tryPatrolRepostSources(snapshot.unlockedRepostSources(), latestOwnerAt, jitterMinutes);
+            ObjectNode rpOnly = tryPatrolRepostSources(snapshot.unlockedRepostSources(), snapshot.ownerAccountId(), latestOwnerAt, jitterMinutes);
             if (rpOnly != null) {
                 return rpOnly.put("dispatchOrder", "ONLY_REPOST_CONFIGURED");
             }
@@ -2703,7 +3222,7 @@ public class AutoRepostService {
                 snapshot.recentAutoModesNewestFirst(), this.randomDrawSupplier);
 
         if (orderDecision.primaryMode() == AutoPublishMode.REPOST) {
-            ObjectNode rpResult = tryPatrolRepostSources(snapshot.unlockedRepostSources(), latestOwnerAt, jitterMinutes);
+            ObjectNode rpResult = tryPatrolRepostSources(snapshot.unlockedRepostSources(), snapshot.ownerAccountId(), latestOwnerAt, jitterMinutes);
             if (rpResult != null) {
                 return rpResult
                         .put("dispatchOrder", orderDecision.reasonCode())
@@ -2725,7 +3244,7 @@ public class AutoRepostService {
                         .put("forcedByTwoStreak", orderDecision.forcedByTwoStreak())
                         .put("randomDraw", orderDecision.randomNumber());
             }
-            ObjectNode rpFallback = tryPatrolRepostSources(snapshot.unlockedRepostSources(), latestOwnerAt, jitterMinutes);
+            ObjectNode rpFallback = tryPatrolRepostSources(snapshot.unlockedRepostSources(), snapshot.ownerAccountId(), latestOwnerAt, jitterMinutes);
             if (rpFallback != null) {
                 return rpFallback
                         .put("dispatchOrder", orderDecision.reasonCode() + "_FALLBACK_REPOST")
@@ -2741,16 +3260,16 @@ public class AutoRepostService {
                 .put("jitterMinutes", jitterMinutes);
     }
 
-    private ObjectNode tryPatrolRepostSources(List<ObjectNode> unlockedSources, long latestOwnerAt, int jitterMinutes) {
+    private ObjectNode tryPatrolRepostSources(List<ObjectNode> unlockedSources, String checkedOwnerId, long latestOwnerAt, int jitterMinutes) {
         if (unlockedSources == null || unlockedSources.isEmpty()) return null;
         // Pass 1: Prefer newly published content within the 48h freshness window
         for (ObjectNode source : unlockedSources) {
             List<ObjectNode> freshCandidates = loadRepostCandidatesForWindow(source, PATROL_MAX_FRESHNESS_AGE_MS, false);
             if (freshCandidates.isEmpty()) continue;
-            String publishedMaterialId = processAuthorBatchInternal(source, freshCandidates, true, false);
+            String publishedMaterialId = processAuthorBatchInternal(source, freshCandidates, true, false, false, checkedOwnerId);
             if (publishedMaterialId != null && !publishedMaterialId.isBlank()) {
                 return object()
-                        .put("status", "PUBLISHED")
+                        .put("status", recordedDispatchStatus("auto_repost", publishedMaterialId))
                         .put("mode", "REPOST")
                         .put("repostSourceTier", "FRESH")
                         .put("materialId", publishedMaterialId)
@@ -2763,10 +3282,10 @@ public class AutoRepostService {
         for (ObjectNode source : unlockedSources) {
             List<ObjectNode> recentCandidates = loadRepostCandidatesForWindow(source, RECENT_REPOST_FALLBACK_MAX_AGE_MS, true);
             if (recentCandidates.isEmpty()) continue;
-            String publishedMaterialId = processAuthorBatchInternal(source, recentCandidates, true, true);
+            String publishedMaterialId = processAuthorBatchInternal(source, recentCandidates, true, true, false, checkedOwnerId);
             if (publishedMaterialId != null && !publishedMaterialId.isBlank()) {
                 return object()
-                        .put("status", "PUBLISHED")
+                        .put("status", recordedDispatchStatus("auto_repost", publishedMaterialId))
                         .put("mode", "REPOST")
                         .put("repostSourceTier", "RECENT_FALLBACK")
                         .put("materialId", publishedMaterialId)
@@ -2789,22 +3308,8 @@ public class AutoRepostService {
             return synced;
         }
         String aid = source.path("authorId").asText(source.path("id").asText("")).strip();
-        String uname = source.path("username").asText("").replaceFirst("^@+", "").strip();
         long scanNow = clock.millis();
-        int maxItems = recentArchiveFallback ? 12 : 8;
-        return store.tx(tx -> {
-            List<ObjectNode> local = new ArrayList<>();
-            for (ObjectNode m : tx.all("material")) {
-                boolean same = (!aid.isBlank() && aid.equals(m.path("authorId").asText("")))
-                        || (!uname.isBlank() && uname.equalsIgnoreCase(m.path("username").asText("").replaceFirst("^@+", "")));
-                if (!same) continue;
-                long pubAt = m.path("publishedAt").asLong(0L);
-                if (pubAt <= 0L || scanNow - pubAt > windowMs) continue;
-                local.add(m.deepCopy());
-            }
-            local.sort(Comparator.comparingLong((ObjectNode m) -> m.path("publishedAt").asLong(0L)).reversed());
-            return local.stream().limit(maxItems).toList();
-        });
+        return store.tx(tx -> SourceCollector.storedRepostCandidates(tx, aid, scanNow, windowMs));
     }
 
     void processCandidate(ObjectNode sourceSnapshot, ObjectNode materialSnapshot) {
@@ -2813,19 +3318,11 @@ public class AutoRepostService {
     }
 
     void processAuthorBatch(ObjectNode sourceSnapshot, List<ObjectNode> materialSnapshots) {
-        processAuthorBatchInternal(sourceSnapshot, materialSnapshots, false, false);
+        processAuthorBatchInternal(sourceSnapshot, materialSnapshots, false, false, false, null);
     }
 
-    private String processAuthorBatchInternal(ObjectNode sourceSnapshot, List<ObjectNode> materialSnapshots, boolean patrolMode) {
-        return processAuthorBatchInternal(sourceSnapshot, materialSnapshots, patrolMode, false);
-    }
-
-    private String processAuthorBatchInternal(
-            ObjectNode sourceSnapshot,
-            List<ObjectNode> materialSnapshots,
-            boolean patrolMode,
-            boolean recentArchiveFallback
-    ) {
+    private String processAuthorBatchInternal(ObjectNode sourceSnapshot, List<ObjectNode> materialSnapshots,
+            boolean patrolMode, boolean recentArchiveFallback, boolean cooldownWakeup, String patrolOwnerId) {
         if (sourceSnapshot == null || materialSnapshots == null || materialSnapshots.isEmpty()) return "";
         long now = clock.millis();
         if (isInAutoRepostQuietWindow(now)) {
@@ -2850,6 +3347,29 @@ public class AutoRepostService {
         }
         if (filtered.isEmpty()) return "";
 
+        boolean checkTimeline = !patrolMode || cooldownWakeup || store.tx(tx -> filtered.stream()
+                .map(m -> tx.get("auto_repost", m.path("id").asText()))
+                .anyMatch(r -> r != null && r.path("deferredPendingEval").asBoolean()
+                        && (patrolMode || clock.millis() >= r.path("deferredUntilMs").asLong())));
+        String targetSourceId = sourceSnapshot.path("authorId").asText(sourceSnapshot.path("id").asText(""));
+        ObjectNode checkedOwner = checkTimeline ? store.tx(tx -> {
+            ObjectNode source = tx.get("source", targetSourceId);
+            if (source == null || !"ACTIVE".equals(source.path("status").asText()) || !source.path("autoRepostEnabled").asBoolean()
+                    || !AssistantWorkflow.settings(tx).path("enabled").asBoolean(true)
+                    || filtered.stream().noneMatch(m -> SourceCollector.belongsToSource(m, targetSourceId))) return null;
+            return tx.ownerBinding();
+        }) : null;
+        if (checkTimeline) {
+            if (checkedOwner == null) return "";
+            String ownerId = checkedOwner.path("accountId").asText();
+            String username = checkedOwner.path("username").asText("").replaceFirst("^@+", "");
+            if (refreshOwnerTimeline(ownerId, username) < 0L) {
+                long checkAt = clock.millis();
+                scheduleDeferredCdWakeup(targetSourceId, checkAt + PaidCapabilityGate.RETRY_INTERVAL_MS, checkAt);
+                return "";
+            }
+        }
+
         record ClaimedItem(String materialId, String topicId, ObjectNode material) { }
         record BatchClaimContext(
                 String ownerId,
@@ -2866,9 +3386,11 @@ public class AutoRepostService {
         ) { }
 
         BatchClaimContext ctx = store.tx(tx -> {
-            ObjectNode owner = tx.get("meta", "owner");
+            ObjectNode owner = tx.ownerBinding();
             ObjectNode settings = AssistantWorkflow.settings(tx);
             if (owner == null || owner.path("accountId").asText("").isBlank()
+                    || (patrolOwnerId != null && !patrolOwnerId.equals(owner.path("accountId").asText()))
+                    || (checkedOwner != null && !checkedOwner.path("accountId").equals(owner.path("accountId")))
                     || !settings.path("enabled").asBoolean(true)) {
                 return null;
             }
@@ -2891,23 +3413,36 @@ public class AutoRepostService {
                 if (!patrolMode && !recentArchiveFallback && enabledAt > 0L && pubAt < enabledAt) continue;
                 ObjectNode existingRec = tx.get("auto_repost", mid);
                 if (existingRec != null) {
+                    if (!repostAuthorized(tx, existingRec, ownerAccountId)) continue;
+                    if (existingRec.path("autoRetryAt").asLong() > 0L) continue;
                     if (patrolMode || recentArchiveFallback) {
                         String recStatus = existingRec.path("status").asText("");
                         boolean patrolRetryable = Set.of(
                                 "SKIPPED_COOLDOWN", "SKIPPED_AUTHOR_COOLDOWN", "SKIPPED_QUIET_HOURS", "JUDGE_FAILED"
                         ).contains(recStatus);
-                        if (!patrolRetryable) continue;
+                        if (!patrolRetryable && !correctedQuoteVerdict(existingRec)) continue;
                     } else {
                         boolean canUnlockDeferred = existingRec.path("deferredPendingEval").asBoolean(false)
                                 && now >= existingRec.path("deferredUntilMs").asLong(0L);
-                        if (!canUnlockDeferred) continue;
+                        if (!canUnlockDeferred && !correctedQuoteVerdict(existingRec)) continue;
                     }
                 }
-                ObjectNode liveMat = tx.get("material", mid);
-                if (liveMat == null) continue;
-                String topicId = AssistantTopics.topicOf(tx, mid);
+                ObjectNode liveMat = tx.rewriteMaterial(mid, clock.millis());
+                if (!SourceCollector.belongsToSource(snapMat, sourceId) || !SourceCollector.belongsToSource(liveMat, sourceId)
+                        || !tx.retainedMaterialAuthorMatches(mid, sourceId)) continue;
+                long livePublishedAt = liveMat.path("publishedAt").asLong();
+                if (livePublishedAt <= 0 || livePublishedAt > clock.millis() || clock.millis() - livePublishedAt > maxAgeMs) continue;
+                String topicId = tx.publicationTopic(liveMat, mid);
+                ObjectNode prior = repostConflict(tx, mid, topicId);
+                if (prior != null) {
+                    if ("PUBLISHED".equals(prior.path("status").asText())) {
+                        tx.put("auto_repost", mid, baseRecord(liveSource, liveMat, topicId, now, ownerAccountId)
+                                .put("status","SKIPPED_DUPLICATE").put("reason","该素材或选题已有发布回执"));
+                    }
+                    continue;
+                }
                 eligible.add(new ClaimedItem(mid, topicId, liveMat));
-                if (recentArchiveFallback && eligible.size() >= 3) {
+                if (patrolMode && eligible.size() >= (recentArchiveFallback ? 3 : 8)) {
                     break;
                 }
             }
@@ -2915,52 +3450,14 @@ public class AutoRepostService {
 
             // Check duplicate topics & daily limit first for non-CD permanent guards, THEN check Dual CD BEFORE any LLM call!
             int dailyLimit = Math.max(1, settings.path("autoRepostDailyLimit").asInt(DEFAULT_DAILY_LIMIT));
-            LocalDate today = Instant.ofEpochMilli(now).atZone(AssistantRetention.ZONE).toLocalDate();
-            long todayStart = today.atStartOfDay(AssistantRetention.ZONE).toInstant().toEpochMilli();
-            int publishedToday = 0;
-            java.util.Set<String> activeTopics = new java.util.HashSet<>();
-            for (ObjectNode rec : tx.all("auto_repost")) {
-                String recStatus = rec.path("status").asText("");
-                if (Set.of("PUBLISHED", "SENDING", "UNCERTAIN").contains(recStatus)) {
-                    String tid = rec.path("topicId").asText("");
-                    if (!tid.isBlank()) activeTopics.add(tid);
-                }
-                if (!rec.path("manual").asBoolean(false) && Set.of("PUBLISHED", "UNCERTAIN").contains(recStatus)) {
-                    long recPubAt = rec.path("publishedAt").asLong(rec.path("dispatchedAt").asLong(0L));
-                    if (recPubAt >= todayStart) publishedToday++;
-                }
-            }
-            for (ObjectNode rec : tx.all("auto_rewrite")) {
-                String recStatus = rec.path("status").asText("");
-                if (Set.of("PUBLISHED", "SENDING", "UNCERTAIN").contains(recStatus)) {
-                    String tid = rec.path("topicId").asText("");
-                    if (!tid.isBlank()) activeTopics.add(tid);
-                }
-                if (Set.of("PUBLISHED", "UNCERTAIN").contains(recStatus)) {
-                    long recPubAt = rec.path("publishedAt").asLong(rec.path("dispatchedAt").asLong(0L));
-                    if (recPubAt >= todayStart) publishedToday++;
-                }
-            }
-
-            List<ClaimedItem> nonDupItems = new ArrayList<>();
-            for (ClaimedItem item : eligible) {
-                if (!item.topicId().isBlank() && activeTopics.contains(item.topicId())) {
-                    tx.put("auto_repost", item.materialId(), baseRecord(liveSource, item.material(), item.topicId(), now)
-                            .put("status", "SKIPPED_DUPLICATE")
-                            .put("deferredPendingEval", false)
-                            .put("reason", "同一事件选题已触发过自动转发"));
-                } else {
-                    nonDupItems.add(item);
-                }
-            }
-            if (nonDupItems.isEmpty()) return null;
+            int publishedToday = autoPublicationsToday(tx, now);
 
             DualCooldown dualCd = computeLiveDualCooldown(
                     tx, settings, ownerAccountId, ownerUsername, candidateAuthorId, candidateUsername, "", now);
             if (dualCd.globalCdActive()) {
                 long wakeAtMs = dualCd.globalReadyAtMs();
-                for (ClaimedItem item : nonDupItems) {
-                    tx.put("auto_repost", item.materialId(), baseRecord(liveSource, item.material(), item.topicId(), now)
+                for (ClaimedItem item : eligible) {
+                    tx.put("auto_repost", item.materialId(), baseRecord(liveSource, item.material(), item.topicId(), now, ownerAccountId)
                             .put("status", "SKIPPED_COOLDOWN")
                             .put("deferredPendingEval", true)
                             .put("deferredUntilMs", wakeAtMs)
@@ -2983,8 +3480,8 @@ public class AutoRepostService {
                         String deferReason = liveOrder.forcedByTwoStreak()
                                 ? "已连续 2 次自动引用转发，本轮直接切换执行洗稿发送"
                                 : "本轮随机抽中双数（洗稿发送），优先执行洗稿发送";
-                        for (ClaimedItem item : nonDupItems) {
-                            tx.put("auto_repost", item.materialId(), baseRecord(liveSource, item.material(), item.topicId(), now)
+                        for (ClaimedItem item : eligible) {
+                            tx.put("auto_repost", item.materialId(), baseRecord(liveSource, item.material(), item.topicId(), now, ownerAccountId)
                                     .put("status", "SKIPPED_COOLDOWN")
                                     .put("deferredPendingEval", true)
                                     .put("deferredUntilMs", now + nextGap)
@@ -2997,8 +3494,8 @@ public class AutoRepostService {
             }
 
             if (publishedToday >= dailyLimit) {
-                for (ClaimedItem item : nonDupItems) {
-                    tx.put("auto_repost", item.materialId(), baseRecord(liveSource, item.material(), item.topicId(), now)
+                for (ClaimedItem item : eligible) {
+                    tx.put("auto_repost", item.materialId(), baseRecord(liveSource, item.material(), item.topicId(), now, ownerAccountId)
                             .put("status", "SKIPPED_LIMIT")
                             .put("deferredPendingEval", false)
                             .put("reason", "已达单日自动引用转发保护上限（" + dailyLimit + " 条）"));
@@ -3006,18 +3503,18 @@ public class AutoRepostService {
                 return null;
             }
 
-            List<ClaimedItem> evalItems = nonDupItems;
+            List<ClaimedItem> evalItems = eligible;
             if (dualCd.authorCdActive()) {
                 if (patrolMode || recentArchiveFallback) {
                     // Strictly keep 16h same-author lock during interval patrol and recent-content fallback
                     return null;
                 }
                 evalItems = new ArrayList<>();
-                for (ClaimedItem item : nonDupItems) {
+                for (ClaimedItem item : eligible) {
                     if (mightBeDirectPassCandidate(item.material())) {
                         evalItems.add(item);
                     } else {
-                        tx.put("auto_repost", item.materialId(), baseRecord(liveSource, item.material(), item.topicId(), now)
+                        tx.put("auto_repost", item.materialId(), baseRecord(liveSource, item.material(), item.topicId(), now, ownerAccountId)
                                 .put("status", "SKIPPED_AUTHOR_COOLDOWN")
                                 .put("deferredPendingEval", false)
                                 .put("reason", dualCd.blockingReasonText()));
@@ -3029,8 +3526,12 @@ public class AutoRepostService {
             }
 
             for (ClaimedItem item : evalItems) {
-                tx.put("auto_repost", item.materialId(), baseRecord(liveSource, item.material(), item.topicId(), now)
+                tx.put("auto_repost", item.materialId(), baseRecord(liveSource, item.material(), item.topicId(), now, ownerAccountId)
                         .put("status", "EVALUATING")
+                        .put("quoteSourceFingerprint", quoteSourceFingerprint(item.material()))
+                        .put("quoteAuthorFollowers", quoteAuthorFollowers(liveSource, item.material()))
+                        .put("strictSixteenHourAuthorLock", patrolMode || recentArchiveFallback)
+                        .put("candidateWindowMs", maxAgeMs)
                         .put("deferredPendingEval", false));
             }
             ObjectNode prefs = AssistantWorkflow.preferences(tx);
@@ -3063,7 +3564,7 @@ public class AutoRepostService {
                     .toList());
             ObjectNode rwDone = tryPatrolRewriteSources(rewriteSources, ctx.ownerId(), ctx.ownerUsername(), 0L, 0);
             if (rwDone == null) {
-                processAuthorBatchInternal(sourceSnapshot, materialSnapshots, true, false);
+                processAuthorBatchInternal(sourceSnapshot, materialSnapshots, true, false, false, ctx.ownerId());
             }
             return "";
         }
@@ -3190,8 +3691,8 @@ public class AutoRepostService {
                     deferredExtraDirectPass = true;
                 }
                 store.tx(tx -> {
-                    ObjectNode rec = tx.get("auto_repost", item.materialId());
-                    if (rec != null && "EVALUATING".equals(rec.path("status").asText(""))) {
+                    ObjectNode rec = authorizedRepostAtStage(tx, item.materialId(), ctx.ownerId(), "EVALUATING");
+                    if (rec != null) {
                         ObjectNode next = j != null ? applyJudgment(rec.deepCopy(), j, evaluatedAt) : rec.deepCopy();
                         if (extraQualifying) {
                             tx.put("auto_repost", item.materialId(), next
@@ -3251,12 +3752,16 @@ public class AutoRepostService {
         return "";
     }
 
-    private boolean wasDispatchedOrPublished(String materialId) {
-        if (materialId == null || materialId.isBlank()) return false;
+    private String recordedDispatchStatus(String table, String materialId) {
         return store.tx(tx -> {
-            ObjectNode rec = tx.get("auto_repost", materialId);
-            return rec != null && Set.of("PUBLISHED", "SENDING", "UNCERTAIN").contains(rec.path("status").asText(""));
+            ObjectNode record = tx.get(table, materialId);
+            return record == null ? "" : record.path("status").asText("");
         });
+    }
+
+    private boolean wasDispatchedOrPublished(String materialId) {
+        return materialId != null && !materialId.isBlank()
+                && Set.of("PUBLISHED", "SENDING", "UNCERTAIN").contains(recordedDispatchStatus("auto_repost", materialId));
     }
 
     private void evaluateAndPublish(
@@ -3385,8 +3890,8 @@ public class AutoRepostService {
         long evaluatedAt = clock.millis();
         if (!judgment.shouldRepost()) {
             store.tx(tx -> {
-                ObjectNode rec = tx.get("auto_repost", materialId);
-                if (rec != null && "EVALUATING".equals(rec.path("status").asText())) {
+                ObjectNode rec = authorizedRepostAtStage(tx, materialId, ownerId, "EVALUATING");
+                if (rec != null) {
                     ObjectNode next = applyJudgment(rec.deepCopy(), judgment, evaluatedAt);
                     if (onlyDirectPassAllowed && !PiAgentViralJudge.isDirectPassCategory(judgment.category())) {
                         tx.put("auto_repost", materialId, next
@@ -3407,7 +3912,7 @@ public class AutoRepostService {
         String commentText = buildCommentText(useTemplate, source, material, judgment);
         if (commentText.isBlank()) {
             store.tx(tx -> {
-                ObjectNode rec = tx.get("auto_repost", materialId);
+                ObjectNode rec = authorizedRepostAtStage(tx, materialId, ownerId, "EVALUATING");
                 if (rec != null) {
                     tx.put("auto_repost", materialId, applyJudgment(rec.deepCopy(), judgment, evaluatedAt)
                             .put("status", "FAILED")
@@ -3421,12 +3926,24 @@ public class AutoRepostService {
         dispatchCommentAndPublish(materialId, ownerId, ownerUsername, topicId, commentText, judgment, evaluatedAt, enforceQuietWindow, strictSixteenHourAuthorLock);
     }
 
-    private static final java.util.regex.Pattern STATUS_URL_ID_PATTERN = java.util.regex.Pattern.compile("/status/([0-9]{2,20})");
-
     private static String extractStatusIdFromUrl(String url) {
-        if (url == null || url.isBlank()) return null;
-        var m = STATUS_URL_ID_PATTERN.matcher(url);
-        return m.find() ? m.group(1) : null;
+        XPostLink link = XPostLink.parse(url);
+        return link == null ? null : link.tweetId();
+    }
+
+    private static boolean hasProtectedPublication(AssistantStore.Tx tx, String kind, String materialId, String topicId) {
+        String original = resolveMaterialQuoteTweetId(tx, materialId, null);
+        return tx.matchingQuoteOrRewrite(kind, materialId, original == null ? "" : original, topicId, true) != null;
+    }
+
+    private static ObjectNode repostConflict(AssistantStore.Tx tx, String materialId, String topicId) {
+        String original = resolveMaterialQuoteTweetId(tx, materialId, null);
+        for (String kind : List.of("publication", "auto_rewrite", "auto_repost")) {
+            var conflict = tx.matchingQuoteOrRewrite(kind, materialId, original, topicId, true,
+                    "auto_repost".equals(kind) ? materialId : "");
+            if (conflict != null) return conflict;
+        }
+        return null;
     }
 
     private static String resolveMaterialQuoteTweetId(AssistantStore.Tx tx, String materialId, ObjectNode rec) {
@@ -3449,6 +3966,31 @@ public class AutoRepostService {
         return null;
     }
 
+    private static void verifyManualQuoteAuthor(AssistantStore.Tx tx, String sourceKey, ObjectNode material, XPostLink requested) {
+        String authorId = material.path("authorId").asText("");
+        String handle = material.path("username").asText("").replaceFirst("^@+", "");
+        ObjectNode source = tx.get("source", sourceKey);
+        if (source == null) {
+            for (var entry : tx.all("source")) {
+                if ("REMOVED".equals(entry.path("status").asText())
+                        || !sourceKey.equalsIgnoreCase(entry.path("username").asText("").replaceFirst("^@+", ""))) continue;
+                if (source != null && !source.path("authorId").equals(entry.path("authorId")))
+                    throw new XDataProviderException(409, "来源用户名对应多个账号，请按作者重新选择原帖");
+                source = entry;
+            }
+        }
+        boolean matches = source == null
+                ? !sourceKey.isBlank() && (sourceKey.equals(authorId) || (!sourceKey.matches("[0-9]+") && sourceKey.equalsIgnoreCase(handle)))
+                : SourceCollector.belongsToSource(material, source.path("authorId").asText(source.path("id").asText()));
+        if (!matches) throw new XDataProviderException(409, "所选原帖与当前来源作者不一致");
+        String linkHandle = requested == null ? null : requested.username();
+        XPostLink storedLink = XPostLink.parse(material.path("sourceUrl").asText(""));
+        if (linkHandle != null && !"i".equalsIgnoreCase(linkHandle) && !linkHandle.equalsIgnoreCase(handle)
+                && (storedLink == null || !linkHandle.equalsIgnoreCase(storedLink.username()))
+                && (source == null || !linkHandle.equalsIgnoreCase(source.path("username").asText(""))))
+            throw new XDataProviderException(409, "原帖链接的作者与所选素材不一致");
+    }
+
     public ObjectNode publishManualQuote(String accountId, String username, String rawSourceKey, ObjectNode body) {
         if (!store.isOwner(accountId)) {
             throw new XDataProviderException(403, "仅限内容助手所有者使用");
@@ -3456,6 +3998,7 @@ public class AutoRepostService {
         if (oauthService == null || publishClient == null) {
             throw new XDataProviderException(503, "引用发布服务未启用");
         }
+        reconcileAcceptedReceipts();
         ObjectNode req = body == null ? object() : body;
         String commentText = OwnerQuoteStyleDistiller.stripWrappingQuotesOrFences(req.path("commentText").asText("")).strip();
         if (commentText.isBlank()) {
@@ -3467,139 +4010,258 @@ public class AutoRepostService {
         }
         String materialId = req.path("materialId").asText("").strip();
         String requestedSourceUrl = req.path("sourceUrl").asText("").strip();
-        String pubKey = "manual-quote-" + clientRequestId;
+        XPostLink requested = XPostLink.parse(requestedSourceUrl);
+        if (!requestedSourceUrl.isBlank() && requested == null)
+            throw new IllegalArgumentException("原帖链接无效");
+        String selectedId = materialId.isBlank() && requested != null ? requested.tweetId() : materialId;
+        if (selectedId.isBlank()) throw new IllegalArgumentException("缺少有效原帖推文 ID，无法引用转发");
+        if (selectedId.matches("[0-9]{2,20}") && requested != null && !selectedId.equals(requested.tweetId()))
+            throw new XDataProviderException(409, "所选素材与原帖链接的推文 ID 不一致");
+        String pubKey = "manual-quote-" + (clientRequestId.isBlank()
+                ? AssistantWorkflow.digest(object().put("accountId", accountId).put("material", materialId)
+                        .put("sourceUrl", requestedSourceUrl).put("commentText", commentText))
+                : clientRequestId);
         String sourceKey = rawSourceKey == null ? "" : rawSourceKey.replaceFirst("^@+", "").strip();
 
-        record PreparedManualQuote(
-                ObjectNode existingPublished,
-                String quoteTweetId,
-                String resolvedMaterialId,
-                String topicId,
-                String sourceUrl,
-                String requestDigest
-        ) { }
+        ObjectNode snapshot = store.tx(tx -> {
+            ObjectNode material = tx.rewriteMaterial(selectedId, clock.millis());
+            if (material != null) return material;
+            ObjectNode historical = tx.get("publication", pubKey);
+            if (historical == null && selectedId.matches("[0-9]{2,20}"))
+                historical = tx.protectedPublicationByDigest(AssistantWorkflow.digest(object().put("materialId", selectedId)
+                        .put("quoteTweetId", selectedId).put("commentText", commentText)), accountId);
+            if (historical == null || !selectedId.equals(historical.path("materialId").asText()))
+                historical = tx.get("auto_repost", selectedId);
+            return historical == null || !tx.publicationOwnerMatches(historical, accountId) || historical.path("authorId").asText("").isBlank()
+                    ? null : historical.deepCopy().put("id", selectedId);
+        });
+        if (snapshot == null) {
+            if (!selectedId.matches("[0-9]{2,20}") || sources == null)
+                throw new XDataProviderException(409, "未能核实所选原帖及作者，请刷新来源");
+            snapshot = sources.fetchTweetMaterialById(selectedId);
+            if (snapshot == null || !selectedId.equals(snapshot.path("id").asText()))
+                throw new XDataProviderException(409, "未能核实所选原帖及作者，请刷新来源");
+        }
+        ObjectNode selectedMaterial = snapshot;
+        List<ObjectNode> pendingManual = pendingManualReceipts(accountId);
+        record PreparedManualQuote(ObjectNode row, String quoteTweetId, String sourceUrl) { }
 
         PreparedManualQuote prepared = store.tx(tx -> {
-            ObjectNode mat = materialId.isBlank() ? null : tx.get("material", materialId);
-            String quoteTweetId = resolveMaterialQuoteTweetId(tx, materialId, null);
-            if (quoteTweetId == null) {
-                quoteTweetId = extractStatusIdFromUrl(requestedSourceUrl);
-            }
+            var owner = tx.ownerBinding();
+            if (owner == null || !accountId.equals(owner.path("accountId").asText()))
+                throw new XDataProviderException(403, "当前账号绑定已变更");
+            ObjectNode mat = tx.rewriteMaterial(selectedId, clock.millis());
+            if (mat == null) mat = selectedMaterial;
+            verifyManualQuoteAuthor(tx, sourceKey, mat, requested);
+            if (!tx.retainedMaterialAuthorMatches(selectedId, mat.path("authorId").asText()))
+                throw new XDataProviderException(409, "所选原帖与已保存的来源作者不一致");
+            XPostLink storedLink = XPostLink.parse(mat.path("sourceUrl").asText(""));
+            String quoteTweetId = selectedId.matches("[0-9]{2,20}") ? selectedId : storedLink != null ? storedLink.tweetId() : null;
             if (quoteTweetId == null) {
                 throw new IllegalArgumentException("缺少有效原帖推文 ID，无法引用转发");
             }
-            String resolvedMatId = !materialId.isBlank() ? materialId : quoteTweetId;
-            String topicId = AssistantTopics.topicOf(tx, resolvedMatId);
-            String resolvedUrl = !requestedSourceUrl.isBlank()
-                    ? requestedSourceUrl
-                    : (mat != null && !mat.path("sourceUrl").asText("").isBlank()
-                            ? mat.path("sourceUrl").asText("")
-                            : (!sourceKey.isBlank()
-                                    ? ("https://x.com/" + sourceKey + "/status/" + quoteTweetId)
-                                    : ("https://x.com/i/status/" + quoteTweetId)));
+            if ((requested != null && !quoteTweetId.equals(requested.tweetId()))
+                    || (storedLink != null && !quoteTweetId.equals(storedLink.tweetId())))
+                throw new XDataProviderException(409, "所选素材与原帖链接的推文 ID 不一致");
+            String resolvedMatId = selectedId;
+            String topicId = tx.publicationTopic(mat, selectedId);
+            String resolvedUrl = new XPostLink(quoteTweetId, mat.path("username").asText("")).url();
 
             String requestDigest = AssistantWorkflow.digest(object()
                     .put("materialId", resolvedMatId)
                     .put("quoteTweetId", quoteTweetId)
                     .put("commentText", commentText));
+            for (ObjectNode pending : pendingManual) {
+                if (requestDigest.equals(pending.path("requestDigest").asText()))
+                    return new PreparedManualQuote(pending.deepCopy().put("receiptPending", true), quoteTweetId, resolvedUrl);
+                if (pubKey.equals(pending.path("id").asText()))
+                    throw new XDataProviderException(409, "同一请求标识已用于其他引用内容");
+            }
             ObjectNode existing = tx.get("publication", pubKey);
             if (existing != null) {
+                if (!tx.publicationOwnerMatches(existing, accountId))
+                    throw new XDataProviderException(403, "该回执不属于当前发布账号");
                 if (!requestDigest.equals(existing.path("requestDigest").asText(""))) {
                     throw new XDataProviderException(409, "同一请求标识已用于其他引用内容");
                 }
                 String existingStatus = existing.path("status").asText("");
                 if ("PUBLISHED".equals(existingStatus)) {
-                    return new PreparedManualQuote(existing, quoteTweetId, resolvedMatId, topicId, resolvedUrl, requestDigest);
+                    return new PreparedManualQuote(existing, quoteTweetId, resolvedUrl);
                 }
                 if ("SENDING".equals(existingStatus) || "UNCERTAIN".equals(existingStatus)) {
                     throw new XDataProviderException(409, "该引用发布正在处理或回执待确认，请勿重复提交");
                 }
             }
 
-            tx.put("publication", pubKey, object()
+            // Older clients can generate a new key after losing a response.
+            ObjectNode prior = tx.protectedPublicationByDigest(requestDigest, accountId);
+            if (prior != null) {
+                if (!tx.publicationOwnerMatches(prior, accountId))
+                    throw new XDataProviderException(403, "该回执不属于当前发布账号");
+                if ("PUBLISHED".equals(prior.path("status").asText())) {
+                    return new PreparedManualQuote(prior, quoteTweetId, resolvedUrl);
+                }
+                throw new XDataProviderException(409, "同一条引用发布的回执待确认，请勿重复提交");
+            }
+
+            tx.requireNoPendingQuoteOrRewrite(resolvedMatId, quoteTweetId, topicId);
+            ScheduledPublicationGuard.requireAvailableCopy(tx, "", quoteTweetId, commentText, List.of(), "", "", 0);
+            ObjectNode reservation = tx.put("publication", pubKey, object()
                     .put("requestDigest", requestDigest)
-                    .put("status", "SENDING")
+                    .put("sendAttempt", java.util.UUID.randomUUID().toString())
+                    .put("requestedText", commentText).put("requestedQuoteTweetId", quoteTweetId)
+                    .put("ownerAccountId", accountId)
+                    .put("status", "SENDING").put("postRequestDispatched", false)
                     .put("source", "MANUAL_QUOTE_REPOST")
                     .put("topicId", topicId)
                     .put("materialId", resolvedMatId)
+                    .put("authorId", mat.path("authorId").asText(""))
+                    .put("username", mat.path("username").asText("")).put("authorName", mat.path("authorName").asText(""))
+                    .put("sourceUrl", resolvedUrl).put("createdAt", clock.millis())
                     .put("quoteTweetId", quoteTweetId)
                     .put("quotedTweetId", quoteTweetId)
                     .put("text", commentText));
-            return new PreparedManualQuote(null, quoteTweetId, resolvedMatId, topicId, resolvedUrl, requestDigest);
+            return new PreparedManualQuote(reservation, quoteTweetId, resolvedUrl);
         });
 
-        if (prepared.existingPublished() != null) {
-            return prepared.existingPublished();
+        if ("PUBLISHED".equals(prepared.row().path("status").asText())) {
+            return prepared.row();
         }
 
-        final String accessToken = com.xops.hub.provider.PaidCapabilityGate.withCaller(
-                com.xops.hub.provider.PaidCapabilityGate.PRIVILEGED_USERNAME, accountId,
-                () -> oauthService.getValidWriteAccessToken(accountId, false));
-
-        final String publishedTweetId;
+        final String accessToken;
         try {
-            publishedTweetId = com.xops.hub.provider.PaidCapabilityGate.withCaller(
-                    com.xops.hub.provider.PaidCapabilityGate.PRIVILEGED_USERNAME, accountId,
-                    () -> XPublishClient.withQuoteTweetUrl(
-                            prepared.sourceUrl(),
-                            () -> publishClient.createTweet(accessToken, commentText, List.of(), prepared.quoteTweetId())));
-        } catch (XPublishException ex) {
-            store.tx(tx -> {
-                ObjectNode rec = tx.get("publication", pubKey);
-                if (rec != null) {
-                    tx.put("publication", pubKey, rec.deepCopy()
-                            .put("status", ex.isDeliveryUncertain() ? "UNCERTAIN" : "FAILED")
-                            .put("error", safeError(ex)));
-                }
-                return null;
-            });
+            accessToken = PaidCapabilityGate.withCaller(PaidCapabilityGate.PRIVILEGED_USERNAME, accountId, store.isOwner(accountId),
+                    () -> oauthService.getValidWriteAccessToken(accountId, false));
+        } catch (RuntimeException ex) {
+            store.recordPublicationFailure(pubKey, prepared.row(), safeError(ex), false);
             throw ex;
         }
 
-        long doneMs = clock.millis();
-        String uname = (username == null || username.isBlank()) ? "i" : username;
-        String publishedUrl = "https://x.com/" + uname + "/status/" + publishedTweetId;
+        PublicationReceipt receipt;
+        try {
+            receipt = PaidCapabilityGate.withCaller(PaidCapabilityGate.PRIVILEGED_USERNAME, accountId, store.isOwner(accountId),
+                    () -> XPublishClient.withDispatchedPayload(commentText, prepared.quoteTweetId(),
+                            payload -> AssistantPublishing.markRequestDispatched(store, pubKey, accountId, clock.millis(), payload),
+                            () -> XPublishClient.withQuoteTweetUrl(prepared.sourceUrl(),
+                                    () -> publishClient.createTweet(accessToken, commentText, List.of(), prepared.quoteTweetId()))));
+        } catch (RuntimeException ex) {
+            boolean uncertain = !(ex instanceof XPublishException failure) || failure.isDeliveryUncertain();
+            store.recordPublicationFailure(pubKey, prepared.row(), safeError(ex), uncertain);
+            throw ex;
+        }
 
-        ObjectNode result = store.tx(tx -> {
-            ObjectNode pub = tx.put("publication", pubKey, object()
-                    .put("requestDigest", prepared.requestDigest())
-                    .put("status", "PUBLISHED")
-                    .put("source", "MANUAL_QUOTE_REPOST")
-                    .put("topicId", prepared.topicId())
-                    .put("materialId", prepared.resolvedMaterialId())
-                    .put("quoteTweetId", prepared.quoteTweetId())
-                    .put("quotedTweetId", prepared.quoteTweetId())
-                    .put("text", commentText)
-                    .put("publishedTweetId", publishedTweetId)
-                    .put("publishedTweetUrl", publishedUrl)
-                    .put("publishedAt", doneMs));
+        ObjectNode accepted = applyReceipt(prepared.row().deepCopy().put("source", quoteSource("MANUAL", receipt.mode()))
+                .put("postRequestDispatched", true).put("commentText", commentText),
+                receipt, prepared.quoteTweetId(), clock.millis(), username);
+        return persistAcceptedReceipt(pubKey, accepted);
+    }
 
-            ObjectNode existingRepost = tx.get("auto_repost", prepared.resolvedMaterialId());
-            ObjectNode mat = tx.get("material", prepared.resolvedMaterialId());
-            ObjectNode nextRepost = existingRepost != null
-                    ? existingRepost.deepCopy()
-                    : object()
-                            .put("materialId", prepared.resolvedMaterialId())
-                            .put("topicId", prepared.topicId())
-                            .put("authorId", mat != null ? mat.path("authorId").asText("") : "")
-                            .put("username", mat != null ? mat.path("username").asText(sourceKey) : sourceKey)
-                            .put("authorName", mat != null ? mat.path("authorName").asText("") : "")
-                            .put("sourceUrl", prepared.sourceUrl())
-                            .put("createdAt", doneMs);
-            nextRepost.put("status", "PUBLISHED")
-                    .put("manual", true)
-                    .put("commentText", commentText)
-                    .put("quoteTweetId", prepared.quoteTweetId())
-                    .put("quoteVoiceVersion", 7)
-                    .put("publishedTweetId", publishedTweetId)
-                    .put("publishedTweetUrl", publishedUrl)
-                    .put("publishedAt", doneMs)
-                    .put("error", "");
-            tx.put("auto_repost", prepared.resolvedMaterialId(), nextRepost);
-            return pub;
+    private static boolean boundPublisherMatches(AssistantStore.Tx tx, ObjectNode rec, String expectedOwnerId) {
+        ObjectNode owner = tx.ownerBinding();
+        if (owner == null) return false;
+        String ownerId = owner.path("accountId").asText();
+        return (expectedOwnerId == null || expectedOwnerId.equals(ownerId))
+                && (rec == null || tx.publicationOwnerMatches(rec, ownerId));
+    }
+
+    private boolean repostAuthorized(AssistantStore.Tx tx, ObjectNode rec, String expectedOwnerId) {
+        return sourcePermitsPublication(tx, rec, expectedOwnerId, AutoPublishMode.REPOST);
+    }
+
+    private boolean sourcePermitsPublication(AssistantStore.Tx tx, ObjectNode rec, String expectedOwnerId, AutoPublishMode mode) {
+        if (rec == null || !boundPublisherMatches(tx, rec, expectedOwnerId)
+                || !AssistantWorkflow.settings(tx).path("enabled").asBoolean(true)) return false;
+        // Old rows may only have the original author's stable ID after the material expires.
+        String authorId = rec.path("authorId").asText("");
+        if (authorId.isBlank() || !authorId.equals(rec.path("sourceId").asText(authorId))) return false;
+        ObjectNode source = tx.get("source", authorId);
+        if (source == null || !authorId.equals(source.path("authorId").asText(source.path("id").asText()))
+                || !"ACTIVE".equals(source.path("status").asText())
+                || !source.path(mode == AutoPublishMode.REWRITE ? "autoRewriteEnabled" : "autoRepostEnabled").asBoolean(false)) return false;
+        String materialId = rec.path("materialId").asText(rec.path("id").asText());
+        return tx.retainedMaterialAuthorMatches(materialId, authorId);
+    }
+
+    private ObjectNode authorizedRepostAtStage(AssistantStore.Tx tx, String materialId, String ownerId, String stage) {
+        ObjectNode rec = tx.get("auto_repost", materialId);
+        if (rec == null || !stage.equals(rec.path("status").asText())) return null;
+        if (repostAuthorized(tx, rec, ownerId)) {
+            if (matchesEvaluatedQuote(tx, rec, tx.rewriteMaterial(materialId, clock.millis()))) return rec;
+            rec.remove(List.of("automaticRetryRunning", "autoRetryAt", "commentText"));
+            tx.put("auto_repost", materialId, rec.put("status", "JUDGE_FAILED").put("quoteSourceNeedsReview", true)
+                    .put("error", "评估后原帖已更正，请重新评估附文"));
+            return null;
+        }
+        rec.remove(List.of("automaticRetryRunning", "autoRetryAt"));
+        tx.put("auto_repost", materialId, rec.put("status", "FAILED").put("error", "原始素材与当前获准自动引用的来源或作者不一致"));
+        return null;
+    }
+
+    private static final class RepostDispatchBlocked extends XPublishException {
+        RepostDispatchBlocked() { super(409, "自动引用的发送条件已变更", false); }
+    }
+
+    private boolean hasDispatchConflict(AssistantStore.Tx tx, String materialId, ObjectNode row) {
+        String topic = tx.publicationTopic(row, materialId);
+        row.put("topicId", topic);
+        ObjectNode conflict = repostConflict(tx, materialId, topic);
+        if (conflict == null) return false;
+        if ("PUBLISHED".equals(conflict.path("status").asText())) {
+            row.remove("autoRetryAt");
+            row.put("status", "SKIPPED_DUPLICATE").put("reason", "该素材或选题已有发布回执");
+        } else {
+            long checkAt = clock.millis() + PaidCapabilityGate.RETRY_INTERVAL_MS;
+            if (row.path("automaticRetryRunning").asBoolean()) row.put("autoRetryAt", checkAt);
+            else row.put("deferredPendingEval", true).put("deferredUntilMs", checkAt);
+            row.put("status", "SKIPPED_COOLDOWN").put("reason", "同一原帖或选题的发布回执待核实，稍后重查");
+        }
+        row.remove("automaticRetryRunning");
+        tx.put("auto_repost", materialId, row);
+        return true;
+    }
+
+    private boolean maySendRepost(AssistantStore.Tx tx, String materialId, ObjectNode rec, String ownerId,
+                                  String ownerUsername, boolean automatic, boolean exemptAuthor, long now) {
+        if (automatic && rec.path("candidateWindowMs").asLong() > 0L) {
+            ObjectNode material = tx.rewriteMaterial(materialId, now);
+            long published = material == null ? rec.path("sourcePublishedAt").asLong() : material.path("publishedAt").asLong();
+            if (published <= 0L || published > now || now - published > rec.path("candidateWindowMs").asLong()) {
+                rec.remove(List.of("autoRetryAt", "automaticRetryRunning"));
+                tx.put("auto_repost", materialId, rec.put("status", "SKIPPED").put("reason", "原帖已超出本轮引用的时间范围"));
+                return false;
+            }
+        }
+        RepostCooldown pause = repostCooldown(tx, rec, ownerId, ownerUsername, materialId, exemptAuthor, now);
+        if (!recentOwnerTimelineCheck(tx, ownerId, ownerUsername, now))
+            pause = new RepostCooldown("SKIPPED_COOLDOWN", now + PaidCapabilityGate.RETRY_INTERVAL_MS, "暂时无法核实发布账号的最新发帖时间，稍后重查");
+        long windowCheckAt = clock.millis();
+        if (automatic && isInAutoRepostQuietWindow(windowCheckAt)) {
+            long end = com.xops.hub.config.XOpsProperties.nextQuietWindowEndEpochMs(windowCheckAt, AssistantRetention.ZONE, quietStartHour(), quietEndHour());
+            pause = new RepostCooldown("SKIPPED_QUIET_HOURS", end, quietWindowReason());
+        }
+        if (pause == null) return true;
+        if (rec.path("automaticRetryRunning").asBoolean()) rec.put("autoRetryAt", pause.readyAt);
+        rec.remove("automaticRetryRunning");
+        tx.put("auto_repost", materialId, rec.put("status", pause.status).put("reason", pause.getMessage()));
+        return false;
+    }
+
+    private void verifySendingRepost(String materialId, String ownerId, String username, boolean automatic,
+                                     boolean exemptAuthor, XPublishClient.PublicationPayload payload) {
+        boolean ok = store.tx(tx -> {
+            ObjectNode rec = authorizedRepostAtStage(tx, materialId, ownerId, "SENDING");
+            if (rec == null || hasDispatchConflict(tx, materialId, rec)
+                    || !maySendRepost(tx, materialId, rec, ownerId, username, automatic, exemptAuthor, clock.millis())) return false;
+            if (payload != null) {
+                rec.put("text", payload.text()).put("publicationMode", payload.mode().name())
+                        .put("source", quoteSource("AUTO", payload.mode())).put("dispatchedAt", clock.millis());
+                if (payload.quoteTweetId() == null) rec.remove(List.of("quoteTweetId", "quotedTweetId"));
+                else rec.put("quoteTweetId", payload.quoteTweetId()).put("quotedTweetId", payload.quoteTweetId());
+                tx.put("auto_repost", materialId, rec);
+            }
+            return true;
         });
-        clearPreviewCache();
-        return result;
+        if (!ok) throw new RepostDispatchBlocked();
     }
 
     private void dispatchCommentAndPublish(
@@ -3638,31 +4300,39 @@ public class AutoRepostService {
             boolean enforceQuietWindow,
             boolean strictSixteenHourAuthorLock
     ) {
+        if (!store.tx(tx -> authorizedRepostAtStage(tx, materialId, ownerId, "EVALUATING") != null)) return;
         final String accessToken;
         try {
             accessToken = com.xops.hub.provider.PaidCapabilityGate.withCaller(
-                    com.xops.hub.provider.PaidCapabilityGate.PRIVILEGED_USERNAME, ownerId,
+                    com.xops.hub.provider.PaidCapabilityGate.PRIVILEGED_USERNAME, ownerId, store.isOwner(ownerId),
                     () -> oauthService.getValidWriteAccessToken(ownerId, false));
         } catch (RuntimeException ex) {
-            store.tx(tx -> {
+            boolean budgetBlocked = UpstreamBudgetGuard.isBudgetReached(ex);
+            long retryAt = clock.millis() + PaidCapabilityGate.RETRY_INTERVAL_MS;
+            boolean saved = store.tx(tx -> {
                 ObjectNode rec = tx.get("auto_repost", materialId);
-                if (rec != null) {
-                    ObjectNode next = judgment != null ? applyJudgment(rec.deepCopy(), judgment, evaluatedAt) : rec.deepCopy();
-                    tx.put("auto_repost", materialId, next
-                            .put("status", "AUTH_REQUIRED")
-                            .put("commentText", commentText)
-                            .put("error", safeError(ex)));
-                }
-                return null;
+                if (rec == null || !"EVALUATING".equals(rec.path("status").asText())) return false;
+                ObjectNode next = judgment != null ? applyJudgment(rec.deepCopy(), judgment, evaluatedAt) : rec.deepCopy();
+                if (budgetBlocked) next.put("autoRetryAt", retryAt).put("budgetDeferred", true);
+                else next.remove("autoRetryAt");
+                next.remove("automaticRetryRunning");
+                tx.put("auto_repost", materialId, next.put("status", budgetBlocked ? "FAILED" : "AUTH_REQUIRED")
+                        .put("commentText", commentText).put("error", safeError(ex)));
+                return true;
             });
+            if (saved && budgetBlocked) scheduleBudgetRetry(materialId, ownerId, retryAt, ex);
             return;
         }
 
         // Fail-closed checkpoint before POST /2/tweets so uncertain responses are never double-sent.
-        record QuoteDispatchTarget(String quoteTweetId, String quoteTweetUrl) { }
+        if (!store.tx(tx -> recentOwnerTimelineCheck(tx, ownerId, ownerUsername, clock.millis())))
+            refreshOwnerTimeline(ownerId, ownerUsername.replaceFirst("^@+", ""));
+        record QuoteDispatchTarget(String quoteTweetId, String quoteTweetUrl, boolean exemptAuthor) { }
         QuoteDispatchTarget dispatchTarget = store.tx(tx -> {
-            ObjectNode rec = tx.get("auto_repost", materialId);
-            if (rec == null || !"EVALUATING".equals(rec.path("status").asText())) return null;
+            ObjectNode rec = authorizedRepostAtStage(tx, materialId, ownerId, "EVALUATING");
+            if (rec == null) return null;
+            if (hasDispatchConflict(tx, materialId, rec)) return null;
+            if (dailyLimitPreventsSend(tx, rec, "auto_repost", materialId)) return null;
             String resolvedQuoteId = resolveMaterialQuoteTweetId(tx, materialId, rec);
             if (resolvedQuoteId == null) {
                 ObjectNode failed = judgment != null ? applyJudgment(rec.deepCopy(), judgment, evaluatedAt) : rec.deepCopy();
@@ -3686,136 +4356,274 @@ public class AutoRepostService {
                         : ("https://x.com/i/status/" + resolvedQuoteId);
             }
             long dispatchMs = clock.millis();
-            if (enforceQuietWindow && isInAutoRepostQuietWindow(dispatchMs)) {
-                ObjectNode skipped = judgment != null ? applyJudgment(rec.deepCopy(), judgment, evaluatedAt) : rec.deepCopy();
-                tx.put("auto_repost", materialId, skipped
-                        .put("status", "SKIPPED_QUIET_HOURS")
-                        .put("commentText", commentText)
-                        .put("reason", quietWindowReason()));
-                return null;
-            }
             boolean exemptAuthorCd = !strictSixteenHourAuthorLock && (judgment != null
                     ? PiAgentViralJudge.isDirectPassCategory(judgment.category())
                     : PiAgentViralJudge.isDirectPassCategory(rec.path("category").asText("")));
-            ObjectNode recentSameAuthor = exemptAuthorCd
-                    ? null
-                    : findRecentSameAuthorRepost(
-                            tx.all("auto_repost"),
-                            rec.path("authorId").asText(""),
-                            rec.path("username").asText(""),
-                            materialId,
-                            dispatchMs);
-            if (recentSameAuthor != null) {
-                ObjectNode skipped = judgment != null ? applyJudgment(rec.deepCopy(), judgment, evaluatedAt) : rec.deepCopy();
-                tx.put("auto_repost", materialId, skipped
-                        .put("status", "SKIPPED_AUTHOR_COOLDOWN")
-                        .put("commentText", commentText)
-                        .put("reason", "16 小时内已转发过 @" + rec.path("username").asText("").replaceFirst("^@+", "") + "，避免连续转发同一人"));
-                return null;
-            }
-            ObjectNode settings = AssistantWorkflow.settings(tx);
-            long latestOwnerTweetAt = resolveLatestOwnerTweetEpochMs(tx, ownerId, ownerUsername, materialId, dispatchMs);
-            long requiredOwnerGapMs = resolveEffectiveOwnerGapMs(settings, latestOwnerTweetAt);
-            if (requiredOwnerGapMs > 0L && latestOwnerTweetAt > 0L
-                    && dispatchMs - latestOwnerTweetAt >= 0L && dispatchMs - latestOwnerTweetAt < requiredOwnerGapMs) {
-                int jitterMin = resolveOwnerTweetJitterMinutes(latestOwnerTweetAt);
-                long remMin = Math.max(1L, (requiredOwnerGapMs - (dispatchMs - latestOwnerTweetAt) + 59_999L) / 60_000L);
-                ObjectNode skipped = judgment != null ? applyJudgment(rec.deepCopy(), judgment, evaluatedAt) : rec.deepCopy();
-                tx.put("auto_repost", materialId, skipped
-                        .put("status", "SKIPPED_COOLDOWN")
-                        .put("commentText", commentText)
-                        .put("reason", "距我账号上一条推文不足 1小时+" + jitterMin + "分钟（还差约 " + remMin + " 分钟）"));
-                return null;
-            }
             ObjectNode next = judgment != null ? applyJudgment(rec.deepCopy(), judgment, evaluatedAt) : rec.deepCopy();
+            next.put("commentText", commentText);
+            if (!maySendRepost(tx, materialId, next, ownerId, ownerUsername, enforceQuietWindow, exemptAuthorCd, dispatchMs)) return null;
+            next.remove(List.of("publicationMode", "text", "source", "quotedTweetId"));
             tx.put("auto_repost", materialId, next
                     .put("status", "SENDING")
-                    .put("commentText", commentText)
-                    .put("quoteTweetId", resolvedQuoteId)
+                    .put("requestedQuoteTweetId", resolvedQuoteId).put("quoteTweetId", resolvedQuoteId)
                     .put("dispatchedAt", dispatchMs));
-            return new QuoteDispatchTarget(resolvedQuoteId, resolvedQuoteUrl);
+            return new QuoteDispatchTarget(resolvedQuoteId, resolvedQuoteUrl, exemptAuthorCd);
         });
         if (dispatchTarget == null) return;
         String quoteTweetId = dispatchTarget.quoteTweetId();
 
+        PublicationReceipt receipt;
         try {
-            String publishedTweetId = com.xops.hub.provider.PaidCapabilityGate.withCaller(
-                    com.xops.hub.provider.PaidCapabilityGate.PRIVILEGED_USERNAME, ownerId,
-                    () -> XPublishClient.withQuoteTweetUrl(
-                            dispatchTarget.quoteTweetUrl(),
-                            () -> publishClient.createTweet(accessToken, commentText, List.of(), quoteTweetId)));
-            if (paidGate != null) {
-                paidGate.markSucceeded("auto-repost:" + materialId);
-            }
-            long doneMs = clock.millis();
-            String uname = ownerUsername.isBlank() ? "i" : ownerUsername;
-            String publishedUrl = "https://x.com/" + uname + "/status/" + publishedTweetId;
-            store.tx(tx -> {
-                ObjectNode rec = tx.get("auto_repost", materialId);
-                if (rec != null) {
-                    tx.put("auto_repost", materialId, rec.deepCopy()
-                            .put("status", "PUBLISHED")
-                            .put("quoteTweetId", quoteTweetId)
-                            .put("publishedTweetId", publishedTweetId)
-                            .put("publishedTweetUrl", publishedUrl)
-                            .put("publishedAt", doneMs)
-                            .put("error", ""));
-                }
-                tx.put("publication", "auto-repost-" + materialId, object()
-                        .put("status", "PUBLISHED")
-                        .put("source", "AUTO_QUOTE_REPOST")
-                        .put("topicId", topicId)
-                        .put("materialId", materialId)
-                        .put("quoteTweetId", quoteTweetId)
-                        .put("quotedTweetId", quoteTweetId)
-                        .put("text", commentText)
-                        .put("publishedTweetId", publishedTweetId)
-                        .put("publishedTweetUrl", publishedUrl)
-                        .put("publishedAt", doneMs));
-                return null;
-            });
-            recordOwnerPublishAndScheduleNextSlot(doneMs);
-        } catch (XPublishException ex) {
-            String terminalStatus = ex.isDeliveryUncertain() ? "UNCERTAIN" : "FAILED";
-            store.tx(tx -> {
-                ObjectNode rec = tx.get("auto_repost", materialId);
-                if (rec != null) {
-                    tx.put("auto_repost", materialId, rec.deepCopy()
-                            .put("status", terminalStatus)
-                            .put("error", safeError(ex)));
-                }
-                return null;
-            });
-            if (!ex.isDeliveryUncertain() && paidGate != null) {
-                paidGate.scheduleIdempotentRetry(
-                        "auto-repost:" + materialId,
-                        "x_tweet_create",
-                        com.xops.hub.provider.PaidCapabilityGate.PRIVILEGED_USERNAME,
-                        ownerId,
-                        safeError(ex),
-                        () -> retry(materialId)
-                );
-            }
+            receipt = PaidCapabilityGate.withCaller(PaidCapabilityGate.PRIVILEGED_USERNAME, ownerId, store.isOwner(ownerId),
+                    () -> XPublishClient.withPublicationPreflight(commentText, quoteTweetId,
+                            () -> verifySendingRepost(materialId, ownerId, ownerUsername, enforceQuietWindow, dispatchTarget.exemptAuthor(), null),
+                            payload -> verifySendingRepost(materialId, ownerId, ownerUsername, enforceQuietWindow, dispatchTarget.exemptAuthor(), payload),
+                            () -> XPublishClient.withQuoteTweetUrl(dispatchTarget.quoteTweetUrl(),
+                                    () -> publishClient.createTweet(accessToken, commentText, List.of(), quoteTweetId))));
+        } catch (RepostDispatchBlocked blocked) {
+            if (enforceQuietWindow && isInAutoRepostQuietWindow(clock.millis())) scheduleQuietWindowEndWakeup(clock.millis());
+            return;
         } catch (RuntimeException ex) {
-            store.tx(tx -> {
-                ObjectNode rec = tx.get("auto_repost", materialId);
-                if (rec != null) {
-                    tx.put("auto_repost", materialId, rec.deepCopy()
-                            .put("status", "FAILED")
-                            .put("error", safeError(ex)));
-                }
-                return null;
-            });
-            if (paidGate != null) {
-                paidGate.scheduleIdempotentRetry(
-                        "auto-repost:" + materialId,
-                        "x_tweet_create",
-                        com.xops.hub.provider.PaidCapabilityGate.PRIVILEGED_USERNAME,
-                        ownerId,
-                        safeError(ex),
-                        () -> retry(materialId)
-                );
+            if (ex instanceof XPublishException blocked && !blocked.isDeliveryUncertain()
+                    && UpstreamBudgetGuard.isBudgetReached(blocked.getCause())) {
+                long retryAt = clock.millis() + PaidCapabilityGate.RETRY_INTERVAL_MS;
+                boolean saved = store.tx(tx -> {
+                    var row = tx.get("auto_repost", materialId);
+                    if (row == null || !"SENDING".equals(row.path("status").asText())) return false;
+                    row.remove("automaticRetryRunning");
+                    tx.put("auto_repost", materialId, row.put("status", "FAILED").put("budgetDeferred", true)
+                            .put("autoRetryAt", retryAt).put("error", safeError(blocked)));
+                    return true;
+                });
+                if (saved) scheduleBudgetRetry(materialId, ownerId, retryAt, blocked);
+                return;
             }
+            boolean retryable = markSendFailure("auto_repost", materialId, ex);
+            if (retryable && paidGate != null) {
+                paidGate.scheduleIdempotentRetry("auto-repost:" + materialId, "x_tweet_create",
+                        PaidCapabilityGate.PRIVILEGED_USERNAME, ownerId, safeError(ex),
+                        () -> runAutomaticRepostRetry(materialId), true, store.isOwner(ownerId));
+            }
+            return;
+        }
+        completeAutoPublish(AutoPublishMode.REPOST, materialId, ownerId, ownerUsername, topicId, receipt, quoteTweetId, commentText);
+    }
+
+    private void scheduleBudgetRetry(String materialId, String ownerId, long retryAt, RuntimeException failure) {
+        String key = "auto-repost:" + materialId;
+        if (paidGate != null && !paidGate.deferRunningRetry(key, retryAt))
+            paidGate.scheduleIdempotentRetry(key, "x_tweet_create", PaidCapabilityGate.PRIVILEGED_USERNAME, ownerId,
+                    safeError(failure), () -> runAutomaticRepostRetry(materialId), true, store.isOwner(ownerId));
+    }
+
+    // Only a definite rejection proves that replaying the remote operation is safe.
+    private boolean markSendFailure(String table, String key, RuntimeException ex) {
+        boolean rejected = ex instanceof XPublishException publish && !publish.isDeliveryUncertain();
+        markSendingRecordFailed(table, key, ex, rejected);
+        return rejected;
+    }
+
+    private void markSendingRecordFailed(String table, String key, RuntimeException ex, boolean safeToRetry) {
+        store.tx(tx -> {
+            ObjectNode rec = tx.get(table, key);
+            if (rec != null && "SENDING".equals(rec.path("status").asText())) {
+                if ("auto_repost".equals(table)) {
+                    rec.remove("autoRetryAt");
+                    if (safeToRetry && paidGate != null) {
+                        boolean automatic = rec.path("automaticRetryRunning").asBoolean();
+                        var existing = paidGate.getRetrySnapshot("auto-repost:" + key);
+                        if (!automatic && existing != null && existing.state() == PaidCapabilityGate.RetryState.PENDING) {
+                            rec.put("autoRetryAttempts", existing.retryCount()).put("autoRetryAt", existing.nextRetryAtEpochMs());
+                        } else {
+                            scheduleNextAttempt(rec, rec.path("autoRetryAttempts").asInt() + (automatic ? 1 : 0));
+                        }
+                    }
+                    rec.remove("automaticRetryRunning");
+                }
+                tx.put(table, key, rec.put("status", safeToRetry ? "FAILED" : "UNCERTAIN")
+                        .put("error", safeError(ex)));
+            }
+            return null;
+        });
+    }
+
+    private void scheduleNextAttempt(ObjectNode row, int attempts) {
+        row.put("autoRetryAttempts", attempts);
+        if (attempts < PaidCapabilityGate.MAX_IDEMPOTENT_RETRIES) row.put("autoRetryAt", clock.millis() + PaidCapabilityGate.RETRY_INTERVAL_MS);
+        else row.remove("autoRetryAt");
+    }
+
+    private static ObjectNode applyReceipt(ObjectNode record, PublicationReceipt receipt, String requestedQuoteId,
+                                           long doneMs, String username) {
+        record.put("status", "PUBLISHED").put("publicationMode", receipt.mode().name())
+                .put("text", receipt.text()).put("publishedTweetId", receipt.tweetId())
+                .put("publishedTweetUrl", "https://x.com/" + (username == null || username.isBlank() ? "i" : username)
+                        + "/status/" + receipt.tweetId())
+                .put("publishedAt", doneMs).put("error", "");
+        record.remove(List.of("quoteTweetId", "quotedTweetId"));
+        if (requestedQuoteId != null) record.put("requestedQuoteTweetId", requestedQuoteId);
+        if (receipt.quoteTweetId() != null) {
+            record.put("quoteTweetId", receipt.quoteTweetId()).put("quotedTweetId", receipt.quoteTweetId());
+        }
+        return record;
+    }
+
+    private boolean dailyLimitPreventsSend(AssistantStore.Tx tx, ObjectNode rec, String table, String materialId) {
+        int limit = Math.max(1, AssistantWorkflow.settings(tx).path("autoRepostDailyLimit").asInt(DEFAULT_DAILY_LIMIT));
+        if (autoPublicationsToday(tx, clock.millis()) < limit) return false;
+        tx.put(table, materialId, rec.put("status", "SKIPPED_LIMIT").put("reason", "已达当日自动发布上限"));
+        return true;
+    }
+
+    static int autoPublicationsToday(AssistantStore.Tx tx, long now) {
+        ObjectNode owner = tx.ownerBinding();
+        if (owner == null) return 0;
+        String ownerId = owner.path("accountId").asText();
+        long start = Instant.ofEpochMilli(now).atZone(AssistantRetention.ZONE).toLocalDate()
+                .atStartOfDay(AssistantRetention.ZONE).toInstant().toEpochMilli();
+        Set<String> posts = new java.util.HashSet<>();
+        Set<String> receiptedMaterials = new java.util.HashSet<>();
+        for (ObjectNode receipt : tx.automaticReceiptsSince(start)) {
+            if (!tx.publicationOwnerMatches(receipt, ownerId)) continue;
+            String source = receipt.path("source").asText("");
+            String id = receipt.path("id").asText();
+            boolean rewrite = source.startsWith("AUTO_REWRITE") || id.startsWith("auto-rewrite-");
+            String prefix = rewrite ? "auto-rewrite-" : "auto-repost-";
+            String material = receipt.path("materialId").asText(id.startsWith(prefix) ? id.substring(prefix.length()) : id);
+            String key = prefix + material;
+            receiptedMaterials.add(key);
+            posts.add(receipt.path("publishedTweetId").asText(key));
+        }
+        for (String table : List.of("auto_repost", "auto_rewrite")) {
+            for (ObjectNode row : tx.all(table)) {
+                if (row.path("manual").asBoolean() || !Set.of("PUBLISHED","SENDING","UNCERTAIN").contains(row.path("status").asText())) continue;
+                if (!tx.publicationOwnerMatches(row, ownerId)) continue;
+                long at = row.path("publishedAt").asLong(row.path("dispatchedAt").asLong(0));
+                if (at < start) continue;
+                String key = ("auto_rewrite".equals(table) ? "auto-rewrite-" : "auto-repost-") + row.path("materialId").asText(row.path("id").asText());
+                if (!receiptedMaterials.contains(key) || row.hasNonNull("publishedTweetId")) {
+                    posts.add(row.path("publishedTweetId").asText(key));
+                }
+            }
+        }
+        return posts.size();
+    }
+
+    static String quoteSource(String prefix, XPublishClient.PublicationMode mode) {
+        return prefix + switch (mode) {
+            case QUOTE -> "_QUOTE_REPOST";
+            case QUOTE_LINK -> "_LINK_REPOST";
+            case STANDALONE_FALLBACK -> "_STANDALONE_FALLBACK";
+            case ORIGINAL -> "_ORIGINAL_POST";
+        };
+    }
+
+    private synchronized ObjectNode persistAcceptedReceipt(String publicationKey, ObjectNode accepted) {
+        accepted.put("id", publicationKey);
+        String key = accepted.path("publishedTweetId").asText();
+        pendingAcceptedReceipts.put(key, accepted.deepCopy());
+        try {
+            store.savePendingReceipt("auto-and-manual", key, accepted);
+        } catch (RuntimeException failure) {
+            log.warn("Could not journal accepted publication {}", key, failure);
+        }
+        for (int attempt = 0; attempt < 2; attempt++) {
+            try { return commitAcceptedReceipt(accepted); }
+            catch (RuntimeException failure) {
+                accepted.put("receiptRecovered", true);
+                log.warn("Could not record accepted publication {}", key, failure);
+            }
+        }
+        return accepted.deepCopy().put("receiptPending", true);
+    }
+
+    synchronized void reconcileAcceptedReceipts() {
+        store.reconcilePublicationFailures();
+        for (ObjectNode receipt : store.pendingReceipts("auto-and-manual"))
+            pendingAcceptedReceipts.putIfAbsent(receipt.path("publishedTweetId").asText(), receipt);
+        for (ObjectNode receipt : List.copyOf(pendingAcceptedReceipts.values())) {
+            try { commitAcceptedReceipt(receipt.deepCopy().put("receiptRecovered", true)); }
+            catch (RuntimeException failure) { log.warn("Could not reconcile accepted publication {}", receipt.path("publishedTweetId"), failure); }
+        }
+    }
+
+    private synchronized List<ObjectNode> pendingManualReceipts(String ownerId) {
+        return pendingAcceptedReceipts.values().stream().filter(r -> ownerId.equals(r.path("ownerAccountId").asText())
+                && r.path("source").asText().startsWith("MANUAL_")).toList();
+    }
+
+    synchronized void requireReceiptReady(String publicationKey) {
+        reconcileAcceptedReceipts();
+        if (pendingAcceptedReceipts.values().stream().anyMatch(r -> publicationKey.equals(r.path("id").asText())))
+            throw new XDataProviderException(409, "已收到发布成功回执，正在补写本地记录，请刷新");
+    }
+
+    private ObjectNode commitAcceptedReceipt(ObjectNode receipt) {
+        String tweetId = receipt.path("publishedTweetId").asText();
+        ObjectNode saved = store.tx(tx -> {
+            String ownerId = receipt.path("ownerAccountId").asText();
+            String materialId = receipt.path("materialId").asText();
+            String source = receipt.path("source").asText();
+            boolean manual = source.startsWith("MANUAL_");
+            String table = "AUTO_REWRITE_POST".equals(source) ? "auto_rewrite" : "auto_repost";
+            ObjectNode projection = tx.get(table, materialId);
+            String key = receipt.path("id").asText();
+            ObjectNode earlier = tx.get("publication", key);
+            if (earlier != null && (!receiptOwnerMatches(tx, earlier, ownerId)
+                    || ("PUBLISHED".equals(earlier.path("status").asText()) && !tweetId.equals(earlier.path("publishedTweetId").asText())))) {
+                key += "-" + tweetId;
+                earlier = tx.get("publication", key);
+            }
+            ObjectNode pub = receipt.deepCopy();
+            if (projection != null && receiptOwnerMatches(tx, projection, ownerId) && !manual) {
+                pub.put("authorId", projection.path("authorId").asText("")).put("username", projection.path("username").asText(""));
+            }
+            pub.put("topicId", tx.publicationTopic(pub, materialId));
+            if (earlier != null && tweetId.equals(earlier.path("publishedTweetId").asText())
+                    && "PUBLISHED".equals(earlier.path("status").asText())) pub = earlier;
+            else {
+                if (earlier != null && earlier.has("dispatchedAt")) pub.set("dispatchedAt", earlier.get("dispatchedAt"));
+                pub = tx.put("publication", key, pub);
+            }
+            if (projection != null && (!receiptOwnerMatches(tx, projection, ownerId)
+                    || ("PUBLISHED".equals(projection.path("status").asText())
+                        && (tweetId.equals(projection.path("publishedTweetId").asText()) || (manual && !projection.path("manual").asBoolean())
+                            || projection.path("publishedAt").asLong() > receipt.path("publishedAt").asLong())))) return pub;
+            ObjectNode row = projection == null ? object() : projection;
+            row.remove(List.of("autoRetryAt", "autoRetryAttempts", "automaticRetryRunning", "quoteTweetId", "quotedTweetId"));
+            for (String field : List.of("ownerAccountId", "materialId", "topicId", "authorId", "username", "authorName", "sourceUrl",
+                    "status", "publicationMode", "text", "publishedTweetId", "publishedTweetUrl", "publishedAt", "error",
+                    "requestedQuoteTweetId", "quoteTweetId", "quotedTweetId")) {
+                if (pub.has(field)) row.set(field, pub.get(field));
+            }
+            if (manual) row.put("manual", true).put("commentText", receipt.path("commentText").asText()).put("quoteVoiceVersion", 7);
+            tx.put(table, materialId, row);
+            return pub;
+        });
+        store.removePendingReceipt("auto-and-manual", tweetId);
+        pendingAcceptedReceipts.remove(tweetId);
+        clearPreviewCache();
+        return saved;
+    }
+
+    private static boolean receiptOwnerMatches(AssistantStore.Tx tx, ObjectNode row, String ownerId) {
+        return !row.path("ownerReviewRequired").asBoolean() && (ownerId.equals(row.path("ownerAccountId").asText())
+                || (row.path("ownerAccountId").asText("").isBlank() && tx.publicationOwnerMatches(row, ownerId)));
+    }
+
+    private void completeAutoPublish(AutoPublishMode mode, String materialId, String ownerId, String username, String topicId,
+                                     PublicationReceipt receipt, String requestedQuoteId, String requestedText) {
+        boolean rewrite = mode == AutoPublishMode.REWRITE;
+        String prefix = rewrite ? "auto-rewrite" : "auto-repost";
+        long doneMs = clock.millis();
+        ObjectNode pub = object().put("source", rewrite ? "AUTO_REWRITE_POST" : quoteSource("AUTO", receipt.mode()))
+                .put("ownerAccountId", ownerId).put("topicId", topicId).put("materialId", materialId).put("requestedText", requestedText);
+        persistAcceptedReceipt(prefix + "-" + materialId, applyReceipt(pub, receipt, requestedQuoteId, doneMs, username));
+        if (paidGate != null) paidGate.markSucceeded(prefix + ":" + materialId);
+        try {
+            recordOwnerPublishAndScheduleNextSlot(ownerId, username, doneMs);
+        } catch (RuntimeException schedulingFailure) {
+            log.warn("Could not schedule the next slot after tweet {}", receipt.tweetId(), schedulingFailure);
         }
     }
 
@@ -3857,8 +4665,9 @@ public class AutoRepostService {
         return OwnerQuoteStyleDistiller.enforceAdaptiveQuoteFormat(aiText, briefFlash, 280);
     }
 
-    private static ObjectNode baseRecord(ObjectNode source, ObjectNode material, String topicId, long now) {
-        return object()
+    private static ObjectNode baseRecord(ObjectNode source, ObjectNode material, String topicId, long now, String ownerId) {
+        return object().put("ownerAccountId", ownerId).put("sourceId", source.path("authorId").asText(source.path("id").asText("")))
+                .put("previewMaterialFingerprint", previewMaterialFingerprint(material))
                 .put("materialId", material.path("id").asText(""))
                 .put("topicId", topicId)
                 .put("authorId", material.path("authorId").asText(""))
@@ -3907,17 +4716,14 @@ public class AutoRepostService {
         if (m == null) return "";
         if (!"POST".equalsIgnoreCase(m.path("kind").asText("POST"))) return "";
         if (m.path("selfThreadReply").asBoolean(false) || m.path("archiveOnly").asBoolean(false)) return "";
-        if (m.path("hasMedia").asBoolean(false)) return "";
-        if (!m.path("quotedId").asText("").isBlank() || !m.path("quotedText").asText("").isBlank()) return "";
-        if (!m.path("articleUrl").asText("").isBlank()) return "";
+        if (m.path("hasMedia").asBoolean(false) || !m.path("media").isEmpty()) return "";
+        if (hasRewriteQuote(m)) return "";
+        if (hasRewriteArticle(m) || hasOtherRewriteSourceUrl(m) || !m.path("links").isEmpty()) return "";
         String textStatus = m.path("textStatus").asText("");
         if (Set.of("MEDIA_ONLY", "MEDIA_URL_ONLY", "NO_ANALYZABLE_TEXT", "QUOTE_TEXT_MISSING", "QUOTE_SOURCE_MISSING").contains(textStatus)) {
             return "";
         }
-        if (!AssistantTopics.links(m).isEmpty()) return "";
-        String raw = !m.path("articleText").asText("").isBlank()
-                ? m.path("articleText").asText("").strip()
-                : m.path("text").asText("").strip();
+        String raw = m.path("text").asText("").strip();
         if (raw.isBlank()) return "";
         if (EMBEDDED_URL_PATTERN.matcher(raw).find()) return "";
         if (raw.startsWith("@")) return "";
@@ -3934,21 +4740,34 @@ public class AutoRepostService {
         return !extractPureRewriteSourceText(m).isBlank();
     }
 
+    private static boolean hasRewriteArticle(ObjectNode material) {
+        return !material.path("articleUrl").asText("").isBlank() || !material.path("articleId").asText("").isBlank()
+                || !material.path("articleText").asText("").isBlank();
+    }
+
+    private static boolean hasRewriteQuote(ObjectNode material) {
+        return !material.path("quotedId").asText("").isBlank() || !material.path("quotedText").asText("").isBlank()
+                || !material.path("quotedAuthorId").asText("").isBlank() || !material.path("quotedUsername").asText("").isBlank();
+    }
+
+    private static boolean hasOtherRewriteSourceUrl(ObjectNode material) {
+        String sourceUrl = material.path("sourceUrl").asText("").strip();
+        if (sourceUrl.isEmpty()) return false;
+        XPostLink link = XPostLink.parsePermalink(sourceUrl);
+        return link == null || !link.tweetId().equals(material.path("id").asText(""));
+    }
+
     static String rewriteIneligibleReason(ObjectNode m) {
         if (m == null) return "素材为空";
-        if (m.path("hasMedia").asBoolean(false)) return "含图片或视频媒体";
+        if (m.path("hasMedia").asBoolean(false) || !m.path("media").isEmpty()) return "含图片或视频媒体";
         String kind = m.path("kind").asText("POST");
-        if (!"POST".equalsIgnoreCase(kind)
-                || !m.path("quotedId").asText("").isBlank()
-                || !m.path("quotedText").asText("").isBlank()) {
+        if (!"POST".equalsIgnoreCase(kind) || hasRewriteQuote(m)) {
             return "含引用或非原创主帖";
         }
         String textStatus = m.path("textStatus").asText("");
         if (Set.of("MEDIA_ONLY", "MEDIA_URL_ONLY").contains(textStatus)) return "仅媒体无纯文本";
-        if (!m.path("articleUrl").asText("").isBlank() || !AssistantTopics.links(m).isEmpty()) return "含外部链接";
-        String raw = !m.path("articleText").asText("").isBlank()
-                ? m.path("articleText").asText("").strip()
-                : m.path("text").asText("").strip();
+        if (hasRewriteArticle(m) || hasOtherRewriteSourceUrl(m) || !m.path("links").isEmpty()) return "含外部链接或文章";
+        String raw = m.path("text").asText("").strip();
         if (EMBEDDED_URL_PATTERN.matcher(raw).find()) return "正文含链接";
         if (THREAD_OR_VISUAL_DEPENDENCY_PATTERN.matcher(raw).find()) return "依赖看图或串帖上下文";
         return "纯文本过短或结构不足以独立成篇";
@@ -4015,6 +4834,37 @@ public class AutoRepostService {
             long medianLikes
     ) { }
 
+    private static boolean canStartPatrolRewrite(AssistantStore.Tx tx, ObjectNode existing, ObjectNode material, String ownerId) {
+        if (existing == null) return true;
+        if (!boundPublisherMatches(tx, existing, ownerId)) return false;
+        String status = existing.path("status").asText("");
+        return "SKIPPED_COOLDOWN".equals(status) || "SKIPPED_QUIET_HOURS".equals(status)
+                || "SKIPPED_LIMIT".equals(status)
+                || ("SKIPPED".equals(status) && !previewMatchesMaterial(existing, material));
+    }
+
+    private ObjectNode authorizedRewriteAtStage(AssistantStore.Tx tx, String materialId, String ownerId, String stage) {
+        ObjectNode record = tx.get("auto_rewrite", materialId);
+        if (record == null || !stage.equals(record.path("status").asText())) return null;
+        if (sourcePermitsPublication(tx, record, ownerId, AutoPublishMode.REWRITE)) return record;
+        String status = boundPublisherMatches(tx, record, ownerId) ? "FAILED" : "OWNER_REVIEW_REQUIRED";
+        tx.put("auto_rewrite", materialId, record.put("status", status).put("error", "自动洗稿的来源、助手开关或作者授权已变更"));
+        return null;
+    }
+
+    private static boolean hasConflictingRewritePublication(AssistantStore.Tx tx, String materialId, String topicId) {
+        return hasConflictingRewritePublication(tx, materialId, topicId, false);
+    }
+
+    private static boolean hasConflictingRewritePublication(AssistantStore.Tx tx, String materialId, String topicId, boolean sending) {
+        var rewrite = tx.get("auto_rewrite", materialId);
+        String body = rewrite == null ? "" : rewrite.path("rewrittenText").asText("");
+        return (!body.isBlank() && tx.conflictingDelivery("", "", body, List.of(), "auto_rewrite", materialId, 0) != null)
+                || tx.matchingQuoteOrRewrite("auto_rewrite", materialId, materialId, topicId, true, sending ? materialId : "") != null
+                || hasProtectedPublication(tx, "auto_repost", materialId, topicId)
+                || hasProtectedPublication(tx, "publication", materialId, topicId);
+    }
+
     private ObjectNode tryPatrolRewriteSources(
             List<ObjectNode> orderedRewriteSources,
             String ownerId,
@@ -4027,7 +4877,7 @@ public class AutoRepostService {
             String publishedMatId = processAuthorRewriteOnce(source, ownerId, ownerUsername);
             if (publishedMatId != null && !publishedMatId.isBlank()) {
                 return object()
-                        .put("status", "PUBLISHED")
+                        .put("status", recordedDispatchStatus("auto_rewrite", publishedMatId))
                         .put("mode", "REWRITE")
                         .put("materialId", publishedMatId)
                         .put("sourceUsername", source.path("username").asText(""))
@@ -4039,13 +4889,19 @@ public class AutoRepostService {
     }
 
     String processAuthorRewriteOnce(ObjectNode sourceSnapshot, String ownerId, String ownerUsername) {
-        if (sourceSnapshot == null) return "";
+        return processAuthorRewriteOnce(sourceSnapshot, ownerId, ownerUsername, null);
+    }
+
+    private String processAuthorRewriteOnce(ObjectNode sourceSnapshot, String ownerId, String ownerUsername,
+                                            String retryMaterialId) {
+        if (sourceSnapshot == null || !store.tx(tx -> boundPublisherMatches(tx, null, ownerId))) return "";
         long now = clock.millis();
-        if (isInAutoRepostQuietWindow(now)) {
+        boolean automatic = retryMaterialId == null;
+        if (automatic && isInAutoRepostQuietWindow(now)) {
             scheduleQuietWindowEndWakeup(now);
             return "";
         }
-        if (sources != null) {
+        if (automatic && sources != null) {
             sources.syncSourceMaterialsForRewrite(sourceSnapshot, REWRITE_MAX_AGE_MS);
         }
 
@@ -4076,78 +4932,50 @@ public class AutoRepostService {
             }
 
             int dailyLimit = Math.max(1, settings.path("autoRepostDailyLimit").asInt(DEFAULT_DAILY_LIMIT));
-            LocalDate today = Instant.ofEpochMilli(now).atZone(AssistantRetention.ZONE).toLocalDate();
-            long todayStart = today.atStartOfDay(AssistantRetention.ZONE).toInstant().toEpochMilli();
-            int publishedToday = 0;
+            int publishedToday = autoPublicationsToday(tx, now);
             Set<String> usedTopics = new java.util.HashSet<>();
             Set<String> usedMaterials = new java.util.HashSet<>();
             for (ObjectNode rec : tx.all("auto_repost")) {
                 String st = rec.path("status").asText("");
                 if (Set.of("PUBLISHED", "SENDING", "UNCERTAIN").contains(st)) {
                     usedMaterials.add(rec.path("materialId").asText(rec.path("id").asText("")));
-                    String tid = rec.path("topicId").asText("");
+                    String tid = tx.publicationTopic(rec, rec.path("materialId").asText(rec.path("id").asText()));
                     if (!tid.isBlank()) usedTopics.add(tid);
                 }
-                if (Set.of("PUBLISHED", "UNCERTAIN").contains(st)
-                        && rec.path("publishedAt").asLong(rec.path("dispatchedAt").asLong(0L)) >= todayStart) {
-                    publishedToday++;
-                }
             }
+            Map<String, ObjectNode> rewriteRecords = new java.util.HashMap<>();
             for (ObjectNode rec : tx.all("auto_rewrite")) {
                 String st = rec.path("status").asText("");
                 String mid = rec.path("materialId").asText(rec.path("id").asText(""));
-                if (Set.of("PUBLISHED", "SENDING", "UNCERTAIN", "SKIPPED", "SKIPPED_DUPLICATE").contains(st)) {
-                    usedMaterials.add(mid);
-                }
+                rewriteRecords.put(mid, rec);
                 if (Set.of("PUBLISHED", "SENDING", "UNCERTAIN").contains(st)) {
-                    String tid = rec.path("topicId").asText("");
+                    usedMaterials.add(mid);
+                    String tid = tx.publicationTopic(rec, mid);
                     if (!tid.isBlank()) usedTopics.add(tid);
-                }
-                if (Set.of("PUBLISHED", "UNCERTAIN").contains(st)
-                        && rec.path("publishedAt").asLong(rec.path("dispatchedAt").asLong(0L)) >= todayStart) {
-                    publishedToday++;
                 }
             }
             if (publishedToday >= dailyLimit) return null;
 
             String aid = liveSource.path("authorId").asText(sourceId).strip();
-            String uname = liveSource.path("username").asText("").replaceFirst("^@+", "").strip();
-            List<ObjectNode> authorMats = new ArrayList<>();
-            List<Long> allViews = new ArrayList<>();
-            List<Long> allLikes = new ArrayList<>();
-            List<Long> allEng = new ArrayList<>();
-            for (ObjectNode m : tx.all("material")) {
-                boolean same = (!aid.isBlank() && aid.equals(m.path("authorId").asText("")))
-                        || (!uname.isBlank() && uname.equalsIgnoreCase(m.path("username").asText("").replaceFirst("^@+", "")));
-                if (!same) continue;
-                long pubAt = m.path("publishedAt").asLong(0L);
-                if (pubAt <= 0L || now - pubAt > REWRITE_MAX_AGE_MS) continue;
-                authorMats.add(m);
-                long v = m.path("views").asLong(0L);
-                long l = m.path("likes").asLong(0L);
-                long e = computeWeightedEngagement(m);
-                if (v > 0L) allViews.add(v);
-                if (l > 0L) allLikes.add(l);
-                if (e > 0L) allEng.add(e);
-            }
+            List<ObjectNode> authorMats = tx.rewriteWindow(aid, liveSource.path("username").asText(), now - REWRITE_MAX_AGE_MS, now);
             if (authorMats.isEmpty()) return null;
-
-            long medViews = medianOf(allViews);
-            long medLikes = medianOf(allLikes);
-            long medEng = medianOf(allEng);
-            int sampleCount = Math.max(allViews.size(), allEng.size());
+            RewriteTraffic traffic = RewriteTraffic.of(authorMats);
 
             List<RankedRewriteCandidate> ranked = new ArrayList<>();
             for (ObjectNode m : authorMats) {
                 String mid = m.path("id").asText("").strip();
+                if (!automatic && !mid.equals(retryMaterialId)) continue;
                 if (mid.isBlank() || usedMaterials.contains(mid)) continue;
+                if (automatic && !canStartPatrolRewrite(tx, rewriteRecords.get(mid), m, ownerId)) continue;
                 if (!isPureTextRewriteCandidate(m)) continue;
-                if (!isHighTrafficForAuthor(m, medViews, medLikes, medEng, sampleCount)) continue;
+                if (!traffic.qualifies(m)) continue;
                 String tid = AssistantTopics.topicOf(tx, mid);
+                if (tid.isBlank()) tid = m.path("rewriteTopicId").asText("");
                 if (!tid.isBlank() && usedTopics.contains(tid)) continue;
+                if (hasProtectedPublication(tx, "publication", mid, tid)) continue;
                 String pureText = extractPureRewriteSourceText(m);
-                double score = computeRewriteRankScore(m, now, medViews, medEng);
-                ranked.add(new RankedRewriteCandidate(mid, tid, m.deepCopy(), pureText, score, medViews, medLikes));
+                double score = computeRewriteRankScore(m, now, traffic.views(), traffic.engagement());
+                ranked.add(new RankedRewriteCandidate(mid, tid, m.deepCopy(), pureText, score, traffic.views(), traffic.likes()));
             }
             if (ranked.isEmpty()) return null;
             ranked.sort(Comparator.comparingDouble(RankedRewriteCandidate::rankScore).reversed());
@@ -4174,22 +5002,41 @@ public class AutoRepostService {
 
         for (RankedRewriteCandidate cand : ctx.topCandidates()) {
             long claimAt = clock.millis();
-            if (isInAutoRepostQuietWindow(claimAt)) {
+            if (automatic && isInAutoRepostQuietWindow(claimAt)) {
                 scheduleQuietWindowEndWakeup(claimAt);
                 return "";
             }
-            boolean claimed = store.tx(tx -> {
+            ObjectNode claimed = store.tx(tx -> {
                 ObjectNode existing = tx.get("auto_rewrite", cand.materialId());
-                if (existing != null && Set.of("PUBLISHED", "SENDING", "UNCERTAIN", "SKIPPED").contains(existing.path("status").asText(""))) {
-                    return false;
+                if (!automatic) {
+                    ObjectNode retry = authorizedRewriteAtStage(tx, cand.materialId(), ownerId, "EVALUATING");
+                    if (retry == null) return null;
+                    if (!retry.has("reassessedFinalVersion")) retry.remove(List.of("rewrittenText", "commentText"));
+                    retry.remove("rewriteSourceNeedsReview");
+                    return tx.put("auto_rewrite", cand.materialId(), retry.put("previewMaterialFingerprint", previewMaterialFingerprint(cand.material()))
+                            .put("rewriteSourceFingerprint", rewriteSourceFingerprint(cand.material())));
                 }
-                tx.put("auto_rewrite", cand.materialId(), baseRecord(ctx.liveSource(), cand.material(), cand.topicId(), claimAt)
-                        .put("autoKind", "REWRITE")
-                        .put("mode", "REWRITE")
-                        .put("status", "EVALUATING"));
-                return true;
+                if (!canStartPatrolRewrite(tx, existing, cand.material(), ownerId)
+                        || hasConflictingRewritePublication(tx, cand.materialId(), cand.topicId())) return null;
+                if (existing != null && !existing.path("rewrittenText").asText().isBlank()) {
+                    if (existing.path("rewriteSourceNeedsReview").asBoolean() || !matchesFinalRewriteSource(tx, existing, cand.material())) {
+                        tx.put("auto_rewrite", cand.materialId(), existing.put("rewriteSourceNeedsReview", true)
+                                .put("status", "FAILED").put("error", "原素材已变更，请重新评估定稿"));
+                        return null;
+                    }
+                    return tx.put("auto_rewrite", cand.materialId(), existing.put("ownerAccountId", ownerId).put("status", "EVALUATING")
+                            .put("topicId", cand.topicId()).put("rewriteSourceFingerprint", rewriteSourceFingerprint(cand.material())));
+                }
+                ObjectNode claim = baseRecord(ctx.liveSource(), cand.material(), cand.topicId(), claimAt, ownerId);
+                if (!sourcePermitsPublication(tx, claim, ownerId, AutoPublishMode.REWRITE)) return null;
+                return tx.put("auto_rewrite", cand.materialId(), claim.put("autoKind", "REWRITE").put("mode", "REWRITE").put("status", "EVALUATING")
+                        .put("rewriteSourceFingerprint", rewriteSourceFingerprint(cand.material())));
             });
-            if (!claimed) continue;
+            if (claimed == null) continue;
+            if (automatic && !claimed.path("rewrittenText").asText().isBlank()) {
+                if (dispatchRewriteAndPublish(cand.materialId(), ownerId, ownerUsername, cand.topicId(), claimed.path("rewrittenText").asText(), null, claimAt, automatic)) return cand.materialId();
+                continue;
+            }
 
             String authorUname = cand.material().path("username").asText(ctx.liveSource().path("username").asText(""));
             String authorBio = resolveAuthorBio(ctx.liveSource(), List.of(cand.material()));
@@ -4219,8 +5066,9 @@ public class AutoRepostService {
             } catch (RuntimeException ex) {
                 long failAt = clock.millis();
                 store.tx(tx -> {
-                    ObjectNode rec = tx.get("auto_rewrite", cand.materialId());
-                    if (rec != null) {
+                    ObjectNode rec = authorizedRewriteAtStage(tx, cand.materialId(), ownerId, "EVALUATING");
+                    if (rec != null && rewriteSourceStillValid(tx, rec, cand.materialId(), false, automatic)) {
+                        rec.remove(List.of("rewrittenText", "commentText", "reassessedFinalVersion"));
                         tx.put("auto_rewrite", cand.materialId(), rec.deepCopy()
                                 .put("status", "JUDGE_FAILED")
                                 .put("evaluatedAt", failAt)
@@ -4234,8 +5082,9 @@ public class AutoRepostService {
             long evalAt = clock.millis();
             if (!rwJudgment.suitable() || rwJudgment.rewrittenText().isBlank()) {
                 store.tx(tx -> {
-                    ObjectNode rec = tx.get("auto_rewrite", cand.materialId());
-                    if (rec != null) {
+                    ObjectNode rec = authorizedRewriteAtStage(tx, cand.materialId(), ownerId, "EVALUATING");
+                    if (rec != null && rewriteSourceStillValid(tx, rec, cand.materialId(), false, automatic)) {
+                        rec.remove(List.of("rewrittenText", "commentText", "reassessedFinalVersion"));
                         tx.put("auto_rewrite", cand.materialId(), rec.deepCopy()
                                 .put("status", "SKIPPED")
                                 .put("suitabilityScore", rwJudgment.suitabilityScore())
@@ -4257,7 +5106,7 @@ public class AutoRepostService {
                     rwJudgment.rewrittenText(),
                     rwJudgment,
                     evalAt,
-                    true
+                    automatic
             );
             if (published) {
                 return cand.materialId();
@@ -4266,7 +5115,7 @@ public class AutoRepostService {
         return "";
     }
 
-    private ObjectNode retryRewrite(String materialId) {
+    private ObjectNode retryRewrite(String materialId, boolean reassess) {
         record RewriteRetryPlan(
                 ObjectNode updated,
                 boolean reuseText,
@@ -4274,25 +5123,32 @@ public class AutoRepostService {
                 String ownerId,
                 String ownerUsername,
                 String topicId,
-                ObjectNode source,
-                ObjectNode material
+                ObjectNode source
         ) { }
 
         RewriteRetryPlan plan = store.tx(tx -> {
             ObjectNode existing = tx.get("auto_rewrite", materialId);
             if (existing == null) throw new XDataProviderException(404, "洗稿记录不存在");
             String status = existing.path("status").asText("");
-            if (!RETRYABLE_STATUSES.contains(status)) {
+            if (!rewriteRetryable(status)) {
                 throw new XDataProviderException(409, "当前洗稿状态不允许重发，请先核实线上回执");
             }
-            ObjectNode owner = tx.get("meta", "owner");
+            String topicId = tx.publicationTopic(existing, materialId);
+            if (hasConflictingRewritePublication(tx, materialId, topicId)) {
+                throw new XDataProviderException(409, "该素材或选题已有发布或待核实记录");
+            }
+            ObjectNode owner = tx.ownerBinding();
             if (owner == null || owner.path("accountId").asText("").isBlank()) {
                 throw new XDataProviderException(400, "缺少内容助手所有者信息");
             }
             String ownerAccountId = owner.path("accountId").asText("");
+            if (!sourcePermitsPublication(tx, existing, ownerAccountId, AutoPublishMode.REWRITE))
+                throw new XDataProviderException(409, "自动洗稿未获当前作者授权，或助手、来源、洗稿开关已停用");
             String ownerUsername = owner.path("username").asText("i");
             long nowMs = clock.millis();
             ObjectNode settings = AssistantWorkflow.settings(tx);
+            if (autoPublicationsToday(tx, nowMs) >= Math.max(1, settings.path("autoRepostDailyLimit").asInt(DEFAULT_DAILY_LIMIT)))
+                throw new XDataProviderException(409, "已达当日自动发布上限，可在次日重试");
             long latestOwnerAt = resolveLatestOwnerTweetEpochMs(tx, ownerAccountId, ownerUsername, materialId, nowMs);
             long requiredGapMs = resolveEffectiveOwnerGapMs(settings, latestOwnerAt);
             if (requiredGapMs > 0L && latestOwnerAt > 0L && nowMs - latestOwnerAt >= 0L && nowMs - latestOwnerAt < requiredGapMs) {
@@ -4301,38 +5157,53 @@ public class AutoRepostService {
                 throw new XDataProviderException(409, "全局时间锁冷却中（距上一条推文未满 1小时+" + jitterMin + "分钟，还差约 " + remMin + " 分钟）");
             }
             String existingText = existing.path("rewrittenText").asText("").strip();
-            boolean reuse = Set.of("AUTH_REQUIRED", "FAILED").contains(status) && !existingText.isBlank();
-            ObjectNode liveMat = tx.get("material", materialId);
-            String aid = existing.path("authorId").asText(liveMat == null ? "" : liveMat.path("authorId").asText(""));
-            ObjectNode liveSrc = aid.isBlank() ? null : tx.get("source", aid);
-            if (liveSrc == null) {
-                liveSrc = object().put("id", aid).put("authorId", aid)
-                        .put("username", existing.path("username").asText(""))
-                        .put("autoRewriteEnabled", true);
+            ObjectNode liveMat = tx.rewriteMaterial(materialId, nowMs);
+            if (!reassess && "JUDGE_FAILED".equals(status) && !existingText.isBlank())
+                throw new XDataProviderException(409, "旧判定未完成，请核对原素材后重新评估并发送");
+            boolean reuse = !reassess && !existingText.isBlank();
+            if (reuse && (existing.path("rewriteSourceNeedsReview").asBoolean()
+                    || liveMat != null && !matchesFinalRewriteSource(tx, existing, liveMat))) {
+                if (!existing.path("rewriteSourceNeedsReview").asBoolean())
+                    tx.put("auto_rewrite", materialId, existing.put("rewriteSourceNeedsReview", true));
+                return null;
             }
-            ObjectNode updated = tx.put("auto_rewrite", materialId, existing.deepCopy()
-                    .put("status", "EVALUATING")
-                    .put("error", ""));
+            if (!reuse && !canReassessRewrite(tx, liveMat, nowMs))
+                throw new XDataProviderException(409, "原素材不在近 30 天的高热纯文本范围内，无法重新判定该稿件");
+            ObjectNode liveSrc = tx.get("source", existing.path("authorId").asText());
+            ObjectNode next = existing.deepCopy().put("ownerAccountId", ownerAccountId).put("topicId", topicId)
+                    .put("status", "EVALUATING").put("error", "");
+            next.remove("reassessedFinalVersion");
+            if (reassess && !existingText.isBlank() && !"JUDGE_FAILED".equals(status)
+                    && !existing.path("rewriteSourceNeedsReview").asBoolean() && matchesFinalRewriteSource(tx, existing, liveMat))
+                next.put("reassessedFinalVersion", existing.path("version").asInt());
+            if (reuse && liveMat != null) next.put("rewriteSourceFingerprint", rewriteSourceFingerprint(liveMat));
+            ObjectNode updated = tx.put("auto_rewrite", materialId, next);
             return new RewriteRetryPlan(
                     updated, reuse, existingText, ownerAccountId, ownerUsername,
-                    existing.path("topicId").asText(""), liveSrc.deepCopy(),
-                    liveMat == null ? null : liveMat.deepCopy()
+                    topicId, liveSrc.deepCopy()
             );
         });
 
+        if (plan == null) throw new XDataProviderException(409, "原素材已变更或缺少旧版依据，请核对后选择重新评估并发送");
         executor.submit(() -> {
             try {
                 if (plan.reuseText()) {
                     dispatchRewriteAndPublish(materialId, plan.ownerId(), plan.ownerUsername(),
                             plan.topicId(), plan.existingText(), null, clock.millis(), false);
                 } else {
-                    processAuthorRewriteOnce(plan.source(), plan.ownerId(), plan.ownerUsername());
+                    String sent = processAuthorRewriteOnce(plan.source(), plan.ownerId(), plan.ownerUsername(), materialId);
+                    if (sent.isEmpty()) markEvaluationFailed("auto_rewrite", materialId, "原素材当前不满足洗稿条件");
                 }
-            } catch (Exception ex) {
+            } catch (RuntimeException ex) {
+                markEvaluationFailed("auto_rewrite", materialId, safeError(ex));
                 log.warn("Auto-rewrite retry failed for {}: {}", materialId, ex.getMessage());
             }
         });
         return plan.updated();
+    }
+
+    static boolean rewriteRetryable(String status) {
+        return RETRYABLE_STATUSES.contains(status) || "SKIPPED_LIMIT".equals(status);
     }
 
     private boolean dispatchRewriteAndPublish(
@@ -4340,23 +5211,39 @@ public class AutoRepostService {
             String ownerId,
             String ownerUsername,
             String topicId,
-            String rewrittenText,
+            String proposedText,
             PiAgentViralJudge.RewriteJudgment judgment,
             long evaluatedAt,
             boolean enforceQuietWindow
     ) {
+        boolean savedRetry = judgment == null;
+        String rewrittenText = store.tx(tx -> {
+            var rec = authorizedRewriteAtStage(tx, materialId, ownerId, "EVALUATING");
+            if (rec == null || !rewriteSourceStillValid(tx, rec, materialId, savedRetry, enforceQuietWindow)) return null;
+            var material = tx.rewriteMaterial(materialId, clock.millis());
+            try {
+                return PiAgentViralJudge.validatedRewriteText(proposedText, material == null ? "" : material.path("text").asText(""));
+            } catch (IllegalStateException invalid) {
+                rec.remove(List.of("rewrittenText", "commentText"));
+                tx.put("auto_rewrite", materialId, rec.put("status", "JUDGE_FAILED").put("error", safeError(invalid)));
+                return null;
+            }
+        });
+        if (rewrittenText == null) return false;
         final String accessToken;
         try {
             accessToken = com.xops.hub.provider.PaidCapabilityGate.withCaller(
-                    com.xops.hub.provider.PaidCapabilityGate.PRIVILEGED_USERNAME, ownerId,
+                    com.xops.hub.provider.PaidCapabilityGate.PRIVILEGED_USERNAME, ownerId, store.isOwner(ownerId),
                     () -> oauthService.getValidWriteAccessToken(ownerId, false));
         } catch (RuntimeException ex) {
             store.tx(tx -> {
-                ObjectNode rec = tx.get("auto_rewrite", materialId);
+                ObjectNode rec = authorizedRewriteAtStage(tx, materialId, ownerId, "EVALUATING");
                 if (rec != null) {
+                    if (rec.has("reassessedFinalVersion") && !rewriteSourceStillValid(tx, rec, materialId, savedRetry, enforceQuietWindow))
+                        return null;
                     ObjectNode next = applyRewriteJudgment(rec.deepCopy(), judgment, evaluatedAt, rewrittenText);
                     tx.put("auto_rewrite", materialId, next
-                            .put("status", "AUTH_REQUIRED")
+                            .put("status", UpstreamBudgetGuard.isBudgetReached(ex) ? "FAILED" : "AUTH_REQUIRED")
                             .put("error", safeError(ex)));
                 }
                 return null;
@@ -4364,98 +5251,119 @@ public class AutoRepostService {
             return false;
         }
 
+        boolean timelineVerified = enforceQuietWindow && store.tx(tx -> recentOwnerTimelineCheck(tx, ownerId, ownerUsername, clock.millis()))
+                || refreshOwnerTimeline(ownerId, ownerUsername.replaceFirst("^@+", "")) >= 0L;
         boolean readyToSend = store.tx(tx -> {
-            ObjectNode rec = tx.get("auto_rewrite", materialId);
-            if (rec == null || !"EVALUATING".equals(rec.path("status").asText(""))) return false;
-            long dispatchMs = clock.millis();
-            if (enforceQuietWindow && isInAutoRepostQuietWindow(dispatchMs)) {
-                ObjectNode skipped = applyRewriteJudgment(rec.deepCopy(), judgment, evaluatedAt, rewrittenText);
-                tx.put("auto_rewrite", materialId, skipped
-                        .put("status", "SKIPPED_QUIET_HOURS")
-                        .put("reason", quietWindowReason()));
+            ObjectNode rec = authorizedRewriteAtStage(tx, materialId, ownerId, "EVALUATING");
+            if (rec == null) return false;
+            applyRewriteJudgment(rec, judgment, evaluatedAt, rewrittenText);
+            if (!timelineVerified) {
+                if (!rewriteSourceStillValid(tx, rec, materialId, savedRetry, enforceQuietWindow)) return false;
+                tx.put("auto_rewrite", materialId, rec.put("status", "SKIPPED_COOLDOWN").put("reason", "暂时无法核实发布账号的最新发帖时间，请稍后重试"));
                 return false;
             }
-            ObjectNode settings = AssistantWorkflow.settings(tx);
-            long latestOwnerTweetAt = resolveLatestOwnerTweetEpochMs(tx, ownerId, ownerUsername, materialId, dispatchMs);
-            long requiredOwnerGapMs = resolveEffectiveOwnerGapMs(settings, latestOwnerTweetAt);
-            if (requiredOwnerGapMs > 0L && latestOwnerTweetAt > 0L
-                    && dispatchMs - latestOwnerTweetAt >= 0L && dispatchMs - latestOwnerTweetAt < requiredOwnerGapMs) {
-                int jitterMin = resolveOwnerTweetJitterMinutes(latestOwnerTweetAt);
-                long remMin = Math.max(1L, (requiredOwnerGapMs - (dispatchMs - latestOwnerTweetAt) + 59_999L) / 60_000L);
-                ObjectNode skipped = applyRewriteJudgment(rec.deepCopy(), judgment, evaluatedAt, rewrittenText);
-                tx.put("auto_rewrite", materialId, skipped
-                        .put("status", "SKIPPED_COOLDOWN")
-                        .put("reason", "距我账号上一条推文不足 1小时+" + jitterMin + "分钟（还差约 " + remMin + " 分钟）"));
-                return false;
-            }
-            ObjectNode sending = applyRewriteJudgment(rec.deepCopy(), judgment, evaluatedAt, rewrittenText);
-            tx.put("auto_rewrite", materialId, sending
-                    .put("status", "SENDING")
-                    .put("dispatchedAt", dispatchMs));
+            if (!rewriteMaySend(tx, rec, materialId, ownerId, ownerUsername, enforceQuietWindow, savedRetry)) return false;
+            tx.put("auto_rewrite", materialId, rec.put("status", "SENDING").put("dispatchedAt", clock.millis()));
             return true;
         });
         if (!readyToSend) return false;
 
+        PublicationReceipt receipt;
         try {
-            // Pure standalone original post — strictly NO quoteTweetId and NO quoteTweetUrl!
-            String publishedTweetId = com.xops.hub.provider.PaidCapabilityGate.withCaller(
-                    com.xops.hub.provider.PaidCapabilityGate.PRIVILEGED_USERNAME, ownerId,
-                    () -> publishClient.createTweet(accessToken, rewrittenText, List.of(), null));
-            if (paidGate != null) {
-                paidGate.markSucceeded("auto-rewrite:" + materialId);
-            }
-            long doneMs = clock.millis();
-            String uname = ownerUsername.isBlank() ? "i" : ownerUsername;
-            String publishedUrl = "https://x.com/" + uname + "/status/" + publishedTweetId;
-            store.tx(tx -> {
-                ObjectNode rec = tx.get("auto_rewrite", materialId);
-                if (rec != null) {
-                    tx.put("auto_rewrite", materialId, rec.deepCopy()
-                            .put("status", "PUBLISHED")
-                            .put("rewrittenText", rewrittenText)
-                            .put("commentText", rewrittenText)
-                            .put("publishedTweetId", publishedTweetId)
-                            .put("publishedTweetUrl", publishedUrl)
-                            .put("publishedAt", doneMs)
-                            .put("error", ""));
-                }
-                tx.put("publication", "auto-rewrite-" + materialId, object()
-                        .put("status", "PUBLISHED")
-                        .put("source", "AUTO_REWRITE_POST")
-                        .put("topicId", topicId)
-                        .put("materialId", materialId)
-                        .put("text", rewrittenText)
-                        .put("publishedTweetId", publishedTweetId)
-                        .put("publishedTweetUrl", publishedUrl)
-                        .put("publishedAt", doneMs));
-                return null;
-            });
-            recordOwnerPublishAndScheduleNextSlot(doneMs);
-            return true;
-        } catch (XPublishException ex) {
-            String terminalStatus = ex.isDeliveryUncertain() ? "UNCERTAIN" : "FAILED";
-            store.tx(tx -> {
-                ObjectNode rec = tx.get("auto_rewrite", materialId);
-                if (rec != null) {
-                    tx.put("auto_rewrite", materialId, rec.deepCopy()
-                            .put("status", terminalStatus)
-                            .put("error", safeError(ex)));
-                }
-                return null;
-            });
-            return false;
+            receipt = PaidCapabilityGate.withCaller(PaidCapabilityGate.PRIVILEGED_USERNAME, ownerId, store.isOwner(ownerId),
+                    () -> XPublishClient.withPublicationPreflight(rewrittenText, null,
+                            () -> verifySendingRewrite(materialId, ownerId, ownerUsername, enforceQuietWindow, savedRetry),
+                            () -> publishClient.createTweet(accessToken, rewrittenText, List.of(), null)));
         } catch (RuntimeException ex) {
-            store.tx(tx -> {
-                ObjectNode rec = tx.get("auto_rewrite", materialId);
-                if (rec != null) {
-                    tx.put("auto_rewrite", materialId, rec.deepCopy()
-                            .put("status", "FAILED")
-                            .put("error", safeError(ex)));
-                }
-                return null;
-            });
+            return !markSendFailure("auto_rewrite", materialId, ex);
+        }
+        completeAutoPublish(AutoPublishMode.REWRITE, materialId, ownerId, ownerUsername, topicId, receipt, null, rewrittenText);
+        return true;
+    }
+
+    static boolean withinRewriteWindow(ObjectNode source, long now) {
+        long published = source.path("publishedAt").asLong();
+        return published > 0 && published <= now && now - published <= REWRITE_MAX_AGE_MS;
+    }
+
+    static boolean canReassessRewrite(AssistantStore.Tx tx, ObjectNode material, long now) {
+        if (material == null || !withinRewriteWindow(material, now) || !isPureTextRewriteCandidate(material)) return false;
+        var pool = tx.rewriteWindow(material.path("authorId").asText(), material.path("username").asText(), now - REWRITE_MAX_AGE_MS, now);
+        return RewriteTraffic.of(pool).qualifies(material);
+    }
+
+    private boolean rewriteSourceStillValid(AssistantStore.Tx tx, ObjectNode rec, String materialId, boolean savedRetry, boolean automatic) {
+        long now = clock.millis();
+        ObjectNode material = tx.rewriteMaterial(materialId, now);
+        boolean changed = rec.path("rewriteSourceNeedsReview").asBoolean()
+                || material != null && !matchesFinalRewriteSource(tx, rec, material);
+        if (!changed && (savedRetry && !automatic || canReassessRewrite(tx, material, now))) return true;
+        if (savedRetry) {
+            if (changed) rec.put("rewriteSourceNeedsReview", true);
+            rec.put("status", "FAILED").put("error", changed ? "原素材已变更，请重新评估定稿" : "原素材已过期或热度下降，已保留定稿供人工重试");
+        } else if (!changed && !automatic && rec.has("reassessedFinalVersion")) {
+            ObjectNode approved = tx.version("auto_rewrite", materialId, rec.path("reassessedFinalVersion").asInt());
+            if (tx.publicationOwnerMatches(approved, rec.path("ownerAccountId").asText())) {
+                tx.put("auto_rewrite", materialId, approved.put("rewriteSourceFingerprint", rec.path("rewriteSourceFingerprint").asText())
+                        .put("error", "原素材已过期或热度下降，已保留原定稿供人工重试"));
+                return false;
+            }
+            rec.remove(List.of("rewrittenText", "commentText", "reassessedFinalVersion"));
+            rec.put("status", "JUDGE_FAILED").put("error", "无法核对原定稿的发布账号");
+        } else {
+            rec.remove(List.of("rewrittenText", "commentText"));
+            rec.put("status", "JUDGE_FAILED").put("error", "原素材已变更、过期或不再符合高热纯文本洗稿条件");
+        }
+        tx.put("auto_rewrite", materialId, rec);
+        return false;
+    }
+
+    private boolean rewriteMaySend(AssistantStore.Tx tx, ObjectNode rec, String materialId, String ownerId, String username,
+                                   boolean checkQuiet, boolean savedRetry) {
+        if (!rewriteSourceStillValid(tx, rec, materialId, savedRetry, checkQuiet)) return false;
+        String topic = tx.publicationTopic(rec, materialId);
+        boolean reserved = "SENDING".equals(rec.path("status").asText());
+        if (hasConflictingRewritePublication(tx, materialId, topic, reserved)) {
+            tx.put("auto_rewrite", materialId, rec.put("status", "SKIPPED_DUPLICATE").put("reason", "该素材或选题已有发布或待核实记录"));
             return false;
         }
+        long now = clock.millis();
+        ObjectNode settings = AssistantWorkflow.settings(tx);
+        int limit = Math.max(1, settings.path("autoRepostDailyLimit").asInt(DEFAULT_DAILY_LIMIT));
+        long dayStart = Instant.ofEpochMilli(now).atZone(AssistantRetention.ZONE).toLocalDate().atStartOfDay(AssistantRetention.ZONE).toInstant().toEpochMilli();
+        int ownReservation = reserved && rec.path("dispatchedAt").asLong() >= dayStart ? 1 : 0;
+        if (autoPublicationsToday(tx, now) - ownReservation >= limit) {
+            tx.put("auto_rewrite", materialId, rec.put("status", "SKIPPED_LIMIT").put("reason", "已达当日自动发布上限"));
+            return false;
+        }
+        if (checkQuiet && isInAutoRepostQuietWindow(now)) {
+            tx.put("auto_rewrite", materialId, rec.put("status", "SKIPPED_QUIET_HOURS").put("reason", quietWindowReason()));
+            return false;
+        }
+        if (!recentOwnerTimelineCheck(tx, ownerId, username, now)) {
+            tx.put("auto_rewrite", materialId, rec.put("status", "SKIPPED_COOLDOWN").put("reason", "发布账号的发帖时间需要重新核实，请稍后重试"));
+            return false;
+        }
+        long latest = resolveLatestOwnerTweetEpochMs(tx, ownerId, username, materialId, now);
+        long gap = resolveEffectiveOwnerGapMs(settings, latest);
+        if (latest > 0 && latest <= now && now - latest < gap) {
+            long minutes = Math.max(1L, (gap - (now - latest) + 59_999L) / 60_000L);
+            tx.put("auto_rewrite", materialId, rec.put("status", "SKIPPED_COOLDOWN").put("reason", "发布账号冷却中，还需约 " + minutes + " 分钟"));
+            return false;
+        }
+        if (!topic.equals(rec.path("topicId").asText())) {
+            rec.put("topicId", topic);
+            if (reserved) tx.put("auto_rewrite", materialId, rec);
+        }
+        return true;
+    }
+
+    private void verifySendingRewrite(String materialId, String ownerId, String username, boolean enforceQuietWindow, boolean savedRetry) {
+        boolean allowed = store.tx(tx -> {
+            ObjectNode row = authorizedRewriteAtStage(tx, materialId, ownerId, "SENDING");
+            return row != null && rewriteMaySend(tx, row, materialId, ownerId, username, enforceQuietWindow, savedRetry);
+        });
+        if (!allowed) throw new XPublishException(409, "洗稿发送条件已变更", false);
     }
 
     private static ObjectNode applyRewriteJudgment(

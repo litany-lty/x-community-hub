@@ -20,7 +20,7 @@ class ContentSourceProviderTest {
                 return ExactFollowProviderTest.Reply.ok("""
                         {"tweets":[
                           {"id":"post","text":"author view","createdAt":"2026-11-21T01:00:00Z","quoted_tweet":{"text":"quoted fact","author":{"id":"quoted-id","userName":"quoted"}}},
-                          {"id":"article","text":"preview","createdAt":"2026-11-21T00:00:00Z","article":{"title":"Full title","content":{"text":"Full article"}}},
+                          {"id":"article","text":"preview","retweetCount":7,"createdAt":"2026-11-21T00:00:00Z","article":{"title":"Full title","content":{"text":"Full article"}}},
                           {"id":"qarticle","text":"commentary","createdAt":"2026-11-20T23:30:00Z","quoted_tweet":{"id":"q-original","text":"article preview","author":{"id":"quoted-id","userName":"quoted"},"article":{"title":"Quoted title"}}},
                           {"id":"reply","text":"reply","isReply":true,"inReplyToUsername":"peer","createdAt":"2026-11-20T23:00:00Z"},
                           {"id":"retweet","text":"RT @peer repost","createdAt":"2026-11-20T22:00:00Z"},
@@ -42,9 +42,9 @@ class ContentSourceProviderTest {
             if (uri.getPath().endsWith("/tweets")) {
                 return ExactFollowProviderTest.Reply.ok("""
                         {"tweets":[
-                          {"id":"post","author":{"id":"author-id","userName":"author"}},
-                          {"id":"article","author":{"id":"author-id","userName":"author"}},
-                          {"id":"qarticle","author":{"id":"author-id","userName":"author"}},
+                          {"id":"post","retweetCount":7,"quoteCount":3,"author":{"id":"author-id","userName":"author"}},
+                          {"id":"article","retweetCount":7,"author":{"id":"author-id","userName":"author"}},
+                          {"id":"qarticle","retweetCount":0,"quoteCount":0,"author":{"id":"author-id","userName":"author"}},
                           {"id":"reply","author":{"id":"author-id","userName":"author"}},
                           {"id":"retweet","author":{"id":"author-id","userName":"author"}},
                           {"id":"media","author":{"id":"author-id","userName":"author"}}
@@ -66,6 +66,10 @@ class ContentSourceProviderTest {
             assertThat(page.posts().get(0).quotedTextStatus()).isEqualTo("SOURCE_MISSING");
             assertThat(page.posts().get(1).articleText()).contains("Full article").doesNotContain("Full title");
             assertThat(page.posts().get(1).styleText()).isEqualTo("Full article");
+            assertThat(page.posts().get(1).reposts()).as("quote count was not observed").isNull();
+            assertThat(fixture.provider.observePost("author-id", "article").has("reposts")).isFalse();
+            assertThat(fixture.provider.observePost("author-id", "post").required("reposts").asLong()).isEqualTo(10);
+            assertThat(fixture.provider.observePost("author-id", "qarticle").required("reposts").asLong()).isZero();
             assertThat(page.posts().get(2).articleText()).isEqualTo("Quoted full body");
             assertThat(page.posts().get(2).articleRole()).isEqualTo("QUOTED");
             assertThat(page.posts().get(2).articleTextStatus()).isEqualTo("FULL");

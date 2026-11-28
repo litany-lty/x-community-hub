@@ -15,6 +15,7 @@
     };
 
     const AUTHOR_REPO_URL = "https://github.com/litany-lty/x-community-hub";
+    const AUTHOR_ARCHIVE_ACCOUNT_ID = "2095392916734976000";
     const AUTHOR_BANNER_URL = "/author-banner.webp";
     const AUTHOR_AVATAR_URL = "/author-avatar.webp";
     const MEDIA_CACHE_NAME = "xops-media-v1";
@@ -89,6 +90,7 @@
         assistantView: "assistant",
         assistantGenerationTargetPinned: false,
         assistantSelectedTopicId: "",
+        assistantExternalTopicId: "",
         assistantTopicSearch: "",
         assistantTopicStatus: "",
         assistantTopicAuthor: "",
@@ -113,10 +115,11 @@
         assistantCreationAngle: "",
         assistantOrganizeMode: false,
         assistantLoading: false,
-        assistantMutation: "",
+        assistantMutation: null,
         assistantDraftDirty: false,
         assistantDraftSaveTimerId: null,
         assistantDraftSave: null,
+        assistantDraftConflict: null,
         assistantTaskTimerId: null,
         assistantRequestGeneration: 0,
         backgroundRefreshTimerId: null,
@@ -137,6 +140,7 @@
         activeScheduleDraftIdx: 0,
         mediaPickerTargetIdx: 0,
         scheduleDraftRestoring: false,
+        scheduleDraftRestore: null,
         scheduleDraftPersistenceReady: false,
         composerClientRequestId: "",
         schedulePollTimerId: null,
@@ -238,8 +242,20 @@
         state.assistantTaskTimerId = null;
         state.assistantAccess = null;
         state.assistantDashboard = null;
+        if (typeof repostPreviewState !== "undefined") {
+            if (document.getElementById("repostPreviewModal")?.hidden === false) closeRepostPreviewModal(true);
+            else repostPreviewState.requestToken++;
+            repostPreviewState.owner = null;
+            repostPreviewState.source = null;
+            repostPreviewState.items = [];
+            repostPreviewState.publishingIds = new Set();
+            repostPreviewState.editedComments.clear();
+            repostPreviewState.editedRewrites.clear();
+            document.getElementById("repostPreviewTimelineList")?.replaceChildren();
+        }
         state.assistantMaterialsFeed = null;
         state.assistantSelectedTopicId = "";
+        state.assistantExternalTopicId = "";
         state.assistantTopicSearch = "";
         state.assistantTopicStatus = "";
         state.assistantTopicAuthor = "";
@@ -277,11 +293,12 @@
         if ($("assistantLinkResearchInput")) $("assistantLinkResearchInput").value = "";
         state.assistantOrganizeMode = false;
         state.assistantLoading = false;
-        state.assistantMutation = "";
+        state.assistantMutation = null;
         state.assistantGenerationTargetPinned = false;
         clearTimeout(state.assistantDraftSaveTimerId);
         state.assistantDraftSaveTimerId = null;
         state.assistantDraftSave = null;
+        state.assistantDraftConflict = null;
         state.assistantDraftDirty = false;
         state.assistantRequestGeneration++;
         if ($("assistantSettingsForm")?.dataset) {
@@ -336,6 +353,7 @@
         state.activeScheduleDraftIdx = 0;
         state.mediaPickerTargetIdx = 0;
         state.scheduleDraftRestoring = false;
+        state.scheduleDraftRestore = null;
         state.scheduleDraftPersistenceReady = false;
         cancelScheduleDraftPersistence();
         state.composerClientRequestId = "";
@@ -648,22 +666,15 @@
     }
 
     function isOwnerAllPermissions() {
-        const loggedIn = typeof isLoggedIn === "function" ? isLoggedIn() : Boolean(state.authStatus?.loggedIn);
-        if (!loggedIn) return false;
-        if (state.authStatus?.ownerAllPermissions === true) return true;
-        if (state.assistantAccess?.allowed === true) return true;
-        if (
-            state.accessPolicy?.top5FullAccess === true &&
-            String(state.authStatus?.user?.username || "").replace(/^@+/, "").toLowerCase() === "elidlicom"
-        ) {
-            return true;
-        }
-        return false;
+        const auth = state.authStatus;
+        return auth?.loggedIn === true && auth.ownerAllPermissions === true
+            && Boolean(String(auth.user?.id || "").trim());
     }
 
     function isExplicitNonOwnerSession() {
         const auth = state.authStatus;
         if (!auth || !auth.loggedIn) return false;
+        if (auth.ownerAllPermissions === false) return true;
         if (auth.ownerAllPermissions === true) return false;
         const uname = String(auth.user?.username || "").replace(/^@+/, "").trim().toLowerCase();
         if (uname) return uname !== "elidlicom";
@@ -1167,15 +1178,7 @@
             showToast("请先使用 X 账号授权登录");
             return;
         }
-        if (
-            (tabId === "follow-audit" || tabId === "schedule") &&
-            state.authStatus?.ownerAllPermissions !== true &&
-            (state.authStatus?.ownerAllPermissions === false ||
-                Boolean(
-                    state.authStatus?.user?.username &&
-                        String(state.authStatus.user.username).replace(/^@+/, "").trim().toLowerCase() !== "elidlicom"
-                ))
-        ) {
+        if ((tabId === "follow-audit" || tabId === "schedule") && state.authStatus?.ownerAllPermissions !== true) {
             tabId = "activity";
         }
         if (state.activeTab === tabId && historyMode === "push") {
@@ -1317,6 +1320,7 @@
             method: "POST", cache: "no-store", headers
         }, 15000);
         if (!result.resp.ok) throw new Error(result.body.message || result.body.error || "后台刷新受理失败");
+        if (isCurrent && !isCurrent()) return null;
         state.backgroundRefreshStatus = result.body || null;
         return state.backgroundRefreshStatus;
     }
@@ -1326,11 +1330,14 @@
         state.backgroundRefreshTimerId = null;
         const expectedUserId = stableUserId(state.authStatus?.user);
         if (!expectedUserId) return;
+        const generation = state.reportRequestGeneration;
+        const isCurrentPoll = () => isLoggedIn() && !state.isLoggingOut &&
+            stableUserId(state.authStatus?.user) === expectedUserId && generation === state.reportRequestGeneration;
         const pollOnce = async () => {
-            if (!isLoggedIn() || state.isLoggingOut || stableUserId(state.authStatus?.user) !== expectedUserId) return;
+            if (!isCurrentPoll()) return;
             try {
                 const { resp, body } = await requestJsonWithin("/api/analyze/bundle/refresh/status", { cache: "no-store" }, 15000);
-                if (!isLoggedIn() || state.isLoggingOut || stableUserId(state.authStatus?.user) !== expectedUserId) return;
+                if (!isCurrentPoll()) return;
                 if (resp.ok && body) {
                     state.backgroundRefreshStatus = body;
                     if (state.report) renderDailyCacheStatus(state.report);
@@ -1338,12 +1345,16 @@
                         state.backgroundRefreshTimerId = setTimeout(pollOnce, 2000);
                         return;
                     }
-                    if (body.state === "SUCCEEDED" && !state.isFetching && !state.isSilentRefreshing) {
-                        void loadSelfReport({ reloadFromServer: true, silent: true });
+                    if (["SUCCEEDED", "PARTIAL", "CACHED"].includes(body.state)) {
+                        if (state.isFetching || state.isSilentRefreshing) {
+                            state.backgroundRefreshTimerId = setTimeout(pollOnce, 2000);
+                        } else {
+                            void loadSelfReport({ reloadFromServer: true, silent: true, completedRefresh: body });
+                        }
                     }
                 }
             } catch (_) {
-                if (isLoggedIn() && !state.isLoggingOut && stableUserId(state.authStatus?.user) === expectedUserId) {
+                if (isCurrentPoll()) {
                     state.backgroundRefreshTimerId = setTimeout(pollOnce, 4000);
                 }
             }
@@ -1482,7 +1493,7 @@
 
             // 首次进入尚未拿到全量报告前，立即用本地快照预填横幅、头像、简介与计数，消除首屏布局跳变
             if (!state.report) {
-                const isAuthorSelf = String(effectiveUser.username || "").replace(/^@+/, "").toLowerCase() === "elidlicom";
+                const isAuthorSelf = state.authStatus.ownerAllPermissions === true;
                 const earlyBanner = (cachedHeader && cachedHeader.bannerUrl) || (isAuthorSelf ? AUTHOR_BANNER_URL : "");
                 applyCoverBanner($("profileCover"), earlyBanner);
                 const heroEl = $("profileHero");
@@ -1497,7 +1508,8 @@
                 $("profileHandleText").textContent = "@" + effectiveUser.username;
                 $("profilePersonaTag").textContent =
                     (cachedHeader && cachedHeader.personaTag) || (state.storedMode ? "已入库" : "同步中");
-                $("visitXProfileLink").href = `https://x.com/${encodeURIComponent(effectiveUser.username)}`;
+                $("visitXProfileLink").href = effectiveUser.id ? `https://x.com/i/user/${encodeURIComponent(effectiveUser.id)}`
+                    : `https://x.com/${encodeURIComponent(effectiveUser.username)}`;
                 if (cachedHeader && cachedHeader.bio) {
                     $("profileBio").textContent = cachedHeader.bio;
                     $("profileBio").hidden = false;
@@ -1583,9 +1595,9 @@
         window.location.href = "/api/auth/x/login";
     }
 
-    function startCacheCooldownTicker(remainingSeconds) {
+    function startCacheCooldownTicker(nextRefreshAt) {
         clearInterval(state.cooldownTimerId);
-        state.cacheExpiresEpochMs = Date.now() + Math.max(0, Number(remainingSeconds || 0)) * 1000;
+        state.cacheExpiresEpochMs = Date.parse(nextRefreshAt) || 0;
         updateRefreshButtonState();
     }
 
@@ -1696,6 +1708,7 @@
     async function loadSelfReport(options = {}) {
         const continueRelations = !state.storedMode && options?.continueRelations === true;
         const reloadFromServer = !state.storedMode && options?.reloadFromServer === true;
+        const completedRefresh = reloadFromServer ? options?.completedRefresh : null;
         const forceRefresh = !state.storedMode && !continueRelations && (options === true || options?.forceRefresh === true);
         const silent = !state.storedMode && !forceRefresh && !continueRelations &&
             (options?.silent === true || (reloadFromServer && Boolean(state.report)));
@@ -1721,10 +1734,11 @@
             state.bundle &&
             state.bundle[state.period] &&
             bundleOwnerId &&
-            bundleOwnerId === authUserId
+            bundleOwnerId === authUserId &&
+            (state.storedMode || Date.parse(state.bundle[state.period].nextRefreshAt) > Date.now())
         ) {
             const cachedPeriodReport = state.bundle[state.period];
-            startCacheCooldownTicker(cachedPeriodReport.cacheRemainingSeconds);
+            startCacheCooldownTicker(cachedPeriodReport.nextRefreshAt);
             applyLoadedPeriodReport(cachedPeriodReport);
             return;
         }
@@ -1794,16 +1808,13 @@
             let bundleBody;
             try {
                 resp = await fetch(
-                    `/api/analyze/bundle?period=${encodeURIComponent(reqPeriod)}&targetDays=${encodeURIComponent(reqDays)}${state.storedMode ? "&stored=true" : continueRelations ? "&continueRelations=true" : ""}${sendRefresh ? "&refresh=true" : ""}${sendPreferStored ? "&preferStored=true" : ""}`,
+                    `/api/analyze/bundle?period=${encodeURIComponent(reqPeriod)}&targetDays=${encodeURIComponent(reqDays)}${state.storedMode || completedRefresh ? "&stored=true" : continueRelations ? "&continueRelations=true" : ""}${sendRefresh ? "&refresh=true" : ""}${sendPreferStored ? "&preferStored=true" : ""}`,
                     {
                         cache: "no-store",
                         signal: abortCtrl.signal
                     }
                 );
                 bundleBody = await safeParseJson(resp);
-                if (bundleBody && bundleBody.backgroundRefreshStatus) {
-                    state.backgroundRefreshStatus = bundleBody.backgroundRefreshStatus;
-                }
             } finally {
                 clearTimeout(fetchTimeout);
             }
@@ -1833,6 +1844,10 @@
             if (nonNullReports.some((report) => stableUserId(report?.profile) !== authUserId)) {
                 throw new Error("报表账号与当前登录账号不匹配，请重新加载");
             }
+            const background = completedRefresh || bundleBody.backgroundRefreshStatus;
+            const cycle = bundleBody.dailyCacheStatus?.cycleStartedAt;
+            state.backgroundRefreshStatus = !background?.newerResultAvailable && background?.cycleStartedAt && cycle &&
+                Date.parse(background.cycleStartedAt) !== Date.parse(cycle) ? null : background || null;
             state.bundle = {
                 HOURS_24: bundleBody.hours24 || null,
                 HOURS_48: bundleBody.day || null,
@@ -1845,9 +1860,10 @@
             state.pendingRelationshipChecks = state.storedMode ? 0 : Math.max(0, Number(bundleBody.pendingRelationshipChecks || 0));
 
             const targetReport = state.bundle[state.period] || state.bundle.HOURS_24 || nonNullReports[0];
-            startCacheCooldownTicker(targetReport.cacheRemainingSeconds);
+            startCacheCooldownTicker(targetReport.nextRefreshAt);
             applyLoadedPeriodReport(targetReport);
-            if (!state.storedMode && state.backgroundRefreshStatus?.state === "RUNNING") {
+            if (!state.storedMode && (state.backgroundRefreshStatus?.state === "RUNNING" ||
+                    (!completedRefresh && state.backgroundRefreshStatus?.newerResultAvailable))) {
                 scheduleWorkspaceRefreshPoll(authUname, selectedPeriod || "HOURS_24", selectedDays || 1);
             } else if (
                 !silent &&
@@ -1856,10 +1872,10 @@
                 !continueRelations &&
                 state.dailyCacheStatus?.canContinue &&
                 !state.dailyCacheStatus.lastAttemptDegraded &&
-                state.backgroundRefreshStatus?.state !== "SUCCEEDED"
+                (forceRefresh || !state.backgroundRefreshStatus || state.backgroundRefreshStatus.state === "IDLE")
             ) {
-                void startColdWorkspaceRefresh(selectedPeriod || "HOURS_24", 1)
-                    .then(() => scheduleWorkspaceRefreshPoll(authUname, selectedPeriod || "HOURS_24", 1))
+                void startColdWorkspaceRefresh(selectedPeriod || "HOURS_24", 1, requestIsCurrent)
+                    .then(status => { if (status && requestIsCurrent()) scheduleWorkspaceRefreshPoll(authUname, selectedPeriod || "HOURS_24", 1); })
                     .catch(() => {});
             }
         } catch (err) {
@@ -1965,23 +1981,24 @@
     }
 
     function buildFallbackAuthorCardData() {
-        const selfHandle = String(state.authStatus?.user?.username || "").replace(/^@+/, "");
-        const selfIsAuthor = selfHandle.toLowerCase() === "elidlicom";
-        const cachedAuthor = (state.report && state.report.profile && selfIsAuthor)
-            ? state.report.profile
-            : null;
+        const selfIsAuthor = isOwnerAllPermissions();
+        const authorId = String((selfIsAuthor && state.authStatus.user.id) || state.accessPolicy?.authorAccountId || AUTHOR_ARCHIVE_ACCOUNT_ID);
+        const cachedAuthor = String(state.report?.profile?.id || "") === authorId ? state.report.profile : null;
+        const handle = (selfIsAuthor && state.authStatus.user.username) || state.accessPolicy?.authorHandle || cachedAuthor?.username || "";
+        const authorLabel = handle ? `@${handle}` : "作者";
         return {
             usageCount: state.usageCount || 0,
             modalReasonCode: "MANUAL_PREVIEW",
             modalBadgeText: state.usageCount > 0 ? `作者主页 · 第 ${state.usageCount} 次使用` : "作者主页 · 开源说明",
-            modalTitle: "你好，我是作者 @elidlicom",
+            modalTitle: handle ? `你好，我是作者 @${handle}` : "你好，我是作者",
             modalMessage:
-                "每次使用本工作台，后端都会真实付费调用 X / 数据接口。项目免费开放并全量开源，结个善缘，欢迎关注 @elidlicom 交流进展！\n\n" +
+                `每次使用本工作台，后端都会真实付费调用 X / 数据接口。项目免费开放并全量开源，结个善缘，欢迎关注 ${authorLabel} 交流进展！\n\n` +
                 AUTHOR_COST_STORY,
             followingAuthor: Boolean(state.accessPolicy?.followsAuthor),
             selfIsAuthor,
             authorProfile: {
-                username: "elidlicom",
+                id: authorId,
+                username: handle,
                 displayName: cachedAuthor?.displayName || "Litany（李丰一）",
                 avatarUrl: "/author-avatar.webp",
                 bannerUrl: AUTHOR_BANNER_URL,
@@ -1991,8 +2008,8 @@
                 followersCount: cachedAuthor?.followersCount || 0,
                 totalPostsCount: cachedAuthor?.totalPostsCount || 0
             },
-            authorProfileUrl: "https://x.com/elidlicom",
-            authorFollowIntentUrl: "https://x.com/intent/follow?screen_name=elidlicom"
+            authorProfileUrl: `https://x.com/i/user/${encodeURIComponent(authorId)}`,
+            authorFollowIntentUrl: `https://x.com/intent/follow?user_id=${encodeURIComponent(authorId)}`
         };
     }
 
@@ -2075,7 +2092,7 @@
             .replace(/\s{2,}/g, " ")
             .trim() || AUTHOR_DEFAULT_BIO;
         const author = {
-            username: rawAuthor.username || "elidlicom",
+            username: rawAuthor.username || state.accessPolicy?.authorHandle || "",
             displayName: rawAuthor.displayName || "Litany（李丰一）",
             avatarUrl: rawAuthor.avatarUrl || "/author-avatar.webp",
             bannerUrl: rawAuthor.bannerUrl || AUTHOR_BANNER_URL,
@@ -2085,7 +2102,8 @@
             followersCount: rawAuthor.followersCount || 0,
             tweetCount: rawAuthor.totalPostsCount || rawAuthor.tweetCount || 0
         };
-        const handle = String(author.username || "elidlicom").replace(/^@+/, "");
+        const handle = String(author.username).replace(/^@+/, "");
+        const authorLabel = handle ? `@${handle}` : "作者";
         const badgeEl = document.getElementById("authorModalBadge");
         if (badgeEl) {
             const countVal = Number(data.usageCount || state.usageCount || 0);
@@ -2095,10 +2113,10 @@
             badgeEl.textContent = badgeText;
             badgeEl.hidden = !badgeText;
         }
-        $("authorModalTitle").textContent = data.modalTitle || `你好，我是作者 @${handle}`;
+        $("authorModalTitle").textContent = data.modalTitle || (handle ? `你好，我是作者 @${handle}` : "你好，我是作者");
 
         const rawMessage = String(
-            data.modalMessage || `因为每次使用这个网站服务，我都是真实付费调用 API 的。结个善缘，求关注 @${handle}！`
+            data.modalMessage || `因为每次使用这个网站服务，我都是真实付费调用 API 的。结个善缘，求关注 ${authorLabel}！`
         ).replace(/\n+开源仓库（可本地部署，与线上一致）：https?:\/\/\S+\s*$/m, "").trim();
         const msgEl = $("authorModalMessage");
         msgEl.innerHTML = "";
@@ -2115,7 +2133,7 @@
         const verEl = $("authorModalVerified");
         verEl.innerHTML = verifiedSvgHtml(Boolean(author.verified));
         verEl.hidden = !author.verified;
-        $("authorModalHandle").textContent = `@${handle}`;
+        $("authorModalHandle").textContent = handle ? authorLabel : "";
         $("authorModalBio").textContent = author.bio;
 
         const followingCount = Number(author.followingCount || 0);
@@ -2138,22 +2156,23 @@
         $("authorModalSelfTag").hidden = !isSelf;
         $("authorModalFollowedTag").hidden = isSelf || !isFollowing;
 
-        const safeProfileUrl = safeHttpUrl(data.authorProfileUrl, `https://x.com/${encodeURIComponent(handle)}`);
+        const authorId = encodeURIComponent(rawAuthor.id || state.accessPolicy?.authorAccountId || AUTHOR_ARCHIVE_ACCOUNT_ID);
+        const safeProfileUrl = safeHttpUrl(data.authorProfileUrl, `https://x.com/i/user/${authorId}`);
         const safeFollowUrl = safeHttpUrl(
             data.authorFollowIntentUrl,
-            `https://x.com/intent/follow?screen_name=${encodeURIComponent(handle)}`
+            `https://x.com/intent/follow?user_id=${authorId}`
         );
         const headerLink = $("authorModalHeaderLink");
         headerLink.href = safeProfileUrl;
-        headerLink.textContent = `@${handle} ↗`;
+        headerLink.textContent = `${authorLabel} ↗`;
 
         const followBtn = $("authorModalFollowBtn");
         followBtn.href = isFollowing || isSelf ? safeProfileUrl : safeFollowUrl;
         $("authorModalFollowBtnText").textContent = isSelf
             ? "查看我的 X 主页 ↗"
             : isFollowing
-              ? `已关注 · 访问 @${handle} 主页 ↗`
-              : `关注 @${handle} ↗`;
+              ? `已关注 · 访问 ${authorLabel} 主页 ↗`
+              : `关注 ${authorLabel} ↗`;
 
         const profileLink = $("authorModalProfileLink");
         profileLink.href = safeProfileUrl;
@@ -2192,16 +2211,13 @@
                     ? (validRank !== null ? `互动第 ${validRank} 名（前 5 免等待全开）` : "全时间维度已解锁")
                     : p.top50AutoSync && validRank !== null
                       ? `互动第 ${validRank} 名（前 50 每日自动同步）`
-                      : `24h 物理落盘 · 30 天滚动窗口`;
+                      : `每次同步 24 小时 · 保留近 30 天`;
                 const followText = p.followsAuthor ? "已关注作者" : "未关注作者";
-                const quotaText = Number(p.dailyRefreshLimit || 1) > 10
-                    ? "不限刷新"
-                    : `今日剩余刷新 ${Number(p.dailyRefreshRemaining ?? 0)}/${Number(p.dailyRefreshLimit || 1)}`;
                 statusBox.innerHTML =
-                    `<div>已累计 <strong>${Number(p.accumulatedDays || 1)}/30</strong> 天 · ${followText} · ${quotaText}</div>` +
-                    `<div>${rankBadge}</div>`;
+                    `<div>已累计 <strong>${Number(p.accumulatedDays ?? 0)}/30</strong> 天 · ${followText}</div>` +
+                    `<div>${rankBadge}</div><div>${reportSyncTimes(state.dailyCacheStatus).join(" · ")}</div>`;
             } else {
-                statusBox.textContent = "默认 24 小时 · 单次加载 24h · 每日物理落盘 · 滚动保留 30 天。";
+                statusBox.textContent = "每次同步 24 小时 · 保留近 30 天";
             }
         }
         const focusEl = document.getElementById("unlockGuideFocusMsg");
@@ -2218,7 +2234,7 @@
                     focusEl.hidden = false;
                 } else if (focusPeriodCode && focusPeriodCode !== "HOURS_24") {
                     const label = PERIOD_META[focusPeriodCode]?.badgePrefix || focusPeriodCode;
-                    focusEl.textContent = `${label}暂未解锁：每日物理存储 24 小时数据，累计满对应天数后自动开放。`;
+                    focusEl.textContent = `${label}暂未解锁。完成同步的天数达到要求后即可查看。`;
                     focusEl.hidden = false;
                 } else {
                     focusEl.hidden = true;
@@ -2237,12 +2253,14 @@
         const followTxtEl = document.getElementById("unlockGuideFollowText");
         if (followEl && followTxtEl) {
             const followed = Boolean(p?.followsAuthor);
+            const authorId = encodeURIComponent(p?.authorAccountId || AUTHOR_ARCHIVE_ACCOUNT_ID);
             followEl.href = followed
-                ? "https://x.com/elidlicom"
-                : "https://x.com/intent/follow?screen_name=elidlicom";
+                ? `https://x.com/i/user/${authorId}`
+                : `https://x.com/intent/follow?user_id=${authorId}`;
+            const authorLabel = p?.authorHandle ? `@${p.authorHandle}` : "作者";
             followTxtEl.textContent = followed
-                ? "已关注 · 访问 @elidlicom 主页 ↗"
-                : "关注 @elidlicom ↗";
+                ? `已关注 · 访问 ${authorLabel} 主页 ↗`
+                : `关注 ${authorLabel} ↗`;
         }
         modal.hidden = false;
         syncBodyModalLock();
@@ -2302,7 +2320,7 @@
             status.snapshotAt ? `资料快照 ${fmtTime(status.snapshotAt)}` : "",
             status.latestMetricFetchedAt ? `指标最近采集 ${fmtTime(status.latestMetricFetchedAt)}（近24h，分批读数）`
                 : "指标最近采集时间未确认（近24h）",
-            status.lastCompletedAt ? `最近完整更新 ${fmtTime(status.lastCompletedAt)}` : "尚无完整更新记录",
+            ...reportSyncTimes(status),
             `近24h推文${status.timelineCovered ? "已覆盖" : "待补齐"} ${status.recentPosts} 条`,
             `收到的互动${status.inboundCovered ? "已覆盖" : "待补齐"} ${status.recentInbound} 条`,
             status.unattemptedMetricPosts === undefined ? `待补指标 ${status.pendingMetricPosts} 帖`
@@ -2315,10 +2333,46 @@
             parts.unshift(`后台刷新失败${background.error ? ` · ${background.error}` : ""}`);
         } else if (background?.state === "SUCCEEDED") {
             parts.unshift(`后台刷新完成${background.completedAt ? ` · ${fmtTime(background.completedAt)}` : ""}`);
+        } else if (background?.state === "PARTIAL") {
+            parts.unshift("后台已更新部分数据，仍待补齐");
+        } else if (background?.state === "CACHED") {
+            parts.unshift("本次复用已保存的报表");
         }
         el.textContent = parts.filter(Boolean).join(" · ");
         el.title = [el.textContent, status?.cycleStartedAt ? `本轮采集起点 ${fmtTime(status.cycleStartedAt)}` : ""].filter(Boolean).join(" · ");
         el.hidden = !el.textContent;
+    }
+
+    function followRateDisplay(report) {
+        const audit = report.followAudit || {};
+        const card = report.innerCircle?.shareCard || {};
+        const value = audit.followBackRatePct ?? card.followBackRatePct;
+        const sampled = Boolean(audit.followingsSampleTruncated);
+        const count = Number(audit.followingSampleCount || 0);
+        const unknown = Number(audit.unknownFollowBackCount || 0);
+        const label = sampled ? "样本回关率" : "关注回关率";
+        const scope = sampled ? `仅已采集的 ${count} 个关注对象` : "全部关注对象";
+        let rate = value == null || (sampled && count === 0) ? "--" : `${value}%`;
+        if (unknown > 0 && count > 0) {
+            const mutual = Number(audit.mutualCount || 0);
+            rate = `${(100 * mutual / count).toFixed(1)}%–${(100 * (mutual + unknown) / count).toFixed(1)}%`;
+        }
+        const detail = sampled || unknown > 0
+            ? `${label} ${rate}（${scope}${unknown > 0 ? `，${unknown} 个未知关系` : ""}）`
+            : audit.followBackRateLabel || card.followBackRateLabel || `${label} ${rate}`;
+        return { label, rate, scope, detail };
+    }
+
+    function reportSyncTimes(status) {
+        const completed = status?.lastCompletedAt ? Date.parse(status.lastCompletedAt) : NaN;
+        const next = status?.nextCheckAt ? Date.parse(status.nextCheckAt)
+            : status?.nextCheckAt === undefined && Number.isFinite(completed) ? completed + 3_600_000 : NaN;
+        const format = time => new Date(time).toLocaleString("zh-CN", {timeZone: "Asia/Shanghai", hour12: false});
+        return [
+            Number.isFinite(completed) ? `上次完整同步 ${format(completed)}` : "尚无完整同步记录",
+            Number.isFinite(next) ? `下次可检查更新 ${format(next)}` : "现在可检查更新",
+            ...(status?.canContinue ? ["本轮可继续补齐"] : [])
+        ];
     }
 
     function renderProfileHeader(report) {
@@ -2361,7 +2415,7 @@
         renderDailyCacheStatus(report);
 
         // 头像与主页基本资料
-        const isAuthorSelf = String(p.username || "").replace(/^@+/, "").toLowerCase() === "elidlicom";
+        const isAuthorSelf = state.authStatus?.ownerAllPermissions === true && String(state.authStatus.user?.id) === String(p.id);
         const heroBannerUrl = p.bannerUrl || (isAuthorSelf ? AUTHOR_BANNER_URL : "");
         applyCoverBanner($("profileCover"), heroBannerUrl);
         const heroEl = $("profileHero");
@@ -2378,17 +2432,17 @@
         const cleanBio = (p.bio || "").replace(/[\u200B-\u200D\uFEFF]/g, "").trim();
         $("profileBio").textContent = cleanBio;
         $("profileBio").hidden = !cleanBio;
-        $("visitXProfileLink").href = `https://x.com/${encodeURIComponent(p.username)}`;
+        $("visitXProfileLink").href = p.id ? `https://x.com/i/user/${encodeURIComponent(p.id)}`
+            : `https://x.com/${encodeURIComponent(p.username)}`;
         const hs = Number(act.activityHealthScore || 0);
         $("healthScoreChip").textContent = hs < 0 ? "健康 --" : `健康 ${hs}`;
         $("healthScoreChip").className = `health-score-chip ${hs < 0 ? "" : hs >= 50 ? "judge-good" : "judge-warn"}`;
 
         $("profileFollowingNum").textContent = fmtNum(p.followingCount);
         $("profileFollowersNum").textContent = fmtNum(p.followersCount);
-        const followBackRateComplete = audit.followBackRateComplete ??
-            (!audit.followersSampleTruncated && !audit.followingsSampleTruncated && Number(audit.unknownFollowBackCount || 0) === 0);
-        $("profileMutualRateNum").textContent = `${followBackRateComplete ? "" : "~"}${audit.followBackRatePct}%`;
-        $("profileMutualRateNum").title = audit.followBackRateLabel || `${followBackRateComplete ? "关注" : "样本"}回关率 ${audit.followBackRatePct}%`;
+        const followRate = followRateDisplay(report);
+        $("profileMutualRateNum").textContent = `${audit.followingsSampleTruncated ? "样本 " : ""}${followRate.rate}`;
+        $("profileMutualRateNum").title = followRate.detail;
         $("profileTotalTweetsNum").textContent = fmtNum(p.totalPostsCount);
 
         const selfId = stableUserId(state.authStatus?.user);
@@ -2420,8 +2474,8 @@
                 /^单次加载 24 小时并已完成物理落盘（当前滚动保留近 30 天共 \d+ 条动态、\d+ 条互动）(?:（@\w+ 互动第 \d+ 名·已解锁全时间窗口）)?$/.test(rawNotice) ||
                 /^每日物理存储模式：\d+ 条动态、\d+ 条互动已落盘。(?:你位列 @\w+ 互动前 \d+（第 \d+ 名），每日自动同步最近 24 小时并落盘；)?单次仅加载 24 小时，动态保留近 30 天窗口数据。$/.test(rawNotice);
             const canContinueSync = Boolean(status?.canContinue);
-            const dataIncomplete = canContinueSync && (status?.timelineCovered === false || status?.inboundCovered === false ||
-                (pendingMetrics > 0 && (!Number.isFinite(unattemptedMetrics) || unattemptedMetrics > 0)));
+            const dataIncomplete = status?.timelineCovered === false || status?.inboundCovered === false ||
+                (canContinueSync && pendingMetrics > 0 && (!Number.isFinite(unattemptedMetrics) || unattemptedMetrics > 0));
             const metricsUnavailable = !canContinueSync && pendingMetrics > 0 && unattemptedMetrics === 0;
             const followRateComplete = audit.followBackRateComplete ??
                 (!audit.followersSampleTruncated && !audit.followingsSampleTruncated && Number(audit.unknownFollowBackCount || 0) === 0);
@@ -2456,7 +2510,7 @@
                         }
                     });
                 }
-                syncDetails.classList?.toggle?.("is-attention", isDemo || needsAttention || dataIncomplete);
+                syncDetails.classList?.toggle?.("is-attention", isDemo || needsAttention || (canContinueSync && dataIncomplete));
                 const attentionKey = needsAttention && !isDemo
                     ? [rawNotice, shortCoverage, summaryText, Boolean(status?.lastAttemptDegraded),
                         audit.followersSampleTruncated, audit.followingsSampleTruncated,
@@ -2730,7 +2784,7 @@
         return "未互关";
     }
 
-    function buildPeerDetailHtml(report, item) {
+    function buildPeerDetailHtml(report, item, ambiguousHandle = false) {
         const me = report.profile;
         const peer = item.peer;
         const myRaw = Number(item.myRawCommentCount || 0);
@@ -2765,9 +2819,9 @@
             ${item.recentSnippet ? `<div class="snippet-quote">${escapeHtml(item.recentSnippet)}</div>` : ""}
             <div class="peer-detail-actions">
                 ${replyBtn}
-                <a class="x-outline-pill sm" href="${escapeHtml(peerLatestPostsUrl(peer.username))}" target="_blank" rel="noopener noreferrer">最新推文 ↗</a>
-                <a class="x-outline-pill sm" href="${escapeHtml(peerDialogueUrl(me.username, peer.username))}" target="_blank" rel="noopener noreferrer">对话 ↗</a>
-                <a class="x-outline-pill sm" href="https://x.com/${encodeURIComponent(peer.username)}" target="_blank" rel="noopener noreferrer">主页 ↗</a>
+                ${ambiguousHandle ? "" : `<a class="x-outline-pill sm" href="${escapeHtml(peerLatestPostsUrl(peer.username))}" target="_blank" rel="noopener noreferrer">最新推文 ↗</a>
+                <a class="x-outline-pill sm" href="${escapeHtml(peerDialogueUrl(me.username, peer.username))}" target="_blank" rel="noopener noreferrer">对话 ↗</a>`}
+                ${peer.id || !ambiguousHandle ? `<a class="x-outline-pill sm" href="https://x.com/${peer.id ? "i/user/" + encodeURIComponent(peer.id) : encodeURIComponent(peer.username)}" target="_blank" rel="noopener noreferrer">主页 ↗</a>` : ""}
             </div>
         </div>`;
     }
@@ -2952,12 +3006,24 @@
         const remainPeers = Math.max(0, list.length - visiblePeers.length);
         const meUsername = report.profile.username;
         const expandedKey = (state.expandedPeerUsername || "").toLowerCase();
+        const countsByHandle = new Map();
+        for (const { peer } of report.interactions.peerStats || []) {
+            const handle = peer.username.toLowerCase();
+            countsByHandle.set(handle, (countsByHandle.get(handle) || 0) + 1);
+        }
 
         const rowsMarkup = visiblePeers
             .map((item) => {
                 const u = item.peer;
-                const isOpen = expandedKey === u.username.toLowerCase();
+                const handle = u.username.toLowerCase();
+                const key = u.id ? `id:${u.id}` : handle;
+                const isOpen = expandedKey === key;
+                const ambiguousHandle = countsByHandle.get(handle) > 1;
                 const meta = getPeerStatusMeta(item, meUsername, state.peerRelFilter);
+                if (ambiguousHandle && activeFilter !== "UNREPLIED_POST") {
+                    meta.actionText = "主页";
+                    meta.actionUrl = u.id ? `https://x.com/i/user/${encodeURIComponent(u.id)}` : "";
+                }
                 const actionCls = meta.primary ? "x-blue-pill sm" : "x-outline-pill sm";
                 const redundantPrimaryTag =
                     (activeFilter === "MUTUAL" && meta.label === "互相评论") ||
@@ -2969,14 +3035,14 @@
                 const extraTagHtml = meta.extraTag
                     ? `<span class="mini-tag amber">${escapeHtml(meta.extraTag)}</span>`
                     : "";
-                return `<div class="peer-item ${isOpen ? "is-open" : ""}" data-list-key="${escapeHtml(u.username.toLowerCase())}">
-                    <div class="x-user-row clickable peer-row" data-peer-handle="${escapeHtml(u.username)}" role="button" tabindex="0" aria-expanded="${isOpen}">
+                return `<div class="peer-item ${isOpen ? "is-open" : ""}" data-list-key="${escapeHtml(key)}">
+                    <div class="x-user-row clickable peer-row" data-peer-handle="${escapeHtml(u.username)}" data-peer-key="${escapeHtml(key)}" role="button" tabindex="0" aria-expanded="${isOpen}">
                         ${avatarHtml(u, "md")}
                         <div class="user-row-main">
                             <div class="peer-row-line">
                                 <span class="peer-name" data-i18n-ignore>${escapeHtml(u.displayName)}</span>
                                 ${verifiedSvgHtml(u.verified)}
-                                <span class="user-handle-muted" data-i18n-ignore>@${escapeHtml(u.username)}</span>
+                                <span class="user-handle-muted" data-i18n-ignore>@${escapeHtml(u.username)}${ambiguousHandle ? ` · ID ${escapeHtml(u.id || "—")}` : ""}</span>
                                 ${mainTagHtml}
                                 ${extraTagHtml}
                             </div>
@@ -2984,10 +3050,10 @@
                                 去评 <strong>${item.myRepliesToPeer}</strong> · 来评 <strong>${item.peerRepliesToMe}</strong> · ${escapeHtml(followRelationText(item, report))}
                             </div>
                         </div>
-                        <a class="${actionCls} peer-ext-link" href="${escapeHtml(meta.actionUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(meta.actionText)} ↗</a>
+                        ${meta.actionUrl ? `<a class="${actionCls} peer-ext-link" href="${escapeHtml(meta.actionUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(meta.actionText)} ↗</a>` : ""}
                         <svg class="peer-chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="M3.543 8.96l1.414-1.42L12 14.59l7.043-7.05 1.414 1.42L12 17.41 3.543 8.96z"/></svg>
                     </div>
-                    ${isOpen ? buildPeerDetailHtml(report, item) : ""}
+                    ${isOpen ? buildPeerDetailHtml(report, item, ambiguousHandle) : ""}
                 </div>`;
             })
             .join("");
@@ -3013,7 +3079,7 @@
         });
 
         const toggleRow = (row) => {
-            const handle = row.dataset.peerHandle;
+            const handle = row.dataset.peerKey || row.dataset.peerHandle;
             state.expandedPeerUsername =
                 (state.expandedPeerUsername || "").toLowerCase() === handle.toLowerCase() ? null : handle;
             renderPeerList(report);
@@ -3294,6 +3360,153 @@
         return body;
     }
 
+    async function assistantPublishRequestId(ownerId, operation, ...content) {
+        const identity = new TextEncoder().encode(JSON.stringify([ownerId, operation, ...content]));
+        const digest = await crypto.subtle.digest("SHA-256", identity);
+        return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+    }
+
+    function assistantPublishNotice(receipt) {
+        switch (receipt?.publicationMode) {
+            case "QUOTE": return "已引用原帖发布";
+            case "QUOTE_LINK": return "已发布，并附上原帖链接";
+            case "STANDALONE_FALLBACK": return "原帖引用受限，已作为独立推文发布";
+            default: return "发布已确认";
+        }
+    }
+
+    async function publishAssistantDraftNow(draftId, quoteSource) {
+        const isCurrent = captureUserScope();
+        if (!isCurrent()) return;
+        const draft = await saveAssistantDraftEditor();
+        if (!isCurrent() || draft?.id !== draftId) return;
+        try {
+            const key = await assistantPublishRequestId(stableUserId(state.authStatus.user), "draft", draftId, draft.version, quoteSource);
+            if (!isCurrent()) return;
+            const receipt = await runAssistantMutation("publish-now", `/drafts/${encodeURIComponent(draftId)}/publish-now`,
+                { version: draft.version, quoteSource, clientRequestId: key }, 60000);
+            if (receipt && isCurrent()) showToast(assistantPublishNotice(receipt));
+        } catch (error) {
+            if (isCurrent()) setContentAssistantError(formatLocalizedFetchError(error, "发布请求未完成"));
+        }
+    }
+
+    async function publishRepostPreviewItem(id) {
+        const isCurrentUser = captureUserScope();
+        if (!isCurrentUser() || !id || repostPreviewState.publishingIds.has(id)) return;
+        const found = repostPreviewState.items.find((item) => String(item.material?.id || "") === id);
+        if (!found || quoteDeliveryStatus(found.decision)) return;
+        const comment = getRepostItemCommentText(id).trim();
+        if (!comment) { showToast("转发附文不能为空"); return; }
+        const quoteId = resolveRepostQuoteTweetId(found?.material || { id });
+        if (!quoteId) { showToast("该素材缺少有效原帖推文 ID，无法引用转发"); return; }
+        const attemptKey = quoteAttemptKey(found.material);
+        const pending = repostPreviewState.pendingQuotes.get(attemptKey);
+        if (pending) {
+            markQuoteAwaitingReceipt(found, pending);
+            renderRepostPreviewTimeline(id);
+            return;
+        }
+        const sourceUrl = found ? resolveRepostMaterialUrl(found.material) : "";
+        const beforeSend = found.decision;
+        const sourceKey = repostPreviewState.sourceKey;
+        const token = repostPreviewState.requestToken;
+        const isCurrent = () => isCurrentUser() && token === repostPreviewState.requestToken;
+        const currentCard = () => isCurrentUser() && sourceKey === repostPreviewState.sourceKey
+            && repostPreviewState.items.find(item => String(item.material?.id || "") === id);
+        const submitting = repostPreviewState.publishingIds;
+        submitting.add(id);
+        let attempt;
+        renderRepostPreviewTimeline(id);
+        try {
+            const key = await assistantPublishRequestId(stableUserId(state.authStatus.user), "manual-quote", id, quoteId, comment);
+            if (!isCurrent()) return;
+            attempt = { key, comment, afterRevision: Number(beforeSend?.receiptRevision || 0) };
+            repostPreviewState.pendingQuotes.set(attemptKey, attempt);
+            const receipt = await contentAssistantRequest(`/sources/${encodeURIComponent(sourceKey)}/publish-quote`,
+                { materialId: id, sourceUrl, commentText: comment, clientRequestId: key }, 60000);
+            if (!receipt?.publishedTweetId && !receipt?.publishedTweetUrl) throw new Error("发布结果待核实");
+            forgetQuoteAttempt(attemptKey, attempt);
+            const currentItem = currentCard();
+            if (currentItem) {
+                currentItem.decision = {
+                    ...currentItem.decision, evaluated: true, wouldAutoRepost: true,
+                    persistedStatus: "PUBLISHED", decisionCode: "PUBLISHED", receiptRevision: Number(receipt.receiptRevision || 0),
+                    publishedTweetUrl: receipt?.publishedTweetUrl || currentItem.decision?.publishedTweetUrl || "",
+                    publicationMode: receipt?.publicationMode, publishedText: receipt?.text, commentText: comment
+                };
+            }
+            if (isCurrent()) showToast(assistantPublishNotice(receipt));
+        } catch (error) {
+            const currentItem = currentCard();
+            const ambiguous = !error.httpStatus || error.httpStatus >= 500;
+            if (attempt && !ambiguous) {
+                forgetQuoteAttempt(attemptKey, attempt);
+                if (currentItem?.decision?.pendingRequest?.key === attempt.key) currentItem.decision = beforeSend;
+            }
+            if (attempt && currentItem && (ambiguous || error.httpStatus === 409)) {
+                if (ambiguous) {
+                    markQuoteAwaitingReceipt(currentItem, attempt);
+                    renderRepostPreviewTimeline(id);
+                }
+                try { await refreshQuoteReceipt(id); } catch (_) { /* Keep the displayed receipt until a read succeeds. */ }
+            }
+            if (isCurrent() && !quoteDeliveryStatus(currentItem?.decision)) showToast(formatLocalizedFetchError(error, "引用发布请求未完成"));
+        } finally {
+            submitting.delete(id);
+            if (currentCard()) renderRepostPreviewTimeline(id);
+        }
+    }
+
+    function quoteAttemptKey(material) {
+        return JSON.stringify([stableUserId(state.authStatus?.user), resolveRepostQuoteTweetId(material) || material.id]);
+    }
+
+    function forgetQuoteAttempt(key, attempt) {
+        const active = repostPreviewState.pendingQuotes.get(key);
+        if (active?.key === attempt.key && active.afterRevision === attempt.afterRevision) repostPreviewState.pendingQuotes.set(key, null);
+    }
+
+    function markQuoteAwaitingReceipt(row, attempt) {
+        if (quoteDeliveryStatus(row.decision) && Number(row.decision?.receiptRevision || 0) > attempt.afterRevision) {
+            row.decision = { ...row.decision, pendingRequest: attempt };
+            return;
+        }
+        row.decision = { ...row.decision, persistedStatus: "UNCERTAIN", decisionCode: "UNCERTAIN",
+            receiptRevision: attempt.afterRevision, pendingRequest: attempt, publishedText: "", commentText: attempt.comment };
+    }
+
+    async function refreshQuoteReceipt(id) {
+        const token = repostPreviewState.requestToken;
+        const account = captureUserScope();
+        const entry = () => repostPreviewState.items.find(item => String(item.material?.id || "") === id);
+        const original = entry();
+        if (!original) return;
+        const before = original.decision;
+        const key = quoteAttemptKey(original.material);
+        const attempt = repostPreviewState.pendingQuotes.get(key);
+        const result = await contentAssistantRequest(`/sources/${encodeURIComponent(repostPreviewState.sourceKey)}/repost-preview`,
+            { materialId: id, receiptOnly: true, ...(attempt ? { clientRequestId: attempt.key } : {}) });
+        if (!account() || token !== repostPreviewState.requestToken || String(result?.material?.id) !== id || !result.preview) return;
+        if (String(result.owner?.accountId || "") !== stableUserId(state.authStatus?.user)) return;
+        const row = entry();
+        if (!row) return;
+        const next = result.preview;
+        const active = repostPreviewState.pendingQuotes.get(key);
+        if (active && (active.key !== attempt?.key || active.afterRevision !== attempt?.afterRevision)) return;
+        let pendingRequest = null;
+        if (attempt) {
+            const matched = Number(next.requestReceiptRevision || 0) > attempt.afterRevision;
+            if (!matched && !(quoteDeliveryStatus(next) && Number(next.receiptRevision || 0) > attempt.afterRevision)) return;
+            if (matched) forgetQuoteAttempt(key, attempt);
+            else pendingRequest = active;
+        }
+        const previous = row.decision?.pendingRequest && !active ? null : row.decision;
+        row.decision = preservePublishedQuote(previous, { ...row.decision, ...next, pendingRequest,
+            persistedStatus: next.persistedStatus || "", decisionCode: next.decisionCode || "PENDING_EVAL" }, row.decision !== before);
+        renderRepostPreviewTimeline(id);
+    }
+
     function setContentAssistantError(message) {
         const el = $("contentAssistantError");
         if (!el) return;
@@ -3301,6 +3514,7 @@
         el.hidden = !message;
     }
 
+    const PENDING_QUOTE_STORAGE_PREFIX = "xops_pending_quote:";
     const repostPreviewState = {
         requestToken: 0,
         sourceKey: "",
@@ -3316,10 +3530,75 @@
         evaluatingIds: new Set(),
         rewritingIds: new Set(),
         publishingIds: new Set(),
+        pendingQuotes: browserRecords(PENDING_QUOTE_STORAGE_PREFIX),
         expandedIds: new Set(),
-        editedComments: new Map(),
-        editedRewrites: new Map()
+        editedComments: sourcePreviewDrafts("quote"),
+        editedRewrites: sourcePreviewDrafts("rewrite")
     };
+
+    function sourcePreviewDrafts(kind) {
+        const records = browserRecords("xops_source_draft:");
+        function context(id) {
+            const owner = String(repostPreviewState.owner?.accountId || "");
+            if (!owner || owner !== stableUserId(state.authStatus?.user)) return null;
+            const row = repostPreviewState.items.find(item => String(item.material?.id || "") === id);
+            if (!row) return null;
+            const m = row.material;
+            const post = resolveRepostQuoteTweetId(m) || id;
+            const author = m.authorId || repostPreviewState.source?.authorId || repostPreviewState.sourceKey;
+            const key = JSON.stringify([owner, author, post, kind]);
+            const original = m.sourceFingerprint || JSON.stringify([m.text, m.quotedText, m.articleText]);
+            return { key, original, row, owner };
+        }
+        function record(ctx) {
+            if (!ctx) return null;
+            const stored = records.get(ctx.key);
+            return stored?.original === ctx.original && typeof stored.text === "string" ? stored : null;
+        }
+        return {
+            get: id => record(context(id))?.text,
+            has: id => record(context(id)) !== null,
+            reference: id => record(context(id))?.reference,
+            set(id, text) {
+                const ctx = context(id);
+                if (!ctx) return;
+                const entry = { original: ctx.original, text };
+                if (kind === "rewrite") {
+                    const rw = ctx.row.rewrite;
+                    entry.reference = record(ctx)?.reference || {
+                        ownerAccountId: ctx.owner, materialId: id, recordVersion: Number(rw?.savedDraftVersion || 0),
+                        ...(rw?.previewId ? { previewId: rw.previewId } : {})
+                    };
+                }
+                records.set(ctx.key, entry);
+            },
+            delete(id) {
+                const ctx = context(id);
+                if (ctx && record(ctx)) records.set(ctx.key, null);
+            },
+            clear() { records.clearMemory(); }
+        };
+    }
+
+    function browserRecords(prefix) {
+        const unsaved = new Map();
+        return {
+            get(key) {
+                if (unsaved.has(key)) return unsaved.get(key);
+                try { return JSON.parse(localStorage.getItem(prefix + key)); } catch (_) { return null; }
+            },
+            set(key, entry) {
+                try {
+                    if (entry === null) localStorage.removeItem(prefix + key);
+                    else localStorage.setItem(prefix + key, JSON.stringify(entry));
+                    unsaved.delete(key);
+                } catch (_) {
+                    unsaved.set(key, entry);
+                }
+            },
+            clearMemory() { unsaved.clear(); }
+        };
+    }
 
     const DEFAULT_GENERATION_TARGET_SPEC = "chatgpt|gpt-6.2-astra";
     const DEFAULT_GENERATION_EFFORT = "medium";
@@ -3653,38 +3932,42 @@
         return payload;
     }
 
-    function resolveRepostMaterialUrl(material = {}) {
-        const handle = String(material.username || repostPreviewState.source?.username || "").replace(/^@+/, "");
+    function resolveRepostMaterialUrl(material = {}, fallbackUsername = repostPreviewState.source?.username) {
+        const handle = String(material.username || fallbackUsername || "").replace(/^@+/, "");
         const id = String(material.id || "").trim();
-        const fallback = /^[0-9]+$/.test(id)
-            ? (handle ? `https://x.com/${encodeURIComponent(handle)}/status/${id}` : `https://x.com/i/status/${id}`)
-            : "";
-        const raw = String(material.sourceUrl || fallback).trim();
+        const raw = String(material.sourceUrl || "").trim();
+        if (/^[0-9]{2,20}$/.test(id) && resolveRepostQuoteTweetId({ sourceUrl: raw }) !== id) {
+            return `https://x.com/${/^[A-Za-z0-9_]{1,15}$/.test(handle) ? handle : "i"}/status/${id}`;
+        }
         return raw && typeof safeHttpUrl === "function" ? safeHttpUrl(raw, "") : raw;
     }
 
     function resolveRepostQuoteTweetId(material = {}) {
         const id = String(material?.id || "").trim();
         if (/^[0-9]{2,20}$/.test(id)) return id;
-        const match = String(material?.sourceUrl || "").match(/\/status\/([0-9]{2,20})(?:[/?#]|$)/i);
+        const match = String(material?.sourceUrl || "").trim().match(/^https?:\/\/(?:(?:www|mobile)\.)?(?:x|twitter)\.com\/(?:[A-Za-z0-9_]{1,15}\/status|i\/web\/status)\/([0-9]{2,20})(?:\/(?:photo|video)\/[0-9]+)?\/?(?:[?#]\S*)?$/i);
         return match ? match[1] : "";
     }
 
     function getRepostItemCommentText(materialId) {
         const id = String(materialId || "");
+        const found = repostPreviewState.items.find((it) => String(it.material?.id || "") === id);
+        if (quoteDeliveryStatus(found?.decision)) return String(found.decision.publishedText || found.decision.commentText || "");
         if (repostPreviewState.editedComments.has(id)) {
             return String(repostPreviewState.editedComments.get(id) || "");
         }
-        const found = repostPreviewState.items.find((it) => String(it.material?.id || "") === id);
         return String(found?.decision?.commentText || "");
     }
 
     function getRewriteItemText(materialId) {
+        const ownerId = repostPreviewState.owner?.accountId;
+        if (ownerId && String(ownerId) !== String(state.authStatus?.user?.id || "")) return "";
         const id = String(materialId || "");
+        const found = repostPreviewState.items.find((it) => String(it.material?.id || "") === id);
+        if (["PUBLISHED", "SENDING", "UNCERTAIN"].includes(found?.rewrite?.status)) return String(found.rewrite.rewrittenText || "");
         if (repostPreviewState.editedRewrites.has(id)) {
             return String(repostPreviewState.editedRewrites.get(id) || "");
         }
-        const found = repostPreviewState.items.find((it) => String(it.material?.id || "") === id);
         return String(found?.rewrite?.rewrittenText || "");
     }
 
@@ -3742,10 +4025,15 @@
     }
 
     function repostDecisionBadgeMeta(decision, isEvaluating = false) {
+        switch (quoteDeliveryStatus(decision)) {
+            case "UNCERTAIN": return { cls: "error", label: "待核实" };
+            case "SENDING": return { cls: "running", label: "发送中" };
+            case "PUBLISHED": return { cls: "ok", label: assistantPublishNotice(decision) };
+        }
         if (isEvaluating) return { cls: "running", label: "判定中…" };
         const code = String(decision?.decisionCode || "PENDING_EVAL").toUpperCase();
         switch (code) {
-            case "PUBLISHED": return { cls: "ok", label: "已转发" };
+            case "PUBLISHED": return { cls: "ok", label: assistantPublishNotice(decision) };
             case "WOULD_REPOST": return { cls: "ok", label: "会转发" };
             case "SKIP_AUTHOR_COOLDOWN": return { cls: "running", label: "账号 CD" };
             case "SKIP_NOT_FIT": return { cls: "running", label: "不契合" };
@@ -3829,9 +4117,9 @@
             for (const it of items) {
                 if (!it) continue;
                 const dec = (it.decision ||= {});
-                if (dec.persistedStatus === "PUBLISHED") continue;
+                if (quoteDeliveryStatus(dec)) continue;
                 const alreadyEvaluated = Boolean(dec.evaluated);
-                const exemptAuthorCd = isDirectPassRepostCategory(dec.category);
+                const exemptAuthorCd = !dec.strictSixteenHourAuthorLock && isDirectPassRepostCategory(dec.category);
                 const contentPass = dec.contentPass !== undefined
                     ? Boolean(dec.contentPass)
                     : Boolean((dec.viralPass || exemptAuthorCd) && dec.accountFit);
@@ -3872,8 +4160,8 @@
         for (let i = items.length - 1; i >= 0; i--) {
             const it = items[i];
             const dec = it?.decision;
-            if (!dec || !dec.evaluated || dec.persistedStatus === "PUBLISHED") continue;
-            const exemptAuthorCd = isDirectPassRepostCategory(dec.category);
+            if (!dec || !dec.evaluated || quoteDeliveryStatus(dec)) continue;
+            const exemptAuthorCd = !dec.strictSixteenHourAuthorLock && isDirectPassRepostCategory(dec.category);
             const persisted = String(dec.persistedStatus || "");
             const guardPersisted = ["SKIPPED_DUPLICATE", "SKIPPED_LIMIT", "SKIPPED_COOLDOWN"]
                 .includes(persisted) || (!exemptAuthorCd && persisted === "SKIPPED_AUTHOR_COOLDOWN");
@@ -4050,10 +4338,10 @@
 
         const mainText = String(mat.articleText || mat.text || "");
         const rankNum = Number(rw.rank || displayRank || 0);
-        const isPublished = String(rw.persistedStatus || "").toUpperCase() === "PUBLISHED" || String(rw.status || "").toUpperCase() === "PUBLISHED";
+        const isPublished = !rw.unsentPreview && (rw.persistedStatus === "PUBLISHED" || rw.status === "PUBLISHED");
         const badgeMeta = isRewriting
             ? { cls: "running", label: "生成中…" }
-            : (isPublished
+            : rw.unsentPreview ? { cls: "muted", label: "未发送预览" } : (isPublished
                 ? { cls: "ok", label: "已洗稿" }
                 : (rw.evaluated ? { cls: rw.suitable ? "ok" : "running", label: rw.suitable ? "可洗稿" : "待调优" } : { cls: "ok", label: "会洗稿" }));
         const scoreText = rw.evaluated && Number(rw.suitabilityScore) > 0 ? `适格 ${Number(rw.suitabilityScore)}` : "";
@@ -4075,21 +4363,21 @@
                 <div class="repost-owner-row">
                     <div class="repost-owner-identity">${ownerAvatar}<strong>${escapeHtml(owner.displayName)}</strong><span>@${escapeHtml(owner.username)}</span></div>
                 </div>
-                <textarea class="repost-preview-comment is-loading" rows="2" readonly>生成洗稿中…</textarea>
+                <textarea class="repost-preview-comment is-loading" rows="2" readonly placeholder="生成洗稿中…"></textarea>
             </div>`;
-        } else if (rewriteVal) {
+        } else if (rewriteVal || repostPreviewState.editedRewrites.has(id)) {
             previewSectionHtml = `<div class="timeline-owner-quote-box">
                 <div class="repost-owner-row">
                     <div class="repost-owner-identity">${ownerAvatar}<strong>${escapeHtml(owner.displayName)}</strong><span>@${escapeHtml(owner.username)}</span></div>
                     ${pubTweetUrl ? `<a class="link-inline-btn" href="${pubTweetUrl}" target="_blank" rel="noopener noreferrer">查看已发推文 ↗</a>` : ""}
                 </div>
-                <textarea class="repost-preview-comment${isRewriting ? " is-loading" : ""}" rows="6" maxlength="600" data-rewrite-text-input="${escapeHtml(id)}" aria-label="洗稿内容预览"${isRewriting ? " readonly" : ""}>${escapeHtml(rewriteVal)}</textarea>
+                <textarea class="repost-preview-comment${isRewriting ? " is-loading" : ""}" rows="6" maxlength="600" data-rewrite-text-input="${escapeHtml(id)}" aria-label="洗稿内容预览"${isRewriting || isPublished ? " readonly" : ""}>${escapeHtml(rewriteVal)}</textarea>
                 <div class="repost-preview-actions">
                     <button type="button" class="x-outline-pill sm" data-rewrite-regen-item="${escapeHtml(id)}"${isRewriting ? " disabled" : ""}>${isRewriting ? "生成中…" : "换一版"}</button>
                     <div class="repost-preview-actions-right">
                         <button type="button" class="x-outline-pill sm" data-rewrite-copy-item="${escapeHtml(id)}"${isRewriting ? " disabled" : ""}>复制正文</button>
                         <a class="x-outline-pill sm" data-rewrite-intent-link="${escapeHtml(id)}" href="${intentHref}" target="_blank" rel="noopener noreferrer">去 X 发帖 ↗</a>
-                        <button type="button" class="x-blue-pill sm" data-rewrite-schedule-item="${escapeHtml(id)}"${isRewriting ? " disabled" : ""}>转入定时</button>
+                        <button type="button" class="x-blue-pill sm" data-rewrite-schedule-item="${escapeHtml(id)}"${isRewriting ? " disabled" : ""}>转入排期草稿</button>
                     </div>
                 </div>
             </div>`;
@@ -4134,7 +4422,7 @@
         const isPublishing = Boolean(repostPreviewState.publishingIds?.has(id));
         const willRepost = Boolean(dec.evaluated && dec.wouldAutoRepost);
         const isFocused = Boolean(id && id === repostPreviewState.focusedMaterialId);
-        const isExpanded = willRepost || isFocused || repostPreviewState.expandedIds.has(id);
+        const isExpanded = willRepost || isFocused || repostPreviewState.expandedIds.has(id) || repostPreviewState.editedComments.has(id);
         const badge = repostDecisionBadgeMeta(dec, isEvaluating);
         const dualScore = repostDualScoreText(dec, repostPreviewState.source);
         const scoreBreakdown = repostScoreBreakdownText(dec);
@@ -4177,6 +4465,8 @@
             ? `<div class="author-timeline-reason${reasonCls}">${escapeHtml(reasonText)}</div>`
             : "";
 
+        const rewrite = item.rewrite;
+        const rejectedRewrite = repostPreviewState.filterMode === "ALL" && rewrite?.evaluated && rewrite.status === "SKIPPED" && !rewrite.suitable;
         const owner = resolveRepostOwnerIdentity(repostPreviewState.owner);
         const ownerAvatar = typeof avatarHtml === "function"
             ? avatarHtml({ username: owner.username, displayName: owner.displayName, avatarUrl: owner.avatarUrl }, "sm")
@@ -4185,7 +4475,20 @@
         const composedHref = buildRepostIntentHref([commentVal.trim(), sourceUrl].filter(Boolean).join("\n"));
 
         let quoteSectionHtml = "";
-        if (isEvaluating && !commentVal) {
+        const delivery = quoteDeliveryStatus(dec) || (isPublishing ? "SENDING" : "");
+        if (delivery) {
+            const uncertain = delivery === "UNCERTAIN";
+            const final = delivery === "PUBLISHED";
+            quoteSectionHtml = `<div class="timeline-owner-quote-box">
+                ${commentVal ? `<p class="author-timeline-text" data-i18n-ignore>${escapeHtml(commentVal)}</p>` : ""}
+                ${uncertain ? '<p class="author-timeline-reason" role="status">发布结果待核实，请先查看发布记录。</p>' : ""}
+                <div class="repost-preview-actions">
+                    <button type="button" class="x-blue-pill sm" data-repost-publish-item="${escapeHtml(id)}" disabled>${uncertain ? "待核实" : final ? "已发布" : "发送中…"}</button>
+                    ${!final && !isPublishing ? `<button type="button" class="x-outline-pill sm" data-repost-refresh-receipt="${escapeHtml(id)}">刷新回执</button>` : ""}
+                    ${uncertain ? `<button type="button" class="x-outline-pill sm" data-repost-review-item="${escapeHtml(id)}">查看待核实记录</button>` : ""}
+                    ${commentVal ? `<button type="button" class="x-outline-pill sm" data-repost-copy-item="${escapeHtml(id)}">复制附文</button>` : ""}
+                </div></div>`;
+        } else if (isEvaluating && !commentVal) {
             quoteSectionHtml = `<div class="timeline-owner-quote-box">
                 <div class="repost-owner-row">
                     <div class="repost-owner-identity">${ownerAvatar}<strong>${escapeHtml(owner.displayName)}</strong><span>@${escapeHtml(owner.username)}</span></div>
@@ -4197,12 +4500,11 @@
                 <span class="timeline-skip-quote-snippet">重新生成</span>
                 <span>↻</span>
             </button>`;
-        } else if (commentVal) {
+        } else if (commentVal || repostPreviewState.editedComments.has(id)) {
             if (isExpanded) {
                 quoteSectionHtml = `<div class="timeline-owner-quote-box">
                     <div class="repost-owner-row">
                         <div class="repost-owner-identity">${ownerAvatar}<strong>${escapeHtml(owner.displayName)}</strong><span>@${escapeHtml(owner.username)}</span></div>
-                        ${pubTweetUrl ? `<a class="link-inline-btn" href="${pubTweetUrl}" target="_blank" rel="noopener noreferrer">查看已发推文 ↗</a>` : ""}
                     </div>
                     <textarea class="repost-preview-comment${isEvaluating ? " is-loading" : ""}" rows="6" maxlength="400" data-repost-comment-input="${escapeHtml(id)}" aria-label="转发附文预览"${isEvaluating ? " readonly" : ""}>${escapeHtml(commentVal)}</textarea>
                     <div class="repost-preview-actions">
@@ -4210,7 +4512,7 @@
                         <div class="repost-preview-actions-right">
                             <button type="button" class="x-outline-pill sm" data-repost-copy-item="${escapeHtml(id)}"${isEvaluating || isPublishing ? " disabled" : ""}>复制附文</button>
                             <a class="x-outline-pill sm" data-repost-intent-link="${escapeHtml(id)}" href="${composedHref}" target="_blank" rel="noopener noreferrer">去 X 转发 ↗</a>
-                            <button type="button" class="x-outline-pill sm" data-repost-schedule-item="${escapeHtml(id)}"${isEvaluating || isPublishing ? " disabled" : ""}>转入定时</button>
+                            <button type="button" class="x-outline-pill sm" data-repost-schedule-item="${escapeHtml(id)}"${isEvaluating || isPublishing ? " disabled" : ""}>转入排期草稿</button>
                             <button type="button" class="x-blue-pill sm" data-repost-publish-item="${escapeHtml(id)}"${isEvaluating || isPublishing ? " disabled" : ""}>${isPublishing ? "发布中…" : "立即引用"}</button>
                         </div>
                     </div>
@@ -4247,6 +4549,7 @@
                     <span class="assistant-state ${badge.cls}">${escapeHtml(badge.label)}</span>
                     ${dualScore ? `<span class="timeline-dual-score"${scoreBreakdown ? ` title="${escapeHtml(scoreBreakdown)}"` : ""}>${escapeHtml(dualScore)}</span>` : ""}
                     ${evalTriggerBtn}
+                    ${pubTweetUrl ? `<a class="link-inline-btn" href="${escapeHtml(pubTweetUrl)}" target="_blank" rel="noopener noreferrer">查看已发推文 ↗</a>` : ""}
                     ${sourceUrl ? `<a class="link-inline-btn" href="${sourceUrl}" target="_blank" rel="noopener noreferrer">原帖 ↗</a>` : ""}
                 </div>
             </div>
@@ -4254,6 +4557,9 @@
             ${quotedSubHtml}
             ${metricParts.length ? `<div class="author-timeline-meta-row"><span>${escapeHtml(metricParts.join(" · "))}</span></div>` : ""}
             ${reasonHtml}
+            ${rejectedRewrite ? `<div class="author-timeline-reason is-mismatch">洗稿未通过 · ${escapeHtml(rewrite.reason || rewrite.ineligibleReason || "不符合洗稿条件")}</div>` : ""}
+            ${!delivery && dec.publishedText && dec.publicationMode && dec.publishedText !== commentVal
+                ? `<div class="author-timeline-reason"><span>已发布正文</span> <span data-i18n-ignore>${escapeHtml(dec.publishedText)}</span></div>` : ""}
             ${quoteSectionHtml}
         </article>`;
     }
@@ -4269,6 +4575,13 @@
 
     function renderRepostPreviewTimeline(singleMaterialId = "") {
         recomputeTimeline16hWindow();
+        const active = singleMaterialId && repostPreviewState.items.find(item => String(item.material?.id || "") === singleMaterialId);
+        if (active && quoteDeliveryStatus(active.decision) === "UNCERTAIN"
+                && ["REPOST", "SKIP"].includes(repostPreviewState.filterMode) && !itemMatchesRepostFilter(active)) {
+            repostPreviewState.filterMode = "ALL";
+            repostPreviewState.focusedMaterialId = singleMaterialId;
+            singleMaterialId = "";
+        }
         if (repostPreviewState.source) {
             renderRepostPreviewHeader(repostPreviewState.source);
         }
@@ -4318,9 +4631,13 @@
     async function evaluateSingleTimelineItem(materialId, forceRegenerate, token, expandOnFinish = false, forceWriteComment = false) {
         const id = String(materialId || "").trim();
         if (!id || token !== repostPreviewState.requestToken) return;
-        if (repostPreviewState.evaluatingIds.has(id) && !forceRegenerate && !forceWriteComment) return;
+        if (repostPreviewState.evaluatingIds.has(id)) return;
         repostPreviewState.evaluatingIds.add(id);
-        if (forceRegenerate || forceWriteComment) repostPreviewState.editedComments.delete(id);
+        const requestOrder = nextQuotePreviewOrder();
+        const previousEdit = repostPreviewState.editedComments.get(id);
+        const originalItem = repostPreviewState.items.find(item => String(item.material?.id || "") === id);
+        const originalDecision = originalItem?.decision;
+        const originalFingerprint = originalItem?.material?.sourceFingerprint;
         if (expandOnFinish) repostPreviewState.expandedIds.add(id);
         renderRepostPreviewTimeline(id);
         try {
@@ -4355,14 +4672,22 @@
             );
             if (token !== repostPreviewState.requestToken) return;
             const target = repostPreviewState.items.find((it) => String(it.material?.id || "") === id);
-            if (target && res?.preview) {
-                target.decision = res.preview;
-                if (res.material) target.material = res.material;
+            if ((target?.quotePreviewOrder || 0) > requestOrder) return;
+            if (String(res?.material?.id || "") !== id || !res?.preview) throw new Error("返回的素材与所选原帖不一致，请刷新重试");
+            if (target) {
+                target.quotePreviewOrder = requestOrder;
+                target.decision = preservePublishedQuote(target.decision, res.preview, target.decision !== originalDecision);
+                target.material = res.material;
+                if ((forceRegenerate || forceWriteComment) && !quoteDeliveryStatus(target.decision)
+                        && originalFingerprint === res.material.sourceFingerprint && !res.preview.fallbackUsed && res.preview.commentText?.trim()
+                        && repostPreviewState.editedComments.get(id) === previousEdit) {
+                    repostPreviewState.editedComments.delete(id);
+                }
             }
         } catch (err) {
             if (token !== repostPreviewState.requestToken) return;
             const target = repostPreviewState.items.find((it) => String(it.material?.id || "") === id);
-            if (target) {
+            if (target && (target.quotePreviewOrder || 0) <= requestOrder && !quoteDeliveryStatus(target.decision)) {
                 target.decision = {
                     ...(target.decision || {}),
                     evaluated: false,
@@ -4382,9 +4707,12 @@
     async function previewSingleRewriteItem(materialId, forceRegenerate, token) {
         const id = String(materialId || "").trim();
         if (!id || token !== repostPreviewState.requestToken) return;
-        if (repostPreviewState.rewritingIds.has(id) && !forceRegenerate) return;
+        if (repostPreviewState.rewritingIds.has(id)) return;
         repostPreviewState.rewritingIds.add(id);
-        if (forceRegenerate) repostPreviewState.editedRewrites.delete(id);
+        const initial = repostPreviewState.items.find((item) => String(item.material?.id || "") === id)?.rewrite;
+        const initialStatus = initial?.status;
+        const initialVersion = Number(initial?.recordVersion || 0);
+        const previousEdit = repostPreviewState.editedRewrites.get(id);
         renderRepostPreviewTimeline(id);
         try {
             const reqBody = {
@@ -4415,10 +4743,21 @@
             );
             if (token !== repostPreviewState.requestToken) return;
             const target = repostPreviewState.items.find((it) => String(it.material?.id || "") === id);
-            if (target && res?.rewrite) {
+            if (String(res?.material?.id || "") !== id || !res?.rewrite) throw new Error("返回的素材与所选原帖不一致，请刷新重试");
+            if (target) {
+                const current = target.rewrite;
+                const status = current?.status;
+                const currentVersion = Number(current?.recordVersion || 0);
+                const newerReceipt = (status !== initialStatus || currentVersion !== initialVersion)
+                        && ["PUBLISHED", "SENDING", "UNCERTAIN", "EVALUATING", "JUDGE_FAILED"].includes(status);
+                if (currentVersion > Number(res.rewrite.recordVersion || 0)
+                        || newerReceipt && status !== res.rewrite.status
+                        && (status === "PUBLISHED" || !["PUBLISHED", "UNCERTAIN"].includes(res.rewrite.status))) return;
                 target.rewrite = { ...(target.rewrite || {}), ...res.rewrite };
-                if (res.material) target.material = res.material;
-                repostPreviewState.editedRewrites.delete(id);
+                target.material = res.material;
+                if (forceRegenerate && res.rewrite.rewrittenText?.trim() && repostPreviewState.editedRewrites.get(id) === previousEdit) {
+                    repostPreviewState.editedRewrites.delete(id);
+                }
             }
         } catch (err) {
             if (token === repostPreviewState.requestToken && typeof showToast === "function") {
@@ -4432,6 +4771,28 @@
         }
     }
 
+    function nextQuotePreviewOrder() {
+        repostPreviewState.quoteRequestOrder = (repostPreviewState.quoteRequestOrder || 0) + 1;
+        return repostPreviewState.quoteRequestOrder;
+    }
+
+    function quoteDeliveryStatus(decision) {
+        const status = decision?.persistedStatus || decision?.decisionCode;
+        return ["SENDING", "UNCERTAIN", "PUBLISHED"].includes(status) ? status : "";
+    }
+
+    function preservePublishedQuote(previous, decision, newerReceipt = false) {
+        const before = Number(previous?.receiptRevision || 0);
+        const after = Number(decision?.receiptRevision || 0);
+        const status = quoteDeliveryStatus(previous);
+        const next = quoteDeliveryStatus(decision);
+        if (previous?.pendingRequest && !next && Number(decision?.requestReceiptRevision || 0) <= previous.pendingRequest.afterRevision) return previous;
+        if (before && after && before !== after) return before > after ? previous : decision;
+        if (newerReceipt && status && (status === "PUBLISHED" || next !== "PUBLISHED")) return previous;
+        if (before > after || (status === "PUBLISHED" && next !== "PUBLISHED" && !after)) return previous;
+        return decision;
+    }
+
     async function evaluateAuthorAccountOnceInModal(token, forceRegenerate = false) {
         if (!repostPreviewState.sourceKey || token !== repostPreviewState.requestToken) return;
         const dualCd = resolveDualCdView(repostPreviewState.source || {});
@@ -4439,12 +4800,16 @@
             renderRepostPreviewTimeline();
             return;
         }
-        if (repostPreviewState.evaluatingAccountOnce && !forceRegenerate) return;
+        if (repostPreviewState.evaluatingAccountOnce) return;
         repostPreviewState.evaluatingAccountOnce = true;
-        if (forceRegenerate) repostPreviewState.editedComments.clear();
+        const requestOrder = nextQuotePreviewOrder();
+        const initialItems = new Map(repostPreviewState.items.map(item => [String(item.material?.id || ""), { ...item }]));
+        const previousEdits = forceRegenerate ? new Map([...initialItems.keys()]
+            .filter(id => repostPreviewState.editedComments.has(id)).map(id => [id, repostPreviewState.editedComments.get(id)])) : null;
         renderRepostPreviewSubbar();
         try {
             const reqBody = { ...(repostPreviewState.overrides || {}) };
+            if (repostPreviewState.focusedMaterialId) reqBody.materialId = repostPreviewState.focusedMaterialId;
             const modalChk = $("repostPolishEnabledCheck");
             const modalPromptEl = $("repostPolishPromptInput");
             if (modalChk && typeof modalChk.checked === "boolean") {
@@ -4471,7 +4836,37 @@
             if (data?.owner) repostPreviewState.owner = data.owner;
             if (data?.source) repostPreviewState.source = data.source;
             if (data?.cooldown) repostPreviewState.cooldown = data.cooldown;
-            if (Array.isArray(data?.items)) repostPreviewState.items = data.items;
+            if (Array.isArray(data?.items)) {
+                const currentItems = new Map(repostPreviewState.items.map(item => [String(item.material?.id || ""), item]));
+                const regenerated = new Set(data.regeneratedCommentIds || []);
+                for (const item of data.items) {
+                    const id = String(item.material?.id || "");
+                    const initial = initialItems.get(id);
+                    const current = currentItems.get(id);
+                    currentItems.delete(id);
+                    if (current && initial && current.rewrite !== initial.rewrite) item.rewrite = current.rewrite;
+                    if ((current?.quotePreviewOrder || 0) > requestOrder) {
+                        item.quotePreviewOrder = current.quotePreviewOrder;
+                        item.material = current.material;
+                        item.decision = preservePublishedQuote(item.decision, current.decision);
+                        continue;
+                    }
+                    if (current && initial && current.material !== initial.material && !current.quotePreviewOrder) item.material = current.material;
+                    item.quotePreviewOrder = requestOrder;
+                    item.decision = preservePublishedQuote(current?.decision, item.decision, current?.decision !== initial?.decision);
+                    if (regenerated.has(id) && previousEdits?.has(id) && !quoteDeliveryStatus(item.decision)
+                            && initial?.material?.sourceFingerprint === item.material?.sourceFingerprint
+                            && item.decision?.commentText?.trim() && !item.decision.fallbackUsed
+                            && previousEdits.get(id) === repostPreviewState.editedComments.get(id)) {
+                        repostPreviewState.editedComments.delete(id);
+                    }
+                }
+                for (const [id, current] of currentItems) {
+                    const initial = initialItems.get(id);
+                    if (!initial || current.decision !== initial.decision || current.rewrite !== initial.rewrite) data.items.push(current);
+                }
+                repostPreviewState.items = data.items;
+            }
         } catch (err) {
             if (token === repostPreviewState.requestToken && typeof showToast === "function") {
                 showToast(formatLocalizedFetchError(err, "本账号合并判定未完成，请稍后重试"));
@@ -4493,12 +4888,9 @@
         repostPreviewState.cooldown = null;
         repostPreviewState.evaluatingIds.clear();
         repostPreviewState.rewritingIds.clear();
-        repostPreviewState.publishingIds.clear();
         repostPreviewState.expandedIds.clear();
-        repostPreviewState.editedComments.clear();
-        repostPreviewState.editedRewrites.clear();
         repostPreviewState.items = [];
-        repostPreviewState.filterMode = "ALL";
+        repostPreviewState.filterMode = options.filterMode === "REWRITE" ? "REWRITE" : "ALL";
         if (repostPreviewState.focusedMaterialId) {
             repostPreviewState.expandedIds.add(repostPreviewState.focusedMaterialId);
         }
@@ -4512,7 +4904,8 @@
         try {
             const data = await contentAssistantRequest(
                 `/sources/${encodeURIComponent(key)}/timeline`,
-                { ...(repostPreviewState.overrides || {}) },
+                { ...(repostPreviewState.overrides || {}), ...(repostPreviewState.focusedMaterialId
+                    ? { materialId: repostPreviewState.focusedMaterialId } : {}) },
                 35000
             );
             if (token !== repostPreviewState.requestToken) return;
@@ -4520,6 +4913,14 @@
             repostPreviewState.source = data?.source || repostPreviewState.source;
             repostPreviewState.cooldown = data?.cooldown || data?.source?.cooldown || null;
             repostPreviewState.items = Array.isArray(data?.items) ? data.items : [];
+            for (const row of repostPreviewState.items) {
+                if (!row.material?.id) continue;
+                const attempt = repostPreviewState.pendingQuotes.get(quoteAttemptKey(row.material));
+                if (attempt) {
+                    markQuoteAwaitingReceipt(row, attempt);
+                    void refreshQuoteReceipt(String(row.material.id)).catch(() => {});
+                }
+            }
             renderRepostPreviewTimeline();
 
             if (repostPreviewState.focusedMaterialId && listEl?.querySelector) {
@@ -4542,7 +4943,7 @@
             const hasPendingTopWindow = repostPreviewState.items
                 .slice(0, 8)
                 .some((it) => !it.decision?.evaluated);
-            if (hasPendingTopWindow) {
+            if (hasPendingTopWindow && repostPreviewState.filterMode !== "REWRITE") {
                 void evaluateAuthorAccountOnceInModal(token, false);
             }
         } catch (err) {
@@ -4580,7 +4981,6 @@
         repostPreviewState.requestToken++;
         repostPreviewState.evaluatingIds.clear();
         repostPreviewState.rewritingIds.clear();
-        repostPreviewState.publishingIds.clear();
         const modal = document.getElementById("repostPreviewModal");
         if (modal) modal.hidden = true;
         syncBodyModalLock();
@@ -4603,7 +5003,7 @@
             VERIFIED: "已核实", SUPPORTS: "证据支持", PARTIALLY_SUPPORTS: "部分印证",
             REFUTES: "证据否定", UNRELATED: "不构成依据", UNVERIFIED: "待核实", CONFLICT: "有冲突",
             SUPPORTED: "证据充分", FULL: "完整内容", PREVIEW: "预览待补全", NO_USABLE_EVIDENCE: "暂无可用证据",
-            READ: "已读取", MATERIAL_FULL: "原帖全文", UNREADABLE: "网页不可读",
+            READ: "已读取", MATERIAL_FULL: "原文全文", MATERIAL_PREVIEW: "原文节选", MATERIAL_EXCERPT: "已采集片段", UNREADABLE: "网页不可读",
             BLOCKED: "访问受阻", TIMED_OUT: "读取超时", TOO_LARGE: "体积超限", SKIPPED: "已跳过",
             OBSERVED: "已测量", RECORDED: "已记录", MISSING_WINDOW: "已错过窗口", OUTSIDE_WINDOW: "超出窗口",
             RETRYABLE_ERROR: "待重试", INSUFFICIENT: "样本不足",
@@ -4656,18 +5056,22 @@
         return map[String(stage || "").toUpperCase()] || stage || "";
     }
 
-    function assistantSourceRefLabel(rawRef) {
+    function assistantSourceRefLabel(rawRef, materialEvidence = []) {
         const ref = String(rawRef || "").trim();
         if (!ref) return "";
         const webMatch = /^source-(\d+)(?:#p(\d+))?$/i.exec(ref);
         if (webMatch) return `网页来源 #${webMatch[1]}${webMatch[2] ? `（第 ${webMatch[2]} 段）` : ""}`;
-        const matMatch = /^material-[^-]+-(author-article|quoted-article|author|quoted)(?:#p(\d+))?$/i.exec(ref);
+        const matMatch = /^material-.+?-(author-article|quoted-article|article|author|quoted|link)(?:#p(\d+))?$/i.exec(ref);
         if (matMatch) {
+            const status = materialEvidence.find(entry => entry.id === ref.split("#")[0])?.status;
+            const article = ["MATERIAL_PREVIEW","MATERIAL_EXCERPT"].includes(status) ? "文章节选" : "文章全文";
             const roleName = {
                 author: "作者原帖正文",
                 quoted: "被引用原帖正文",
-                "author-article": "作者文章全文",
-                "quoted-article": "被引用文章全文"
+                "author-article": "作者" + article,
+                "quoted-article": "被引用" + article,
+                article: "归属待核实的" + article,
+                link: "链接原文"
             }[matMatch[1].toLowerCase()] || "原帖素材";
             return `${roleName}${matMatch[2] ? `（第 ${matMatch[2]} 段）` : ""}`;
         }
@@ -4872,23 +5276,20 @@
         const materialEvidence = Array.isArray(research.materialEvidence) ? research.materialEvidence : [];
         const materialHtml = materialEvidence.length
             ? `<div class="assistant-research-block"><strong>已采集一手原文</strong><ol>${materialEvidence.map((source) => {
-                const role = String(source.id || "").match(/-(author-article|quoted-article|author|quoted|link)$/)?.[1];
-                const roleLabel = { author: "作者正文", quoted: "引用帖正文",
-                    "author-article": "作者文章全文", "quoted-article": "引用帖文章全文",
-                    link: "链接原文" }[role] || "正文角色未知";
+                const roleLabel = assistantSourceRefLabel(source.id, materialEvidence);
                 const url = String(source.url || "");
                 const linkedPost = /^https:\/\/x\.com\/([A-Za-z0-9_]{1,15})\/status\/\d+$/.exec(url);
                 const safeExternalUrl = !linkedPost && url ? safeHttpUrl(url) : "";
                 const author = linkedPost ? `@${linkedPost[1]}` : (source.title || source.publisher || "原帖作者");
                 const excerpts = Array.isArray(source.excerpts) ? source.excerpts : [];
-                return `<li><span>${roleLabel} · </span>${linkedPost
+                return `<li><span>${escapeHtml(roleLabel)} · </span>${linkedPost
                     ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(author)} 原帖 ↗</a>`
                     : (safeExternalUrl
                         ? `<a href="${safeExternalUrl}" target="_blank" rel="noopener noreferrer">${escapeHtml(author)} ↗</a>`
                         : escapeHtml(author))}
                     ${excerpts.filter((excerpt) => excerpt?.text).map((excerpt) => `<blockquote>${escapeHtml(excerpt.text)}</blockquote>`).join("")}</li>`;
             }).join("")}</ol></div>` : "";
-        const formatSourceRef = (rawRef) => typeof assistantSourceRefLabel === "function" ? assistantSourceRefLabel(rawRef) : String(rawRef || "");
+        const formatSourceRef = (rawRef) => typeof assistantSourceRefLabel === "function" ? assistantSourceRefLabel(rawRef, materialEvidence) : String(rawRef || "");
         const relationLabels = { LINKED_IN_BODY: "正文链接指向", SAME_FINAL_URL: "指向同一最终网址" };
         const sourceRelations = Array.isArray(research.sourceRelations) ? research.sourceRelations.filter((entry) =>
             entry?.fromSourceId && entry.toSourceId && Object.hasOwn(relationLabels, entry.relation || entry.type)) : [];
@@ -4918,6 +5319,7 @@
         const changes = Array.isArray(draft?.evidenceChanges) ? draft.evidenceChanges : [];
         const factChanges = Array.isArray(draft?.factChanges) ? draft.factChanges : [];
         if (!draft?.sourcesChanged && !changes.length && !factChanges.length) return "";
+        const targetMaterialId = String(draft?.materialId || fallbackMaterialId || "").trim();
         const labels = {
             SOURCE_TEXT_UPDATED: "来源正文已更新", SOURCE_NOW_UNREADABLE: "来源当前不可读",
             SOURCE_READABLE_AGAIN: "来源恢复可读", TOPIC_MEMBERS_CHANGED: "选题成员已变化",
@@ -4928,19 +5330,16 @@
             ${changes.length ? `<ul>${changes.map((change) => `<li>${escapeHtml(labels[change.type] || change.type || "依据变化")}
                 ${change.url ? ` · <a href="${safeHttpUrl(change.url)}" target="_blank" rel="noopener noreferrer">查看来源 ↗</a>` : ""}</li>`).join("")}</ul>` : ""}
             ${factChanges.length ? `<div class="assistant-fact-changes">${factChanges.map((change) => `<p><del>${escapeHtml(change.before || "")}</del><ins>${escapeHtml(change.after || "")}</ins>
-                ${Array.isArray(change.sourceIds) && change.sourceIds.length ? `<small>依据：${change.sourceIds.map((r) => escapeHtml(typeof assistantSourceRefLabel === "function" ? assistantSourceRefLabel(r) : r)).join("、")}</small>` : ""}</p>`).join("")}</div>` : ""}
-            ${fallbackMaterialId
+                ${Array.isArray(change.sourceIds) && change.sourceIds.length ? `<small>依据：${change.sourceIds.map((r) => escapeHtml(typeof assistantSourceRefLabel === "function" ? assistantSourceRefLabel(r, draft?.research?.materialEvidence || []) : r)).join("、")}</small>` : ""}</p>`).join("")}</div>` : ""}
+            ${targetMaterialId
                 ? (draft?.id
-                    ? `<button type="button" class="x-outline-pill sm" data-assistant-research-upgrade="${escapeHtml(draft.id)}" data-material-id="${escapeHtml(fallbackMaterialId)}">按最新依据深挖出新版</button>`
-                    : `<button type="button" class="x-outline-pill sm" data-assistant-research="${escapeHtml(fallbackMaterialId)}" data-regenerate="true">按最新依据重新研究</button>`)
+                    ? `<button type="button" class="x-outline-pill sm" data-assistant-research-upgrade="${escapeHtml(draft.id)}" data-material-id="${escapeHtml(targetMaterialId)}">按最新依据深挖出新版</button>`
+                    : `<button type="button" class="x-outline-pill sm" data-assistant-research="${escapeHtml(targetMaterialId)}" data-regenerate="true">按最新依据重新研究</button>`)
                 : ""}
         </div>`;
     }
 
-    function renderAssistantObservationReview(dashboard, topic, topicDrafts) {
-        const draftIds = new Set(topicDrafts.map((draft) => draft.id));
-        const observationRows = Array.isArray(dashboard.observations) ? dashboard.observations : dashboard.observations?.items || [];
-        const observations = observationRows.filter((row) => row.topicId === topic.id || draftIds.has(row.draftId));
+    function renderAssistantObservationReview(dashboard, observations) {
         const metrics = [
             ["views", "浏览"], ["likes", "赞"], ["replies", "评论"],
             ["reposts", "转发"], ["bookmarks", "收藏"]
@@ -4985,16 +5384,18 @@
 
     function renderAssistantHistory(history) {
         if (!history || typeof history !== "object") return `<div class="assistant-empty compact">暂无历史归档状态。</div>`;
-        const sources = Array.isArray(history.sources) ? history.sources : [];
-        const summary = `<div class="assistant-history-summary"><span>长期素材 <strong>${fmtNum(history.materials || 0)}</strong></span>
-            <span>入站互动 <strong>${fmtNum(history.interactions || 0)}</strong></span>
+        const received = Array.isArray(history.sources) ? history.sources : [];
+        const ownerId = String(history.ownerAccountId || state.authStatus?.user?.id || "");
+        const sources = received.filter(source => source && source.owner === true && ownerId
+            && String(source.authorId || source.id || "") === ownerId);
+        if (!sources.length) return `<div class="assistant-empty compact">尚无作者的历史归档。</div>`;
+        const materials = sources.length === received.length ? history.materials : sources[0].timelineSavedCount;
+        const interactions = sources.length === received.length ? history.interactions : sources[0].inboundSavedCount;
+        const summary = `<div class="assistant-history-summary"><span>长期素材 <strong>${fmtNum(materials || 0)}</strong></span>
+            <span>入站互动 <strong>${fmtNum(interactions || 0)}</strong></span>
             <span class="assistant-state ${history.complete ? "ok" : "running"}">${history.complete ? "动态与入站历史已完成" : "动态或入站仍待补齐"}</span></div>`;
-        const rows = sources.length ? sources.map((source) => {
+        const rows = sources.map((source) => {
             const name = source.username ? `@${source.username}` : "匿名来源";
-            const hasRank = source.rank !== null && source.rank !== undefined && Number.isFinite(Number(source.rank));
-            const scope = source.owner ? "本人" : hasRank
-                ? `前10 · #${source.rank}${source.qualificationProvisional ? `（暂定，已有 ${Number(source.qualificationWindowDays || 0)} 天）` : ""}`
-                : "历史来源";
             const dimension = (prefix, label) => {
                 const exhausted = source[prefix + "Exhausted"] === true;
                 const complete = source[prefix + "BackfillComplete"] === true;
@@ -5013,10 +5414,10 @@
             const retryBtnHtml = retryExhausted
                 ? `<button type="button" class="link-inline-btn" data-assistant-history-retry="1">手动重试</button>`
                 : "";
-            return `<article class="assistant-history-source"><div class="assistant-pane-head"><span><strong>${escapeHtml(name)}</strong><small>${escapeHtml(scope)}</small></span>
+            return `<article class="assistant-history-source"><div class="assistant-pane-head"><span><strong>${escapeHtml(name)}</strong><small>本人</small></span>
                 <span class="assistant-head-actions"><span class="assistant-state ${sourceStateClass}">${sourceStateText}</span>${retryBtnHtml}</span></div>
                 <div class="assistant-history-dimensions">${dimension("timeline", "动态")}${dimension("inbound", "入站")}</div></article>`;
-        }).join("") : `<div class="assistant-empty compact">尚无本人或前 10 历史来源。</div>`;
+        }).join("");
         return summary + rows;
     }
 
@@ -5024,11 +5425,11 @@
         const status = String(task.status || "").toUpperCase();
         const canCancel = ["QUEUED", "RUNNING", "WAITING_STYLE", "WAITING_SAMPLES"].includes(status);
         const repair = task.constraintRepair;
-        const canRetry = !repair?.attempted && ["FAILED", "INTERRUPTED", "PARTIAL", "BLOCKED_CONFIG", "RESEARCH_PARTIAL", "WAITING_STYLE"].includes(status);
+        const canRetry = !repair?.attempted && ["FAILED", "INTERRUPTED", "BLOCKED_CONFIG", "RESEARCH_PARTIAL", "CANCELLED", "WAITING_STYLE", "WAITING_SAMPLES"].includes(status);
         const retryLabel = status === "RESEARCH_PARTIAL" ? "继续深挖" : "重试";
         const kindText = typeof assistantTaskKindLabel === "function" ? assistantTaskKindLabel(task.kind) : (task.kind || "助手任务");
         const stageText = typeof assistantTaskStageLabel === "function" ? assistantTaskStageLabel(task.stage) : (task.stage === "OPTIMIZE_REVISION" ? "自动修订" : task.stage || "");
-        const candidate = repair && !canCancel && status !== "SUCCEEDED" ? task.result?.text : "";
+        const candidate = repair && !canCancel && !["READY", "SUCCEEDED"].includes(status) ? task.result?.text : "";
         return `<div class="assistant-task-row">
             <span class="assistant-state ${assistantStatusClass(status)}">${escapeHtml(assistantStatusLabel(status))}</span>
             <span><strong>${escapeHtml(kindText)}</strong><small>${escapeHtml(stageText)}${task.error ? (stageText ? " · " : "") + escapeHtml(task.error) : ""}</small></span>
@@ -5080,13 +5481,7 @@
             }
         }
         const urlMatches = text.match(/https?:\/\/[^\s<>"')\]）】，。；！？]+/gi) || [];
-        const hasExternalLink = urlMatches.some((rawUrl) => {
-            const hostMatch = rawUrl.match(/^https?:\/\/([^/?#:]+)/i);
-            const host = hostMatch ? hostMatch[1].toLowerCase() : "";
-            return Boolean(host)
-                && host !== "x.com" && !host.endsWith(".x.com")
-                && host !== "twitter.com" && !host.endsWith(".twitter.com");
-        });
+        const { hasExternalLink } = classifyDraftLinks(urlMatches);
         return { hanCount, weighted, tier, tierLabel, hook, hasExternalLink };
     }
 
@@ -5150,15 +5545,38 @@
     }
 
     function resolveAssistantDraftSourcePost(draft, materials) {
-        const list = Array.isArray(materials) ? materials : [];
-        const matched = (draft?.materialId ? list.find((item) => item?.id === draft.materialId) : null) || list[0] || null;
-        if (!matched) return null;
-        const rawId = String(matched.id || "").trim();
-        const urlMatch = String(matched.sourceUrl || "").match(/https?:\/\/(?:(?:www|mobile)\.)?(?:x|twitter)\.com\/([A-Za-z0-9_]{1,15})\/status\/([0-9]+)/i);
-        const tweetId = /^[0-9]+$/.test(rawId) ? rawId : (urlMatch ? urlMatch[2] : "");
-        const rawUser = String(matched.username || (urlMatch ? urlMatch[1] : "") || "").trim().replace(/^@/, "");
-        if (!tweetId || !/^[A-Za-z0-9_]{1,15}$/.test(rawUser)) return null;
-        return { tweetId, url: `https://x.com/${rawUser}/status/${tweetId}` };
+        if (!draft) return null;
+        if (Object.hasOwn(draft, "quoteSourcePost")) return draft.quoteSourcePost;
+        const snapshot = draft.research?.snapshot;
+        const frozen = Array.isArray(snapshot?.materials) ? snapshot.materials : [];
+        const id = String(draft.materialId || draft.research?.materialId || snapshot?.selectedMaterialId
+            || (frozen.length === 1 ? frozen[0]?.id : "") || "").trim();
+        const stable = /^[0-9]{2,20}$/.test(id);
+        const matched = frozen.find((item) => id && String(item?.id || "") === id);
+        const postLink = /^https?:\/\/(?:(?:www|mobile)\.)?(?:x|twitter)\.com\/(?:([A-Za-z0-9_]{1,15})\/status|i\/web\/status)\/([0-9]{2,20})(?:\/(?:photo|video)\/[0-9]+)?\/?(?:[?#]\S*)?$/i;
+        let link = String(matched?.sourceUrl || "").trim().match(postLink);
+        if (!matched?.sourceUrl) {
+            for (const evidence of draft.research?.materialEvidence || []) {
+                if (id && !["author", "author-article", "link"].some((role) => evidence.id === `material-${id}-${role}`)) continue;
+                if (!id && evidence.id && !/^material-.+-(?:author|author-article|link)$/.test(evidence.id)) continue;
+                const cited = String(evidence.url || "").trim().match(postLink);
+                if (!cited) {
+                    if (id && !stable) return null;
+                    continue;
+                }
+                if (stable && cited[2] !== id) continue;
+                if (link && link[2] !== cited[2]) return null;
+                link = cited;
+            }
+        }
+        const live = stable && Array.isArray(materials) ? materials.find((item) => String(item?.id || "") === id) : null;
+        if (!matched && !link && live) link = String(live.sourceUrl || "").trim().match(postLink);
+        const tweetId = stable ? id : link?.[2];
+        if (!tweetId) return null;
+        const linkedHandle = link?.[2] === tweetId && String(link[1] || "").toLowerCase() !== "i" ? link[1] : "";
+        const username = String(linkedHandle || matched?.username || live?.username || "").replace(/^@/, "");
+        const handle = /^[A-Za-z0-9_]{1,15}$/.test(username) ? username : "i";
+        return { tweetId, url: `https://x.com/${handle}/status/${tweetId}` };
     }
 
     function assistantDraftNumberChangesText(changes) {
@@ -5249,6 +5667,12 @@
         return found ? found.name : skillId;
     }
 
+    function selectedAssistantTopic(dashboard) {
+        const id = state.assistantSelectedTopicId;
+        return dashboard?.detailTopic && dashboard.detailTopic.id === id ? dashboard.detailTopic
+            : (dashboard?.topics || []).find((topic) => topic.id === id);
+    }
+
     function renderAssistantSkillBar(dashboard) {
         const bar = $("assistantSkillBar");
         if (!bar) return;
@@ -5257,7 +5681,7 @@
         const activeId = validIds.has(state.assistantSelectedSkill)
             ? state.assistantSelectedSkill : "AUTO";
         state.assistantSelectedSkill = activeId;
-        const selectedTopic = (dashboard?.topics || []).find((item) => item.id === state.assistantSelectedTopicId);
+        const selectedTopic = selectedAssistantTopic(dashboard);
         const autoHint = selectedTopic?.recommendedSkillName || "自动";
         const autoActive = activeId === "AUTO";
         const autoChip = `<button type="button" class="pill-chip sm assistant-skill-chip${autoActive ? " active" : ""}" data-assistant-skill="AUTO" aria-pressed="${autoActive ? "true" : "false"}" title="按当前选题内容特征自动匹配最合适的爆款体裁">智能匹配<em>${escapeHtml(autoHint)}</em></button>`;
@@ -5276,7 +5700,7 @@
         const analyzable = Boolean(typeof materialText === "function" ? materialText(material)
             : (material.text || material.quotedText || material.articleText))
             && !["NO_ANALYZABLE_TEXT", "MEDIA_ONLY", "MEDIA_URL_ONLY"].includes(String(material.textStatus || "").toUpperCase());
-        const url = material.sourceUrl && typeof safeHttpUrl === "function" ? safeHttpUrl(material.sourceUrl) : "";
+        const url = resolveRepostMaterialUrl(material, "");
         const fallbackSrc = (state.assistantDashboard?.sources || []).find((s) =>
             (material.authorId && s.authorId === material.authorId)
             || (material.username && String(s.username || "").toLowerCase() === String(material.username).toLowerCase()));
@@ -5310,7 +5734,7 @@
             </div>
             ${renderAssistantMaterialBody(material)}
             <div class="assistant-material-actions">
-                ${url ? `<a href="${url}" target="_blank" rel="noopener noreferrer">查看原帖 ↗</a>` : ""}
+                ${url ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">查看原帖 ↗</a>` : ""}
                 ${options.showTopicJump && material.topicId ? `<button type="button" class="link-inline-btn" data-assistant-open-topic="${escapeHtml(material.topicId)}">查看所属选题</button>` : ""}
                 ${analyzable ? `<button type="button" class="link-inline-btn" data-assistant-research="${escapeHtml(material.id)}" data-research-mode="FAST">极速成稿</button>` : ""}
                 ${analyzable ? `<button type="button" class="link-inline-btn" data-assistant-research="${escapeHtml(material.id)}">研究并生成</button>` : ""}
@@ -5322,8 +5746,9 @@
 
     function renderAssistantTopicDetail(dashboard) {
         const container = $("assistantTopicDetail");
-        const topic = (dashboard.topics || []).find((item) => item.id === state.assistantSelectedTopicId);
+        const topic = selectedAssistantTopic(dashboard);
         if (!topic) {
+            if (state.assistantDraftDirty && $("assistantDraftEditor")) return;
             container.innerHTML = `<div class="assistant-empty">选择一个选题查看来源、研究和稿件。</div>`;
             return;
         }
@@ -5337,11 +5762,13 @@
         const requestedDraftId = state.assistantSelectedDraftByTopic[topic.id];
         const draft = topicDrafts.find((item) => item.id === requestedDraftId) || topicDrafts[0];
         if (draft) state.assistantSelectedDraftByTopic[topic.id] = draft.id;
-        const currentDraftBox = $("assistantDraftEditor")?.closest("[data-draft-id]");
-        if (currentDraftBox?.dataset.draftId === draft?.id
-            && (state.assistantDraftDirty || document.activeElement === $("assistantDraftEditor")
-                || (currentDraftBox?.dataset.draftVersion === String(draft?.version)
-                    && $("assistantDraftVersions")?.hidden === false))) {
+        const currentEditor = $("assistantDraftEditor");
+        const currentDraftBox = currentEditor?.closest("[data-draft-id]");
+        if (state.assistantDraftDirty && currentDraftBox && currentDraftBox.dataset.draftId !== draft?.id) return;
+        const focused = currentEditor && document.activeElement === currentEditor;
+        if (draft && currentDraftBox?.dataset.draftId === draft.id
+            && (state.assistantDraftDirty || (currentDraftBox.dataset.draftVersion === String(draft.version)
+                && (focused || $("assistantDraftVersions")?.hidden === false)))) {
             $("assistantTopicTasks").innerHTML = taskHtml;
             return;
         }
@@ -5362,7 +5789,7 @@
             : "";
         const sourcePost = draft ? resolveAssistantDraftSourcePost(draft, materials) : null;
         const draftResStatus = draft ? assistantDraftResearchStatus(draft) : null;
-        const upgradeMatId = draft?.materialId || primaryMaterial?.id || materials[0]?.id || "";
+        const upgradeMatId = draft?.materialId || draft?.research?.materialId || draft?.research?.snapshot?.selectedMaterialId || "";
         const draftHtml = draft ? `<div class="assistant-draft" data-draft-id="${escapeHtml(draft.id)}" data-draft-version="${Number(draft.version || 0)}">
             <div class="assistant-pane-head"><h3 id="assistantDraftTitle">初稿 v${Number(draft.version || 0)}</h3>
                 <div class="assistant-draft-head-actions">
@@ -5372,7 +5799,7 @@
                         `<option value="${escapeHtml(item.id)}"${item.id === draft.id ? " selected" : ""}>稿件 ${index + 1} · v${Number(item.version || 0)}</option>`).join("")}</select>` : ""}
                     <button type="button" class="x-outline-pill sm" data-assistant-history="${escapeHtml(draft.id)}">版本记录</button>
                 </div></div>
-            ${renderAssistantEvidenceChanges(draft, materials[0]?.id)}
+            ${renderAssistantEvidenceChanges(draft, upgradeMatId)}
             ${draft.angleInstruction ? `<small class="assistant-draft-angle">${escapeHtml(draft.angleInstruction)}</small>` : ""}
             <textarea id="assistantDraftEditor" rows="9" data-i18n-ignore>${escapeHtml(draft.text || "")}</textarea>
             <div id="assistantDraftLiveMetrics" class="assistant-draft-metrics" data-i18n-ignore>${renderAssistantDraftMetricsHtml(draft.text || "")}</div>
@@ -5380,6 +5807,11 @@
             <p id="assistantDraftNumberChanges" class="inline-feedback is-error"${numberChangesText ? "" : " hidden"}>${escapeHtml(numberChangesText)}</p>
             ${renderAssistantConstraintRepair(draft.constraintRepair, "SUCCEEDED")}
             <p class="inline-feedback" id="assistantDraftSaveState" role="status"></p>
+            <div id="assistantDraftConflict" hidden>
+                <details open><summary>另一页面保存的正文</summary><pre id="assistantDraftRemoteText"></pre></details>
+                <button type="button" class="x-outline-pill sm" data-assistant-resolve-conflict="local">将本页正文保存为新版本</button>
+                <button type="button" class="link-inline-btn" data-assistant-resolve-conflict="remote">采用另一页面的版本</button>
+            </div>
             <div class="assistant-revision-panel">
                 <div class="assistant-optimize-presets" role="group" aria-label="切换体裁与改稿快捷项">
                     ${assistantWritingSkills(dashboard).map((skill) =>
@@ -5422,21 +5854,33 @@
                 <button type="button" id="assistantAdoptDraftVersion" class="x-outline-pill sm">采用此版本</button>
             </section>
         </div>` : "";
-        const publications = draft ? (dashboard.publications || []).filter((item) => item.draftId === draft.id) : [];
+        const publications = draft ? (dashboard.publications || []).filter((item) => item.draftId === draft.id
+            && (item.topicId === topic.id || !item.topicId || (item.status === "SCHEDULED" && !item.deleted))) : [];
         const publicationHtml = publications.length ? publications.map((publication) => {
             const pubFmt = typeof formatAssistantDateTime === "function" ? formatAssistantDateTime : () => "";
-            const pubTime = publication.publishedAt ? `发布于 ${pubFmt(publication.publishedAt)}`
-                : publication.scheduledAt ? `排期于 ${pubFmt(publication.scheduledAt)}`
-                : publication.jobId ? "已同步至定时队列" : "已登记排期";
+            const scheduledAt = publication.scheduledAtEpochMs || publication.scheduledAt;
+            const status = String(publication.status || "").toUpperCase();
+            let pubTime = "";
+            if (publication.publishedAt) pubTime = `发布于 ${pubFmt(publication.publishedAt)}`;
+            else if (status === "FAILED") pubTime = publication.error || "未完成发布";
+            else if (status === "UNCERTAIN") pubTime = "回执待核实";
+            else if (scheduledAt) pubTime = `排期于 ${pubFmt(scheduledAt)}`;
+            else if (publication.jobId) pubTime = "已同步至定时队列";
+            else if (status === "PENDING") pubTime = "已登记排期";
             return `<div class="assistant-publication-row">
             <span class="assistant-state ${assistantStatusClass(publication.status)}">${escapeHtml(assistantStatusLabel(publication.status))}</span>
-            <span><strong>排期版本 v${Number(publication.draftVersion || 0)}</strong><small>${escapeHtml(pubTime)}</small></span>
-            ${String(publication.status || "").toUpperCase() === "SCHEDULED" && Number(draft.version) !== Number(publication.draftVersion)
-                ? `<button type="button" class="link-inline-btn" data-assistant-update-scheduled="${escapeHtml(publication.id || publication.intentId)}" data-publication-intent="${escapeHtml(publication.intentId || publication.id)}">更新为当前版本</button>` : ""}
+            ${assistantVerificationButtons(publication)}
+            <span><strong>稿件版本 v${Number(publication.draftVersion || 0)}</strong><small>${escapeHtml(pubTime)}</small></span>
+            ${status === "SCHEDULED" && !publication.deleted
+                ? `<button type="button" class="link-inline-btn" data-assistant-update-scheduled="${escapeHtml(publication.id || publication.intentId)}" data-publication-draft-id="${escapeHtml(draft.id)}" data-publication-intent="${escapeHtml(publication.intentId || publication.id)}"${!state.assistantDraftDirty && Number(draft.version) === Number(publication.draftVersion) ? " hidden" : ""}>更新为当前版本</button>` : ""}
         </div>`;
         }).join("") : "";
-        const hasObservations = Array.isArray(dashboard.observations)
-            && dashboard.observations.some((row) => row.topicId === topic.id || topicDrafts.some((d) => d.id === row.draftId));
+        const observationRows = Array.isArray(dashboard.observations) ? dashboard.observations : dashboard.observations?.items || [];
+        const topicObservations = observationRows.filter((row) => row.topicId === topic.id);
+        const reviewHtml = topicObservations.length ? `<details class="assistant-collapsible assistant-detail-section">
+                <summary>发布复盘</summary>
+                <div class="assistant-collapsible-body">${renderAssistantObservationReview(dashboard, topicObservations)}</div>
+            </details>` : "";
         const headPrimaryAction = draft
             ? ""
             : (primaryMaterial
@@ -5463,10 +5907,6 @@
             ${publications.length ? `<details class="assistant-collapsible assistant-detail-section">
                 <summary>发布关联（${publications.length}）</summary>
                 <div class="assistant-collapsible-body">${publicationHtml}</div>
-            </details>` : ""}
-            ${hasObservations ? `<details class="assistant-collapsible assistant-detail-section">
-                <summary>发布复盘</summary>
-                <div class="assistant-collapsible-body">${renderAssistantObservationReview(dashboard, topic, topicDrafts)}</div>
             </details>` : ""}`
             : `${tasksSectionHtml}
             <section class="assistant-detail-section">
@@ -5482,7 +5922,12 @@
                     <span class="assistant-total-score">${assistantScoreText(topic.score)}</span>
                 </div>
             </div>
-            ${detailSectionsHtml}`;
+            ${detailSectionsHtml}${reviewHtml}`;
+        if (focused && draft && currentDraftBox?.dataset.draftId === draft.id) {
+            const editor = $("assistantDraftEditor");
+            editor?.focus?.({ preventScroll: true });
+            editor?.setSelectionRange?.(currentEditor.selectionStart, currentEditor.selectionEnd);
+        }
     }
 
     function assistantKeyValueRows(value) {
@@ -5645,6 +6090,7 @@
                                 </div>
                             </div>
                             <div class="assistant-source-controls">
+                                <button type="button" class="x-outline-pill sm" data-source-repost-preview="${esc(source.id)}" data-source-preview-mode="REWRITE">洗稿</button>
                                 <label class="assistant-setting-toggle is-inline"><input type="checkbox" data-source-autorepost-toggle="${esc(source.id)}"${autoOn ? " checked" : ""} /><span>自动转推</span></label>
                                 <label class="assistant-setting-toggle is-inline" title="找出该账号高流量纯文本内容进行学习与改写，共用全局时间锁间隔发送（不引用原帖）"><input type="checkbox" data-source-autorewrite-toggle="${esc(source.id)}"${rewriteOn ? " checked" : ""} /><span>洗稿发送</span></label>
                                 <select class="x-select assistant-tier-select" data-assistant-source-tier="${esc(source.id)}" aria-label="采集档位">
@@ -5690,11 +6136,19 @@
         }
         const autoFeedEl = $("assistantAutoRepostFeed");
         if (autoFeedEl) {
-            const items = Array.isArray(dashboard.autoReposts) ? dashboard.autoReposts.slice(0, 8) : [];
+            const unconfirmed = dashboard.unconfirmedPublications || [];
+            const awaitingVerification = new Set(unconfirmed.filter(row => row.autoKind)
+                .map(row => row.autoKind + ":" + (row.materialId || row.id)));
+            const activityKey = row => (row.autoKind || row.mode || "REPOST") + ":" + (row.materialId || row.id);
+            const hasRetryList = Array.isArray(dashboard.retryableAutoPublications);
+            const retryable = new Map((dashboard.retryableAutoPublications || []).map(row => [activityKey(row), row]));
+            const items = (dashboard.autoReposts || []).filter(row => !awaitingVerification.has(activityKey(row))).slice(0, 8);
+            const shown = new Set(items.map(activityKey));
+            for (const [key, row] of retryable) if (!shown.has(key) && !awaitingVerification.has(key)) items.push(row);
             if (items.length) {
                 autoFeedEl.hidden = false;
                 const statusLabels = {
-                    PUBLISHED: ["ok", "已引用转发"],
+                    PUBLISHED: ["ok", "已发布"],
                     EVALUATING: ["running", "判定中"],
                     SENDING: ["running", "发送中"],
                     SKIPPED: ["muted", "未达转发条件"],
@@ -5702,6 +6156,8 @@
                     SKIPPED_DUPLICATE: ["muted", "同事件去重"],
                     SKIPPED_LIMIT: ["muted", "达日上限"],
                     SKIPPED_COOLDOWN: ["muted", "冷却跳过"],
+                    SKIPPED_QUIET_HOURS: ["muted", "静默期跳过"],
+                    OWNER_REVIEW_REQUIRED: ["error", "待核实作者"],
                     AUTH_REQUIRED: ["error", "需发推授权"],
                     JUDGE_FAILED: ["error", "判定异常"],
                     UNCERTAIN: ["error", "回执待核"],
@@ -5716,6 +6172,7 @@
                     SKIPPED_LIMIT: ["muted", "达日上限"],
                     SKIPPED_COOLDOWN: ["muted", "冷却跳过"],
                     SKIPPED_QUIET_HOURS: ["muted", "静默期跳过"],
+                    OWNER_REVIEW_REQUIRED: ["error", "待核实作者"],
                     AUTH_REQUIRED: ["error", "需发推授权"],
                     JUDGE_FAILED: ["error", "洗稿异常"],
                     UNCERTAIN: ["error", "回执待核"],
@@ -5724,23 +6181,26 @@
                 autoFeedEl.innerHTML = items.map((item) => {
                     const st = String(item.status || "").toUpperCase();
                     const isRewrite = String(item.autoKind || item.mode || "").toUpperCase() === "REWRITE";
-                    const [cls, label] = (isRewrite ? rewriteStatusLabels[st] : statusLabels[st]) || statusLabels[st] || ["muted", st || "记录"];
+                    const [cls, statusLabel] = (isRewrite ? rewriteStatusLabels[st] : statusLabels[st]) || statusLabels[st] || ["muted", st || "记录"];
+                    const label = st === "PUBLISHED" && !isRewrite && item.publicationMode
+                        ? assistantPublishNotice(item) : statusLabel;
                     const rawScore = isRewrite ? Number(item.suitabilityScore || item.viralScore) : Number(item.viralScore);
                     const scorePart = Number.isFinite(rawScore) && rawScore > 0
                         ? (isRewrite ? ` · 适格 ${rawScore}` : ` · 热度 ${rawScore}`) : "";
                     const pubUrl = item.publishedTweetUrl && typeof safeHttpUrl === "function" ? safeHttpUrl(item.publishedTweetUrl) : "";
                     const srcUrl = item.sourceUrl && typeof safeHttpUrl === "function" ? safeHttpUrl(item.sourceUrl) : "";
-                    const detailText = item.rewrittenText || item.commentText || item.reason || item.error || item.summary || "";
-                    const canRetry = ["AUTH_REQUIRED", "JUDGE_FAILED", "FAILED", "SKIPPED_COOLDOWN", "SKIPPED_AUTHOR_COOLDOWN"].includes(st);
+                    const detailText = (st === "PUBLISHED" ? item.text : "") || item.rewrittenText || item.commentText || item.reason || item.error || item.summary || "";
+                    const action = retryable.get(activityKey(item));
+                    const canRetry = hasRetryList ? Boolean(action) : ["AUTH_REQUIRED", "JUDGE_FAILED", "FAILED", "SKIPPED_COOLDOWN", "SKIPPED_AUTHOR_COOLDOWN", "SKIPPED_QUIET_HOURS"].includes(st);
                     const itemId = item.materialId || item.id || "";
                     const retryBtnHtml = canRetry && itemId
-                        ? `<button type="button" class="link-inline-btn" data-autorepost-retry="${esc(itemId)}">重试</button>`
+                        ? `<button type="button" class="link-inline-btn" data-autorepost-retry="${esc(itemId)}" data-publish-mode="${isRewrite ? "REWRITE" : "REPOST"}">重试</button>${isRewrite && action?.canReassess ? `<button type="button" class="link-inline-btn" data-autorepost-retry="${esc(itemId)}" data-publish-mode="REWRITE" data-reassess="true">重新评估并发送</button>` : ""}`
                         : "";
                     return `<div class="assistant-autorepost-item">
                         <div>
                             <span class="assistant-state ${cls}">${esc(label)}</span>
                             <strong>@${esc(item.username || "source")}${esc(scorePart)}</strong>
-                            ${detailText ? `<small>${esc(detailText)}</small>` : ""}
+                            ${detailText ? `<small${st === "PUBLISHED" ? " data-i18n-ignore" : ""}>${esc(detailText)}</small>` : ""}
                         </div>
                         <div class="assistant-draft-head-actions">
                             ${retryBtnHtml}
@@ -5752,6 +6212,14 @@
             } else {
                 autoFeedEl.hidden = true;
                 autoFeedEl.innerHTML = "";
+            }
+            if (unconfirmed.length) {
+                autoFeedEl.hidden = false;
+                autoFeedEl.insertAdjacentHTML("afterbegin", unconfirmed.map(row => `<div class="assistant-autorepost-item" data-verification-material="${esc(row.materialId || row.quoteTweetId || row.id)}"${row.autoKind === "REPOST" || row.source === "MANUAL_QUOTE_REPOST" ? ` data-quote-verification="${esc(row.requestedQuoteTweetId || row.quoteTweetId || row.materialId || row.id)}"` : ""}>
+                    <div><strong>${row.scheduledDelivery ? "定时发布待核实" : row.autoKind === "REWRITE" ? "自动洗稿待核实" : row.autoKind === "REPOST" ? "自动引用待核实"
+                        : String(row.source || "").startsWith("MANUAL_") ? "手动引用待核实" : "草稿直发待核实"}</strong>
+                    <small data-i18n-ignore>${escapeHtml((row.publicationMode ? row.text : "") || row.requestedText || row.text || row.rewrittenText || row.commentText || "")}</small></div>
+                    <div class="assistant-draft-head-actions">${assistantVerificationButtons(row)}</div></div>`).join(""));
             }
         }
         const capabilities = dashboard.capabilities || {};
@@ -5934,13 +6402,13 @@
                 unavailable: "受限",
                 DEGRADED: "降级"
             }[ledgerRaw] || ledgerRaw || "--";
-            const fmtUsd = (v) => Number.isFinite(Number(v)) ? `$${Number(v).toFixed(2)}` : "--";
+            const fmtUsd = (v) => v != null && Number.isFinite(Number(v)) ? `$${Number(v).toFixed(2)}` : "--";
             budgetEl.innerHTML = dashboard.upstreamBudget ? assistantKeyValueRows({
                 共享账本: ledgerLabel,
-                本小时请求: `${dashboard.upstreamBudget.hourlyUsed ?? 0} / ${dashboard.upstreamBudget.hourlyBudget ?? "--"}`,
-                今日请求: `${dashboard.upstreamBudget.dailyUsed ?? 0} / ${dashboard.upstreamBudget.dailyBudget ?? "--"}`,
+                本小时请求: `${dashboard.upstreamBudget.hourlyUsed ?? "--"} / ${dashboard.upstreamBudget.hourlyBudget ?? "--"}`,
+                今日请求: `${dashboard.upstreamBudget.dailyUsed ?? "--"} / ${dashboard.upstreamBudget.dailyBudget ?? "--"}`,
                 今日预留: `${fmtUsd(dashboard.upstreamBudget.dailyUsdReserved)} / ${fmtUsd(dashboard.upstreamBudget.dailyUsdBudget)}`,
-                超限拦截: `${dashboard.upstreamBudget.budgetRejectedCalls ?? 0}`
+                超限拦截: `${dashboard.upstreamBudget.budgetRejectedCalls ?? "--"}`
             }) : "";
         }
         $("assistantHistoryStatus").innerHTML = renderAssistantHistory(dashboard.history);
@@ -6016,8 +6484,17 @@
             if (!isCurrent()) return;
             const topics = dashboard.topics || [];
             const current = state.assistantSelectedTopicId;
-            const selected = topics.some((item) => item.id === current) ? current : topics[0]?.id || "";
-            if (current !== selected && state.assistantDraftDirty && !await saveAssistantDraftEditor()) return;
+            const selected = (current && current === state.assistantExternalTopicId) || topics.some((item) => item.id === current)
+                ? current : topics[0]?.id || "";
+            if (state.assistantDraftDirty) {
+                const editing = $("assistantDraftEditor")?.closest("[data-draft-id]")?.dataset.draftId;
+                if (current !== selected || !(dashboard.drafts || []).some((draft) => draft.id === editing && draft.topicId === selected)) {
+                    const saved = await saveAssistantDraftEditor();
+                    if (!saved) return;
+                    const incoming = (dashboard.drafts || []).find((draft) => draft.id === saved.id);
+                    if (incoming && saved.version >= incoming.version) Object.assign(incoming, saved);
+                }
+            }
             if (!isCurrent()) return;
             state.assistantDashboard = dashboard;
             state.assistantTopicOffset = topicOffset;
@@ -6034,10 +6511,44 @@
         }
     }
 
+    function assistantVerificationButtons(row) {
+        if (row.acceptedReceipt) return '<span class="assistant-state running">X 已确认发布，正在补记回执</span>';
+        const auto = ["REPOST", "REWRITE"].includes(row.autoKind);
+        const direct = !row.jobId && /^(DIRECT_|MANUAL_)/.test(row.source || "");
+        if (row.status !== "UNCERTAIN" || !(row.scheduledDelivery || auto || direct)) return "";
+        const id = auto ? row.materialId || row.id : row.id;
+        const mode = row.scheduledDelivery ? ' data-publish-mode="SCHEDULED"' : auto ? ` data-publish-mode="${row.autoKind}"` : "";
+        const attrs = `data-assistant-verify="${escapeHtml(id)}" data-version="${Number(row.version)}"${mode}`;
+        return `<a href="https://x.com/${encodeURIComponent(state.authStatus?.user?.username || "i")}" target="_blank" rel="noopener noreferrer">查看我的时间线 ↗</a>
+            <button type="button" class="link-inline-btn" ${attrs} data-published="true">登记已发布</button>
+            <button type="button" class="link-inline-btn" ${attrs} data-published="false">已核实未发布</button>`;
+    }
+
+    async function verifyAssistantPublication(button) {
+        const id = button.dataset.assistantVerify;
+        const published = button.dataset.published === "true";
+        const decision = { version: Number(button.dataset.version), published };
+        if (published) {
+            const entered = window.prompt("请输入你已在 X 时间线上核实的帖子 ID 或链接");
+            if (entered === null) return;
+            const match = entered.trim().match(/^(?:https?:\/\/(?:www\.)?(?:x\.com|twitter\.com)\/(?:[\w]+|i\/web)\/status\/)?(\d{2,20})(?:[/?#].*)?$/);
+            if (!match) { showToast("请输入有效的 X 帖子 ID 或链接"); return; }
+            decision.tweetId = match[1];
+        } else if (!window.confirm("已检查 X 时间线，确认这条帖子没有发布？确认后可重新提交。")) return;
+        const mode = button.dataset.publishMode;
+        const path = ["REPOST", "REWRITE"].includes(mode)
+            ? `/auto-reposts/${encodeURIComponent(id)}/verify?mode=${mode}`
+            : mode === "SCHEDULED" ? `/scheduled-publications/${encodeURIComponent(id)}/verify` : `/publications/${encodeURIComponent(id)}/verify`;
+        const result = await runAssistantMutation("verify-" + id, path, decision);
+        if (result) showToast(published ? "已登记发布回执" : "已核实未发布，可以重新提交");
+    }
+
     async function runAssistantMutation(key, path, payload, timeoutMs = 30000) {
         const isCurrentUser = captureUserScope();
         if (state.assistantMutation || !isCurrentUser()) return null;
-        state.assistantMutation = key;
+        let complete;
+        const operation = { key, done: new Promise((resolve) => { complete = resolve; }) };
+        state.assistantMutation = operation;
         setContentAssistantError("");
         try {
             const result = await contentAssistantRequest(path, payload, timeoutMs);
@@ -6048,7 +6559,8 @@
             if (isCurrentUser()) setContentAssistantError(error.message || "操作未完成。");
             return null;
         } finally {
-            if (isCurrentUser()) state.assistantMutation = "";
+            if (state.assistantMutation === operation) state.assistantMutation = null;
+            complete();
         }
     }
 
@@ -6061,13 +6573,22 @@
         try {
             const detail = await contentAssistantRequest(`/topics/${encodeURIComponent(topicId)}/detail`);
             if (!isCurrent()) return;
-            if (detail.topic) {
+            if (state.assistantDraftDirty && Array.isArray(detail.drafts)) {
+                const editing = $("assistantDraftEditor")?.closest("[data-draft-id]")?.dataset.draftId;
+                if (editing && !detail.drafts.some((draft) => draft.id === editing)
+                    && (!await saveAssistantDraftEditor() || !isCurrent())) return;
+            }
+            if (detail.topic?.id === topicId) {
+                dashboard.detailTopic = detail.topic;
                 dashboard.topics = (dashboard.topics || []).map((item) => item.id === topicId ? detail.topic : item);
             }
-            for (const key of ["materials", "tasks", "drafts"]) {
+            for (const key of ["materials", "tasks", "drafts", "publications", "observations"]) {
                 if (!Array.isArray(detail[key])) continue;
+                const incomingIds = new Set(detail[key].map((item) => item.id).filter(Boolean));
+                const draftIds = key === "publications" ? new Set((detail.drafts || []).map((draft) => draft.id)) : null;
                 dashboard[key] = [
-                    ...(dashboard[key] || []).filter((item) => item.topicId !== topicId),
+                    ...(dashboard[key] || []).filter((item) => item.topicId !== topicId && !incomingIds.has(item.id)
+                        && !(draftIds?.has(item.draftId) && item.status === "SCHEDULED")),
                     ...detail[key]
                 ];
             }
@@ -6080,7 +6601,44 @@
     async function loadAssistantTopicPage(offset) {
         const isCurrentUser = captureUserScope();
         if (!await saveAssistantDraftEditor() || !isCurrentUser()) return;
+        state.assistantExternalTopicId = "";
         await loadContentAssistant(false, Math.max(0, Number(offset) || 0), true);
+    }
+
+    async function openAssistantCreationTopic(topicId) {
+        const isCurrentUser = captureUserScope();
+        if (!topicId || !await saveAssistantDraftEditor() || !isCurrentUser()) return;
+        state.assistantSelectedTopicId = topicId;
+        state.assistantExternalTopicId = topicId;
+        state.assistantOrganizeMode = false;
+        state.assistantView = "assistant";
+        renderContentAssistant();
+        await loadAssistantTopicDetail(topicId);
+    }
+
+    function assistantCreationRequest(fields) {
+        const instruction = ($("assistantCreationAngleInput")?.value ?? state.assistantCreationAngle ?? "").trim();
+        const target = parseGenerationTargetSpec(
+            $("assistantGenTargetSelect")?.value || state.assistantGenerationTargetSpec,
+            $("assistantGenEffortSelect")?.value ?? state.assistantGenerationEffort
+        );
+        const payload = { ...fields, ...target, skillId: state.assistantSelectedSkill || "AUTO", clientRequestId: newClientRequestId() };
+        if (instruction) payload.instruction = instruction;
+        return payload;
+    }
+
+    async function startAssistantMaterialResearch(button) {
+        const isCurrentUser = captureUserScope();
+        const request = assistantCreationRequest({
+            materialId: button.dataset.assistantResearch,
+            mode: button.dataset.researchMode || "RESEARCH",
+            regenerate: button.dataset.regenerate === "true"
+        });
+        if (!await saveAssistantDraftEditor() || !isCurrentUser()) return;
+        const task = await runAssistantMutation("research", "/research", request, 180000);
+        if (task?.topicId && (state.assistantView !== "assistant" || state.assistantSelectedTopicId !== task.topicId)) {
+            await openAssistantCreationTopic(task.topicId);
+        }
     }
 
     async function loadAssistantMaterialsFeed(offset = state.assistantMaterialOffset || 0) {
@@ -6209,12 +6767,19 @@
         const isCurrentUser = captureUserScope();
         if (!isCurrentUser()) return false;
         if (state.assistantDraftSave) {
-            await state.assistantDraftSave;
-            if (!isCurrentUser() || $("assistantDraftEditor") !== editor) return false;
+            const saved = await state.assistantDraftSave;
+            if (!saved || !isCurrentUser() || $("assistantDraftEditor") !== editor) return false;
+            return saveAssistantDraftEditor();
         }
+        if (state.assistantDraftConflict?.id === draftId) return false;
         const queue = state.assistantDashboard?.drafts || [];
         const draft = queue.find((item) => item.id === draftId);
-        if (!state.assistantDraftDirty) return draft || true;
+        if (!state.assistantDraftDirty) {
+            if (draft && Number(draft.version) === Number(draftBox.dataset.draftVersion)) return draft;
+            if (draft) renderAssistantTopicDetail(state.assistantDashboard);
+            setContentAssistantError("稿件已更新，请确认当前显示的版本后再操作。");
+            return false;
+        }
         const text = editor.value;
         const version = Number(draftBox.dataset.draftVersion || 0);
         $("assistantDraftSaveState").textContent = "正在保存…";
@@ -6240,9 +6805,23 @@
                 syncScheduleDraftUnloadProtection();
                 $("assistantDraftSaveState").textContent = updatedWhileSaving ? "等待保存…" : "已保存";
                 return saved;
-            }, (error) => {
+            }, async (error) => {
                 if (isCurrentUser() && $("assistantDraftEditor") === editor) {
                     $("assistantDraftSaveState").textContent = error.message || "保存失败，编辑仍在此页。";
+                    if (error.httpStatus === 409) {
+                        try {
+                            const versions = await contentAssistantRequest(`/drafts/${encodeURIComponent(draftId)}/versions`);
+                            const latest = versions[0];
+                            if (!isCurrentUser() || $("assistantDraftEditor") !== editor || latest?.id !== draftId || latest.version <= version) return false;
+                            state.assistantDraftConflict = latest;
+                            $("assistantDraftRemoteText").textContent = latest.text;
+                            $("assistantDraftConflict").hidden = false;
+                            $("assistantDraftSaveState").textContent = `另一页面已保存 v${latest.version}。本页输入已保留，请选择要使用的正文。`;
+                        } catch {
+                            if (isCurrentUser() && $("assistantDraftEditor") === editor)
+                                $("assistantDraftSaveState").textContent = "暂时无法读取新版本，本页输入已保留，可继续编辑后重试。";
+                        }
+                    }
                 }
                 return false;
             })
@@ -6255,24 +6834,53 @@
         return state.assistantDraftDirty ? saveAssistantDraftEditor() : saved;
     }
 
+    async function resolveAssistantDraftConflict(choice) {
+        const latest = state.assistantDraftConflict;
+        const editor = $("assistantDraftEditor");
+        const box = editor?.closest("[data-draft-id]");
+        if (!latest || latest.id !== box?.dataset.draftId || !["local", "remote"].includes(choice)) return;
+        const isCurrentUser = captureUserScope();
+        state.assistantDraftConflict = null;
+        $("assistantDraftConflict").hidden = true;
+        box.dataset.draftVersion = String(latest.version);
+        if (choice === "local") {
+            if (!await saveAssistantDraftEditor() || !isCurrentUser()) return;
+        } else {
+            editor.value = latest.text;
+            state.assistantDraftDirty = false;
+            const cached = state.assistantDashboard?.drafts?.find(draft => draft.id === latest.id);
+            if (cached) Object.assign(cached, latest, {topicId: cached.topicId});
+            $("assistantDraftTitle").textContent = `初稿 v${latest.version}`;
+            $("assistantDraftSaveState").textContent = "已采用另一页面的版本";
+            syncScheduleDraftUnloadProtection();
+        }
+        await loadContentAssistant(true, undefined, true);
+    }
+
     function queueAssistantDraftSave() {
         clearTimeout(state.assistantDraftSaveTimerId);
         const editor = $("assistantDraftEditor");
-        if (!editor?.closest("[data-draft-id]")) return;
+        const draftBox = editor?.closest("[data-draft-id]");
+        if (!draftBox) return;
         state.assistantDraftDirty = true;
+        document.querySelectorAll("[data-assistant-update-scheduled][hidden]").forEach((button) => {
+            if (button.dataset.publicationDraftId === draftBox.dataset.draftId) button.hidden = false;
+        });
         syncScheduleDraftUnloadProtection();
+        if (state.assistantDraftConflict?.id === draftBox.dataset.draftId) return;
         $("assistantDraftSaveState").textContent = "等待保存…";
         state.assistantDraftSaveTimerId = setTimeout(() => void saveAssistantDraftEditor(), 1000);
     }
 
     async function sendAssistantDraftToSchedule(draftId, quoteSource = false) {
-        const draft = (state.assistantDashboard?.drafts || []).find((item) => item.id === draftId);
-        const editor = $("assistantDraftEditor");
-        if (!draft || !editor) return;
-        const saved = await saveAssistantDraftEditor();
-        if (!saved) return;
-        const resolved = saved.id ? saved : { ...draft, ...saved };
-        const topicId = resolved.topicId || draft.topicId;
+        const resolved = await saveAssistantDraftEditor();
+        if (!resolved || resolved.id !== draftId) return;
+        if (state.scheduleDraftRestore || state.scheduleDraftRestoring || state.scheduleDraftPersistenceReady === false) {
+            const isCurrentUser = captureUserScope();
+            await (state.scheduleDraftRestore?.promise || restoreScheduleDraftAfterStepUpAuth());
+            if (!isCurrentUser() || state.scheduleDraftRestoring || state.scheduleDraftPersistenceReady === false) return;
+        }
+        const topicId = resolved.topicId;
         const topicMaterials = (state.assistantDashboard?.materials || []).filter((item) =>
             item.topicId === topicId);
         const sourcePost = quoteSource ? resolveAssistantDraftSourcePost(resolved, topicMaterials) : null;
@@ -6283,19 +6891,19 @@
         ensureScheduleDraftInitialized();
         const target = state.scheduleDraftItems.find((item) => !hasScheduleDraftContent(item));
         const sourceRef = {
-            assistantDraftId: resolved.id || draft.id,
-            assistantDraftVersion: Number(resolved.version || draft.version),
+            assistantDraftId: resolved.id,
+            assistantDraftVersion: Number(resolved.version),
             topicId,
             quoteSource: Boolean(quoteSource && sourcePost)
         };
         const quoteMeta = sourcePost ? { quoteTweetId: sourcePost.tweetId, quoteTweetUrl: sourcePost.url } : null;
         if (target) {
-            target.text = editor.value;
+            target.text = resolved.text;
             target.sourceRef = sourceRef;
             target.quoteTweetId = quoteMeta ? quoteMeta.quoteTweetId : "";
             target.quoteTweetUrl = quoteMeta ? quoteMeta.quoteTweetUrl : "";
         } else if (state.scheduleDraftItems.length < MAX_BATCH_SCHEDULE_ITEMS) {
-            state.scheduleDraftItems.push(createScheduleDraftItem(editor.value, null, [], false, sourceRef, null, quoteMeta));
+            state.scheduleDraftItems.push(createScheduleDraftItem(resolved.text, null, [], false, sourceRef, null, quoteMeta));
             state.activeScheduleDraftIdx = state.scheduleDraftItems.length - 1;
         } else {
             setContentAssistantError("排期草稿已满，请先提交或移除一条。");
@@ -6305,7 +6913,7 @@
         renderScheduleDraftItems();
         queueScheduleDraftPersistence();
         switchTab("schedule");
-        if (editor.value.length > MAX_SCHEDULE_TEXT_LENGTH) {
+        if (resolved.text.length > MAX_SCHEDULE_TEXT_LENGTH) {
             const targetIndex = target ? state.scheduleDraftItems.indexOf(target) : state.activeScheduleDraftIdx;
             setScheduleComposerError(scheduleTextLengthError(targetIndex, state.scheduleDraftItems.length),
                 true, { draftIndex: targetIndex, field: "text" });
@@ -6317,29 +6925,24 @@
     function renderTimingPanel(report) {
         const ct = report.contentTiming;
         const formatStats = ct.formatStats || [];
-        const knownFormatStats = formatStats.filter(
-            (f) => (Number(f.algoScoreSampleCount) > 0 && Number(f.avgAlgoScore) > 0)
-                || (Number(f.viewSampleCount) > 0 && Number(f.avgViews) > 0)
-        );
-        const bestFormat = knownFormatStats.length >= 2
-            ? [...knownFormatStats].sort((a, b) =>
-                (Number(b.avgAlgoScore || 0) - Number(a.avgAlgoScore || 0))
-                || (Number(b.avgViews || 0) - Number(a.avgViews || 0))
-            )[0]
-            : null;
-        const bestFormatCode = bestFormat ? bestFormat.formatCode : "";
+        const bestFormatCode = ct.bestFormatCode;
 
         $("formatCardsGrid").innerHTML = formatStats
             .map((f) => {
                 const isWinner = Boolean(bestFormatCode && f.formatCode === bestFormatCode && f.postCount > 0);
                 const bmKnown = hasMetricSample(f, "bookmarkSampleCount");
+                const hasPosts = f.postCount > 0;
+                const viewSummary = hasPosts && f.viewSampleCount === 0 ? tr("浏览量尚未取得")
+                    : `均浏览 ${hasPosts && hasMetricSample(f, "viewSampleCount") ? fmtNum(f.avgViews) : "--"}`;
+                const formatSummary = !hasPosts && ct.timelineWindowComplete !== true ? tr("已采集样本中暂无该体裁的主帖")
+                    : `${f.postCount} 帖 · ${viewSummary}`;
                 return `<div class="format-card${isWinner ? " is-winning-format" : ""}">
                     <div class="format-head-row">
                         <div class="format-title">${escapeHtml(f.formatLabel)}</div>
                         ${isWinner ? `<span class="mini-tag green format-win-badge">表现最佳</span>` : ""}
                     </div>
                     <div class="format-er">${hasMetricSample(f, "engagementRateSampleCount") ? `${f.avgEngagementRatePct}%` : "--"} <span style="font-size:11.5px; font-weight:500; color:var(--text-secondary)">互动率</span></div>
-                    <div class="format-meta">${f.postCount} 帖 · 均浏览 ${hasMetricSample(f, "viewSampleCount") ? fmtNum(f.avgViews) : "--"}</div>
+                    <div class="format-meta">${escapeHtml(formatSummary)}</div>
                     <div class="format-meta">赞 ${hasMetricSample(f, "likeSampleCount") ? f.avgLikes : "--"} · 评 ${hasMetricSample(f, "replySampleCount") ? f.avgReplies : "--"} · 藏 ${bmKnown ? f.avgBookmarks : "--"}</div>
                 </div>`;
             })
@@ -6406,7 +7009,8 @@
         const calEl = $("algoCalibrationPanel");
         if (calEl) {
             const cal = ah.calibration || null;
-            if (cal && (cal.samplePostCount > 0 || (cal.replyTemplateRisk && cal.replyTemplateRisk.evaluatedReplyCount > 0))) {
+            if (cal && (cal.samplePostCount > 0 || cal.unknownRelationCommentCount > 0 || cal.knownRelationCommentCount > 0
+                    || (cal.replyTemplateRisk && cal.replyTemplateRisk.evaluatedReplyCount > 0))) {
                 const replyBoostMult = (Number(cal.inferredEffectiveReplyWeight || 5) / 5).toFixed(1);
                 const mutualVal = cal.mutualShareKnown ? `${cal.mutualCommenterSharePct}%` : "--";
                 const mutualSub = cal.mutualShareKnown
@@ -6450,6 +7054,7 @@
                             <span class="algo-cal-label">互关评论占比</span>
                             <span class="algo-cal-val" style="color:var(--x-blue)">${escapeHtml(mutualVal)}</span>
                             <span class="algo-cal-sub">${escapeHtml(mutualSub)}</span>
+                            ${cal.unknownRelationCommentCount > 0 ? `<span class="algo-cal-sub">${escapeHtml(`关系已核实 ${cal.knownRelationCommentCount ?? 0} 条，未知 ${cal.unknownRelationCommentCount} 条`)}</span>` : ""}
                         </div>
                         <div class="algo-cal-card">
                             <span class="algo-cal-label">新帖冷启动达标</span>
@@ -6541,22 +7146,21 @@
         "ow.ly", "rebrand.ly", "shorturl.at", "rb.gy", "soo.gd"
     ]);
 
-    function extractPrimaryDraftDomain(urls) {
-        let sawTco = false;
-        for (const u of (urls || [])) {
-            const m = /^https?:\/\/([^/\s:?#]+)/i.exec(String(u || ""));
-            if (!m) continue;
-            let host = m[1].toLowerCase();
-            if (host.startsWith("www.")) host = host.slice(4);
-            if (host.startsWith("mobile.")) host = host.slice(7);
-            if (host === "x.com" || host === "twitter.com") continue;
-            if (host === "t.co") {
-                sawTco = true;
-                continue;
+    function classifyDraftLinks(urls, nativeAttachment = false) {
+        let shortLinks = 0;
+        let unknown = false;
+        for (const raw of urls) {
+            try {
+                const host = new URL(raw).hostname.toLowerCase().replace(/\.$/, "");
+                if (host === "t.co") shortLinks++;
+                else if (host && !/(^|\.)(x\.com|twitter\.com)$/.test(host)) {
+                    return { hasExternalLink: true, domain: host.replace(/^www\./, "") };
+                }
+            } catch (_) {
+                unknown = true;
             }
-            return host;
         }
-        return sawTco ? "t.co" : "";
+        return { hasExternalLink: unknown || shortLinks > Number(nativeAttachment) ? null : false, domain: "" };
     }
 
     function buildCalibrationShingleArray(cleanText) {
@@ -6616,8 +7220,8 @@
             const union = qSet.size + sShingles.length - inter;
             const jaccard = union > 0 ? inter / union : 0.0;
             const fmtMatch = draftFeat.formatCode === s.formatCode ? 1.0 : 0.0;
-            const extMatch = Boolean(draftFeat.hasExternalLink) === Boolean(s.hasExternalLink) ? 1.0 : 0.0;
-            const domainMatch = (draftFeat.hasExternalLink && draftFeat.externalDomain && draftFeat.externalDomain === s.externalDomain) ? 1.0 : 0.0;
+            const extMatch = typeof draftFeat.hasExternalLink === "boolean" && draftFeat.hasExternalLink === s.hasExternalLink ? 1.0 : 0.0;
+            const domainMatch = (draftFeat.hasExternalLink && s.hasExternalLink && draftFeat.externalDomain && draftFeat.externalDomain === s.externalDomain) ? 1.0 : 0.0;
             const listMatch = Boolean(draftFeat.structuredList) === Boolean(s.structuredList) ? 1.0 : 0.0;
             const qMatch = Boolean(draftFeat.hasQuestion) === Boolean(s.hasQuestion) ? 1.0 : 0.0;
             const lenDiff = Math.abs(Math.log1p(Math.max(0, draftFeat.cleanCharLen)) - Math.log1p(Math.max(0, Number(s.cleanCharLen || 0))));
@@ -6733,17 +7337,15 @@
         return set;
     }
 
-    function evaluateCorpusSimilarity(cleanText, skipDraftIdx) {
-        const normDraft = normalizeForDuplicateCheck(cleanText);
-        if (!normDraft || Array.from(normDraft).length < 8) {
+    function evaluateCorpusSimilarity(text, skipDraftIdx) {
+        const draft = String(text || "").trim();
+        if (!draft) {
             return { maxSim: 0, exactMatch: false, sourceLabel: "" };
         }
-        const draftSet = buildDuplicateShingleSet(normDraft);
+        const normDraft = normalizeForDuplicateCheck(draft);
+        const draftSet = Array.from(normDraft).length >= 8 ? buildDuplicateShingleSet(normDraft) : null;
         const candidates = [];
-        const topPosts = state.report && state.report.contentTiming && Array.isArray(state.report.contentTiming.topPosts)
-            ? state.report.contentTiming.topPosts
-            : [];
-        for (const p of topPosts) {
+        for (const p of representativePostCards(state.report?.contentTiming)) {
             if (p && p.text) candidates.push({ text: p.text, label: "近期已发样本推文" });
         }
         for (const j of (state.scheduleJobs || [])) {
@@ -6762,12 +7364,12 @@
         let exactMatch = false;
         for (const cand of candidates) {
             const normCand = normalizeForDuplicateCheck(cand.text);
-            if (!normCand) continue;
-            if (normCand === normDraft) {
+            if (cand.text.trim() === draft || (normDraft && normCand === normDraft)) {
                 return { maxSim: 1.0, exactMatch: true, sourceLabel: cand.label };
             }
+            if (!draftSet?.size || !normCand) continue;
             const candSet = buildDuplicateShingleSet(normCand);
-            if (!draftSet.size || !candSet.size) continue;
+            if (!candSet.size) continue;
             let inter = 0;
             for (const tok of draftSet) {
                 if (candSet.has(tok)) inter++;
@@ -6879,24 +7481,10 @@
         // 2. 48h 候选窗口与连续发帖间隔
         const refEpochMs = hasPlannedTime ? plannedEpochMs : Date.now();
         const ageCutoffMs = refEpochMs - ageWindowHrs * 3600_000;
-        const recentEpochs = [];
-        if (ct && Array.isArray(ct.topPosts)) {
-            for (const p of ct.topPosts) {
-                const ms = p && p.createdAt ? new Date(p.createdAt).getTime() : NaN;
-                if (Number.isFinite(ms) && ms >= ageCutoffMs && ms <= refEpochMs) {
-                    recentEpochs.push(ms);
-                }
-            }
-        }
-        if (ah && ah.latestMainPostAt) {
-            const latestMs = new Date(ah.latestMainPostAt).getTime();
-            if (Number.isFinite(latestMs) && latestMs >= ageCutoffMs && latestMs <= refEpochMs) {
-                if (!recentEpochs.some((e) => Math.abs(e - latestMs) < 60_000)) {
-                    recentEpochs.push(latestMs);
-                }
-            }
-        }
-        const active48hCount = recentEpochs.length;
+        const observedTimes = ah?.recentMainPostTimes;
+        const activePostCount = Array.isArray(observedTimes)
+            ? observedTimes.map(at => Date.parse(at)).filter(ms => ms >= ageCutoffMs && ms <= refEpochMs).length
+            : null;
         const multSecond = computeUpstreamDiversityMult(ev, 1);
         const multThird = computeUpstreamDiversityMult(ev, 2);
 
@@ -6913,11 +7501,12 @@
         let effectiveDivMult = 1.0;
 
         if (severeGap) {
-            effectiveDivMult = active48hCount >= 2 ? multThird : multSecond;
+            effectiveDivMult = activePostCount >= 2 ? multThird : multSecond;
             score -= maxDivPen;
-            checks.push(
-                `距上一条推文仅 ${gapMin} 分钟，连续发帖会使第 2 条推荐权重折损至 ${Math.round(multSecond * 100)}%`
-            );
+            const weightPct = Math.round(effectiveDivMult * 100);
+            checks.push(activePostCount === null
+                ? `距上一条推文仅 ${gapMin} 分钟，旧报表缺少连续发帖记录，推荐权重估计至多 ${weightPct}%`
+                : `距上一条推文仅 ${gapMin} 分钟，按已采集的连续发帖估算推荐权重为 ${weightPct}%`);
             rewrites.push(`距上一条推文仅 ${gapMin} 分钟，建议延后至满 ${minGapHrsLabel} 小时再发，避免连发曝光折损。`);
         } else if (mildGap) {
             const mildPen = Math.max(6, Math.round(maxDivPen * 0.5));
@@ -6964,7 +7553,7 @@
         // 3. 重复文本与相似度检查
         const cleanText = text.replace(URL_TOKEN_RE, "").trim();
         const simTh = Number(dc.duplicateSimilarityThreshold ?? ev.dppTheta ?? 0.65);
-        const dupEval = evaluateCorpusSimilarity(cleanText, skipDraftIdx);
+        const dupEval = evaluateCorpusSimilarity(text, skipDraftIdx);
         const simPct = Math.round(dupEval.maxSim * 100);
         if (dupEval.exactMatch) {
             const exactPen = Number(dc.exactDuplicateTextPenalty ?? 35);
@@ -6988,8 +7577,7 @@
 
         // 4. 外链、短链信誉与 @非粉丝提及检查
         const urls = text.match(URL_TOKEN_RE) || [];
-        const hasExtLink = urls.some((u) => !/^https?:\/\/((www|mobile)\.)?(x\.com|twitter\.com)(\/|$)/i.test(u));
-        const draftDomain = hasExtLink ? extractPrimaryDraftDomain(urls) : "";
+        const { hasExternalLink: hasExtLink, domain: draftDomain } = classifyDraftLinks(urls, hasMedia || Boolean(options.quoteTweetId));
         const isShortenerUrl = Boolean(draftDomain && KNOWN_SHORTENER_DOMAINS.has(draftDomain));
         const rawMentions = text.match(/(?:^|[^\w])@([A-Za-z0-9_]{1,15})/g) || [];
         const mentionHandles = Array.from(
@@ -7017,6 +7605,8 @@
             checks.push(
                 `包含普通外链（${escapeHtml(draftDomain || "外链")}），链接本身不扣分，曝光主要取决于点击后的停留阅读`
             );
+        } else if (hasExtLink === null) {
+            checks.push("链接目标待确认");
         } else {
             checks.push(
                 `无外链或异常提及风险`
@@ -7099,7 +7689,8 @@
             ? "内容重复"
             : (dupEval.maxSim >= simTh && Array.from(cleanText).length >= 16 ? `相似 ${simPct}%` : "原创");
         const safetyDimScore = riskyUrlMention ? 56 : (isShortenerUrl ? 68 : 100);
-        const safetyDimVal = riskyUrlMention ? "外链+@非粉" : (isShortenerUrl ? "短链风险" : (hasExtLink ? "普通外链" : "无风险"));
+        const safetyDimVal = riskyUrlMention ? "外链+@非粉" : (isShortenerUrl ? "短链风险"
+            : (hasExtLink === null ? "链接目标待确认" : hasExtLink ? "普通外链" : "无风险"));
 
         const dimList = [
             { key: "oon", label: "陌生人推荐", score: oonDimScore, valLabel: oonDimVal },
@@ -7306,49 +7897,32 @@
 
     function renderTopTweetsList(report) {
         const p = report.profile;
-        let topPosts = [...(report.contentTiming.topPosts || [])];
-
-        if (state.topPostFormat !== "ALL") {
-            topPosts = topPosts.filter((t) => {
-                if (state.topPostFormat === "THREAD") return Boolean(t.isThread);
-                if (state.topPostFormat === "MEDIA") return !t.isThread && Boolean(t.hasMedia);
-                return !t.isThread && !t.hasMedia;
-            });
+        const timing = report.contentTiming;
+        const format = state.topPostFormat;
+        const sort = state.topPostSortBy;
+        const limit = 24;
+        const candidates = representativePostCards(timing);
+        const indices = timing.postRankings?.byFormat?.[format]?.[sort];
+        const stats = (timing.formatStats || []).filter(f => format === "ALL" || f.formatCode === format);
+        const observedCount = stats.reduce((sum, f) => sum + Number(f.postCount || 0), 0);
+        const hasViewReadings = !stats.length || stats.some(f => f.viewSampleCount !== 0);
+        let topPosts;
+        let limitedCache = false;
+        if (Array.isArray(indices)) {
+            topPosts = indices.slice(0, limit).map(i => candidates[i]).filter(Boolean);
+        } else {
+            const available = candidates.filter(t => format === "ALL" ||
+                format === (t.isThread ? "THREAD" : t.hasMedia ? "MEDIA" : "TEXT"));
+            topPosts = legacyRepresentativePosts(available, sort).slice(0, limit);
+            const needed = sort === "composite" ? Math.min(limit, observedCount) : observedCount;
+            limitedCache = stats.length ? available.length < needed : candidates.length >= limit && (format !== "ALL" || sort !== "composite");
         }
+        const notice = [];
+        if (observedCount > 0 && !hasViewReadings) notice.push("浏览量尚未取得");
+        if (limitedCache) notice.push("当前缓存仅含部分代表推文");
 
-        topPosts.sort((a, b) => {
-            const required = {
-                algoScore: ["views", "likes", "replies", "reposts", "bookmarks"],
-                er: ["views", "likes", "replies", "reposts", "bookmarks"],
-                views: ["views"], bookmarks: ["bookmarks"], replies: ["replies"]
-            }[state.topPostSortBy];
-            if (required) {
-                const sortable = (post) => postMetricsKnown(post, required) &&
-                    (state.topPostSortBy !== "er" || Number(post.viewCount) > 0) &&
-                    (state.topPostSortBy !== "algoScore" || Number(post.algoScore) >= 0);
-                const availabilityOrder = Number(sortable(b)) - Number(sortable(a));
-                if (availabilityOrder) return availabilityOrder;
-                if (!sortable(a)) return 0;
-            }
-            switch (state.topPostSortBy) {
-                case "algoScore":
-                    return (b.algoScore || 0) - (a.algoScore || 0) || b.viewCount - a.viewCount;
-                case "views":
-                    return b.viewCount - a.viewCount || b.totalEngagements - a.totalEngagements;
-                case "er":
-                    return b.engagementRatePct - a.engagementRatePct || b.viewCount - a.viewCount;
-                case "bookmarks":
-                    return b.bookmarkCount - a.bookmarkCount || (b.bookmarkRatePct || 0) - (a.bookmarkRatePct || 0);
-                case "replies":
-                    return b.replyCount - a.replyCount || b.totalEngagements - a.totalEngagements;
-                default:
-                    return 0; // 保持后端综合影响力默认排序
-            }
-        });
-
-        $("topTweetsList").innerHTML = topPosts.length
+        const cardsHtml = topPosts.length
             ? topPosts
-                  .slice(0, 12)
                   .map((t) => {
                       const engagementKnown = postMetricsKnown(t, ["likes", "replies", "reposts", "bookmarks"]);
                       const erKnown = engagementKnown && postMetricsKnown(t, ["views"]);
@@ -7398,9 +7972,42 @@
                       </article>`;
                   })
                   .join("")
-            : emptyStateHtml("当前类型暂无推文", widerPeriodActions());
+            : "";
+        const messages = notice.map(message => `<div class="format-meta">${escapeHtml(tr(message))}</div>`).join("");
+        const emptyMessage = timing.timelineWindowComplete === true ? "当前类型暂无推文" : "已采集样本中暂无该体裁的主帖";
+        $("topTweetsList").innerHTML = messages + (cardsHtml || (notice.length ? "" : emptyStateHtml(emptyMessage, widerPeriodActions())));
         $("topTweetsList").querySelectorAll(".tweet-text").forEach((el) => {
             el.addEventListener("click", () => el.classList.toggle("is-expanded"));
+        });
+    }
+
+    function representativePostCards(timing) {
+        return [...(timing?.topPosts || []), ...(timing?.postRankings?.additionalPosts || [])];
+    }
+
+    function legacyRepresentativePosts(posts, sort) {
+        const engagementFields = ["likes", "replies", "reposts", "bookmarks"];
+        const metrics = {
+            views: ["viewCount", ["views"]], replies: ["replyCount", ["replies"]],
+            bookmarks: ["bookmarkCount", ["bookmarks"]], engagements: ["totalEngagements", engagementFields],
+            er: ["engagementRatePct", ["views", ...engagementFields]],
+            algoScore: ["algoScore", ["views", ...engagementFields]], bookmarkRate: ["bookmarkRatePct", ["views", "bookmarks"]]
+        };
+        if (!metrics[sort]) return posts;
+        function score(post, name) {
+            const [field, required] = metrics[name];
+            if (!postMetricsKnown(post, required) || post[field] == null || !Number.isFinite(Number(post[field]))) return -Infinity;
+            if ((name === "er" || name === "bookmarkRate") && !(Number(post.viewCount) > 0)) return -Infinity;
+            if (name === "algoScore" && Number(post[field]) < 0) return -Infinity;
+            return Number(post[field]);
+        }
+        const secondary = { views: "engagements", replies: "engagements", bookmarks: "bookmarkRate" }[sort] || "views";
+        return posts.sort((a, b) => {
+            const left = score(a, sort), right = score(b, sort);
+            if (left !== right) return right - left;
+            if (left === -Infinity) return 0;
+            const leftTie = score(a, secondary), rightTie = score(b, secondary);
+            return leftTie === rightTie ? 0 : rightTie - leftTie;
         });
     }
 
@@ -7408,16 +8015,21 @@
     function getEffectiveShareTweetText(report) {
         const sc = report.innerCircle.shareCard;
         const uname = String(report.profile?.username || "").replace(/^@+/, "");
-        const viaSuffix = uname && uname.toLowerCase() !== "elidlicom" ? " via @elidlicom" : "";
+        const authorId = String(state.accessPolicy?.authorAccountId || AUTHOR_ARCHIVE_ACCOUNT_ID);
+        const viaSuffix = uname && String(report.profile?.id || "") !== authorId
+            ? ` via https://x.com/i/user/${encodeURIComponent(authorId)}` : "";
         let raw = (sc.shareTweetText || "").replace(/平均互动率/g, "平均公开互动率");
         if (!hasMetricSample(sc, "engagementRateSampleCount")) {
             raw = raw.replace(/平均公开互动率\s*[\d.]+%/g, "平均公开互动率 --");
         }
         if (sc.metricsNote && !raw.includes(sc.metricsNote)) raw += `\n${sc.metricsNote}`;
-        if (state.shareHideFollowRate) {
+        const followRate = followRateDisplay(report);
+        if (state.shareHideFollowRate || report.followAudit) {
             raw = raw.replace(
-                /(?:🤝\s*)?(?:关注|样本)回关率\s*[\d.]+%(?:[ \t]*[（(][^）)\r\n]*[）)])?/g,
-                `📈 周期总浏览 ${hasMetricSample(report.activity, "viewSampleCount") ? fmtNum(report.activity.totalViews) : "--"}`
+                /(?:🤝\s*)?(?:关注|样本)回关率\s*(?:--|[\d.]+%(?:–[\d.]+%)?)(?:[ \t]*[（(][^）)\r\n]*[）)])?/g,
+                state.shareHideFollowRate
+                    ? `📈 周期总浏览 ${hasMetricSample(report.activity, "viewSampleCount") ? fmtNum(report.activity.totalViews) : "--"}`
+                    : `🤝 ${followRate.detail}`
             );
         }
         if (uname && /我的\s*X\s*社区运营/.test(raw)) {
@@ -7435,11 +8047,13 @@
                 : "--";
             const metricRight = state.shareHideFollowRate
                 ? `📈 浏览 ${hasMetricSample(act, "viewSampleCount") ? fmtNum(act.totalViews) : "--"}`
-                : `🤝 回关率 ${Number(sc.followBackRatePct || 0).toFixed(1)}%`;
+                : `🤝 ${followRate.label} ${followRate.rate}`;
             const scoreStr = Number(sc.activityHealthScore) >= 0 ? `${sc.activityHealthScore}/100` : "--";
+            const posts = sc.originalPosts ?? (Number.isFinite(act.originalPosts) && Number.isFinite(act.quotes)
+                ? act.originalPosts + act.quotes : "--");
             const compactZh = [
                 `📊 @${uname || "me"} ${periodLabel}${viaSuffix}`,
-                `✍️ 发帖 ${sc.authoredTotal ?? 0} ｜ 💬 回复 ${sc.repliesCount ?? 0}（${Number(sc.replyToPostRatio || 0).toFixed(1)}x）`,
+                `✍️ 发帖 ${posts} ｜ 💬 回复 ${sc.replies ?? act.replies ?? "--"}（${Number(sc.replyToPostRatio || 0).toFixed(1)}x）`,
                 `⚡ 互动率 ${erText} ｜ ${metricRight}`,
                 `🏆 ${sc.personaTag || "活跃运营"}（${scoreStr}）`,
                 "#BuildInPublic #X运营"
@@ -7686,6 +8300,7 @@
         ctx.fillStyle = pal.blue;
         ctx.fillText(personaText, 82, 191, pillW - 44);
 
+        const followRate = followRateDisplay(report);
         const fourthCard = state.shareHideFollowRate
             ? {
                   label: "周期总浏览",
@@ -7694,9 +8309,9 @@
                   color: pal.green
               }
             : {
-                  label: (sc.followBackRateLabel || "").startsWith("样本") ? "样本回关率" : "关注回关率",
-                  val: `${sc.followBackRatePct}%`,
-                  sub: (sc.followBackRateLabel || "").startsWith("样本") ? "名单未完整，未知关系待确认" : "关注列表互关健康度",
+                  label: followRate.label,
+                  val: followRate.rate,
+                  sub: followRate.scope,
                   color: pal.green
               };
 
@@ -8456,7 +9071,7 @@
                 assistantDraftVersion: Number(sourceRef.assistantDraftVersion || 0),
                 topicId: String(sourceRef.topicId || ""),
                 quoteSource: Boolean(sourceRef.quoteSource)
-            } : null
+            } : sourceRef?.rewriteSource ? { rewriteSource: sourceRef.rewriteSource } : null
         };
     }
 
@@ -8548,48 +9163,15 @@
     }
 
     function hasScheduleAccessDecision() {
-        if (typeof isOwnerAllPermissions === "function" && isOwnerAllPermissions()) return true;
-        if (
-            state.authStatus?.ownerAllPermissions === false ||
-            Boolean(
-                state.authStatus?.user?.username &&
-                    String(state.authStatus.user.username).replace(/^@+/, "").trim().toLowerCase() !== "elidlicom"
-            )
-        ) {
-            return true;
-        }
-        return Boolean(
-            state.scheduleAccess
-            || (state.accessPolicy && typeof state.accessPolicy.scheduledPublishAllowed === "boolean")
-        );
+        return state.authStatus?.loggedIn === true;
     }
 
     function isScheduleEligible() {
-        if (typeof isOwnerAllPermissions === "function" && isOwnerAllPermissions()) return true;
-        if (
-            state.authStatus?.ownerAllPermissions === false ||
-            Boolean(
-                state.authStatus?.user?.username &&
-                    String(state.authStatus.user.username).replace(/^@+/, "").trim().toLowerCase() !== "elidlicom"
-            )
-        ) {
-            return false;
-        }
-        if (state.scheduleAccess) {
-            return Boolean(state.scheduleAccess.allowed);
-        }
-        if (state.accessPolicy && typeof state.accessPolicy.scheduledPublishAllowed === "boolean") {
-            return Boolean(state.accessPolicy.scheduledPublishAllowed);
-        }
-        return true;
+        return isOwnerAllPermissions();
     }
 
     function getScheduleLockedReason() {
-        return (
-            state.scheduleAccess?.reason
-            || state.accessPolicy?.scheduledPublishLockedReason
-            || "定时发布付费能力仅对 @elidlicom 开放使用。"
-        );
+        return "定时发布仅向已验证的作者账号开放。";
     }
 
     const STEPUP_SCHEDULE_DRAFT_KEY = "xops_stepup_schedule_draft";
@@ -8847,6 +9429,17 @@
     }
 
     async function restoreScheduleDraftAfterStepUpAuth() {
+        const generation = state.userScopeGeneration;
+        const userId = stableUserId(state.authStatus?.user);
+        const pending = state.scheduleDraftRestore;
+        if (pending && pending.generation === generation && pending.userId === userId) return pending.promise;
+        const restore = {generation, userId, promise: restoreScheduleDraftContents()};
+        state.scheduleDraftRestore = restore;
+        try { await restore.promise; }
+        finally { if (state.scheduleDraftRestore === restore) state.scheduleDraftRestore = null; }
+    }
+
+    async function restoreScheduleDraftContents() {
         cancelScheduleDraftPersistence();
         const userId = stableUserId(state.authStatus?.user);
         if (!isLoggedIn() || !userId) return;
@@ -8969,36 +9562,7 @@
         const locked = loggedIn && decided && !eligible;
 
         const eligCard = document.getElementById("scheduleEligibilityCard");
-        if (eligCard) {
-            eligCard.hidden = !locked;
-            if (locked) {
-                const descEl = document.getElementById("scheduleEligibilityDesc");
-                const rawReason = getScheduleLockedReason();
-                const isGenericTop100Msg = /^定时发布仅限与\s*@?elidlicom\s*互动频率前\s*100/.test(rawReason.trim());
-                if (descEl) {
-                    descEl.textContent = isGenericTop100Msg ? "" : rawReason;
-                    descEl.hidden = isGenericTop100Msg;
-                }
-                const rank = state.scheduleAccess?.authorInteractionRank ?? state.accessPolicy?.authorInteractionRank ?? null;
-                const rankText = rank === 0
-                    ? "✓ 作者本人"
-                    : rank != null && rank >= 1 && rank <= 100
-                        ? `✓ 互动第 ${rank} 名`
-                        : rank != null && rank > 100
-                            ? `当前第 ${rank} 名（需前 100）`
-                            : "未进入互动前 100";
-                const metaEl = document.getElementById("scheduleEligibilityMeta");
-                if (metaEl) {
-                    metaEl.innerHTML =
-                        `<span class="mini-tag ${rank !== null && rank <= 100 ? "green" : "amber"}">${escapeHtml(rankText)}</span>`;
-                }
-                const actionLink = document.getElementById("scheduleEligibilityActionLink");
-                if (actionLink) {
-                    actionLink.href = "https://x.com/elidlicom";
-                    actionLink.textContent = "去互动 ↗";
-                }
-            }
-        }
+        if (eligCard) eligCard.hidden = !locked;
 
         const draftItems = state.scheduleDraftItems || [];
         const draftCount = draftItems.length;
@@ -9483,7 +10047,7 @@
         });
     }
 
-    function sendTextDraftToSchedule(text, attachedFiles = [], quoteMeta = null) {
+    function sendTextDraftToSchedule(text, attachedFiles = [], quoteMeta = null, rewriteSource = null) {
         switchTab("schedule");
         if (state.scheduleDraftRestoring) {
             setScheduleComposerError("图片正在恢复，请稍候再加入草稿。", true);
@@ -9520,7 +10084,7 @@
         item.files = media.files;
         item.quoteTweetId = String(quoteMeta?.quoteTweetId || "").trim();
         item.quoteTweetUrl = String(quoteMeta?.quoteTweetUrl || "").trim();
-        if (!quoteMeta?.quoteTweetId) item.sourceRef = null;
+        item.sourceRef = rewriteSource ? { rewriteSource } : null;
         if (!item.timeTouched) {
             const jitterMin = getRecommendedScheduleJitterMin(item);
             const gapMs = MIN_SCHEDULE_INTERVAL_MS + jitterMin * 60_000;
@@ -9631,6 +10195,11 @@
         return true;
     }
 
+    function canRescheduleJob(job) {
+        return Boolean(job && !job.uncertainDelivery &&
+            ["SCHEDULED", "OVERDUE_CONFIRM_REQUIRED", "FAILED", "CANCELLED"].includes(job.status));
+    }
+
     function preserveRescheduleEditor(listEl) {
         if (!listEl) return false;
         const jobId = state.rescheduleEditingJobId;
@@ -9638,13 +10207,14 @@
         const key = CSS.escape(jobId);
         if (!listEl.querySelector('[data-resched-input="' + key + '"]')) return false;
         const job = (state.scheduleJobs || []).find((item) => item.id === jobId);
-        const editable = job && ["SCHEDULED", "OVERDUE_CONFIRM_REQUIRED", "FAILED", "CANCELLED"].includes(job.status);
+        const editable = canRescheduleJob(job);
         const save = listEl.querySelector('[data-job-action="save-reschedule"][data-job-id="' + key + '"]');
         if (save) save.disabled = !editable || state.scheduleMutations.has("job:" + jobId)
             || state.scheduleMutations.has("batch-resend");
         if (!editable) {
             const message = !job ? "这条任务已不存在，请关闭编辑。"
                 : job.status === "PUBLISHED" ? "这条任务已发布，无法改期。"
+                : job.uncertainDelivery ? "请先核实原帖是否已发布，再决定是否补发。"
                 : "这条任务正在发送或已进入补发队列，暂时无法改期。";
             setRescheduleError(jobId, message, false, "status");
         } else if (state.rescheduleErrorKind === "status") {
@@ -9652,6 +10222,20 @@
         }
         // Keep the original input node: replacing it dismisses mobile date/time pickers.
         return true;
+    }
+
+    function scheduledPublicationDisplay(job) {
+        const published = job.status === "PUBLISHED";
+        const receipt = published ? job.publicationReceipt : null;
+        const payload = receipt || (job.uncertainDelivery ? job.dispatchedPayload : null);
+        const quoteId = payload ? payload.quoteTweetId : job.quoteTweetId;
+        return {
+            text: payload?.text ?? job.text ?? "",
+            quoteUrl: quoteId ? (job.quoteTweetUrl || `https://x.com/i/status/${quoteId}`) : "",
+            quoteLabel: published && !receipt ? "原计划引用的推文 ↗" : "引用原帖 ↗",
+            modeLabel: receipt?.mode === "QUOTE_LINK" ? "已发布，并附上原帖链接"
+                : receipt?.mode === "STANDALONE_FALLBACK" ? "原帖引用受限，已作为独立推文发布" : ""
+        };
     }
 
     function renderScheduledTweetsList() {
@@ -9727,11 +10311,7 @@
                     alertHtml = `<div class="schedule-job-alert is-danger">${escapeHtml(job.lastError)}</div>`;
                 }
 
-                const canEditTime =
-                    job.status === "SCHEDULED" ||
-                    job.status === "OVERDUE_CONFIRM_REQUIRED" ||
-                    job.status === "FAILED" ||
-                    job.status === "CANCELLED";
+                const canEditTime = canRescheduleJob(job);
                 const showRescheduleBox = state.rescheduleEditingJobId === job.id && canEditTime;
                 const rescheduleMinVal = formatEpochToDatetimeLocalValue(Date.now() + 60_000);
                 const rescheduleBoxHtml = showRescheduleBox
@@ -9781,11 +10361,9 @@
                     ? `原定 ${formatScheduleEpochLabel(job.scheduledAtEpochMs)}`
                     : "";
 
-                const jobQuoteUrl = job.quoteTweetId
-                    ? escapeHtml(safeHttpUrl(job.quoteTweetUrl || `https://x.com/i/status/${job.quoteTweetId}`, `https://x.com/i/status/${job.quoteTweetId}`))
-                    : "";
-                const jobQuoteHtml = jobQuoteUrl
-                    ? `<div class="schedule-quote-attachment is-queued"><a href="${jobQuoteUrl}" target="_blank" rel="noopener noreferrer">引用原帖 ↗</a></div>`
+                const display = scheduledPublicationDisplay(job);
+                const jobQuoteHtml = display.quoteUrl
+                    ? `<div class="schedule-quote-attachment is-queued"><a href="${escapeHtml(safeHttpUrl(display.quoteUrl))}" target="_blank" rel="noopener noreferrer">${escapeHtml(display.quoteLabel)}</a></div>`
                     : "";
 
                 return `<article class="schedule-job-card${showRescheduleBox ? " is-rescheduling" : ""}">
@@ -9793,7 +10371,8 @@
                         <span class="mini-tag ${st.cls}">${escapeHtml(st.label)}</span>
                         <span class="schedule-job-time" ${timeTitle ? `title="${escapeHtml(timeTitle)}"` : ""}>${escapeHtml(timePrefix)}</span>
                     </div>
-                    <div class="schedule-job-text" ${job.text ? "data-i18n-ignore" : ""}>${job.text ? escapeHtml(job.text) : "<span class=\"user-handle-muted\">图片推文</span>"}</div>
+                    <div class="schedule-job-text" ${display.text ? "data-i18n-ignore" : ""}>${display.text ? escapeHtml(display.text) : "<span class=\"user-handle-muted\">图片推文</span>"}</div>
+                    ${display.modeLabel ? `<div class="schedule-job-alert">${escapeHtml(display.modeLabel)}</div>` : ""}
                     ${jobQuoteHtml}
                     ${mediaHtml}
                     ${alertHtml}
@@ -10144,6 +10723,7 @@
                     payload.assistantDraftId = items[0].sourceRef.assistantDraftId;
                     payload.assistantDraftVersion = Number(items[0].sourceRef.assistantDraftVersion || 0);
                 }
+                if (items[0].sourceRef?.rewriteSource) payload.rewriteSource = items[0].sourceRef.rewriteSource;
                 if (items[0].quoteTweetId) {
                     payload.quoteTweetId = items[0].quoteTweetId;
                     if (items[0].quoteTweetUrl) payload.quoteTweetUrl = items[0].quoteTweetUrl;
@@ -10160,6 +10740,7 @@
                     clientRequestId: `${state.composerClientRequestId}_${idx}`,
                     assistantDraftId: it.sourceRef?.assistantDraftId || null,
                     assistantDraftVersion: it.sourceRef?.assistantDraftVersion || null,
+                    rewriteSource: it.sourceRef?.rewriteSource || null,
                     quoteTweetId: it.quoteTweetId || null,
                     quoteTweetUrl: it.quoteTweetUrl || null
                 }));
@@ -10177,6 +10758,7 @@
                     fd.append("assistantDraftId", items[0].sourceRef.assistantDraftId);
                     fd.append("assistantDraftVersion", String(items[0].sourceRef.assistantDraftVersion || 0));
                 }
+                if (items[0].sourceRef?.rewriteSource) fd.append("rewriteSource", JSON.stringify(items[0].sourceRef.rewriteSource));
                 if (items[0].quoteTweetId) {
                     fd.append("quoteTweetId", items[0].quoteTweetId);
                     if (items[0].quoteTweetUrl) fd.append("quoteTweetUrl", items[0].quoteTweetUrl);
@@ -10195,6 +10777,7 @@
                     clientRequestId: `${state.composerClientRequestId}_${idx}`,
                     assistantDraftId: it.sourceRef?.assistantDraftId || null,
                     assistantDraftVersion: it.sourceRef?.assistantDraftVersion || null,
+                    rewriteSource: it.sourceRef?.rewriteSource || null,
                     quoteTweetId: it.quoteTweetId || null,
                     quoteTweetUrl: it.quoteTweetUrl || null
                 }));
@@ -10219,7 +10802,7 @@
             await loadScheduledTweets(true, true);
             if (!mutation.isCurrent()) return;
             if (state.composerClientRequestId === submittedRequestId) clearScheduleComposerDraft();
-            showToast(submittedCount > 1 ? `已批量加入 ${submittedCount} 条定时推文` : "已加入定时发布队列");
+            showToast(submittedCount > 1 ? `已加入队列（${submittedCount} 条）` : "已加入队列");
         } catch (err) {
             if (!mutation.isCurrent()) return;
             const uncertain = !isPreExecutionGatewayRejection(err) && (!err.httpStatus || err.httpStatus >= 500);
@@ -10232,7 +10815,7 @@
                 if (confirmed) {
                     if (state.composerClientRequestId === submittedRequestId) clearScheduleComposerDraft();
                     setScheduleComposerError("");
-                    showToast("已确认加入定时队列");
+                    showToast("已加入队列");
                 } else {
                     setScheduleComposerError("尚未确认提交结果，请先刷新队列核对，避免重复安排；草稿已保留。", true);
                 }
@@ -10701,28 +11284,11 @@
         $("assistantMaterialsList")?.addEventListener("click", async (event) => {
             const openTopic = event.target.closest("[data-assistant-open-topic]");
             if (openTopic) {
-                if (!await saveAssistantDraftEditor()) return;
-                state.assistantSelectedTopicId = openTopic.dataset.assistantOpenTopic;
-                state.assistantView = "assistant";
-                renderContentAssistant();
-                await loadAssistantTopicDetail(state.assistantSelectedTopicId);
+                await openAssistantCreationTopic(openTopic.dataset.assistantOpenTopic);
                 return;
             }
             const research = event.target.closest("[data-assistant-research]");
-            if (research) {
-                const instruction = ($("assistantCreationAngleInput")?.value ?? state.assistantCreationAngle ?? "").trim();
-                const payload = {
-                    materialId: research.dataset.assistantResearch,
-                    mode: research.dataset.researchMode || "RESEARCH",
-                    skillId: state.assistantSelectedSkill || "AUTO",
-                    clientRequestId: newClientRequestId(),
-                    regenerate: research.dataset.regenerate === "true"
-                };
-                if (instruction) payload.instruction = instruction;
-                await runAssistantMutation("research", "/research", payload, 180000);
-                state.assistantView = "assistant";
-                renderContentAssistant();
-            }
+            if (research) await startAssistantMaterialResearch(research);
         });
         const refreshReviewFilter = () => {
             if (state.assistantDashboard) renderAssistantReviewPanel(state.assistantDashboard);
@@ -10778,20 +11344,7 @@
                 return;
             }
             if (!await saveAssistantDraftEditor()) return;
-            const instruction = ($("assistantCreationAngleInput")?.value ?? state.assistantCreationAngle ?? "").trim();
-            const genTarget = parseGenerationTargetSpec(
-                $("assistantGenTargetSelect")?.value || state.assistantGenerationTargetSpec,
-                $("assistantGenEffortSelect") ? $("assistantGenEffortSelect").value : state.assistantGenerationEffort
-            );
-            const payload = {
-                url: rawUrl,
-                mode,
-                skillId: state.assistantSelectedSkill || "AUTO",
-                generationProvider: genTarget.generationProvider,
-                generationModel: genTarget.generationModel,
-                clientRequestId: newClientRequestId()
-            };
-            if (instruction) payload.instruction = instruction;
+            const payload = assistantCreationRequest({ url: rawUrl, mode });
             const researchBtn = $("assistantLinkResearchBtn");
             const fastBtn = $("assistantLinkFastBtn");
             if (researchBtn) researchBtn.disabled = true;
@@ -10800,10 +11353,7 @@
                 const res = await runAssistantMutation("research-link", "/research-link", payload, 180000);
                 if (res && res.topicId) {
                     if (linkInput) linkInput.value = "";
-                    state.assistantSelectedTopicId = res.topicId;
-                    state.assistantOrganizeMode = false;
-                    state.assistantView = "assistant";
-                    await loadContentAssistant(true, 0, true);
+                    await openAssistantCreationTopic(res.topicId);
                     showToast(mode === "FAST" ? "已读取链接正文，正在生成推文…" : "已提交链接调研，正在生成推文…");
                 }
             } finally {
@@ -10847,31 +11397,7 @@
         $("assistantTopicList")?.addEventListener("click", async (event) => {
             const researchBtn = event.target.closest("[data-assistant-research]");
             if (researchBtn) {
-                if (!await saveAssistantDraftEditor()) return;
-                const topicId = researchBtn.dataset.assistantTopicId
-                    || researchBtn.closest("[data-assistant-topic]")?.dataset.assistantTopic || "";
-                if (topicId && topicId !== state.assistantSelectedTopicId) {
-                    state.assistantSelectedTopicId = topicId;
-                    state.assistantOrganizeMode = false;
-                    renderAssistantSkillBar(state.assistantDashboard);
-                }
-                const instruction = ($("assistantCreationAngleInput")?.value ?? state.assistantCreationAngle ?? "").trim();
-                const genTarget = parseGenerationTargetSpec(
-                    $("assistantGenTargetSelect")?.value || state.assistantGenerationTargetSpec,
-                    $("assistantGenEffortSelect") ? $("assistantGenEffortSelect").value : state.assistantGenerationEffort
-                );
-                const payload = {
-                    materialId: researchBtn.dataset.assistantResearch,
-                    mode: researchBtn.dataset.researchMode || "RESEARCH",
-                    skillId: state.assistantSelectedSkill || "AUTO",
-                    generationProvider: genTarget.generationProvider,
-                    generationModel: genTarget.generationModel,
-                    clientRequestId: newClientRequestId(),
-                    regenerate: researchBtn.dataset.regenerate === "true"
-                };
-                if (instruction) payload.instruction = instruction;
-                if (topicId) delete state.assistantSelectedDraftByTopic[topicId];
-                await runAssistantMutation("research", "/research", payload, 180000);
+                await startAssistantMaterialResearch(researchBtn);
                 return;
             }
             const focusDraftBtn = event.target.closest("[data-assistant-focus-draft]");
@@ -10948,7 +11474,7 @@
             const materialId = previewBtn.dataset.repostPreviewMaterialId || "";
             const row = previewBtn.closest("[data-source-row]");
             const overrides = row ? collectSourceAutoRepostOverrides(row, row.dataset.sourceRow || sourceKey) : {};
-            openRepostPreviewModal(sourceKey, { materialId, overrides });
+            openRepostPreviewModal(sourceKey, { materialId, overrides, filterMode: previewBtn.dataset.sourcePreviewMode });
         });
         $("assistantSourcesList")?.addEventListener("change", async (event) => {
             const tierSelect = event.target.closest("[data-assistant-source-tier]");
@@ -11036,12 +11562,17 @@
             }
         });
         $("assistantAutoRepostFeed")?.addEventListener("click", async (event) => {
+            const verify = event.target.closest("[data-assistant-verify]");
+            if (verify) { await verifyAssistantPublication(verify); return; }
             const retryBtn = event.target.closest("[data-autorepost-retry]");
             if (!retryBtn) return;
             const id = (retryBtn.dataset.autorepostRetry || "").trim();
             if (!id) return;
-            const res = await runAssistantMutation("autorepost-retry", `/auto-reposts/${encodeURIComponent(id)}/retry`, {});
-            if (res) showToast("已重新提交自动引用转推");
+            const mode = retryBtn.dataset.publishMode;
+            if (mode !== "REPOST" && mode !== "REWRITE") return;
+            const reassess = mode === "REWRITE" && retryBtn.dataset.reassess === "true";
+            const res = await runAssistantMutation("autorepost-retry", `/auto-reposts/${encodeURIComponent(id)}/retry?mode=${mode}${reassess ? "&reassess=true" : ""}`, {});
+            if (res) showToast(mode === "REWRITE" ? "已重新提交改写稿" : "已重新提交自动引用转推");
         });
         $("assistantHistoryStatus")?.addEventListener("click", async (event) => {
             const retryBtn = event.target.closest("[data-assistant-history-retry]");
@@ -11269,27 +11800,14 @@
             renderAssistantTopicDetail(state.assistantDashboard);
         });
         $("assistantTopicDetail")?.addEventListener("click", async (event) => {
+            const conflict = event.target.closest("[data-assistant-resolve-conflict]");
+            if (conflict) {
+                await resolveAssistantDraftConflict(conflict.dataset.assistantResolveConflict);
+                return;
+            }
             const research = event.target.closest("[data-assistant-research]");
             if (research) {
-                const instruction = ($("assistantCreationAngleInput")?.value ?? state.assistantCreationAngle ?? "").trim();
-                const genTarget = parseGenerationTargetSpec(
-                    $("assistantGenTargetSelect")?.value || state.assistantGenerationTargetSpec,
-                    $("assistantGenEffortSelect") ? $("assistantGenEffortSelect").value : state.assistantGenerationEffort
-                );
-                const payload = {
-                    materialId: research.dataset.assistantResearch,
-                    mode: research.dataset.researchMode || "RESEARCH",
-                    skillId: state.assistantSelectedSkill || "AUTO",
-                    generationProvider: genTarget.generationProvider,
-                    generationModel: genTarget.generationModel,
-                    clientRequestId: newClientRequestId(),
-                    regenerate: research.dataset.regenerate === "true"
-                };
-                if (instruction) payload.instruction = instruction;
-                if (state.assistantSelectedTopicId) {
-                    delete state.assistantSelectedDraftByTopic[state.assistantSelectedTopicId];
-                }
-                await runAssistantMutation("research", "/research", payload, 180000);
+                await startAssistantMaterialResearch(research);
                 return;
             }
             const researchUpgrade = event.target.closest("[data-assistant-research-upgrade]");
@@ -11334,18 +11852,27 @@
                     setContentAssistantError("请先选择要移动的文字来源。");
                     return;
                 }
-                const topic = (state.assistantDashboard?.topics || []).find((item) => item.id === state.assistantSelectedTopicId);
+                const topic = selectedAssistantTopic(state.assistantDashboard);
                 const targetTopicId = $("assistantMoveTarget").value;
                 const versions = { [topic.id]: topic.version };
                 const target = (state.assistantDashboard?.topics || []).find((item) => item.id === targetTopicId);
                 if (target) versions[target.id] = target.version;
-                await runAssistantMutation("move-materials", "/topics/move", { materialIds, targetTopicId, versions });
+                const isCurrentUser = captureUserScope();
+                const editor = $("assistantDraftEditor");
+                if (editor?.readOnly) return;
+                if (editor) editor.readOnly = true;
+                try {
+                    if (!await saveAssistantDraftEditor() || !isCurrentUser() || state.assistantSelectedTopicId !== topic.id) return;
+                    await runAssistantMutation("move-materials", "/topics/move", { materialIds, targetTopicId, versions });
+                } finally {
+                    if (editor) editor.readOnly = false;
+                }
                 return;
             }
             const confirmTopic = event.target.closest("[data-assistant-confirm-topic]");
             if (confirmTopic) {
                 const topicId = confirmTopic.dataset.assistantConfirmTopic;
-                const topic = (state.assistantDashboard?.topics || []).find((item) => item.id === topicId);
+                const topic = selectedAssistantTopic(state.assistantDashboard);
                 const payload = topic?.version !== undefined ? { version: Number(topic.version) } : {};
                 await runAssistantMutation("confirm-topic", `/topics/${encodeURIComponent(topicId)}/confirm`, payload);
                 return;
@@ -11386,6 +11913,7 @@
             if (version) {
                 const preview = $("assistantDraftVersionPreview");
                 preview.dataset.draftId = $("assistantDraftEditor").closest("[data-draft-id]").dataset.draftId;
+                preview.dataset.version = version.dataset.assistantVersion;
                 $("assistantDraftVersionText").value = version.dataset.assistantVersionText || "";
                 $("assistantDraftVersionTitle").textContent = `预览 v${version.dataset.assistantVersion}`;
                 preview.hidden = false;
@@ -11399,18 +11927,22 @@
                 if (preview.hidden || !draftId || preview.dataset.draftId !== draftId) return;
                 const isCurrentUser = captureUserScope();
                 const isCurrentDraft = () => isCurrentUser() && adopt.isConnected && $("assistantDraftEditor") === editor;
-                const text = $("assistantDraftVersionText").value;
+                const sourceVersion = Number(preview.dataset.version);
+                const wasReadOnly = editor.readOnly;
                 adopt.disabled = true;
+                editor.readOnly = true;
                 try {
-                    if (!await saveAssistantDraftEditor() || !isCurrentDraft()) return;
-                    editor.value = text;
-                    const metrics = $("assistantDraftLiveMetrics");
-                    if (metrics) metrics.innerHTML = renderAssistantDraftMetricsHtml(editor.value);
-                    queueAssistantDraftSave();
-                    if (!await saveAssistantDraftEditor() || !isCurrentDraft()) return;
+                    const current = await saveAssistantDraftEditor();
+                    if (!current || current.id !== draftId || !isCurrentDraft()) return;
+                    const restored = await runAssistantMutation("adopt-version", `/drafts/${encodeURIComponent(draftId)}/adopt`,
+                        { version: current.version, sourceVersion });
+                    if (!restored || !isCurrentDraft()) return;
+                    editor.value = restored.text;
                     preview.hidden = true;
                     $("assistantDraftVersions").hidden = true;
+                    renderAssistantTopicDetail(state.assistantDashboard);
                 } finally {
+                    editor.readOnly = wasReadOnly;
                     adopt.disabled = false;
                 }
                 return;
@@ -11555,25 +12087,10 @@
                 return;
             }
             const publishNow = event.target.closest("[data-assistant-publish-now]");
+            const verify = event.target.closest("[data-assistant-verify]");
+            if (verify) { await verifyAssistantPublication(verify); return; }
             if (publishNow) {
-                const draftId = publishNow.dataset.assistantPublishNow;
-                const quoteSource = publishNow.dataset.quoteSource === "true";
-                if (!await saveAssistantDraftEditor()) return;
-                const currentDraft = (state.assistantDashboard?.drafts || []).find((item) => item.id === draftId);
-                if (!currentDraft) return;
-                const result = await runAssistantMutation(
-                    "publish-now",
-                    `/drafts/${encodeURIComponent(currentDraft.id)}/publish-now`,
-                    {
-                        version: currentDraft.version,
-                        quoteSource,
-                        clientRequestId: newClientRequestId()
-                    },
-                    60000
-                );
-                if (result) {
-                    showToast(quoteSource ? "已引用原帖发布并登记复盘" : "已发布并登记复盘");
-                }
+                await publishAssistantDraftNow(publishNow.dataset.assistantPublishNow, publishNow.dataset.quoteSource === "true");
                 return;
             }
             const schedule = event.target.closest("[data-assistant-schedule]");
@@ -11588,8 +12105,12 @@
             if (updateScheduled) {
                 const publication = (state.assistantDashboard?.publications || []).find((item) =>
                     (item.id || item.intentId) === updateScheduled.dataset.assistantUpdateScheduled);
-                const draft = (state.assistantDashboard?.drafts || []).find((item) => item.id === publication?.draftId);
-                if (publication && draft) {
+                const isCurrentUser = captureUserScope();
+                if (!publication || !isCurrentUser()) return;
+                while (state.assistantMutation && isCurrentUser()) await state.assistantMutation.done;
+                if (!isCurrentUser()) return;
+                const draft = await saveAssistantDraftEditor();
+                if (isCurrentUser() && draft?.id === publication.draftId) {
                     await runAssistantMutation("update-scheduled",
                         `/drafts/${encodeURIComponent(draft.id)}/update-scheduled`, {
                             version: draft.version,
@@ -11802,7 +12323,52 @@
                 link.href = buildRepostIntentHref(buildRepostItemComposedText(id));
             }
         });
-        document.getElementById("repostPreviewTimelineList")?.addEventListener("click", (event) => {
+        window.addEventListener("storage", event => {
+            if (!event.key?.startsWith(PENDING_QUOTE_STORAGE_PREFIX) || $("repostPreviewModal")?.hidden !== false) return;
+            const row = repostPreviewState.items.find(item => item.material?.id && PENDING_QUOTE_STORAGE_PREFIX + quoteAttemptKey(item.material) === event.key);
+            if (!row) return;
+            const attempt = repostPreviewState.pendingQuotes.get(quoteAttemptKey(row.material));
+            if (attempt) {
+                markQuoteAwaitingReceipt(row, attempt);
+                renderRepostPreviewTimeline(String(row.material.id));
+            } else {
+                void refreshQuoteReceipt(String(row.material.id)).catch(() => {});
+            }
+        });
+        document.getElementById("repostPreviewTimelineList")?.addEventListener("click", async (event) => {
+            const checkReceipt = event.target?.closest?.("[data-repost-refresh-receipt]");
+            if (checkReceipt) {
+                checkReceipt.disabled = true;
+                const token = repostPreviewState.requestToken;
+                try { await refreshQuoteReceipt(checkReceipt.dataset.repostRefreshReceipt); }
+                catch (error) {
+                    if (token === repostPreviewState.requestToken) showToast(formatLocalizedFetchError(error, "未能刷新回执"));
+                } finally { checkReceipt.disabled = false; }
+                return;
+            }
+            const review = event.target?.closest?.("[data-repost-review-item]");
+            if (review) {
+                const id = review.dataset.repostReviewItem;
+                const row = repostPreviewState.items.find(item => String(item.material?.id || "") === id);
+                const quoteId = row ? resolveRepostQuoteTweetId(row.material) || id : id;
+                const account = captureUserScope();
+                closeRepostPreviewModal();
+                state.assistantView = "monitor";
+                switchTab("timing");
+                renderContentAssistant();
+                await loadContentAssistant(true);
+                if (account() && state.assistantView === "monitor") {
+                    const feed = $("assistantAutoRepostFeed");
+                    const target = feed?.querySelector(`[data-quote-verification][data-verification-material="${CSS.escape(id)}"], [data-quote-verification="${CSS.escape(quoteId)}"]`);
+                    if (!target) {
+                        showToast("暂未找到这条引用的记录，请稍后刷新回执");
+                        return;
+                    }
+                    target?.scrollIntoView({block: "center"});
+                    target?.querySelector("[data-assistant-verify]")?.focus({preventScroll: true});
+                }
+                return;
+            }
             const rwPreviewBtn = event.target?.closest?.("[data-rewrite-preview-item]");
             if (rwPreviewBtn) {
                 const id = rwPreviewBtn.dataset.rewritePreviewItem || "";
@@ -11835,14 +12401,24 @@
             const rwSchedBtn = event.target?.closest?.("[data-rewrite-schedule-item]");
             if (rwSchedBtn) {
                 const id = rwSchedBtn.dataset.rewriteScheduleItem || "";
+                const row = repostPreviewState.items.find((item) => String(item.material?.id || "") === id);
+                const ownerId = String(repostPreviewState.owner?.accountId || "");
+                if (!row || !ownerId || ownerId !== stableUserId(state.authStatus?.user)) {
+                    showToast("发布账号已变更，请重新打开来源时间线");
+                    return;
+                }
                 const text = getRewriteItemText(id).trim();
                 if (!text) {
                     showToast("暂无可转入定时的洗稿内容");
                     return;
                 }
-                if (sendTextDraftToSchedule(text) !== false) {
+                const locked = ["PUBLISHED", "UNCERTAIN", "SENDING"].includes(row.rewrite?.status);
+                const storedRef = !locked && repostPreviewState.editedRewrites.reference?.(id);
+                const rewriteSource = storedRef || { ownerAccountId: ownerId, materialId: id, recordVersion: Number(row.rewrite?.savedDraftVersion || 0) };
+                if (!storedRef && row.rewrite?.previewId) rewriteSource.previewId = row.rewrite.previewId;
+                if (sendTextDraftToSchedule(text, [], null, rewriteSource) !== false) {
                     closeRepostPreviewModal();
-                    showToast("已转入定时发布");
+                    showToast("已转入排期草稿，请确认时间后加入队列");
                 }
                 return;
             }
@@ -11896,6 +12472,7 @@
             if (schedBtn) {
                 const id = schedBtn.dataset.repostScheduleItem || "";
                 const found = (repostPreviewState.items || []).find((it) => String(it.material?.id || "") === id);
+                if (!found || quoteDeliveryStatus(found.decision) || repostPreviewState.publishingIds.has(id)) return;
                 const comment = getRepostItemCommentText(id).trim();
                 if (!comment) {
                     showToast("暂无可转入的转发内容");
@@ -11909,65 +12486,13 @@
                 }
                 if (sendTextDraftToSchedule(comment, [], { quoteTweetId, quoteTweetUrl }) !== false) {
                     closeRepostPreviewModal();
-                    showToast("已带原帖引用转入定时发布");
+                    showToast("已转入排期草稿，请确认时间后加入队列");
                 }
                 return;
             }
             const pubBtn = event.target?.closest?.("[data-repost-publish-item]");
             if (pubBtn) {
-                const id = pubBtn.dataset.repostPublishItem || "";
-                if (!id || repostPreviewState.publishingIds.has(id)) return;
-                const found = (repostPreviewState.items || []).find((it) => String(it.material?.id || "") === id);
-                const comment = getRepostItemCommentText(id).trim();
-                if (!comment) {
-                    showToast("转发附文不能为空");
-                    return;
-                }
-                const sourceUrl = found ? resolveRepostMaterialUrl(found.material) : "";
-                const quoteTweetId = resolveRepostQuoteTweetId(found?.material || { id });
-                if (!quoteTweetId) {
-                    showToast("该素材缺少有效原帖推文 ID，无法引用转发");
-                    return;
-                }
-                const token = repostPreviewState.requestToken;
-                repostPreviewState.publishingIds.add(id);
-                renderRepostPreviewTimeline(id);
-                void (async () => {
-                    try {
-                        const res = await contentAssistantRequest(
-                            `/sources/${encodeURIComponent(repostPreviewState.sourceKey)}/publish-quote`,
-                            {
-                                materialId: id,
-                                sourceUrl,
-                                commentText: comment,
-                                clientRequestId: newClientRequestId()
-                            },
-                            60000
-                        );
-                        if (token !== repostPreviewState.requestToken) return;
-                        if (found) {
-                            found.decision = {
-                                ...(found.decision || {}),
-                                evaluated: true,
-                                wouldAutoRepost: true,
-                                persistedStatus: "PUBLISHED",
-                                decisionCode: "PUBLISHED",
-                                publishedTweetUrl: res?.publishedTweetUrl || found.decision?.publishedTweetUrl || "",
-                                commentText: res?.text || comment
-                            };
-                        }
-                        showToast("已引用原帖发布");
-                    } catch (err) {
-                        if (token === repostPreviewState.requestToken) {
-                            showToast(formatLocalizedFetchError(err, "引用原帖发布失败，请稍后重试"));
-                        }
-                    } finally {
-                        if (token === repostPreviewState.requestToken) {
-                            repostPreviewState.publishingIds.delete(id);
-                            renderRepostPreviewTimeline(id);
-                        }
-                    }
-                })();
+                void publishRepostPreviewItem(pubBtn.dataset.repostPublishItem || "");
             }
         });
 
@@ -12448,7 +12973,7 @@
                 const btn = e.target && e.target.closest ? e.target.closest("[data-top-post-id]") : null;
                 if (!btn) return;
                 const postId = btn.dataset.topPostId;
-                const posts = state.report?.contentTiming?.topPosts || [];
+                const posts = representativePostCards(state.report?.contentTiming);
                 const post = posts.find((item) => String(item.id) === String(postId));
                 if (!post) return;
                 loadDraftIntoSimulator(post.text || "", {
@@ -12843,12 +13368,14 @@
                 }
                 openConfirmResendModal(job);
             } else if (action === "toggle-reschedule") {
+                if (!canRescheduleJob(job)) return;
                 state.rescheduleEditingJobId = state.rescheduleEditingJobId === jobId ? null : jobId;
                 state.rescheduleDraftValue = null;
                 state.rescheduleError = "";
                 state.rescheduleErrorKind = "";
                 renderScheduledTweetsList();
             } else if (action === "save-reschedule") {
+                if (!canRescheduleJob(job)) return;
                 if (hasScheduleAccessDecision() && !isScheduleEligible()) {
                     setRescheduleError(jobId, getScheduleLockedReason(), true);
                     return;
@@ -12980,7 +13507,12 @@
 
         if (authResult === "publish_ok") {
             setPublishAuthError("");
-            showToast("定时发布二次授权已开通！长效离线刷新已启用");
+            const cap = state.authStatus || {};
+            if (!cap.writeAuthorized) showToast("发布权限尚未确认，请在定时发布页重新授权。");
+            else if (cap.mediaWriteAuthorized && cap.offlineRefreshable) showToast("定时发布二次授权已开通！长效离线刷新已启用");
+            else if (cap.offlineRefreshable) showToast("文本发布已授权，长效离线刷新已启用。");
+            else if (cap.mediaWriteAuthorized) showToast("文本和图片发布已授权，尚未确认长效离线刷新。");
+            else showToast("文本发布已授权，尚未确认长效离线刷新。");
             cleanAuthQueryParams();
         } else if (authResult === "ok") {
             showToast("X 授权登录成功！已进入您本人的专属运营工作台");
@@ -12998,13 +13530,7 @@
         }
 
         if (isLoggedIn()) {
-            const nonOwner =
-                state.authStatus?.ownerAllPermissions !== true &&
-                (state.authStatus?.ownerAllPermissions === false ||
-                    Boolean(
-                        state.authStatus?.user?.username &&
-                            String(state.authStatus.user.username).replace(/^@+/, "").trim().toLowerCase() !== "elidlicom"
-                    ));
+            const nonOwner = state.authStatus?.ownerAllPermissions !== true;
             const validTabs = new Set(["activity", "interactions", "follow-audit", "timing", "circle", "schedule"]);
             const initialTab = !nonOwner && (urlTab === "schedule" || authResult === "publish_ok" || publishAuthErr)
                 ? "schedule" : urlTab && validTabs.has(urlTab) ? urlTab : state.activeTab;

@@ -62,6 +62,10 @@ public class OfficialXApiV2Provider {
     }
 
     public RawAccountSnapshot fetchSnapshot(String username, String overrideBearerToken) {
+        return fetchSnapshot(username, overrideBearerToken, null);
+    }
+
+    public RawAccountSnapshot fetchSnapshot(String username, String overrideBearerToken, String expectedAccountId) {
         String rawToken = (overrideBearerToken != null && !overrideBearerToken.isBlank())
                 ? overrideBearerToken.trim()
                 : properties.getOfficialBearerToken();
@@ -73,11 +77,13 @@ public class OfficialXApiV2Provider {
                 : rawToken;
 
         String baseUrl = trimTrailingSlash(properties.getOfficialBaseUrl());
-        String encodedUser = URLEncoder.encode(username, StandardCharsets.UTF_8);
+        boolean byId = expectedAccountId != null && !expectedAccountId.isBlank();
+        String profilePath = byId ? "/users/" + URLEncoder.encode(expectedAccountId, StandardCharsets.UTF_8)
+                : "/users/by/username/" + URLEncoder.encode(username, StandardCharsets.UTF_8);
 
         // 1. 获取用户基本信息（经由共用线程池执行）
         JsonNode userResp = getJson(
-                baseUrl + "/users/by/username/" + encodedUser
+                baseUrl + profilePath
                         + "?user.fields=created_at,description,profile_image_url,profile_banner_url,public_metrics,verified",
                 token
         );
@@ -87,6 +93,8 @@ public class OfficialXApiV2Provider {
         }
         XUserSummary profile = parseV2User(userData);
         String userId = profile.id();
+        if (byId && !expectedAccountId.equals(userId))
+            throw new XDataProviderException(403, "官方返回的账号 ID 与当前登录账号不一致");
 
         // 2-4. 在共用线程池上四路并发拉取动态、提及与关注/粉丝列表
         CompletableFuture<JsonNode> tweetsF = getJsonAsync(
@@ -146,7 +154,7 @@ public class OfficialXApiV2Provider {
                 for (JsonNode m : mData) {
                     String authorId = m.path("author_id").asText("");
                     XUserSummary peer = mentionUsers.get(authorId);
-                    if (peer == null || peer.username().equalsIgnoreCase(profile.username())) {
+                    if (peer == null || userId.equals(peer.id())) {
                         continue;
                     }
                     String replyUserId = replyTargetId(m, mentionTweetAuthors);
@@ -177,7 +185,7 @@ public class OfficialXApiV2Provider {
                             m.path("text").asText(""),
                             m.path("conversation_id").asText(""),
                             inReplyToId,
-                            replyToUsername
+                            replyToUsername, replyUserId
                     ));
                 }
             }
@@ -186,17 +194,22 @@ public class OfficialXApiV2Provider {
         Map<String, RelationshipEntry> relMap = new LinkedHashMap<>();
         JsonNode followingResp = followingF.join();
         JsonNode followersResp = followersF.join();
-        boolean followGraphRestricted = (followingResp == null || followersResp == null);
+        boolean followingsFailed = graphPageUnavailable(followingResp);
+        boolean followersFailed = graphPageUnavailable(followersResp);
+        boolean invalidFollowing = false;
+        boolean invalidFollower = false;
         boolean peerIdentityConflict = false;
         {
             if (followingResp != null && followingResp.path("data").isArray()) {
                 for (JsonNode uNode : followingResp.path("data")) {
+                    if (!graphMemberHasIdentity(uNode)) { invalidFollowing = true; continue; }
                     XUserSummary u = parseV2User(uNode);
                     relMap.put(u.username().toLowerCase(Locale.ROOT), new RelationshipEntry(u, true, false));
                 }
             }
             if (followersResp != null && followersResp.path("data").isArray()) {
                 for (JsonNode uNode : followersResp.path("data")) {
+                    if (!graphMemberHasIdentity(uNode)) { invalidFollower = true; continue; }
                     XUserSummary u = parseV2User(uNode);
                     String key = u.username().toLowerCase(Locale.ROOT);
                     RelationshipEntry prev = relMap.get(key);
@@ -214,9 +227,9 @@ public class OfficialXApiV2Provider {
         }
 
         Instant fetchedAt = Instant.now();
-        boolean followersTruncated = peerIdentityConflict || incompletePage(followersResp)
+        boolean followersTruncated = followersFailed || invalidFollower || peerIdentityConflict || incompletePage(followersResp)
                 || (followersResp != null && followersResp.path("data").size() < profile.followersCount());
-        boolean followingsTruncated = incompletePage(followingResp)
+        boolean followingsTruncated = followingsFailed || invalidFollowing || incompletePage(followingResp)
                 || (followingResp != null && followingResp.path("data").size() < profile.followingCount());
         boolean timelineIncomplete = incompleteStreamPage(tweetsResp);
         boolean mentionsIncomplete = incompleteStreamPage(mentionsResp);
@@ -226,11 +239,31 @@ public class OfficialXApiV2Provider {
                 timeline.size(), inbound.size(), relMap.size(), coveredDays);
         if (partial) notice += "数据未完整覆盖；分页令牌、请求失败或名单不足已标记，未知关系不能认定为未关注/未回关。";
         if (mentionsResp == null) notice += "提及请求失败，互动数据降级。";
-        if (followGraphRestricted) notice += "部分关注图谱请求失败，已保留另一侧可用样本。";
+        if (followingsFailed || followersFailed) notice += "部分关注图谱请求失败，已保留另一侧可用样本。";
         return new RawAccountSnapshot(ProviderMode.X_OFFICIAL_V2, true, notice, fetchedAt, profile,
                 timeline, inbound, new ArrayList<>(relMap.values()), followersTruncated, partial, coveredDays,
                 oldestTime(tweetsResp), nextToken(tweetsResp), !timelineIncomplete,
-                oldestTime(mentionsResp), nextToken(mentionsResp), !mentionsIncomplete, followingsTruncated);
+                oldestTime(mentionsResp), nextToken(mentionsResp), !mentionsIncomplete, followingsTruncated, followingsFailed, followersFailed);
+    }
+
+    private static boolean graphMemberHasIdentity(JsonNode user) {
+        return !user.path("id").asText("").isBlank() && !user.path("username").asText("").isBlank();
+    }
+
+    private static boolean graphPageUnavailable(JsonNode response) {
+        if (response == null) return true;
+        JsonNode members = response.path("data");
+        if (members.isArray()) {
+            for (JsonNode member : members) {
+                if (graphMemberHasIdentity(member)) return false;
+            }
+            if (!members.isEmpty()) return true;
+        } else if (!members.isMissingNode() && !members.isNull()) {
+            return true;
+        }
+        if (!nextToken(response).isBlank() || !response.path("errors").isEmpty()) return true;
+        JsonNode count = response.path("meta").path("result_count");
+        return count.isMissingNode() ? !members.isArray() : !(count.isIntegralNumber() && count.asLong() == 0);
     }
 
     private static String nextToken(JsonNode response) {

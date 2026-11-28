@@ -2,6 +2,7 @@ package com.xops.hub.provider;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.xops.hub.assistant.AssistantStore;
 import com.xops.hub.config.XOpsProperties;
 import com.xops.hub.store.AccountStore;
 import com.xops.hub.store.BlueVerifiedCache;
@@ -135,6 +136,12 @@ public class TwitterApiIoProvider {
     }
 
     private final XOpsProperties properties;
+    @Autowired
+    private AssistantStore ownerStore;
+
+    private boolean retainsOwnerHistory(String username, String accountId) {
+        return AccountStore.retainsFullHistory(username, accountId, ownerStore == null ? null : ownerStore.boundOwnerId());
+    }
     private final ObjectMapper objectMapper;
     private final SharedApiExecutor sharedExecutor;
     private final UpstreamBudgetGuard budgetGuard;
@@ -405,7 +412,7 @@ public class TwitterApiIoProvider {
                 throw new XDataProviderException(503, "免费公开动态暂不可用，已保留当前进度");
             }
         } else if (!useFreeSource(probeUrl) && isPageReadBudgetExhausted()) {
-            budgetGuard.acquirePermit(baseUrl + "/twitter/user/last_tweets?userName=probe", "twitterapi_io_read");
+            budgetGuard.requireAffordable(probeUrl, "twitterapi_io_read");
         }
         String rawKey = properties.getTwitterapiIoKey();
         String apiKey = pureFree ? "" : (rawKey == null ? "" : rawKey.trim());
@@ -451,6 +458,8 @@ public class TwitterApiIoProvider {
             rows = extractArray(root, "tweets", "data");
         }
 
+        if (!hasArray(root, "tweets", "data"))
+            throw new XDataProviderException(502, "上游未返回作者帖子列表，无法核实时间线");
         int pageLimit = Math.max(1, Math.min(100, limit));
         List<TextPost> posts = new ArrayList<>();
         List<String> missingAuthorIds = rows.stream()
@@ -528,11 +537,15 @@ public class TwitterApiIoProvider {
             boolean contentOnly
     ) {
         RawTweet parsed = parseRawTweet(node, author.username());
-        if (parsed == null || parsed.createdAt() == null) {
+        if (parsed == null) {
             return null;
         }
         if (contentOnly && (parsed.kind() == TweetKind.REPLY
                 || parsed.kind() == TweetKind.RETWEET || parsed.selfThreadReply())) {
+            return null;
+        }
+        if (parsed.createdAt() == null) {
+            if (contentOnly) throw new XDataProviderException(502, "原帖缺少有效发布时间，无法核实时间线");
             return null;
         }
         JsonNode rowAuthor = identityRow != null ? identityRow.path("author") : null;
@@ -591,10 +604,7 @@ public class TwitterApiIoProvider {
         String quotedTextStatus = quoteMissing ? "MISSING" : quoteSourceMissing ? "SOURCE_MISSING"
                 : hasSubstantiveText(quotedText) ? "FULL" : "NOT_PRESENT";
         String articleTextStatus = !articlePresent ? "NOT_PRESENT" : fullArticle.isBlank() ? "PREVIEW" : "FULL";
-        Long retweets = metric(node, "retweetCount");
-        Long quotes = metric(node, "quoteCount");
-        Long reposts = retweets == null && quotes == null ? null
-                : (retweets == null ? 0 : retweets) + (quotes == null ? 0 : quotes);
+        Long reposts = observedReposts(node);
         return new TextPost(
                 parsed.id(),
                 author.id(),
@@ -619,7 +629,7 @@ public class TwitterApiIoProvider {
                 "https://x.com/" + author.username() + "/status/" + parsed.id(),
                 parsed.conversationId(),
                 parsed.selfThreadReply(),
-                node.path("isPinned").asBoolean(false),
+                node.path("isPinned").asBoolean(false) || node.path("isPin").asBoolean(false),
                 sourceIdentity,
                 metric(node, "viewCount"),
                 metric(node, "likeCount"),
@@ -648,8 +658,8 @@ public class TwitterApiIoProvider {
             boolean pureFree
     ) {
         Instant effectiveDeadline = deadline != null ? deadline : Instant.now().plusSeconds(SNAPSHOT_SOFT_DEADLINE_SECONDS);
-        if (!pureFree && isPageReadBudgetExhausted()) {
-            budgetGuard.acquirePermit(trimTrailingSlash(properties.getTwitterapiIoBaseUrl())
+        if (!pureFree && !canReadInboundForFree(cursor) && isPageReadBudgetExhausted()) {
+            budgetGuard.requireAffordable(trimTrailingSlash(properties.getTwitterapiIoBaseUrl())
                     + "/twitter/user/mentions?userName=probe", "twitterapi_io_read");
         }
         XUserSummary target = resolvePublicAuthor(username, effectiveDeadline, pureFree);
@@ -709,10 +719,8 @@ public class TwitterApiIoProvider {
         copyObservedMetric(row, observation, "viewCount", "views");
         copyObservedMetric(row, observation, "likeCount", "likes");
         copyObservedMetric(row, observation, "replyCount", "replies");
-        if (row.path("retweetCount").isIntegralNumber() || row.path("quoteCount").isIntegralNumber()) {
-            observation.put("reposts", Math.max(0, row.path("retweetCount").asLong(0))
-                    + Math.max(0, row.path("quoteCount").asLong(0)));
-        }
+        Long reposts = observedReposts(row);
+        if (reposts != null) observation.put("reposts", reposts);
         copyObservedMetric(row, observation, "bookmarkCount", "bookmarks");
         return observation;
     }
@@ -847,6 +855,15 @@ public class TwitterApiIoProvider {
         return t != null && (t.kind() == 'P' || t.kind() == 'Q' || !t.unavailableMetrics().isEmpty());
     }
 
+    public static boolean dailyMetricsFresh(AccountStore.StoredTweet tweet, long cycle, boolean owner) {
+        long earliest = owner && tweet.metricsTimeObserved() ? Math.max(0L, cycle - 180L) : cycle;
+        return tweet.metricsFetchedAt() > 0 && tweet.metricsFetchedAt() >= earliest && tweet.unavailableMetrics().isEmpty();
+    }
+
+    public static boolean dailyMetricsUnattempted(AccountStore.StoredTweet tweet, long cycle, boolean owner) {
+        return tweet.metricsAttemptedAt() < cycle && !dailyMetricsFresh(tweet, cycle, owner);
+    }
+
     public static Instant cutoffForWindowDays(Instant refNow, int targetWindowDays) {
         long hours = targetWindowDays <= 2 ? 49L : (targetWindowDays <= 7 ? 169L : 721L);
         return refNow.minus(Duration.ofHours(hours));
@@ -966,12 +983,13 @@ public class TwitterApiIoProvider {
 
     public SyncOutcome syncStoreSilentHistoryStep(
             String username,
-            AccountStore.StoredAccount existing,
+            AccountStore.StoredAccount previous,
             int maxPagesPerStream,
             String expectedAccountId,
             boolean pureFree,
             boolean skipInbound
     ) {
+        AccountStore.StoredAccount existing = AccountStore.verifiedCoverageBase(previous);
         String rawKey = properties.getTwitterapiIoKey();
         String apiKey = pureFree ? "" : (rawKey == null ? "" : rawKey.trim());
         String baseUrl = trimTrailingSlash(properties.getTwitterapiIoBaseUrl());
@@ -985,7 +1003,7 @@ public class TwitterApiIoProvider {
         }
         KeyPacer pacer = pacerFor(apiKey);
         boolean warmExisting = existing != null && existing.syncedAtInstant() != null && existing.profile() != null;
-        boolean ownerFullHistory = AccountStore.retainsFullHistory(username);
+        boolean ownerFullHistory = retainsOwnerHistory(username, expectedAccountId);
         Instant now = Instant.now();
         boolean staleHead = !warmExisting
                 || Duration.between(existing.syncedAtInstant(), now).getSeconds() >= (ownerFullHistory ? 120L : 21_600L);
@@ -1068,7 +1086,8 @@ public class TwitterApiIoProvider {
         inbound.items().forEach(o -> newInbound.add((InboundInteraction) o));
 
         AccountStore.StoredAccount merged = AccountStore.merge(
-                existing, profile, syncTo, newTweets, newInbound, tweets.coverage(), inbound.coverage(), null, tweets.metricsObservedAt());
+                existing, profile, syncTo, newTweets, newInbound, tweets.coverage(), inbound.coverage(), null,
+                tweets.metricsObservedAt(), retainsOwnerHistory(profile.username(), profile.id()));
         if (pureFree && fxTwitterClient.isSearchCircuitOpen()
                 && ((missingTweetRanges && !AccountStore.missingRanges(merged.tweetCoverage(), cutoff30.getEpochSecond(), headTo).isEmpty())
                     || (!skipInbound && missingInboundRanges
@@ -1086,21 +1105,23 @@ public class TwitterApiIoProvider {
 
     public SyncOutcome syncStoreByHours(
             String username,
-            AccountStore.StoredAccount existing,
+            AccountStore.StoredAccount previous,
             int targetWindowHours,
             boolean headSync,
             boolean lightweightDailyOnly,
             String overrideApiKey,
             String expectedAccountId
     ) {
+        AccountStore.StoredAccount existing = AccountStore.verifiedCoverageBase(previous);
         String rawKey = (overrideApiKey != null && !overrideApiKey.isBlank())
                 ? overrideApiKey.trim()
                 : properties.getTwitterapiIoKey();
-        String apiKey = rawKey == null ? "" : rawKey.trim();
         long startMs = System.currentTimeMillis();
         String baseUrl = trimTrailingSlash(properties.getTwitterapiIoBaseUrl());
         String encodedUser = URLEncoder.encode(username, StandardCharsets.UTF_8);
-        if (apiKey.isBlank() && !useFreeSource(baseUrl + "/twitter/user/info?userName=" + encodedUser)) {
+        boolean freeProfile = useFreeSource(baseUrl + "/twitter/user/info?userName=" + encodedUser);
+        String apiKey = (rawKey == null || (freeProfile && PaidCapabilityGate.isCurrentCallerForbidden())) ? "" : rawKey.trim();
+        if (apiKey.isBlank() && !freeProfile) {
             throw new XDataProviderException(400, "服务端尚未配置 TwitterAPI.io API Key，请在 application.yml 中配置 xops.twitterapi-io-key");
         }
         KeyPacer pacer = pacerFor(apiKey);
@@ -1195,7 +1216,7 @@ public class TwitterApiIoProvider {
                 // 热更新重叠加速：已有持久化账号时，推文/互动未缓存区间与 24h 主帖指标刷新并发启动
                 Instant nowSync = Instant.now();
                 long sinceLastSyncSec = Duration.between(existing.syncedAtInstant(), nowSync).getSeconds();
-                boolean privilegedOwner = AccountStore.retainsFullHistory(existing.profile().username());
+                boolean privilegedOwner = retainsOwnerHistory(existing.profile().username(), existing.profile().id());
                 syncTo = (!privilegedOwner && sinceLastSyncSec >= 0 && sinceLastSyncSec < 60)
                         ? existing.syncedAtInstant()
                         : nowSync;
@@ -1260,20 +1281,10 @@ public class TwitterApiIoProvider {
                     if ((reuseFg || !canFetchFg) && (reuseFr || !canFetchFr)) {
                         if (!existing.hasGraph() && (freshProfile.followingCount() > 0 || freshProfile.followersCount() > 0)) {
                             graphDegraded.set(true);
-                            return CompletableFuture.completedFuture(new HeadGraphStage(freshProfile, false, false, null, null));
-                        }
-                        if (existing.hasGraph()
-                                && (existing.graphRefreshFailed() || existing.followersTruncated() || existing.followingsTruncated())
-                                && existing.followings().size() == freshProfile.followingCount()
-                                && existing.followers().size() == freshProfile.followersCount()) {
-                            return CompletableFuture.completedFuture(new HeadGraphStage(
-                                    freshProfile,
-                                    true,
-                                    true,
-                                    new PagedUserResult(AccountStore.followingUsers(existing),
-                                            new HashSet<>(existing.explicitFollowedBy()), false, false, existing.followingOrderById()),
-                                    new PagedUserResult(AccountStore.followerUsers(existing),
-                                            Set.of(), false, false, existing.followerOrderById())));
+                            PagedUserResult missingSide = new PagedUserResult(List.of(), Set.of(), true, true);
+                            return CompletableFuture.completedFuture(new HeadGraphStage(freshProfile, false, true,
+                                    freshProfile.followingCount() > 0 ? missingSide : null,
+                                    freshProfile.followersCount() > 0 ? missingSide : null));
                         }
                         return CompletableFuture.completedFuture(new HeadGraphStage(freshProfile, existing.hasGraph(), false, null, null));
                     }
@@ -1284,7 +1295,7 @@ public class TwitterApiIoProvider {
                                     AccountStore.followingUsers(existing),
                                     new HashSet<>(existing.explicitFollowedBy()),
                                     existing.followingsTruncated(),
-                                    false, existing.followingOrderById()))
+                                    !reuseFg, existing.followingOrderById()))
                             : (freshProfile.followingCount() > 0
                                     ? fetchPagedUsersAsync(
                                             fgUrl, apiKey, pacer, fgMaxPages,
@@ -1295,7 +1306,7 @@ public class TwitterApiIoProvider {
                                     AccountStore.followerUsers(existing),
                                     Set.of(),
                                     existing.followersTruncated(),
-                                    false, existing.followerOrderById()))
+                                    !reuseFr, existing.followerOrderById()))
                             : (freshProfile.followersCount() > 0
                                     ? fetchFollowersAsync(
                                             baseUrl, encodedUser, freshProfile.id(),
@@ -1317,7 +1328,7 @@ public class TwitterApiIoProvider {
                         : CompletableFuture.completedFuture(DailyMetricRefreshResult.empty());
 
                 CompletableFuture.allOf(headStageF, tweetsF, inboundF, metricsF).join();
-                if (graphDegraded.get() || tweetsDegraded.get() || inboundDegraded.get() || metricsDegraded.get()) {
+                if ((!lightweightDailyOnly && graphDegraded.get()) || tweetsDegraded.get() || inboundDegraded.get() || metricsDegraded.get()) {
                     degraded.set(true);
                 }
                 HeadGraphStage stage = headStageF.join();
@@ -1372,8 +1383,8 @@ public class TwitterApiIoProvider {
                                 ? new PagedUserResult(List.of(), Set.of(), true, true) : null);
 
                 CompletableFuture.allOf(tweetsF, inboundF, followingsF, followersF).join();
-                if (tweetsDegraded.get() || inboundDegraded.get() || graphDegraded.get()
-                        || (apiKey.isBlank() && (profile.followingCount() > 0 || profile.followersCount() > 0))) {
+                if (tweetsDegraded.get() || inboundDegraded.get() || (!lightweightDailyOnly
+                        && (graphDegraded.get() || (apiKey.isBlank() && (profile.followingCount() > 0 || profile.followersCount() > 0))))) {
                     degraded.set(true);
                 }
                 tweets = tweetsF.join();
@@ -1541,7 +1552,8 @@ public class TwitterApiIoProvider {
 
         String self = profile.username();
         AccountStore.StoredAccount merged = AccountStore.merge(
-                existing, profile, syncTo, newTweets, newInbound, tweets.coverage(), inbound.coverage(), graph, metricsObservedAt);
+                existing, profile, syncTo, newTweets, newInbound, tweets.coverage(), inbound.coverage(), graph,
+                metricsObservedAt, retainsOwnerHistory(profile.username(), profile.id()));
         if (!refreshIds.isEmpty() && metricsRequestStarted.get()) {
             merged = AccountStore.withMetricAttempts(merged, refreshIds, Instant.now());
         }
@@ -1605,15 +1617,11 @@ public class TwitterApiIoProvider {
         if (lightweightDailyOnly) {
             long from = syncTo.minus(Duration.ofHours(24)).getEpochSecond();
             long to = syncTo.getEpochSecond();
-            boolean reuseRecentOwnerMetrics = existing != null
-                    && existing.profile() != null
-                    && AccountStore.retainsFullHistory(existing.profile().username())
-                    && to - existing.syncedAt() < 180L;
-            long metricFloor = reuseRecentOwnerMetrics ? Math.max(0L, to - 180L) : dailyCycleStart;
+            boolean owner = retainsOwnerHistory(profile.username(), profile.id());
             for (AccountStore.StoredTweet tweet : merged.tweets()) {
                 if (tweet.createdAt() < from || tweet.createdAt() > to || !isDailyMetricTarget(tweet)) continue;
-                if (tweet.metricsAttemptedAt() < metricFloor) pendingDailyMetrics++;
-                if (tweet.metricsFetchedAt() < metricFloor || !tweet.unavailableMetrics().isEmpty()) incompleteDailyMetrics++;
+                if (dailyMetricsUnattempted(tweet, dailyCycleStart, owner)) pendingDailyMetrics++;
+                if (!dailyMetricsFresh(tweet, dailyCycleStart, owner)) incompleteDailyMetrics++;
             }
             dailyComplete = !degraded.get() && incompleteDailyMetrics == 0
                     && AccountStore.missingRanges(merged.tweetCoverage(), from, to).isEmpty()
@@ -1833,13 +1841,11 @@ public class TwitterApiIoProvider {
         }
         long from = syncTo.minus(Duration.ofHours(24)).getEpochSecond();
         long to = syncTo.getEpochSecond();
-        boolean reuseRecentOwnerMetrics = AccountStore.retainsFullHistory(existing.profile().username())
-                && to - existing.syncedAt() < 180L;
-        long metricFloor = reuseRecentOwnerMetrics ? Math.max(0L, to - 180L) : dailyCycleStart;
+        boolean owner = retainsOwnerHistory(existing.profile().username(), existing.profile().id());
         List<String> candidateIds = existing.tweets().stream()
                 .filter(t -> t.createdAt() >= from && t.createdAt() <= to)
                 .filter(TwitterApiIoProvider::isDailyMetricTarget)
-                .filter(t -> t.metricsAttemptedAt() < metricFloor || !t.unavailableMetrics().isEmpty())
+                .filter(t -> dailyMetricsUnattempted(t, dailyCycleStart, owner))
                 .sorted(java.util.Comparator.comparingLong(AccountStore.StoredTweet::metricsAttemptedAt)
                         .thenComparingInt(t -> !t.unavailableMetrics().isEmpty()
                                 && ((t.kind() == 'P' && (t.flags() & 4) == 0) || t.kind() == 'Q') ? 0 : 1))
@@ -2602,8 +2608,7 @@ public class TwitterApiIoProvider {
             AccountStore.StoredAccount metricStore, AtomicReference<XDataProviderException> capturedError) {
         var read = new ReadDiagnostic(url);
         if (useFreeSource(url)) {
-            boolean pureFree = apiKey == null || apiKey.isBlank()
-                    || (isPureFreeEndpoint(url) && !PaidCapabilityGate.isCurrentCallerPrivileged());
+            boolean pureFree = mustUseFreeOnly(url, apiKey);
             var started = requestStarted != null ? requestStarted : new AtomicBoolean();
             long startNanos = System.nanoTime();
             Instant freeDeadline = pureFree ? deadline : deadline.minusMillis(PAID_FALLBACK_RESERVE_MS);
@@ -2871,8 +2876,7 @@ public class TwitterApiIoProvider {
     private CompletableFuture<JsonNode> getJsonWithRetryAsync(String url, String apiKey, KeyPacer pacer, Instant deadline, SearchReplyRoots searchRoots) {
         var diagnostic = new ReadDiagnostic(url);
         if (useFreeSource(url)) {
-            boolean pureFree = apiKey == null || apiKey.isBlank()
-                    || (isPureFreeEndpoint(url) && !PaidCapabilityGate.isCurrentCallerPrivileged());
+            boolean pureFree = mustUseFreeOnly(url, apiKey);
             var freeStarted = new AtomicBoolean();
             long freeStartNanos = System.nanoTime();
             Instant freeDeadline = pureFree ? deadline : deadline.minusMillis(PAID_FALLBACK_RESERVE_MS);
@@ -2913,7 +2917,8 @@ public class TwitterApiIoProvider {
             }
         });
         String refreshId = MDC.get("workspaceRefreshId");
-        source.whenComplete((value, error) -> withRefreshContext(refreshId, () -> {
+        PaidCapabilityGate.CallerScope caller = PaidCapabilityGate.currentScope();
+        source.whenComplete((value, error) -> withReadContext(refreshId, caller, () -> {
             final CompletableFuture<U> next;
             try {
                 synchronized (gate) {
@@ -2931,7 +2936,7 @@ public class TwitterApiIoProvider {
                 next.cancel(true);
                 return;
             }
-            next.whenComplete((mapped, failure) -> withRefreshContext(refreshId, () -> {
+            next.whenComplete((mapped, failure) -> withReadContext(refreshId, caller, () -> {
                 if (failure == null) result.complete(mapped);
                 else if (isCancellation(failure)) result.cancel(true);
                 else result.completeExceptionally(failure);
@@ -2940,17 +2945,16 @@ public class TwitterApiIoProvider {
         return result;
     }
 
-    private static void withRefreshContext(String refreshId, Runnable action) {
+    private static void withReadContext(String refreshId, PaidCapabilityGate.CallerScope caller, Runnable action) {
         String previous = MDC.get("workspaceRefreshId");
-        if (java.util.Objects.equals(previous, refreshId)) {
-            action.run();
-            return;
-        }
+        PaidCapabilityGate.CallerScope previousCaller = PaidCapabilityGate.currentScope();
+        PaidCapabilityGate.bindScope(caller);
         if (refreshId == null) MDC.remove("workspaceRefreshId");
         else MDC.put("workspaceRefreshId", refreshId);
         try {
             action.run();
         } finally {
+            PaidCapabilityGate.bindScope(previousCaller);
             if (previous == null) MDC.remove("workspaceRefreshId");
             else MDC.put("workspaceRefreshId", previous);
         }
@@ -2965,6 +2969,11 @@ public class TwitterApiIoProvider {
         // 旧的本地模拟端点不能因启用默认配置而发出真实网络请求；免费模拟端点须显式配置。
         return fxTwitterClient.supports(url)
                 && (!isLocalMockBaseUrl() || isLoopbackUrl(properties.getFxtwitterBaseUrl()));
+    }
+
+    private boolean mustUseFreeOnly(String url, String apiKey) {
+        return apiKey == null || apiKey.isBlank() || PaidCapabilityGate.isCurrentCallerForbidden()
+                || (isPureFreeEndpoint(url) && !PaidCapabilityGate.isCurrentCallerPrivileged());
     }
 
     /**
@@ -3479,6 +3488,18 @@ public class TwitterApiIoProvider {
                 kind = TweetKind.POST;
                 targetUsername = null;
                 selfThreadReply = true;
+            } else if (!replyToField.isBlank()) {
+                String targetId = replyTargetUserId(t);
+                if (targetId.isBlank()) {
+                    for (JsonNode mention : t.path("entities").path("user_mentions")) {
+                        String handle = firstNonBlank(mention.path("screen_name").asText(""), mention.path("userName").asText(""));
+                        if (replyToField.equalsIgnoreCase(handle)) {
+                            targetId = firstNonBlank(mention.path("id_str").asText(""), mention.path("id").asText(""));
+                            if (!targetId.isBlank()) break;
+                        }
+                    }
+                }
+                if (!targetId.isBlank()) targetUser = new XUserSummary(targetId, replyToField, replyToField, "", "", false, 0, 0, 0, "");
             }
         } else if (isQuote) {
             JsonNode qtAuthor = t.path("quoted_tweet").path("author");
@@ -3540,6 +3561,11 @@ public class TwitterApiIoProvider {
         return parseInbound(m, selfUsername, null);
     }
 
+    private static String replyTargetUserId(JsonNode node) {
+        return firstNonBlank(node.path("inReplyToUserId").asText(""), node.path("in_reply_to_user_id_str").asText(""),
+                node.path("in_reply_to_user_id").asText(""));
+    }
+
     private InboundInteraction parseInbound(JsonNode m, String selfUsername, String selfId) {
         String text = m.path("text").asText("");
         if (m.hasNonNull("retweeted_tweet") || text.startsWith("RT @")) {
@@ -3548,7 +3574,9 @@ public class TwitterApiIoProvider {
         JsonNode authorNode = m.path("author");
         if (authorNode.isMissingNode()) return null;
         XUserSummary peer = parseUserNode(authorNode, "");
-        if (peer.username().isBlank() || peer.username().equalsIgnoreCase(selfUsername)) {
+        boolean peerIsSelf = selfId != null && !selfId.isBlank() && !peer.id().isBlank()
+                ? selfId.equals(peer.id()) : peer.username().equalsIgnoreCase(selfUsername);
+        if (peer.username().isBlank() || peerIsSelf) {
             return null;
         }
         String replyTo = firstNonBlank(
@@ -3566,16 +3594,19 @@ public class TwitterApiIoProvider {
                 m.path("inReplyToStatusId").asText("")
         );
         boolean isReplyFlag = m.path("isReply").asBoolean(false) || !inReplyToId.isBlank() || !replyTo.isBlank();
+        String receiverId = replyTargetUserId(m);
+        boolean replyToSelf = !receiverId.isBlank() && selfId != null && !selfId.isBlank()
+                ? receiverId.equals(selfId) : replyTo.equalsIgnoreCase(selfUsername);
 
         String quotedAuthor = firstNonBlank(m.path("quoted_tweet").path("author").path("userName").asText(""),
                 m.path("quoted_tweet").path("author").path("username").asText(""));
         String quotedAuthorId = m.path("quoted_tweet").path("author").path("id").asText("");
-        boolean quotesSelf = quotedAuthor.equalsIgnoreCase(selfUsername)
-                || (selfId != null && !selfId.isBlank() && selfId.equals(quotedAuthorId));
+        boolean quotesSelf = !quotedAuthorId.isBlank() && selfId != null && !selfId.isBlank()
+                ? selfId.equals(quotedAuthorId) : quotedAuthor.equalsIgnoreCase(selfUsername);
         InboundKind kind;
         if (quotesSelf && !isReplyFlag) {
             kind = InboundKind.QUOTE_ME;
-        } else if (replyTo.equalsIgnoreCase(selfUsername) || (replyTo.isBlank() && isReplyFlag)) {
+        } else if (replyToSelf) {
             kind = InboundKind.REPLY_TO_ME;
         } else if (quotesSelf) {
             kind = InboundKind.QUOTE_ME;
@@ -3590,7 +3621,7 @@ public class TwitterApiIoProvider {
                 text,
                 conversationId,
                 inReplyToId,
-                replyTo
+                replyToSelf ? selfUsername : replyTo, receiverId
         );
     }
 
@@ -3631,6 +3662,11 @@ public class TwitterApiIoProvider {
     private static Long metric(JsonNode node, String field) {
         return node.path(field).isIntegralNumber() && node.path(field).asLong() >= 0
                 ? node.path(field).asLong() : null;
+    }
+
+    private static Long observedReposts(JsonNode node) {
+        Long retweets = metric(node, "retweetCount"), quotes = metric(node, "quoteCount");
+        return retweets == null || quotes == null ? null : retweets + quotes;
     }
 
     private static boolean hasSubstantiveText(String text) {

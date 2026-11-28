@@ -189,7 +189,9 @@ class ContentIntelligenceTest {
             return new TextModelClient.ModelResult(text, List.of(), null, "model", mapper.createObjectNode(), Map.of());
         };
         var stages = new AssistantIntelligence(mapper, environment, model, reader);
-        var settings = mapper.createObjectNode().put("version", 1).put("model", "plain").put("protocol", "MESSAGES")
+        var settings = mapper.createObjectNode().put("version", 1)
+                .put("provider", "commandcode").put("providerManuallySelected", true)
+                .put("model", "plain").put("protocol", "MESSAGES")
                 .put("researchModel", "research").put("researchProtocol", "RESPONSES").put("contextTokens", 32000);
         var input = mapper.createObjectNode();
         input.putObject("topic").put("title", "事件");

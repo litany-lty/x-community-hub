@@ -60,7 +60,7 @@ function navigationFixture(initialUrl = 'https://app.example.test/') {
     };
     const state = {
         activeTab: 'activity', tabScrollPositions: {}, report: null,
-        authStatus: { loggedIn: true, user: { id: 'owner-1' } }
+        authStatus: { loggedIn: true, ownerAllPermissions: true, user: { id: 'owner-1' } }
     };
     const ctx = {
         state, window, URL, URLSearchParams,

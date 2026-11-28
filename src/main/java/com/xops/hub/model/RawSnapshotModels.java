@@ -167,13 +167,20 @@ public final class RawSnapshotModels {
             String snippet,
             String conversationId,
             String inReplyToId,
-            String inReplyToUsername
+            String inReplyToUsername,
+            String inReplyToUserId
     ) {
         @JsonCreator
         public InboundInteraction {
             conversationId = conversationId != null ? conversationId : "";
             inReplyToId = inReplyToId != null ? inReplyToId : "";
             inReplyToUsername = inReplyToUsername != null ? inReplyToUsername : "";
+            inReplyToUserId = inReplyToUserId != null ? inReplyToUserId : "";
+        }
+
+        public InboundInteraction(String tweetId, XUserSummary peer, Instant createdAt, InboundKind kind,
+                String snippet, String conversationId, String inReplyToId, String inReplyToUsername) {
+            this(tweetId, peer, createdAt, kind, snippet, conversationId, inReplyToId, inReplyToUsername, "");
         }
 
         public InboundInteraction(
@@ -228,12 +235,26 @@ public final class RawSnapshotModels {
             Instant mentionsTailTime,
             String mentionsNextCursor,
             boolean mentionsExhausted,
-            boolean followingsTruncated
+            boolean followingsTruncated,
+            boolean followingsRequestFailed,
+            boolean followersRequestFailed
     ) {
         @JsonCreator
         public RawAccountSnapshot {
             timelineNextCursor = timelineNextCursor != null ? timelineNextCursor : "";
             mentionsNextCursor = mentionsNextCursor != null ? mentionsNextCursor : "";
+        }
+
+        public RawAccountSnapshot(ProviderMode resolvedProvider, boolean liveData, String bannerNotice,
+                Instant fetchedAt, XUserSummary profile, List<RawTweet> timeline,
+                List<InboundInteraction> inboundInteractions, List<RelationshipEntry> relationships,
+                boolean followersTruncated, boolean degradedPartial, int coveredWindowDays,
+                Instant timelineTailTime, String timelineNextCursor, boolean timelineExhausted,
+                Instant mentionsTailTime, String mentionsNextCursor, boolean mentionsExhausted, boolean followingsTruncated) {
+            this(resolvedProvider, liveData, bannerNotice, fetchedAt, profile, timeline, inboundInteractions,
+                    relationships, followersTruncated, degradedPartial, coveredWindowDays, timelineTailTime,
+                    timelineNextCursor, timelineExhausted, mentionsTailTime, mentionsNextCursor, mentionsExhausted,
+                    followingsTruncated, false, false);
         }
 
         public RawAccountSnapshot(ProviderMode resolvedProvider, boolean liveData, String bannerNotice,

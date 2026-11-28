@@ -17,12 +17,14 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.stream.Collectors;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.function.Supplier;
@@ -154,10 +156,12 @@ public class CommunityAnalyticsEngine {
         boolean sampleCapped = !coverageComplete && !accumulatedSummaryMode;
         Instant effectiveCutoff = (coverageComplete || accumulatedSummaryMode) ? cutoff : coverageStart;
 
-        List<RawTweet> windowTimeline = allTimeline.stream()
-                .filter(t -> t.createdAt() != null && !t.createdAt().isBefore(effectiveCutoff) && !t.createdAt().isAfter(refNow))
+        List<RawTweet> observedPeriodTimeline = allTimeline.stream()
+                .filter(t -> t.createdAt() != null && !t.createdAt().isBefore(cutoff) && !t.createdAt().isAfter(refNow))
                 .sorted(Comparator.comparing(RawTweet::createdAt).reversed())
                 .toList();
+        List<RawTweet> windowTimeline = effectiveCutoff.equals(cutoff) ? observedPeriodTimeline : observedPeriodTimeline.stream()
+                .filter(t -> !t.createdAt().isBefore(effectiveCutoff)).toList();
         List<InboundInteraction> windowInbound = allInbound.stream()
                 .filter(i -> i.createdAt() != null && !i.createdAt().isBefore(effectiveCutoff) && !i.createdAt().isAfter(refNow))
                 .sorted(Comparator.comparing(InboundInteraction::createdAt).reversed())
@@ -197,7 +201,7 @@ public class CommunityAnalyticsEngine {
                 algo
         );
         InteractionOverview interactions = buildInteractionOverview(
-                selfKey,
+                selfKey, snapshot.profile().id(),
                 allTimeline,
                 allInbound,
                 windowTimeline,
@@ -205,6 +209,7 @@ public class CommunityAnalyticsEngine {
                 relByKey,
                 snapshot.followersTruncated(),
                 snapshot.followingsTruncated(),
+                coverageComplete,
                 algo
         );
         FollowAuditOverview followAudit = buildFollowAuditOverview(
@@ -213,8 +218,8 @@ public class CommunityAnalyticsEngine {
                 periodLabel,
                 snapshot.followersTruncated(),
                 snapshot.followingsTruncated(),
-                sampleCapped,
-                observedInteractionPeers(windowTimeline, windowInbound, selfKey),
+                !coverageComplete,
+                observedInteractionPeers(windowTimeline, windowInbound),
                 quoteCountsByPeer(windowTimeline, windowInbound, selfKey)
         );
         Map<String, Long> mainPostGapMinutesById = computeMainPostGapsMinutes(allTimeline);
@@ -222,7 +227,8 @@ public class CommunityAnalyticsEngine {
 
         ContentTimingOverview contentTiming = buildContentTimingOverview(
                 snapshot.profile(),
-                windowTimeline,
+                observedPeriodTimeline,
+                snapshot.timelineExhausted() || (snapshot.timelineTailTime() != null && !snapshot.timelineTailTime().isAfter(cutoff)),
                 mainPostGapMinutesById,
                 authorEngagedMainPostIds,
                 zoneId,
@@ -296,10 +302,11 @@ public class CommunityAnalyticsEngine {
             if (entry == null || entry.user() == null || entry.user().username() == null) {
                 continue;
             }
-            String key = entry.user().username().toLowerCase(Locale.ROOT);
-            if (key.isEmpty() || key.equals(selfKey)) {
+            String handle = normKey(entry.user().username());
+            if (handle.isEmpty() || handle.equals(selfKey)) {
                 continue;
             }
+            String key = peerIdentity(handle, entry.user());
             RelationshipEntry prev = map.get(key);
             if (prev == null) {
                 map.put(key, entry);
@@ -735,7 +742,7 @@ public class CommunityAnalyticsEngine {
      * 3. 精准识别「我没回谁（含我帖内漏回评论 + 我未回访他主帖）」「谁没回我」与全息关系定性。
      */
     private InteractionOverview buildInteractionOverview(
-            String selfKey,
+            String selfKey, String selfId,
             List<RawTweet> allTimeline,
             List<InboundInteraction> allInbound,
             List<RawTweet> windowTimeline,
@@ -743,6 +750,7 @@ public class CommunityAnalyticsEngine {
             Map<String, RelationshipEntry> relByKey,
             boolean followersTruncated,
             boolean followingsTruncated,
+            boolean activityCoverageComplete,
             XAlgorithmProfile algo
     ) {
         // 第一步：基于全量 30 天快照构建「我方主帖归属索引」与「外部主帖帖主索引」，确保跨时间窗评论也能 100% 识别帖主
@@ -770,7 +778,8 @@ public class CommunityAnalyticsEngine {
             String rid = normId(in.inReplyToId());
             String rUser = normKey(in.inReplyToUsername());
             // 对方直接评论根帖（inReplyToId == conversationId）且被回复人是本人 -> 该根帖 100% 属于我方主帖（即使发于 30 天前）
-            if (!cid.isEmpty() && cid.equals(rid) && rUser.equals(selfKey)) {
+            boolean replyToSelf = in.inReplyToUserId().isBlank() ? rUser.equals(selfKey) : in.inReplyToUserId().equals(selfId);
+            if (in.kind() == InboundKind.REPLY_TO_ME && !cid.isEmpty() && cid.equals(rid) && replyToSelf) {
                 myOwnedRootPostIds.add(cid);
             }
         }
@@ -802,20 +811,21 @@ public class CommunityAnalyticsEngine {
                     || (!rid.isEmpty() && peerCommentIdsOnMyPosts.contains(rid));
             if (inMyOwnPost) {
                 if (!cid.isEmpty() && !targetKey.isEmpty() && !targetKey.equals(selfKey)) {
-                    myRepliedPeersInMyPost.computeIfAbsent(cid, k -> new HashSet<>()).add(targetKey);
+                    myRepliedPeersInMyPost.computeIfAbsent(cid, k -> new HashSet<>()).add(peerIdentity(targetKey, t.targetUser()));
                 }
             } else {
                 if (!tid.isEmpty()) {
                     myOutboundCommentTweetIds.add(tid);
                 }
                 if (!cid.isEmpty() && cid.equals(rid) && !targetKey.isEmpty() && !targetKey.equals(selfKey)) {
-                    externalRootOwnerByConvId.put(cid, targetKey);
+                    externalRootOwnerByConvId.put(cid, peerIdentity(targetKey, t.targetUser()));
                 }
             }
         }
 
         // 第二步：在所选动态时间窗内，严格按「1个帖子算1次」统计双边串门评论
         Map<String, MutablePeerAcc> accMap = new HashMap<>();
+        Map<String, Integer> mentionedHandles = new HashMap<>();
         int filteredSamePostReplies = 0;
 
         for (RawTweet tweet : windowTimeline) {
@@ -838,7 +848,7 @@ public class CommunityAnalyticsEngine {
                         } else if (!cid.isEmpty()) {
                             String knownOwner = externalRootOwnerByConvId.get(cid);
                             // 根帖作者未知或属于第三方时，不把父评论作者认作根帖作者。
-                            if (candidateKey.equals(knownOwner)) {
+                            if (peerIdentity(candidateKey, tweet.targetUser()).equals(knownOwner)) {
                                 MutablePeerAcc acc = getOrCreatePeer(accMap, candidateKey, tweet.targetUser(), relByKey);
                                 acc.myRawCommentCount++;
                                 if (!acc.myVisitedPeerPostIds.add(cid)) {
@@ -866,7 +876,7 @@ public class CommunityAnalyticsEngine {
                         continue;
                     }
                     // 提及独立建账；仅提及对象仍由下方评论/引用主榜规则排除。
-                    getOrCreatePeer(accMap, mKey, null, relByKey).myMentionsOfPeer++;
+                    mentionedHandles.merge(mKey, 1, Integer::sum);
                 }
             }
         }
@@ -876,10 +886,14 @@ public class CommunityAnalyticsEngine {
                 continue;
             }
             String pKey = normKey(inbound.peer().username());
-            if (pKey.isEmpty() || pKey.equals(selfKey)) {
+            boolean self = inbound.peer().id() == null || inbound.peer().id().isBlank()
+                    ? pKey.equals(selfKey) : inbound.peer().id().equals(selfId);
+            if (pKey.isEmpty() || self) {
                 continue;
             }
-            switch (inbound.kind()) {
+            boolean replyToKnownRoot = inbound.kind() == InboundKind.MENTION_ME && normKey(inbound.inReplyToUsername()).isEmpty()
+                    && myOwnedRootPostIds.contains(normId(inbound.inReplyToId()));
+            switch (replyToKnownRoot ? InboundKind.REPLY_TO_ME : inbound.kind()) {
                 case REPLY_TO_ME -> {
                     String cid = normId(inbound.conversationId());
                     String rid = normId(inbound.inReplyToId());
@@ -904,7 +918,7 @@ public class CommunityAnalyticsEngine {
                             acc.noteInteractionTime(inbound.createdAt());
                             acc.noteSnippet("TA 来评我帖：" + inbound.snippet());
 
-                            boolean iRepliedInPost = myRepliedPeersInMyPost.getOrDefault(cid, Set.of()).contains(pKey)
+                            boolean iRepliedInPost = myRepliedPeersInMyPost.getOrDefault(cid, Set.of()).contains(peerIdentity(pKey, inbound.peer()))
                                     || (!tid.isEmpty() && myDirectlyRepliedTweetIds.contains(tid));
                             if (!iRepliedInPost) {
                                 acc.unrepliedMyPostIds.add(cid);
@@ -951,10 +965,14 @@ public class CommunityAnalyticsEngine {
         int inboundHeavyCount = 0;
         int unrepliedMyPostPeers = 0;
         List<PeerInteractionStat> peerStats = new ArrayList<>(accMap.size());
+        Map<String, Long> identitiesPerHandle = accMap.values().stream().collect(
+                Collectors.groupingBy(acc -> normKey(acc.user.username()), Collectors.counting()));
 
         for (Map.Entry<String, MutablePeerAcc> entry : accMap.entrySet()) {
             String pKey = entry.getKey();
             MutablePeerAcc acc = entry.getValue();
+            String handle = normKey(acc.user.username());
+            if (identitiesPerHandle.get(handle) == 1) acc.myMentionsOfPeer = mentionedHandles.getOrDefault(handle, 0);
 
             int myPostVisits = acc.myVisitedPeerPostIds.size();
             int peerPostVisits = acc.peerVisitedMyPostIds.size();
@@ -1042,16 +1060,19 @@ public class CommunityAnalyticsEngine {
             }
 
             boolean relationshipVerified = rel != null && rel.relationshipVerified();
-            boolean followStateKnown = relationshipVerified || ((iFollow || !followingsTruncated)
-                    && (theyFollow || !followersTruncated));
+            boolean followStateKnown = !normId(acc.user.id()).isEmpty() && (relationshipVerified || ((iFollow || !followingsTruncated)
+                    && (theyFollow || !followersTruncated)));
             String followPrefix = !followStateKnown ? "关注关系待核实" : mutual
                     ? "互关好友"
                     : (iFollow
                             ? (acc.user.followersCount() >= 25_000 ? "单向关注大V" : "我单向关注(未回关)")
                             : (theyFollow ? "关注我的粉丝(未回关)" : "未互关推友"));
 
-            String relationshipPortrait = buildRelationshipPortrait(
-                    followPrefix, theyFollow, relationshipVerified || !followersTruncated, acc.user.followersCount(),
+            String relationshipPortrait = !activityCoverageComplete
+                    ? String.format("%s · 已采集的互动中，我去评 TA %d 帖，TA 来评我 %d 帖；本周期仍有未覆盖时段",
+                            followPrefix, myPostVisits, peerPostVisits)
+                    : buildRelationshipPortrait(
+                    followPrefix, theyFollow, followStateKnown || relationshipVerified, acc.user.followersCount(),
                     myPostVisits, peerPostVisits, unrepliedPosts, peerInThread, myInOwnPost,
                     hasPostComments, reciprocityCode, quoteRatioLabel
             );
@@ -1181,17 +1202,22 @@ public class CommunityAnalyticsEngine {
                 followPrefix, myPostVisits, peerPostVisits);
     }
 
+    private static String peerIdentity(String handle, XUserSummary user) {
+        return user != null && !normId(user.id()).isEmpty() ? "id:" + normId(user.id()) : "handle:" + normKey(handle);
+    }
+
     private MutablePeerAcc getOrCreatePeer(
             Map<String, MutablePeerAcc> accMap,
-            String key,
+            String handle,
             XUserSummary candidate,
             Map<String, RelationshipEntry> relByKey
     ) {
+        String key = peerIdentity(handle, candidate);
         MutablePeerAcc existing = accMap.get(key);
         XUserSummary relUser = relByKey.containsKey(key) ? relByKey.get(key).user() : null;
         XUserSummary best = preferRicherUser(relUser, candidate);
         if (best == null) {
-            best = new XUserSummary(key, key, key, "", "", false, 0, 0, 0, "");
+            best = new XUserSummary("", handle, handle, "", "", false, 0, 0, 0, "");
         }
         if (existing == null) {
             MutablePeerAcc created = new MutablePeerAcc(best);
@@ -1203,22 +1229,20 @@ public class CommunityAnalyticsEngine {
     }
 
     // 关系体检保留所有已观察到的交流证据；缺根帖归属的回复不能变成“零互动”。
-    private Set<String> observedInteractionPeers(List<RawTweet> timeline, List<InboundInteraction> inbound, String selfKey) {
+    private Set<String> observedInteractionPeers(List<RawTweet> timeline, List<InboundInteraction> inbound) {
         Set<String> peers = new HashSet<>();
         for (RawTweet tweet : timeline) {
             if (tweet.kind() == TweetKind.RETWEET) continue;
             if (tweet.kind() == TweetKind.REPLY || tweet.kind() == TweetKind.QUOTE) {
-                peers.add(normKey(tweet.targetUsername()));
+                if (!normKey(tweet.targetUsername()).isEmpty()) peers.add(peerIdentity(tweet.targetUsername(), tweet.targetUser()));
             }
             if (tweet.mentionedUsernames() != null) {
-                for (String username : tweet.mentionedUsernames()) peers.add(normKey(username));
+                for (String username : tweet.mentionedUsernames()) peers.add(peerIdentity(username, null));
             }
         }
         for (InboundInteraction interaction : inbound) {
-            if (interaction.peer() != null) peers.add(normKey(interaction.peer().username()));
+            if (interaction.peer() != null) peers.add(peerIdentity(interaction.peer().username(), interaction.peer()));
         }
-        peers.remove("");
-        peers.remove(selfKey);
         return peers;
     }
 
@@ -1233,14 +1257,14 @@ public class CommunityAnalyticsEngine {
             if (tweet == null || tweet.kind() != TweetKind.QUOTE || tweet.targetUsername() == null) continue;
             String key = normKey(tweet.targetUsername());
             if (key.isEmpty() || key.equals(selfKey)) continue;
-            Set<String> ids = outQuotes.computeIfAbsent(key, k -> new HashSet<>());
+            Set<String> ids = outQuotes.computeIfAbsent(peerIdentity(key, tweet.targetUser()), k -> new HashSet<>());
             ids.add(normId(tweet.id()).isEmpty() ? ("q_" + ids.size()) : normId(tweet.id()));
         }
         for (InboundInteraction interaction : inbound) {
             if (interaction == null || interaction.kind() != InboundKind.QUOTE_ME || interaction.peer() == null) continue;
             String key = normKey(interaction.peer().username());
             if (key.isEmpty() || key.equals(selfKey)) continue;
-            Set<String> ids = inQuotes.computeIfAbsent(key, k -> new HashSet<>());
+            Set<String> ids = inQuotes.computeIfAbsent(peerIdentity(key, interaction.peer()), k -> new HashSet<>());
             ids.add(normId(interaction.tweetId()).isEmpty() ? ("iq_" + ids.size()) : normId(interaction.tweetId()));
         }
         Map<String, Integer> totals = new HashMap<>();
@@ -1265,7 +1289,7 @@ public class CommunityAnalyticsEngine {
     ) {
         Map<String, PeerInteractionStat> statByKey = new HashMap<>();
         for (PeerInteractionStat stat : peerStats) {
-            statByKey.put(stat.peer().username().toLowerCase(Locale.ROOT), stat);
+            statByKey.put(peerIdentity(stat.peer().username(), stat.peer()), stat);
         }
 
         int followingCount = 0;
@@ -1322,7 +1346,8 @@ public class CommunityAnalyticsEngine {
                     category = "HAS_QUOTE_INTERACTION";
                     label = "引用互动·未回关";
                     rec = String.format("%s内有 %d 次引用互动（我去评 %d 帖 : TA 来评 %d 帖）；引用与主帖互评分别统计，可结合内容偏好保留关注", periodLabel, quotes, myOut, theirIn);
-                } else if (myOut + theirIn == 0 && observedInteractionPeers.contains(key)) {
+                } else if (myOut + theirIn == 0 && (observedInteractionPeers.contains(key)
+                        || observedInteractionPeers.contains(peerIdentity(u.username(), null)))) {
                     category = "OTHER_INTERACTION";
                     label = "其他互动·未回关";
                     rec = "已观察到回复、提及或帖内接话；暂无可确认的主帖互评证据，不能据此判为零互动，可结合对话与内容偏好决定是否保留关注";
@@ -1411,11 +1436,18 @@ public class CommunityAnalyticsEngine {
             followBackRateLabel = String.format("关注回关率 %.1f%%", followBackRate)
                     + (followersTruncated ? "（关注对象关系已确认；粉丝名单未完整）" : "");
         } else {
-            String incompleteReason = followingsTruncated
-                    ? (followersTruncated ? "关注及粉丝名单未完整" : "关注名单未完整")
-                    : "粉丝名单未完整";
-            if (unknownFollowBackCount > 0) incompleteReason += "，含未知关系";
-            followBackRateLabel = String.format("样本回关率 %.1f%%（%s）", followBackRate, incompleteReason);
+            String scope = followingsTruncated ? "关注名单未完整，仅已采集的 " + followingCount + " 个关注对象" : "全部 " + followingCount + " 个关注对象";
+            String range;
+            if (followingCount == 0) {
+                range = "--";
+            } else if (unknownFollowBackCount > 0) {
+                double upper = round1((mutuals.size() + unknownFollowBackCount) * 100.0 / followingCount);
+                range = String.format(Locale.ROOT, "%.1f%%–%.1f%%", followBackRate, upper);
+                scope += "，" + unknownFollowBackCount + " 个未知关系";
+            } else {
+                range = String.format(Locale.ROOT, "%.1f%%", followBackRate);
+            }
+            followBackRateLabel = "样本回关率 " + range + "（" + scope + "）";
         }
 
         return new FollowAuditOverview(
@@ -1442,6 +1474,7 @@ public class CommunityAnalyticsEngine {
     private ContentTimingOverview buildContentTimingOverview(
             XUserSummary profile,
             List<RawTweet> timeline,
+            boolean timelineWindowComplete,
             Map<String, Long> mainPostGapMinutesById,
             Set<String> authorEngagedMainPostIds,
             ZoneId zoneId,
@@ -1520,14 +1553,6 @@ public class CommunityAnalyticsEngine {
             }
         }
         long overallAvgViews = totalViewKnownCnt > 0 ? Math.round((double) totalViewKnownSum / totalViewKnownCnt) : 0L;
-        int bestViewsIdx = -1;
-        long bestViewsVal = 0L;
-        for (int i = 0; i < 3; i++) {
-            if (fmtAgg[i][0] > 0 && fmtAgg[i][5] > 0 && fmtAvgViews[i] > bestViewsVal) {
-                bestViewsVal = fmtAvgViews[i];
-                bestViewsIdx = i;
-            }
-        }
 
         List<ContentFormatStat> formatStats = new ArrayList<>(3);
         for (int i = 0; i < 3; i++) {
@@ -1536,8 +1561,8 @@ public class CommunityAnalyticsEngine {
             double avgBm = fmtBookmarkCount[i] > 0 ? round1((double) fmtBookmarkSum[i] / fmtBookmarkCount[i]) : 0.0;
             int avgAlgo = fmtAlgoScoreCount[i] > 0 ? (int) Math.round((double) fmtAlgoScoreSum[i] / fmtAlgoScoreCount[i]) : 0;
             String advice = buildFormatAlgoAdvice(
-                    fmtMeta[i][0], cnt, avgV, overallAvgViews, i == bestViewsIdx,
-                    avgBm, fmtBookmarkCount[i], fmtAlgoScoreCount[i] > 0 ? avgAlgo : -1, algo.upstreamEvidence());
+                    fmtMeta[i][0], cnt, timelineWindowComplete, avgV, overallAvgViews,
+                    avgBm, fmtBookmarkCount[i], algo.upstreamEvidence());
             formatStats.add(new ContentFormatStat(
                     fmtMeta[i][0],
                     fmtMeta[i][1],
@@ -1556,7 +1581,7 @@ public class CommunityAnalyticsEngine {
         }
 
         // 按公开互动量与当前生效算法权重排序；评分为本地启发式参考，不代表平台内部权重或推荐来源。
-        List<TopPostCard> topPosts = allScoredCards.stream()
+        List<TopPostCard> compositeOrder = allScoredCards.stream()
                 .sorted(Comparator.comparingDouble((TopPostCard p) ->
                         p.unavailableMetrics().isEmpty()
                                 ? p.replyCount() * scoring.compositeReplyWeight()
@@ -1568,28 +1593,105 @@ public class CommunityAnalyticsEngine {
                                                 ? scoring.compositeAuthorEngagedBonus() : 0.0)
                                 : Double.NEGATIVE_INFINITY
                 ).reversed())
-                .limit(24)
                 .toList();
 
+        List<TopPostCard> topPosts = compositeOrder.stream().limit(REPRESENTATIVE_POST_LIMIT).toList();
+        var comparableFormats = rankedComparableFormats(formatStats);
         return new ContentTimingOverview(
                 zoneId.getId(),
                 formatStats,
-                topPosts
+                topPosts, rankRepresentativePosts(compositeOrder, topPosts), timelineWindowComplete,
+                comparableFormats.isEmpty() ? null : comparableFormats.get(0).formatCode()
         );
+    }
+
+    private static List<ContentFormatStat> rankedComparableFormats(List<ContentFormatStat> formats) {
+        var present = formats.stream().filter(f -> f.postCount() > 0).toList();
+        if (present.size() < 2) return List.of();
+        boolean comparableViews = present.stream().allMatch(f -> f.viewSampleCount() > 0);
+        Comparator<ContentFormatStat> order;
+        if (present.stream().allMatch(f -> f.algoScoreSampleCount() > 0)) {
+            order = Comparator.comparingInt(ContentFormatStat::avgAlgoScore);
+            if (comparableViews) order = order.thenComparingLong(ContentFormatStat::avgViews);
+        } else if (comparableViews) {
+            order = Comparator.comparingLong(ContentFormatStat::avgViews);
+        } else {
+            return List.of();
+        }
+        var ranked = present.stream().sorted(order.reversed()).toList();
+        return order.compare(ranked.get(0), ranked.get(1)) == 0 ? List.of() : ranked;
+    }
+
+    private static final int REPRESENTATIVE_POST_LIMIT = 24;
+
+    private static RepresentativePostRankings rankRepresentativePosts(List<TopPostCard> compositeOrder, List<TopPostCard> topPosts) {
+        Map<String, List<TopPostCard>> groups = new LinkedHashMap<>();
+        groups.put("ALL", compositeOrder);
+        for (String format : List.of("TEXT", "MEDIA", "THREAD")) groups.put(format, new ArrayList<>());
+        for (TopPostCard post : compositeOrder) {
+            groups.get(post.isThread() ? "THREAD" : post.hasMedia() ? "MEDIA" : "TEXT").add(post);
+        }
+        Map<TopPostCard, Integer> indices = new IdentityHashMap<>();
+        for (int i = 0; i < topPosts.size(); i++) indices.put(topPosts.get(i), i);
+        List<TopPostCard> additional = new ArrayList<>();
+        Map<String, Map<String, List<Integer>>> byFormat = new LinkedHashMap<>();
+        groups.forEach((format, group) -> {
+            Map<String, List<Integer>> ranks = new LinkedHashMap<>();
+            for (String metric : List.of("composite", "algoScore", "views", "er", "bookmarks", "replies")) {
+                var ordered = group.stream();
+                if (!metric.equals("composite")) ordered = ordered.sorted((a, b) -> compareRepresentativePosts(a, b, metric));
+                ranks.put(metric, ordered.limit(REPRESENTATIVE_POST_LIMIT).map(post -> indices.computeIfAbsent(post, winner -> {
+                    int index = topPosts.size() + additional.size();
+                    additional.add(winner);
+                    return index;
+                })).toList());
+            }
+            byFormat.put(format, ranks);
+        });
+        return new RepresentativePostRankings(byFormat, additional);
+    }
+
+    private static int compareRepresentativePosts(TopPostCard a, TopPostCard b, String metric) {
+        double left = representativeMetric(a, metric);
+        int primary = Double.compare(representativeMetric(b, metric), left);
+        if (primary != 0 || left == Double.NEGATIVE_INFINITY) return primary;
+        String secondary = switch (metric) {
+            case "bookmarks" -> "bookmarkRate";
+            case "views", "replies" -> "engagements";
+            default -> "views";
+        };
+        return Double.compare(representativeMetric(b, secondary), representativeMetric(a, secondary));
+    }
+
+    private static double representativeMetric(TopPostCard post, String metric) {
+        var missing = post.unavailableMetrics();
+        double unknown = Double.NEGATIVE_INFINITY;
+        return switch (metric) {
+            case "views" -> missing.contains("views") ? unknown : post.viewCount();
+            case "bookmarks" -> missing.contains("bookmarks") ? unknown : post.bookmarkCount();
+            case "replies" -> missing.contains("replies") ? unknown : post.replyCount();
+            case "er" -> missing.isEmpty() && post.viewCount() > 0 ? post.engagementRatePct() : unknown;
+            case "algoScore" -> missing.isEmpty() && post.algoScore() >= 0 ? post.algoScore() : unknown;
+            case "bookmarkRate" -> !missing.contains("bookmarks") && !missing.contains("views") && post.viewCount() > 0
+                    ? post.bookmarkRatePct() : unknown;
+            case "engagements" -> missing.isEmpty() || (missing.size() == 1 && missing.contains("views"))
+                    ? post.totalEngagements() : unknown;
+            default -> throw new IllegalArgumentException("Unknown representative post metric: " + metric);
+        };
     }
 
     private static String buildFormatAlgoAdvice(
             String formatCode,
             int postCount,
+            boolean timelineWindowComplete,
             long avgViews,
             long overallAvgViews,
-            boolean isBestViewsFormat,
             double avgBookmarks,
             int bookmarkSampleCount,
-            int avgAlgoScore,
             XAlgorithmProfile.UpstreamEvidenceSpec ev
     ) {
         if (postCount == 0) {
+            if (!timelineWindowComplete) return "已采集样本中暂无该体裁的主帖";
             return switch (formatCode) {
                 case "MEDIA" -> String.format("本周期暂无图文或视频（视频满 %d 秒计入有效观看），可补充测试。",
                         ev.minVideoDurationMs() / 1000);
@@ -1597,10 +1699,10 @@ public class CommunityAnalyticsEngine {
                 default -> "本周期暂无纯文本推文，纯文本更依赖评论互动与转发分享。";
             };
         }
-        if (isBestViewsFormat && overallAvgViews > 0L) {
+        if (overallAvgViews > 0L) {
             int liftPct = (int) Math.round((avgViews - overallAvgViews) * 100.0 / overallAvgViews);
             if (liftPct >= 15) {
-                return String.format("本账号当前表现最佳体裁，均浏览比整体高 %d%%。", liftPct);
+                return String.format("有浏览读数的主帖样本中，该体裁的均浏览比整体高 %d%%。", liftPct);
             }
         }
         if ("TEXT".equals(formatCode)) {
@@ -1841,32 +1943,37 @@ public class CommunityAnalyticsEngine {
         return gapMap;
     }
 
-    static boolean hasExternalUrl(RawTweet t) {
-        String text = t.text() != null ? t.text() : "";
-        Matcher m = URL_PATTERN.matcher(text);
-        int totalUrls = 0;
-        boolean hasNonTcoOrXDomain = false;
-        while (m.find()) {
-            totalUrls++;
-            String url = m.group().toLowerCase(Locale.ROOT);
-            if (!url.startsWith("https://t.co/")
-                    && !url.startsWith("http://t.co/")
-                    && !url.contains("://x.com/")
-                    && !url.contains("://twitter.com/")) {
-                hasNonTcoOrXDomain = true;
+    private record PostLinks(String externalDomain, boolean unresolved) {
+        boolean hasExternal() { return !externalDomain.isEmpty(); }
+    }
+
+    private static PostLinks classifyLinks(RawTweet tweet) {
+        Matcher urls = URL_PATTERN.matcher(tweet.text() == null ? "" : tweet.text());
+        int shortLinks = 0;
+        boolean unresolved = false;
+        while (urls.find()) {
+            String host;
+            try {
+                host = java.net.URI.create(urls.group()).getHost();
+            } catch (IllegalArgumentException invalidUrl) {
+                host = null;
             }
+            if (host == null) {
+                unresolved = true;
+                continue;
+            }
+            host = host.toLowerCase(Locale.ROOT);
+            if (host.endsWith(".")) host = host.substring(0, host.length() - 1);
+            if (host.equals("x.com") || host.endsWith(".x.com") || host.equals("twitter.com") || host.endsWith(".twitter.com")) continue;
+            if (host.equals("t.co")) {
+                shortLinks++;
+                continue;
+            }
+            return new PostLinks(host.startsWith("www.") ? host.substring(4) : host, false);
         }
-        if (totalUrls == 0) {
-            return false;
-        }
-        if (hasNonTcoOrXDomain) {
-            return true;
-        }
-        // 配图/视频贴或引用贴末尾会自动附带 1 个原生 t.co 媒体短链，不视为站外导流链接
-        if (t.hasMedia() || t.kind() == TweetKind.QUOTE) {
-            return totalUrls >= 2;
-        }
-        return true;
+        // Media and quote tweets can carry one generated attachment link. Other unexpanded t.co links have no known destination.
+        int attachmentLinks = tweet.hasMedia() || tweet.kind() == TweetKind.QUOTE ? 1 : 0;
+        return new PostLinks("", unresolved || shortLinks > attachmentLinks);
     }
 
     private TopPostCard buildScoredTopPostCard(
@@ -1908,7 +2015,7 @@ public class CommunityAnalyticsEngine {
             reachTierLabel = "📊 其他浏览量样本（来源未知）";
         }
 
-        boolean extLink = hasExternalUrl(t);
+        boolean extLink = classifyLinks(t).hasExternal();
         boolean rapidFire = gapMinutesSincePrev != null && gapMinutesSincePrev < rules.minRecommendedGapMinutes();
         boolean controversyRisk = metricKnown(t, "replies") && metricKnown(t, "likes") && metricKnown(t, "bookmarks")
                 && replies >= rules.controversyMinReplies()
@@ -2058,6 +2165,12 @@ public class CommunityAnalyticsEngine {
                 .map(RawTweet::createdAt)
                 .max(Comparator.naturalOrder())
                 .orElse(null);
+        Instant candidateStart = refNow.minus(Duration.ofHours(algo.upstreamEvidence().maxCandidateAgeHours()));
+        List<Instant> recentMainPostTimes = allTimeline.stream()
+                .filter(CommunityAnalyticsEngine::isIndependentMainPost)
+                .map(RawTweet::createdAt)
+                .filter(at -> at != null && !at.isBefore(candidateStart) && !at.isAfter(refNow))
+                .sorted(Comparator.reverseOrder()).toList();
 
         int evalCount = 0;
         int oonCount = 0;
@@ -2102,13 +2215,14 @@ public class CommunityAnalyticsEngine {
                 rapidFireCount++;
             }
 
-            if (hasExternalUrl(t)) {
+            PostLinks links = classifyLinks(t);
+            if (links.hasExternal()) {
                 extLinkCount++;
                 if (metricKnown(t, "views")) {
                     extLinkViewsSum += v;
                     extViewCount++;
                 }
-            } else {
+            } else if (!links.unresolved()) {
                 if (metricKnown(t, "views")) {
                     nativeViewsSum += v;
                     nativeViewCount++;
@@ -2295,7 +2409,8 @@ public class CommunityAnalyticsEngine {
                 algo.name(),
                 authorEngagedPostCount,
                 opsRecommendations,
-                calibration
+                calibration,
+                recentMainPostTimes
         );
     }
 
@@ -2422,30 +2537,29 @@ public class CommunityAnalyticsEngine {
         }
 
         if (contentTiming != null && contentTiming.formatStats() != null) {
-            List<ContentFormatStat> knownFormats = contentTiming.formatStats().stream()
-                    .filter(f -> f.viewSampleCount() > 0 && f.avgViews() > 0)
-                    .sorted(Comparator.comparingDouble(ContentFormatStat::avgAlgoScore)
-                            .thenComparingLong(ContentFormatStat::avgViews).reversed())
-                    .toList();
+            List<ContentFormatStat> knownFormats = rankedComparableFormats(contentTiming.formatStats());
             long overallAvgViews = activity != null ? activity.avgViewsPerPost() : 0L;
-            if (knownFormats.size() >= 2 && overallAvgViews > 0L) {
+            if (knownFormats.size() >= 2 && knownFormats.get(0).viewSampleCount() > 0 && overallAvgViews > 0L) {
                 ContentFormatStat best = knownFormats.get(0);
                 int liftPct = (int) Math.round((best.avgViews() - overallAvgViews) * 100.0 / overallAvgViews);
-                boolean clearAlgoLead = best.algoScoreSampleCount() > 0
-                        && knownFormats.get(1).algoScoreSampleCount() > 0
-                        && (best.avgAlgoScore() - knownFormats.get(1).avgAlgoScore()) >= 8.0
+                boolean clearAlgoLead = knownFormats.stream().allMatch(format -> format.algoScoreSampleCount() > 0)
+                        && (best.avgAlgoScore() - knownFormats.get(1).avgAlgoScore()) >= 8
                         && liftPct >= 0;
                 if (liftPct >= playbook.formatAdvantageThresholdPct() || clearAlgoLead) {
                     String headline = liftPct >= playbook.formatAdvantageThresholdPct()
                             ? String.format("「%s」均浏览高出 %d%%", best.formatLabel(), liftPct)
-                            : String.format("「%s」互动表现最佳", best.formatLabel());
+                            : String.format("「%s」平均规则分领先", best.formatLabel());
                     items.add(new OpsRecommendationItem(
                             "WINNING_FORMAT",
                             "MEDIUM",
                             "体裁",
                             headline,
-                            String.format("近期 %d 条「%s」平均浏览 %d，明显优于其他体裁，同类话题可优先沿用该形式。",
-                                    best.viewSampleCount(), best.formatLabel(), best.avgViews()),
+                            liftPct >= playbook.formatAdvantageThresholdPct()
+                                    ? String.format("近期 %d 条「%s」平均浏览 %d，比本期主帖均值高 %d%%。",
+                                            best.viewSampleCount(), best.formatLabel(), best.avgViews(), liftPct)
+                                    : String.format("「%s」的平均规则分为 %d，领先第二名 %d 分。",
+                                            best.formatLabel(), best.avgAlgoScore(),
+                                            best.avgAlgoScore() - knownFormats.get(1).avgAlgoScore()),
                             "tab:timing|scrollId:formatCardsGrid",
                             null
                     ));
@@ -2459,7 +2573,7 @@ public class CommunityAnalyticsEngine {
                         .filter(f -> !"TEXT".equals(f.formatCode()))
                         .mapToInt(ContentFormatStat::postCount)
                         .sum();
-                if (textCount >= 3 && richCount == 0) {
+                if (textCount >= 3 && richCount == 0 && Boolean.TRUE.equals(contentTiming.timelineWindowComplete())) {
                     items.add(new OpsRecommendationItem(
                             "WINNING_FORMAT",
                             "NORMAL",
@@ -2633,7 +2747,6 @@ public class CommunityAnalyticsEngine {
     );
     private static final Pattern MENTION_STRIP_RE = Pattern.compile("(^|[^\\w])@[A-Za-z0-9_]{1,15}");
     private static final Pattern ASCII_TOKEN_RE = Pattern.compile("[a-z0-9_]{2,}");
-    private static final Pattern URL_HOST_RE = Pattern.compile("^https?://([^/\\s:?#]+)", Pattern.CASE_INSENSITIVE);
 
     private EmpiricalAlgoCalibration buildEmpiricalCalibration(
             XUserSummary profile,
@@ -2654,27 +2767,29 @@ public class CommunityAnalyticsEngine {
         String username = profile.username() != null ? profile.username() : "x";
 
         // 1. 反推本账号互关评论占比与真实期望有效 reply 权重（xai-value-model/weights.rs:603）
-        long totalInboundReplies = 0L;
+        long knownRelationComments = 0L;
+        long unknownRelationComments = 0L;
         long mutualInboundReplies = 0L;
         if (interactions != null && interactions.peerStats() != null) {
             for (PeerInteractionStat p : interactions.peerStats()) {
                 int r = Math.max(0, p.peerRepliesToMe());
                 if (r > 0) {
-                    totalInboundReplies += r;
+                    boolean knownNonMutual = p.peer() != null && !normId(p.peer().id()).isEmpty() && followAudit != null
+                            && ((!p.iFollowThem() && !followAudit.followingsSampleTruncated())
+                                    || (!p.theyFollowMe() && !followAudit.followersSampleTruncated()));
+                    if (!p.followStateKnown() && !knownNonMutual) {
+                        unknownRelationComments += r;
+                        continue;
+                    }
+                    knownRelationComments += r;
                     if (p.iFollowThem() && p.theyFollowMe()) {
                         mutualInboundReplies += r;
                     }
                 }
             }
         }
-        boolean mutualShareKnown = totalInboundReplies >= 3L;
-        double mutualShareRatio = 0.0;
-        if (mutualShareKnown) {
-            mutualShareRatio = (double) mutualInboundReplies / totalInboundReplies;
-        } else if (followAudit != null && followAudit.followersSampleCount() >= 5 && !followAudit.followersSampleTruncated()) {
-            mutualShareRatio = Math.min(1.0, (double) followAudit.mutualCount() / followAudit.followersSampleCount());
-            mutualShareKnown = true;
-        }
+        boolean mutualShareKnown = knownRelationComments >= 3L;
+        double mutualShareRatio = mutualShareKnown ? (double) mutualInboundReplies / knownRelationComments : 0.0;
         double effectiveReplyWeight = round2(ev.replyWeight() + ev.bidirectionalFollowReplyWeightBoost() * mutualShareRatio);
         double mutualSharePct = round1(mutualShareRatio * 100.0);
 
@@ -2697,7 +2812,7 @@ public class CommunityAnalyticsEngine {
         if (validMain.isEmpty()) {
             return new EmpiricalAlgoCalibration(
                     0, MIN_CALIBRATION_POSTS, false,
-                    mutualShareKnown, mutualSharePct, effectiveReplyWeight,
+                    mutualShareKnown, mutualSharePct, effectiveReplyWeight, knownRelationComments, unknownRelationComments,
                     0L, 0L, 0L, 0.0, 0.0,
                     coldStartEligible, 0, 0.0,
                     0.0, 0.0, 16,
@@ -2771,8 +2886,8 @@ public class CommunityAnalyticsEngine {
             String rawText = t.text() != null ? t.text() : "";
             String cleanText = URL_PATTERN.matcher(rawText).replaceAll(" ").trim();
             int cleanLen = cleanText.codePointCount(0, cleanText.length());
-            boolean hasExt = hasExternalUrl(t);
-            String domain = hasExt ? extractPrimaryExternalDomain(t) : "";
+            PostLinks links = classifyLinks(t);
+            String domain = links.externalDomain();
             boolean structuredList = isStructuredListText(rawText);
             boolean hasQuestion = rawText.indexOf('?') >= 0 || rawText.indexOf('？') >= 0;
             boolean engaged = t.id() != null && authorEngagedMainPostIds.contains(t.id());
@@ -2789,7 +2904,7 @@ public class CommunityAnalyticsEngine {
                     cleanLen,
                     structuredList,
                     hasQuestion,
-                    hasExt,
+                    links.unresolved() ? null : links.hasExternal(),
                     domain,
                     engaged,
                     viewsArr[i],
@@ -2847,6 +2962,8 @@ public class CommunityAnalyticsEngine {
                 mutualShareKnown,
                 mutualSharePct,
                 effectiveReplyWeight,
+                knownRelationComments,
+                unknownRelationComments,
                 p25Views,
                 medianViews,
                 p75Views,
@@ -2882,8 +2999,8 @@ public class CommunityAnalyticsEngine {
             CalibrationPostSample s = samples.get(j);
             double jaccard = computeShingleJaccard(qSet, s.shingles());
             double fmtMatch = q.formatCode().equals(s.formatCode()) ? 1.0 : 0.0;
-            double extMatch = (q.hasExternalLink() == s.hasExternalLink()) ? 1.0 : 0.0;
-            double domainMatch = (q.hasExternalLink() && !q.externalDomain().isEmpty()
+            double extMatch = q.hasExternalLink() != null && q.hasExternalLink().equals(s.hasExternalLink()) ? 1.0 : 0.0;
+            double domainMatch = (Boolean.TRUE.equals(q.hasExternalLink()) && !q.externalDomain().isEmpty()
                     && q.externalDomain().equals(s.externalDomain())) ? 1.0 : 0.0;
             double listMatch = (q.structuredList() == s.structuredList()) ? 1.0 : 0.0;
             double qMatch = (q.hasQuestion() == s.hasQuestion()) ? 1.0 : 0.0;
@@ -2994,12 +3111,10 @@ public class CommunityAnalyticsEngine {
         Map<String, List<Long>> byDomain = new LinkedHashMap<>();
         for (RawTweet t : validMain) {
             long v = Math.max(0L, t.viewCount());
-            if (hasExternalUrl(t)) {
-                String domain = extractPrimaryExternalDomain(t);
-                if (!domain.isBlank()) {
-                    byDomain.computeIfAbsent(domain, k -> new ArrayList<>()).add(v);
-                }
-            } else {
+            PostLinks links = classifyLinks(t);
+            if (links.hasExternal()) {
+                byDomain.computeIfAbsent(links.externalDomain(), k -> new ArrayList<>()).add(v);
+            } else if (!links.unresolved()) {
                 nativeSum += v;
                 nativeCnt++;
             }
@@ -3114,29 +3229,6 @@ public class CommunityAnalyticsEngine {
         int hi = (int) Math.ceil(pos);
         if (lo == hi) return sorted[lo];
         return round2(sorted[lo] * (hi - pos) + sorted[hi] * (pos - lo));
-    }
-
-    private static String extractPrimaryExternalDomain(RawTweet t) {
-        String text = t.text() != null ? t.text() : "";
-        Matcher m = URL_PATTERN.matcher(text);
-        boolean sawTco = false;
-        while (m.find()) {
-            String rawUrl = m.group();
-            Matcher hm = URL_HOST_RE.matcher(rawUrl);
-            if (!hm.find()) continue;
-            String host = hm.group(1).toLowerCase(Locale.ROOT);
-            if (host.startsWith("www.")) host = host.substring(4);
-            if (host.startsWith("mobile.")) host = host.substring(7);
-            if ("x.com".equals(host) || "twitter.com".equals(host)) {
-                continue;
-            }
-            if ("t.co".equals(host)) {
-                sawTco = true;
-                continue;
-            }
-            return host;
-        }
-        return sawTco ? "t.co" : "";
     }
 
     private static boolean isStructuredListText(String rawText) {

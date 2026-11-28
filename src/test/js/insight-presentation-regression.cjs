@@ -15,6 +15,18 @@ function sourceSection(startMarker, endMarker) {
     return source.slice(start, end);
 }
 
+const followDisplay = vm.runInNewContext(sourceSection("    function followRateDisplay(", "    function renderProfileHeader(") + "\nfollowRateDisplay");
+const partialAudit = {followingsSampleTruncated: false, followingSampleCount: 8, unknownFollowBackCount: 2,
+    mutualCount: 3, followBackRatePct: 37.5, followBackRateLabel: "约 37.5%"};
+const completeList = followDisplay({followAudit: partialAudit});
+assert.equal(completeList.rate, "37.5%–62.5%");
+assert.match(completeList.detail, /2 个未知关系/);
+assert.doesNotMatch(completeList.detail, /约/);
+const sample = followDisplay({followAudit: {...partialAudit, followingsSampleTruncated: true}});
+assert.equal(sample.label, "样本回关率");
+assert.match(sample.scope, /8/);
+assert.equal(followDisplay({followAudit: {...partialAudit, followingsSampleTruncated: true, followingSampleCount: 0}}).rate, "--");
+
 // Only the fields this renderer writes are needed; execute production code unchanged.
 const nodes = Object.fromEntries([
     "algoReachPoolsGrid", "algoCalibrationPanel", "algoOpsPlaybookList",
@@ -54,7 +66,7 @@ const health = {
     outOfNetworkPostCount: 1, inNetworkPostCount: 4, lowReachPostCount: 1,
     calibration: {
         samplePostCount: 6, medianViews: 800, medianFollowerReachMultiple: 2,
-        mutualShareKnown: false, coldStartEligibleAccount: true,
+        mutualShareKnown: false, knownRelationCommentCount: 0, unknownRelationCommentCount: 3, coldStartEligibleAccount: true,
         coldStartPassRatePct: 50, coldStartPassCount: 3,
         replyTemplateRisk: { evaluatedReplyCount: 8, copyPastaRiskTriggered: false },
         domainStats: [{ domain: "example.com", avgViews: 400, vsNativePct: -20 }],
@@ -88,6 +100,7 @@ assert.doesNotMatch(combined, /互动高但曝光偏低|HISTORICAL-ONLY|LEGACY-U
 assert.equal(occurrences(combined, "候选正文"), 1,
     "A candidate must appear once, without the historical inline/legacy duplicates");
 assert.equal(nodes.algoCalibrationPanel.hidden, false);
+assert.match(nodes.algoCalibrationPanel.innerHTML, /关系已核实 0 条，未知 3 条/);
 assert.match(nodes.algoCalibrationPanel.innerHTML, /日常单帖浏览/);
 assert.match(nodes.algoCalibrationPanel.innerHTML, /常用外链/,
     "Removing residual rows must preserve unrelated calibration content");

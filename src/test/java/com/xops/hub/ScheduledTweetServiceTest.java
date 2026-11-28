@@ -676,10 +676,10 @@ class ScheduledTweetServiceTest {
     }
 
     @Test
-    void scheduledPublishShouldRequireTop100InteractionFrequencyRank() throws Exception {
+    void scheduledPublishRequiresBoundOwnerRegardlessOfRankOrFollowing() throws Exception {
         Instant now = Instant.now();
         Instant oneHourAgo = now.minus(Duration.ofHours(1));
-        XUserSummary author = new XUserSummary("9000", "elidlicom", "Litany", "", "", true, 500, 100, 50, "");
+        XUserSummary author = new XUserSummary(com.xops.hub.model.AuthorIdentity.ARCHIVE_ACCOUNT_ID, "elidlicom", "Litany", "", "", true, 500, 100, 50, "");
 
         List<RawTweet> authorTweets = new ArrayList<>();
         List<XUserSummary> followersList = new ArrayList<>();
@@ -687,7 +687,7 @@ class ScheduledTweetServiceTest {
             String peerUid = String.valueOf(6000 + rank);
             String peerName = "peer_rank_" + rank;
             XUserSummary peer = new XUserSummary(peerUid, peerName, "Peer " + rank, "", "", false, 10, 10, 10, "");
-            if (rank == 100 || rank == 101) {
+            if (rank == 1 || rank == 100 || rank == 101) {
                 followersList.add(peer);
             }
             int replyPairs = 110 - rank;
@@ -718,7 +718,7 @@ class ScheduledTweetServiceTest {
         AccountStore.GraphUpdate authorGraph = new AccountStore.GraphUpdate(
                 List.of(), followersList, Set.of(), false, false, false, false, List.of(), Map.of()
         );
-        Path authorStorePath = tempDir.resolve("users/by-id/9000/store_v" + AccountStore.VERSION + ".json.gz");
+        Path authorStorePath = tempDir.resolve("users/by-id/" + com.xops.hub.model.AuthorIdentity.ARCHIVE_ACCOUNT_ID + "/store_v" + AccountStore.VERSION + ".json.gz");
         AccountStore.StoredAccount authorStore = AccountStore.merge(
                 null, author, now, authorTweets, List.of(), monthCoverage, monthCoverage, authorGraph
         );
@@ -745,9 +745,15 @@ class ScheduledTweetServiceTest {
             seedValidWriteToken("6010", "peer_rank_10");
             seedValidWriteToken("6101", "peer_rank_101");
             seedValidWriteToken("6100", "peer_rank_100");
-            seedValidWriteToken("9000", "elidlicom");
+            seedValidWriteToken(com.xops.hub.model.AuthorIdentity.ARCHIVE_ACCOUNT_ID, "elidlicom");
 
             long scheduledAt = clock.millis() + 60_000L;
+
+            var highestRank = hubService.evaluateScheduledPublishAccess("6001", "peer_rank_1");
+            assertEquals(1, highestRank.authorInteractionRank());
+            assertTrue(highestRank.followsAuthor());
+            assertFalse(highestRank.allowed());
+            assertFalse(hubService.evaluateScheduledPublishAccess("9999", "elidlicom").allowed());
 
             // 1. Unranked user -> blocked from single create, batch create, and publish step-up OAuth
             MockHttpSession strangerSession = authSession("2999", "stranger");
@@ -758,7 +764,7 @@ class ScheduledTweetServiceTest {
             JsonNode strangerList = objectMapper.readTree(strangerBody);
             assertFalse(strangerList.path("scheduleAccessAllowed").asBoolean(true));
             assertTrue(strangerList.path("authorInteractionRank").isNull());
-            assertTrue(strangerList.path("scheduleLockedReason").asText().contains("elidlicom"));
+            assertTrue(strangerList.path("scheduleLockedReason").asText().contains("已验证的作者账号"));
             gatedMvc.perform(multipart("/api/scheduled-tweets")
                             .param("text", "Blocked stranger")
                             .param("scheduledAtEpochMs", String.valueOf(scheduledAt))
@@ -808,7 +814,7 @@ class ScheduledTweetServiceTest {
             assertFalse(rank101List.path("scheduleAccessAllowed").asBoolean(true));
             assertTrue(rank101List.path("followsAuthor").asBoolean(false));
             assertEquals(101, rank101List.path("authorInteractionRank").asInt());
-            assertTrue(rank101List.path("scheduleLockedReason").asText().contains("elidlicom"));
+            assertTrue(rank101List.path("scheduleLockedReason").asText().contains("已验证的作者账号"));
             gatedMvc.perform(multipart("/api/scheduled-tweets")
                             .param("text", "Blocked rank 101 follower")
                             .param("scheduledAtEpochMs", String.valueOf(scheduledAt))
@@ -843,7 +849,7 @@ class ScheduledTweetServiceTest {
                     .andExpect(status().isForbidden());
 
             // 5. @elidlicom author himself is allowed and can create/reschedule/cancel
-            MockHttpSession authorSession = authSession("9000", "elidlicom");
+            MockHttpSession authorSession = authSession(com.xops.hub.model.AuthorIdentity.ARCHIVE_ACCOUNT_ID, "elidlicom");
             String authorCreated = gatedMvc.perform(multipart("/api/scheduled-tweets")
                             .param("text", "Author self scheduled post")
                             .param("scheduledAtEpochMs", String.valueOf(scheduledAt))

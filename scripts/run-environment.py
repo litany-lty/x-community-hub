@@ -209,21 +209,17 @@ def main():
         options.update({
             "xops.scheduler-enabled": "false", "xops.auto-repost-enabled": "false",
             "xops.top50-auto-sync-enabled": "false",
+            "xops.top10-silent-history-enabled": "false",
+            "xops.content-assistant-background-collection-enabled": "false",
             "server.forward-headers-strategy": "none",
             "server.servlet.session.store-dir": str(cwd / ".sessions"),
             "xops.disk-cache-dir": str(cwd / ".cache/snapshots"),
             "xops.algo-profile-path": str(cwd / ".cache/x-algorithm-profile.json"),
         })
-    else:
-        options.update({
-            "xops.scheduler-enabled": "true",
-            "xops.auto-repost-enabled": "true",
-        })
     if args.mode == "preview":
         options.update({
             "xops.default-provider": "DEMO",
             "xops.fxtwitter-enabled": "false",
-            "xops.top10-silent-history-enabled": "false",
             "xops.twitterapi-io-key": "",
             "xops.official-bearer-token": "",
             "xops.oauth-client-id": "",

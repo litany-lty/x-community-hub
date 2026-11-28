@@ -220,7 +220,7 @@ class ChatGptWritingAndSkillsTest {
         AssistantWorker worker = new AssistantWorker(store, intelligence, sources);
         try {
             store.tx(tx -> {
-                tx.put("meta", "owner", object().put("accountId", "owner-1").put("username", "elidlicom"));
+                tx.put("meta", "owner", object().put("bindingSource", "EXPLICIT").put("accountId", "owner-1").put("username", "elidlicom"));
                 ObjectNode cfg = AssistantWorkflow.settings(tx)
                         .put("provider", "chatgpt")
                         .put("model", "chatgpt-default")
@@ -365,14 +365,16 @@ class ChatGptWritingAndSkillsTest {
                 .put("clientRequestId", "req-fast-multi-1")));
 
         ObjectNode research = (ObjectNode) task.path("input").path("research");
-        assertThat(research.path("claims")).hasSize(2);
+        assertThat(research.path("materialId").asText()).isEqualTo("m2");
+        assertThat(research.path("claims")).hasSize(3);
         assertThat(research.at("/claims/0/sourceIds/0").asText()).isEqualTo("material-m2-author");
-        assertThat(research.at("/claims/0/claim").asText()).isEqualTo(
-                "@selecteduser：核心转发点评\n引用 @official_ai：官方公布推理成本下降 50%\n长文全文：长文详细拆解 KV Cache 优化机制");
+        assertThat(research.at("/claims/0/claim").asText()).isEqualTo("@selecteduser：核心转发点评");
+        assertThat(research.at("/claims/1/claim").asText()).isEqualTo("引用 @official_ai：官方公布推理成本下降 50%");
+        assertThat(research.at("/claims/2/claim").asText()).isEqualTo("归属待核实的长文节选：长文详细拆解 KV Cache 优化机制");
+        assertThat(research.path("materialEvidence")).hasSize(3);
         assertThat(research.at("/materialEvidence/0/publisher").asText()).isEqualTo("Selected Author (@selecteduser)");
-        assertThat(research.at("/claims/1/sourceIds/0").asText()).isEqualTo("material-m1-author");
-        assertThat(research.at("/claims/1/claim").asText()).isEqualTo("@firstuser：第一条同选题快讯");
-        assertThat(research.at("/materialEvidence/1/publisher").asText()).isEqualTo("First Author (@firstuser)");
+        assertThat(research.deepCopy().without("snapshot").toString())
+                .doesNotContain("material-m1-author", "第一条同选题快讯", "First Author");
     }
 
     @Test
@@ -492,7 +494,7 @@ class ChatGptWritingAndSkillsTest {
         AssistantWorker worker = new AssistantWorker(store, intelligence, sources);
         try {
             store.tx(tx -> {
-                tx.put("meta", "owner", object().put("accountId", "owner-1").put("username", "elidlicom"));
+                tx.put("meta", "owner", object().put("bindingSource", "EXPLICIT").put("accountId", "owner-1").put("username", "elidlicom"));
                 tx.put("meta", "settings", AssistantWorkflow.settings(tx)
                         .put("provider", "chatgpt")
                         .put("model", "chatgpt-default")
@@ -581,7 +583,7 @@ class ChatGptWritingAndSkillsTest {
         AssistantWorker worker = new AssistantWorker(store, intelligence, sources);
         try {
             store.tx(tx -> {
-                tx.put("meta", "owner", object().put("accountId", "owner-1").put("username", "elidlicom"));
+                tx.put("meta", "owner", object().put("bindingSource", "EXPLICIT").put("accountId", "owner-1").put("username", "elidlicom"));
                 tx.put("meta", "settings", AssistantWorkflow.settings(tx)
                         .put("provider", "chatgpt")
                         .put("model", "chatgpt-default")
@@ -685,7 +687,7 @@ class ChatGptWritingAndSkillsTest {
         long observedAt = publishedAt + 24L * 3_600_000L;
 
         store.tx(tx -> {
-            tx.put("meta", "owner", object().put("accountId", "owner-1").put("username", "elidlicom"));
+            tx.put("meta", "owner", object().put("bindingSource", "EXPLICIT").put("accountId", "owner-1").put("username", "elidlicom"));
             tx.put("meta", "settings", AssistantWorkflow.settings(tx)
                     .put("provider", "chatgpt")
                     .put("model", "chatgpt-default")
@@ -910,7 +912,7 @@ class ChatGptWritingAndSkillsTest {
         try {
             long now = Instant.now().toEpochMilli();
             store.tx(tx -> {
-                tx.put("meta", "owner", object().put("accountId", "owner-1").put("username", "elidlicom"));
+                tx.put("meta", "owner", object().put("bindingSource", "EXPLICIT").put("accountId", "owner-1").put("username", "elidlicom"));
                 // Short low-engagement text (not HIGH_SIGNAL)
                 AssistantWorkflow.ingest(tx, object()
                         .put("id", "m-short")
@@ -1056,7 +1058,7 @@ class ChatGptWritingAndSkillsTest {
         AssistantWorker worker = new AssistantWorker(store, intelligence, sources);
         try {
             store.tx(tx -> {
-                tx.put("meta", "owner", object().put("accountId", "owner-1").put("username", "elidlicom"));
+                tx.put("meta", "owner", object().put("bindingSource", "EXPLICIT").put("accountId", "owner-1").put("username", "elidlicom"));
                 // Also set built-in quote polish prompt on settings to ensure standalone draft is NOT hijacked into quote TL;DR
                 ObjectNode cfg = AssistantWorkflow.settings(tx)
                         .put("provider", "chatgpt")
@@ -1262,6 +1264,255 @@ class ChatGptWritingAndSkillsTest {
                     .put("generationModel", "gemini-4-carbon");
             assertThat(AssistantWorker.stageLeaseMillis(saved120Settings, carbonInput, "OPTIMIZE"))
                     .isEqualTo(255_000L);
+        } finally {
+            worker.close();
+            intelligence.closeReadPool();
+        }
+    }
+
+    @Test
+    void articleAAndArticleBDeepResearchMaterialsStayStrictlyIsolatedDuringResearchDraftingFastRegenAndOptimize() throws Exception {
+        AssistantStore store = new AssistantStore(tempDir.resolve("article-isolation-store"), mapper);
+        SourceCollector sources = mock(SourceCollector.class);
+        when(sources.styleSamples()).thenReturn(object());
+        when(sources.list()).thenReturn(List.of());
+        when(sources.history()).thenReturn(object());
+
+        URI docA = URI.create("https://compiler.example.org/rust-linker-63pct");
+        URI seedLinkA = URI.create("https://compiler.example.org/seed-only-a");
+        URI docB = URI.create("https://storage.example.org/nvme-engine-910k");
+        URI seedLinkB = URI.create("https://storage.example.org/seed-only-b");
+        List<URI> openedUrls = new java.util.concurrent.CopyOnWriteArrayList<>();
+
+        TextSourceReader reader = uri -> {
+            openedUrls.add(uri);
+            if (uri.equals(docA) || uri.equals(seedLinkA)) {
+                return new TextSourceReader.ReadResult(
+                        uri, uri, "text/html", "Compiler Linker Deep Dive A",
+                        "文章A外部深挖：增量符号表裁剪将链接阶段峰值内存降低了 63%，仅适用于 ELF 静态产物。",
+                        "第1段", Instant.parse("2026-11-27T08:00:00Z"), TextSourceReader.Status.READ, "", List.of()
+                );
+            }
+            if (uri.equals(docB) || uri.equals(seedLinkB)) {
+                return new TextSourceReader.ReadResult(
+                        uri, uri, "text/html", "NVMe Engine Deep Dive B",
+                        "文章B外部深挖：零拷贝轮询队列把单盘随机读拉到了 910k IOPS，但会独占一个物理核。",
+                        "第1段", Instant.parse("2026-11-27T09:00:00Z"), TextSourceReader.Status.READ, "", List.of()
+                );
+            }
+            throw new IllegalStateException("Unexpected URI read: " + uri);
+        };
+
+        List<String> searchInputs = new ArrayList<>();
+        List<String> synthInputs = new ArrayList<>();
+        List<String> draftPrompts = new ArrayList<>();
+        List<String> optimizePrompts = new ArrayList<>();
+
+        TextModelClient fakeModel = new TextModelClient() {
+            @Override
+            public java.util.Set<Protocol> supportedProtocols() {
+                return java.util.EnumSet.of(Protocol.RESPONSES);
+            }
+
+            @Override
+            public Protocol defaultProtocol() {
+                return Protocol.RESPONSES;
+            }
+
+            @Override
+            public ModelResult complete(ModelBinding binding, TextRequest request) {
+                String userText = request.userText();
+                if (request.webSearch()) {
+                    searchInputs.add(userText);
+                    boolean isA = userText.contains("art-a") || userText.contains("CompilerAlpha");
+                    URI hit = isA ? docA : docB;
+                    String title = isA ? "Compiler Linker Deep Dive A" : "NVMe Engine Deep Dive B";
+                    return new ModelResult(
+                            "{\"summary\":\"ok\"}",
+                            List.of(new SearchResult(isA ? "compiler linker" : "nvme iops", hit, title, "", "2026-11-27")),
+                            null, "req-search", object(),
+                            Map.of("web_search_1", object().put("hit", hit.toString()))
+                    );
+                }
+                if (userText.startsWith("Build a research result")) {
+                    synthInputs.add(userText);
+                    boolean isA = userText.contains("material-art-a-link");
+                    var synth = object().put("summary", isA ? "文章A深挖摘要：链接内存降63%" : "文章B深挖摘要：随机读达910k IOPS");
+                    var claim = synth.putArray("claims").addObject()
+                            .put("claim", isA ? "增量符号表裁剪使峰值内存降低 63%" : "零拷贝轮询使单盘随机读达到 910k IOPS")
+                            .put("relation", "SUPPORTS");
+                    claim.putArray("sourceIds").add("source-1");
+                    claim.putArray("excerptIds").add("source-1#p1");
+                    synth.putArray("angles").add(isA ? "文章A切口：静态链接内存瓶颈" : "文章B切口：独占物理核换910k吞吐");
+                    synth.putArray("unverified");
+                    return new ModelResult(synth.toString(), List.of(), null, "req-synth", object(), Map.of());
+                }
+                if (userText.startsWith("Write one")) {
+                    draftPrompts.add(userText);
+                    boolean isA = userText.contains("63%");
+                    ObjectNode out = object().put("draft", isA
+                            ? "编译大型工程最怕链接器爆内存，增量符号表直接砍掉 63% 峰值占用。"
+                            : "单盘飙到 910k IOPS 的代价是死绑一颗物理核，高并发存储得重新算核数账。");
+                    out.putArray("usedClaimIds").add("claim-1");
+                    out.putArray("caveats");
+                    out.putArray("factChanges");
+                    return new ModelResult(out.toString(), List.of(), null, "req-draft", object(), Map.of());
+                }
+                if (userText.startsWith("Improve structure")) {
+                    optimizePrompts.add(userText);
+                    ObjectNode out = object()
+                            .put("needsAdditionalResearch", false)
+                            .put("draft", "链接阶段省下 63% 内存后，CI 小规格机器终于不用频繁 OOM 重跑了。");
+                    out.putArray("usedClaimIds").add("claim-1");
+                    out.putArray("caveats");
+                    return new ModelResult(out.toString(), List.of(), null, "req-opt", object(), Map.of());
+                }
+                throw new IllegalStateException("Unexpected prompt: " + userText);
+            }
+        };
+
+        MockEnvironment env = new MockEnvironment().withProperty("X_CONTENT_ASSISTANT_MODEL_PROVIDER", "chatgpt");
+        AssistantIntelligence intelligence = new AssistantIntelligence(mapper, env, fakeModel, reader);
+        AssistantWorker worker = new AssistantWorker(store, intelligence, sources);
+        try {
+            String sharedTopicId = store.tx(tx -> {
+                tx.put("meta", "owner", object().put("bindingSource", "EXPLICIT").put("accountId", "owner-1").put("username", "elidlicom"));
+                tx.put("meta", "settings", AssistantWorkflow.settings(tx)
+                        .put("provider", "chatgpt")
+                        .put("model", "chatgpt-default")
+                        .put("protocol", "RESPONSES")
+                        .put("contextTokens", 200_000)
+                        .put("enabled", true)
+                        .put("modelEnabled", true)
+                        .put("postPolishEnabled", false));
+                String topicA = AssistantWorkflow.ingestDirectLinkMaterial(tx, object()
+                        .put("id", "art-a")
+                        .put("authorId", "web:compiler.example.org")
+                        .put("username", "compiler.example.org")
+                        .put("authorName", "CompilerAlpha Release Note")
+                        .put("text", "CompilerAlpha 新版链接器架构解析 " + seedLinkA)
+                        .put("articleText", "CompilerAlpha 详细介绍静态链接优化。参考延伸：" + seedLinkA)
+                        .put("sourceUrl", "https://compiler.example.org/post-a")
+                        .put("textStatus", "ARTICLE_FULL")
+                        .put("articleTextStatus", "FULL")
+                        .put("sourceIdentity", "USER_LINK")
+                        .put("publishedAt", Instant.now().toEpochMilli()));
+                String topicB = AssistantWorkflow.ingestDirectLinkMaterial(tx, object()
+                        .put("id", "art-b")
+                        .put("authorId", "web:storage.example.org")
+                        .put("username", "storage.example.org")
+                        .put("authorName", "StorageBeta Benchmark")
+                        .put("text", "StorageBeta 零拷贝引擎实测 " + seedLinkB)
+                        .put("articleText", "StorageBeta 披露最新存储引擎测试。参考延伸：" + seedLinkB)
+                        .put("sourceUrl", "https://storage.example.org/post-b")
+                        .put("textStatus", "ARTICLE_FULL")
+                        .put("articleTextStatus", "FULL")
+                        .put("sourceIdentity", "USER_LINK")
+                        .put("publishedAt", Instant.now().toEpochMilli()));
+                String topicC = AssistantWorkflow.ingestDirectLinkMaterial(tx, object()
+                        .put("id", "art-c")
+                        .put("authorId", "web:network.example.org")
+                        .put("username", "network.example.org")
+                        .put("authorName", "NetworkGamma QUIC Note")
+                        .put("text", "NetworkGamma 调整 QUIC 拥塞窗口")
+                        .put("articleText", "NetworkGamma 独立网络协议更新说明。")
+                        .put("sourceUrl", "https://network.example.org/post-c")
+                        .put("textStatus", "ARTICLE_FULL")
+                        .put("articleTextStatus", "FULL")
+                        .put("sourceIdentity", "USER_LINK")
+                        .put("publishedAt", Instant.now().toEpochMilli()));
+                ObjectNode versions = object()
+                        .put(topicA, tx.get("topic", topicA).path("version").asInt())
+                        .put(topicB, tx.get("topic", topicB).path("version").asInt())
+                        .put(topicC, tx.get("topic", topicC).path("version").asInt());
+                AssistantTopics.move(tx, List.of("art-b", "art-c"), topicA, versions, "MODEL");
+                // Simulate shared topic summary polluted by Article A
+                ObjectNode mergedTopic = tx.get("topic", topicA);
+                mergedTopic.put("title", "CompilerAlpha 选题标题").put("summary", "CompilerAlpha 选题级旧摘要");
+                AssistantTopics.persist(tx, topicA, mergedTopic);
+                return topicA;
+            });
+
+            // 1. Deep research + draft on Article A
+            String taskAId = store.tx(tx -> AssistantWorkflow.research(tx, object()
+                    .put("materialId", "art-a")
+                    .put("mode", "RESEARCH")
+                    .put("clientRequestId", "req-iso-a"))).path("id").asText();
+            for (int step = 0; step < 3; step++) {
+                worker.execute(store.tx(t -> t.put("task", taskAId,
+                        t.get("task", taskAId).put("attempt", AssistantWorkflow.id()).put("status", "RUNNING"))));
+            }
+            String draftAId = store.tx(t -> t.get("task", taskAId)).path("draftId").asText();
+            assertThat(openedUrls).containsExactlyInAnyOrder(seedLinkA, docA);
+            assertThat(searchInputs.get(0)).contains("CompilerAlpha").doesNotContain("StorageBeta", "NetworkGamma", "art-b", "art-c");
+            assertThat(synthInputs.get(0)).contains("material-art-a-link").doesNotContain("StorageBeta", "910k", "art-b");
+            assertThat(draftPrompts.get(0))
+                    .contains("63%", "Compiler Linker Deep Dive A", "CompilerAlpha")
+                    .doesNotContain("StorageBeta", "910k", "NVMe", "NetworkGamma", "art-b", "art-c");
+
+            openedUrls.clear();
+
+            // 2. Deep research + draft on Article B (in the same topic!)
+            String taskBId = store.tx(tx -> AssistantWorkflow.research(tx, object()
+                    .put("materialId", "art-b")
+                    .put("mode", "RESEARCH")
+                    .put("clientRequestId", "req-iso-b"))).path("id").asText();
+            for (int step = 0; step < 3; step++) {
+                worker.execute(store.tx(t -> t.put("task", taskBId,
+                        t.get("task", taskBId).put("attempt", AssistantWorkflow.id()).put("status", "RUNNING"))));
+            }
+            assertThat(openedUrls).containsExactlyInAnyOrder(seedLinkB, docB);
+            assertThat(searchInputs.get(1)).contains("StorageBeta").doesNotContain("CompilerAlpha", "选题级旧摘要", "art-a", "art-c");
+            assertThat(synthInputs.get(1)).contains("material-art-b-link").doesNotContain("CompilerAlpha", "63%", "选题级旧摘要", "art-a");
+            assertThat(draftPrompts.get(1))
+                    .contains("910k", "NVMe Engine Deep Dive B", "StorageBeta")
+                    .doesNotContain("CompilerAlpha", "63%", "Compiler Linker Deep Dive A", "选题级旧摘要", "art-a", "art-c");
+
+            // 3. Optimize Draft A AFTER Article B produced newer deep research in the same topic -> MUST NOT mix B into A!
+            String optAId = store.tx(tx -> AssistantWorkflow.optimize(tx, draftAId, object()
+                    .put("version", 1)
+                    .put("instruction", "补充深挖细节改写新版本")
+                    .put("clientRequestId", "req-iso-opt-a"))).path("id").asText();
+            worker.execute(store.tx(t -> t.put("task", optAId,
+                    t.get("task", optAId).put("attempt", AssistantWorkflow.id()).put("status", "RUNNING"))));
+            assertThat(optimizePrompts).hasSize(1);
+            assertThat(optimizePrompts.get(0))
+                    .contains("63%", "Compiler Linker Deep Dive A", "CompilerAlpha")
+                    .doesNotContain("910k", "NVMe Engine Deep Dive B", "StorageBeta", "独占物理核", "art-b", "art-c");
+
+            // 4. Fast regenerate on Article A reuses ONLY Article A's deep research; Fast draft on unresearched Article C stays clean
+            ObjectNode fastA = store.tx(tx -> AssistantWorkflow.research(tx, object()
+                    .put("materialId", "art-a")
+                    .put("mode", "FAST")
+                    .put("regenerate", true)
+                    .put("clientRequestId", "req-iso-fast-a")));
+            String fastAResearch = ((ObjectNode) fastA.at("/input/research")).deepCopy().without("snapshot").toString();
+            assertThat(fastAResearch).contains("63%", "Compiler Linker Deep Dive A")
+                    .doesNotContain("910k", "NVMe Engine Deep Dive B", "StorageBeta", "art-b");
+            String fastAId = fastA.path("id").asText();
+            worker.execute(store.tx(t -> t.put("task", fastAId,
+                    t.get("task", fastAId).put("attempt", AssistantWorkflow.id()).put("status", "RUNNING"))));
+            assertThat(draftPrompts.get(2))
+                    .contains("63%", "Compiler Linker Deep Dive A", "CompilerAlpha")
+                    .doesNotContain("910k", "NVMe Engine Deep Dive B", "StorageBeta", "NetworkGamma", "选题级旧摘要", "art-b", "art-c");
+
+            ObjectNode fastC = store.tx(tx -> AssistantWorkflow.research(tx, object()
+                    .put("materialId", "art-c")
+                    .put("mode", "FAST")
+                    .put("clientRequestId", "req-iso-fast-c")));
+            ObjectNode fastCResearch = ((ObjectNode) fastC.at("/input/research")).deepCopy().without("snapshot");
+            assertThat(fastCResearch.path("evidence")).isEmpty();
+            assertThat(fastCResearch.path("claims")).hasSize(1);
+            assertThat(fastCResearch.toString())
+                    .contains("NetworkGamma")
+                    .doesNotContain("63%", "910k", "CompilerAlpha", "StorageBeta", "选题级旧摘要");
+            String fastCId = fastC.path("id").asText();
+            worker.execute(store.tx(t -> t.put("task", fastCId,
+                    t.get("task", fastCId).put("attempt", AssistantWorkflow.id()).put("status", "RUNNING"))));
+            assertThat(draftPrompts.get(3))
+                    .contains("NetworkGamma")
+                    .doesNotContain("63%", "910k", "CompilerAlpha", "StorageBeta", "选题级旧摘要", "art-a", "art-b");
+            assertThat(sharedTopicId).isNotBlank();
         } finally {
             worker.close();
             intelligence.closeReadPool();

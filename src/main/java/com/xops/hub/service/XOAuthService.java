@@ -41,6 +41,7 @@ public class XOAuthService {
     public static final String LOGIN_OAUTH_SCOPE = "users.read tweet.read";
     public static final String PUBLISH_OAUTH_SCOPE = "users.read tweet.read tweet.write media.write offline.access";
     public static final String DEFAULT_OAUTH_SCOPE = LOGIN_OAUTH_SCOPE;
+    private static final String REJECTED_GRANT_MESSAGE = "X 发推授权已过期或失效，请前往「定时发布」页完成二次授权：";
     private static final String AUTHORIZE_ENDPOINT = "https://x.com/i/oauth2/authorize";
     private static final int MAX_PENDING_STATES = 2000;
     private static final Duration PKCE_STATE_TTL = Duration.ofMinutes(15);
@@ -350,6 +351,10 @@ public class XOAuthService {
         }
     }
 
+    static boolean isRejectedGrantMessage(String message) {
+        return message != null && message.startsWith(REJECTED_GRANT_MESSAGE);
+    }
+
     public void evictStaleTokenBefore(String accountId, long authFailureEpochMs) {
         if (accountId == null || accountId.isBlank() || authFailureEpochMs <= 0L) {
             return;
@@ -357,7 +362,8 @@ public class XOAuthService {
         long failureEpochSec = authFailureEpochMs / 1000L;
         synchronized (lockForAccount(accountId)) {
             StoredOAuthToken token = tokenStore.load(accountId);
-            if (token != null && token.updatedAtEpochSec() < failureEpochSec) {
+            if (token != null && token.updatedAtEpochSec() < failureEpochSec
+                    && token.expiresAtEpochSec() <= Instant.now().getEpochSecond()) {
                 tokenStore.delete(accountId);
             }
         }
@@ -455,10 +461,11 @@ public class XOAuthService {
         if (resp.statusCode() == 400 || resp.statusCode() == 401) {
             String errCode = json.path("error").asText("");
             String errDesc = json.path("error_description").asText(errCode.isBlank() ? "HTTP " + resp.statusCode() : errCode);
-            if (!"invalid_client".equalsIgnoreCase(errCode)) {
-                tokenStore.delete(accountId);
+            if ("invalid_client".equalsIgnoreCase(errCode)) {
+                throw new XDataProviderException(503, "X OAuth 客户端凭据被拒绝，请检查服务端配置");
             }
-            throw new XDataProviderException(401, "X 发推授权已过期或失效，请前往「定时发布」页完成二次授权：" + errDesc);
+            tokenStore.delete(accountId);
+            throw new XDataProviderException(401, REJECTED_GRANT_MESSAGE + errDesc);
         }
         if (resp.statusCode() >= 400 || json.path("access_token").asText("").isBlank()) {
             String errDesc = json.path("error_description").asText(json.path("error").asText("HTTP " + resp.statusCode()));

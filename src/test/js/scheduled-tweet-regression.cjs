@@ -64,6 +64,29 @@ this.__exports = {
 };
 `;
 
+const displayContext = vm.createContext({});
+vm.runInContext(sliceBetween(appJs, "    function canRescheduleJob(", "    function preserveRescheduleEditor(") +
+    sliceBetween(appJs, "    function scheduledPublicationDisplay(", "    function renderScheduledTweetsList("), displayContext);
+for (const status of ["OVERDUE_CONFIRM_REQUIRED", "FAILED", "CANCELLED"]) {
+    assert.equal(displayContext.canRescheduleJob({status, uncertainDelivery: true}), false);
+    assert.equal(displayContext.canRescheduleJob({status, uncertainDelivery: false}), true);
+}
+const originalJob = {status: "PUBLISHED", text: "Planned", quoteTweetId: "101", quoteTweetUrl: "https://x.com/i/status/101"};
+assert.equal(displayContext.scheduledPublicationDisplay(originalJob).quoteLabel, "原计划引用的推文 ↗");
+for (const [mode, text] of [["QUOTE_LINK", "Planned https://x.com/i/status/101"], ["STANDALONE_FALLBACK", "Planned"]]) {
+    const receipt = {mode, text, quoteTweetId: null};
+    const display = displayContext.scheduledPublicationDisplay({...originalJob, publicationReceipt: receipt});
+    assert.equal(display.text, text);
+    assert.equal(display.quoteUrl, "");
+    assert.ok(display.modeLabel);
+    const pending = displayContext.scheduledPublicationDisplay({...originalJob, status: "OVERDUE_CONFIRM_REQUIRED",
+        uncertainDelivery: true, dispatchedPayload: receipt});
+    assert.equal(pending.text, text);
+    assert.equal(pending.quoteUrl, "");
+    assert.equal(pending.modeLabel, "");
+}
+assert.equal(displayContext.scheduledPublicationDisplay({...originalJob, publicationReceipt: {mode: "QUOTE", text: "Planned", quoteTweetId: "101"}}).quoteUrl,
+    originalJob.quoteTweetUrl);
 const MINUTE = 60_000;
 let clockNowMs = Date.UTC(2026, 10, 14, 12, 0, 0);
 class HarnessDate extends Date {

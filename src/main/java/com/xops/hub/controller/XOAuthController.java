@@ -81,16 +81,7 @@ public class XOAuthController {
         AuthenticatedXUser user = session != null
                 ? (AuthenticatedXUser) session.getAttribute(SESSION_AUTH_USER)
                 : null;
-        boolean ownerAllPermissions = false;
-        if (user != null) {
-            if (assistantStore != null && CommunityHubService.AUTHOR_USERNAME.equalsIgnoreCase(user.username())) {
-                ownerAllPermissions = assistantStore.authorize(user);
-            } else if (communityHubService != null) {
-                ownerAllPermissions = communityHubService.isAuthorAccount(user.id(), user.username());
-            } else if (assistantStore != null && user.id() != null && !user.id().isBlank()) {
-                ownerAllPermissions = assistantStore.isOwner(user.id());
-            }
-        }
+        boolean ownerAllPermissions = authorizeOwner(user);
         String baseOrigin = resolveBaseOrigin(request);
         boolean writeAuthorized = false;
         boolean mediaWriteAuthorized = false;
@@ -201,7 +192,7 @@ public class XOAuthController {
             if (!access.allowed()) {
                 String err = (access.reason() != null && !access.reason().isBlank())
                         ? access.reason()
-                        : "定时发布仅限与 @" + CommunityHubService.AUTHOR_USERNAME + " 互动频率前 " + CommunityHubService.TOP_SCHEDULED_PUBLISH_RANK + " 的推友可用";
+                        : CommunityHubService.SCHEDULE_OWNER_REQUIRED;
                 String msg = URLEncoder.encode(err, StandardCharsets.UTF_8);
                 response.sendRedirect("/?tab=schedule&publish_auth_error=" + msg);
                 return;
@@ -261,9 +252,7 @@ public class XOAuthController {
                 throw new IllegalStateException("登录会话已失效，请重新登录");
             }
             promoteAuthenticatedSession(request, response, session, user);
-            if (user != null && assistantStore != null && CommunityHubService.AUTHOR_USERNAME.equalsIgnoreCase(user.username())) {
-                assistantStore.authorize(user);
-            }
+            if (assistantStore != null) assistantStore.observeOAuthOwner(user);
             if (cb.purpose() == XOAuthService.AuthPurpose.PUBLISH || publishFlow) {
                 log.info("X OAuth 2.0 publish step-up authorization succeeded for @{}", user.username());
                 response.sendRedirect("/?auth=publish_ok&tab=schedule");
@@ -331,6 +320,12 @@ public class XOAuthController {
                 throw ex;
             }
         }
+    }
+
+    private boolean authorizeOwner(AuthenticatedXUser user) {
+        if (user == null) return false;
+        return assistantStore != null ? assistantStore.authorize(user)
+                : communityHubService != null && communityHubService.isAuthorAccount(user.id(), user.username());
     }
 
     private void rememberOAuthStateInSession(HttpSession session, String state) {

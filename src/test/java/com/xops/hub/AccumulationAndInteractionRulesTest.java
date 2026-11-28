@@ -1,5 +1,7 @@
 package com.xops.hub;
 
+import static com.xops.hub.model.AuthorIdentity.ARCHIVE_ACCOUNT_ID;
+
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
@@ -264,8 +266,8 @@ class AccumulationAndInteractionRulesTest {
                 String uname = queryParam(ex.getRequestURI().getRawQuery(), "userName");
                 if ("bob".equalsIgnoreCase(uname)) {
                     writeJson(ex, """
-                            {"status":"success","followings":[{"id":"9000","userName":"elidlicom","name":"Litany","isBlueVerified":true}],"has_next_page":false}
-                            """);
+                            {"status":"success","followings":[{"id":"%s","userName":"elidlicom","name":"Litany","isBlueVerified":true}],"has_next_page":false}
+                            """.formatted(ARCHIVE_ACCOUNT_ID));
                 } else {
                     writeJson(ex, """
                             {"status":"success","followings":[{"id":"888","userName":"someone_else","name":"Someone"}],"has_next_page":false}
@@ -314,8 +316,6 @@ class AccumulationAndInteractionRulesTest {
             assertThat(aliceBundle.accessPolicy().accumulatedDays()).isEqualTo(1);
             assertThat(aliceBundle.accessPolicy().followsAuthor()).isFalse();
             assertThat(aliceBundle.accessPolicy().unlockedPeriods()).containsExactly("HOURS_24");
-            assertThat(aliceBundle.accessPolicy().dailyRefreshLimit()).isEqualTo(1);
-            assertThat(aliceBundle.accessPolicy().dailyRefreshRemaining()).isEqualTo(1);
             assertThat(aliceBundle.accessPolicy().accumulatedSummaryMode()).isTrue();
             assertThat(aliceBundle.accessPolicy().authorStatement()).isEqualTo(CommunityHubService.AUTHOR_COST_STORY);
             assertThat(aliceBundle.accessPolicy().repoUrl()).isEqualTo(CommunityHubService.AUTHOR_REPO_URL);
@@ -334,7 +334,7 @@ class AccumulationAndInteractionRulesTest {
                     "alice", ReportPeriod.HOURS_24, null, true, "127.0.0.1", "5001", false);
             assertThat(checked.hours24().fromCache()).isTrue();
             assertThat(checked.hours24().fetchedAt()).isEqualTo(aliceBundle.hours24().fetchedAt());
-            assertThat(checked.accessPolicy().dailyRefreshRemaining()).isEqualTo(1);
+            assertThat(checked.accessPolicy().accumulatedDays()).isEqualTo(aliceBundle.accessPolicy().accumulatedDays());
             assertThat(service.analyzeWorkspaceReport("alice", ReportPeriod.HOURS_24, null, true, "127.0.0.1", "5001").fromCache()).isTrue();
 
             // Bob on day 1 also gets HOURS_24 by default, while 48h/7d/30d require physical daily accumulation
@@ -397,7 +397,7 @@ class AccumulationAndInteractionRulesTest {
         Instant oneHourAgo = now.minus(Duration.ofHours(1));
 
         // Seed @elidlicom store with 55 peers so rankings 1..5, 6..50, and 51..55 are deterministic
-        XUserSummary author = new XUserSummary("9000", "elidlicom", "Litany", "", "", true, 500, 100, 50, "");
+        XUserSummary author = new XUserSummary(ARCHIVE_ACCOUNT_ID, "elidlicom", "Litany", "", "", true, 500, 100, 50, "");
         List<RawTweet> authorTweets = new ArrayList<>();
         List<InboundInteraction> authorInbound = new ArrayList<>();
         for (int rank = 1; rank <= 55; rank++) {
@@ -413,7 +413,7 @@ class AccumulationAndInteractionRulesTest {
         List<long[]> monthCoverage = List.of(new long[]{now.minus(Duration.ofDays(31)).getEpochSecond(), now.getEpochSecond()});
         AccountStore.StoredAccount authorStore = AccountStore.merge(
                 null, author, now, authorTweets, authorInbound, monthCoverage, monthCoverage, null);
-        AccountStore.write(dir.resolve("users/by-id/9000/store_v" + AccountStore.VERSION + ".json.gz"), authorStore, objectMapper);
+        AccountStore.write(dir.resolve("users/by-id/" + ARCHIVE_ACCOUNT_ID + "/store_v" + AccountStore.VERSION + ".json.gz"), authorStore, objectMapper);
 
         // Pre-persist ONLY rank 6 (within Top 50) and rank 52 (outside Top 50). Rank 1 is NOT persisted beforehand.
         XUserSummary rank6 = new XUserSummary("6006", "peer_rank_6", "Rank 6", "", "", false, 10, 10, 10, "");
@@ -425,6 +425,11 @@ class AccumulationAndInteractionRulesTest {
         AccountStore.StoredAccount rank52Store = AccountStore.merge(
                 null, rank52, now.minus(Duration.ofDays(1)), List.of(), List.of(), List.of(), List.of(), null);
         AccountStore.write(dir.resolve("users/by-id/6052/store_v" + AccountStore.VERSION + ".json.gz"), rank52Store, objectMapper);
+
+        XUserSummary rank3 = new XUserSummary("6003", "peer_rank_3", "Rank 3", "", "", false, 10, 10, 10, "");
+        var unbound = AccountStore.merge(null, rank3, now.minus(Duration.ofDays(1)),
+                List.of(), List.of(), List.of(), List.of(), null);
+        AccountStore.write(dir.resolve("users/peer_rank_3/store_v" + AccountStore.VERSION + ".json.gz"), unbound, objectMapper);
 
         List<String> syncedUsernames = new CopyOnWriteArrayList<>();
         String recentIso = oneHourAgo.toString();
@@ -546,7 +551,7 @@ class AccumulationAndInteractionRulesTest {
     @Test
     void authorAndTop5FullWithUnclosedInboundCoverageTailStillShowStoredActivityAndInteractionsAcrossAllPeriods(@TempDir Path dir) throws Exception {
         Instant now = Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS);
-        XUserSummary author = new XUserSummary("88888", "elidlicom", "Author", "", "", true, 1200, 300, 500, "2020");
+        XUserSummary author = new XUserSummary(ARCHIVE_ACCOUNT_ID, "elidlicom", "Author", "", "", true, 1200, 300, 500, "2020");
         AccountStore.StoredUser peerUser = new AccountStore.StoredUser(
                 "Peer X", "", false, 200, 150, "builder", "99001", 80, "2022");
 
@@ -591,7 +596,7 @@ class AccumulationAndInteractionRulesTest {
                 now.minus(Duration.ofMinutes(10)).getEpochSecond(),
                 0L
         );
-        AccountStore.write(dir.resolve("users/by-id/88888/store_v" + AccountStore.VERSION + ".json.gz"), stored, objectMapper);
+        AccountStore.write(dir.resolve("users/by-id/" + ARCHIVE_ACCOUNT_ID + "/store_v" + AccountStore.VERSION + ".json.gz"), stored, objectMapper);
 
         XOpsProperties props = baseTwitterProps(dir, 1);
         TwitterApiIoProvider degradedProvider = new TwitterApiIoProvider(props, objectMapper) {
@@ -605,7 +610,7 @@ class AccumulationAndInteractionRulesTest {
                 props, new DemoXDataProvider(), degradedProvider, new OfficialXApiV2Provider(props, objectMapper), objectMapper);
 
         MultiPeriodDashboardBundle bundle = service.analyzeWorkspaceBundle(
-                "elidlicom", ReportPeriod.HOURS_24, "TWITTERAPI_IO", false, "127.0.0.1", "88888", false);
+                "elidlicom", ReportPeriod.HOURS_24, "TWITTERAPI_IO", false, "127.0.0.1", ARCHIVE_ACCOUNT_ID, false);
 
         assertThat(bundle.accessPolicy().top5FullAccess()).isTrue();
         assertThat(bundle.accessPolicy().accumulatedSummaryMode()).isFalse();
@@ -679,13 +684,13 @@ class AccumulationAndInteractionRulesTest {
                 objectMapper, null, assistantStore);
         try {
             // 1. Cold-start @elidlicom immediately gets all permissions, while spoofed ID is rejected
-            assertThat(service.isAuthorAccount("9000", "elidlicom")).isTrue();
+            assertThat(service.isAuthorAccount(ARCHIVE_ACCOUNT_ID, "elidlicom")).isTrue();
             assertThat(service.isAuthorAccount("9999", "elidlicom")).isFalse();
-            assertThat(service.evaluateScheduledPublishAccess("9000", "elidlicom").allowed()).isTrue();
+            assertThat(service.evaluateScheduledPublishAccess(ARCHIVE_ACCOUNT_ID, "elidlicom").allowed()).isTrue();
             assertThat(service.evaluateScheduledPublishAccess("9999", "elidlicom").allowed()).isFalse();
 
             // 2. Seed @elidlicom with 12 peers & an unclosed 24h-only coverage gap (missing 2..30d history)
-            XUserSummary author = new XUserSummary("9000", "elidlicom", "Litany", "", "", true, 500, 100, 50, "");
+            XUserSummary author = new XUserSummary(ARCHIVE_ACCOUNT_ID, "elidlicom", "Litany", "", "", true, 500, 100, 50, "");
             List<RawTweet> authorTweets = new ArrayList<>();
             for (int rank = 1; rank <= 12; rank++) {
                 String peerUid = String.valueOf(7000 + rank);
@@ -703,7 +708,7 @@ class AccumulationAndInteractionRulesTest {
                     List.of(new long[]{now.minus(Duration.ofHours(24)).getEpochSecond(), now.getEpochSecond()}),
                     List.of(new long[]{now.minus(Duration.ofHours(24)).getEpochSecond(), now.minus(Duration.ofHours(2)).getEpochSecond()}),
                     null);
-            Path authorStoreFile = dir.resolve("users/by-id/9000/store_v" + AccountStore.VERSION + ".json.gz");
+            Path authorStoreFile = dir.resolve("users/by-id/" + ARCHIVE_ACCOUNT_ID + "/store_v" + AccountStore.VERSION + ".json.gz");
             AccountStore.write(authorStoreFile, authorSeed, objectMapper);
 
             // Long-history durable archive is restricted strictly to @elidlicom (non-owner accounts retain 30d rolling window without full-history backfill)
@@ -733,7 +738,7 @@ class AccumulationAndInteractionRulesTest {
             dates.add(today.minusDays(i).toString());
         }
         CommunityHubService.UserUsageEntry entry = new CommunityHubService.UserUsageEntry(
-                0, 0, null, Instant.now(), today.toString(), true, 1, dates);
+                0, 0, null, Instant.now(), dates, 0, null);
         objectMapper.writeValue(usageFile.toFile(), entry);
     }
 

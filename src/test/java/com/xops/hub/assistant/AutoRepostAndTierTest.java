@@ -40,6 +40,11 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 class AutoRepostAndTierTest {
+    private static void emptyVerifiedTimeline(TwitterApiIoProvider provider, String id) {
+        var owner = new XUserSummary(id, "elidlicom", "Author", "", "", false, 0, 0, 0, "");
+        when(provider.fetchTextPostsPage(eq(owner.username()), eq(id), eq(""), eq(20), any()))
+                .thenReturn(new TextPostPage(owner, List.of(), "", true));
+    }
     @TempDir Path tempDir;
 
     @Test
@@ -88,7 +93,7 @@ class AutoRepostAndTierTest {
         AssistantWorker worker = new AssistantWorker(store, mock(AssistantIntelligence.class), collector);
         try {
             store.tx(tx -> {
-                tx.put("meta", "owner", mapper.createObjectNode().put("accountId", "owner-1").put("username", "elidlicom"));
+                tx.put("meta", "owner", mapper.createObjectNode().put("bindingSource", "EXPLICIT").put("accountId", "owner-1").put("username", "elidlicom"));
                 tx.put("meta", "settings", AssistantWorkflow.settings(tx).put("enabled", true).put("collectionEnabled", true).put("modelEnabled", false));
                 return null;
             });
@@ -187,7 +192,7 @@ class AutoRepostAndTierTest {
         try {
             long enabledAt = now.minusSeconds(300).toEpochMilli();
             ObjectNode source = store.tx(tx -> {
-                tx.put("meta", "owner", mapper.createObjectNode().put("accountId", "owner-1").put("username", "elidlicom"));
+                tx.put("meta", "owner", mapper.createObjectNode().put("bindingSource", "EXPLICIT").put("accountId", "owner-1").put("username", "elidlicom"));
                 tx.put("meta", "settings", AssistantWorkflow.settings(tx).put("enabled", true).put("autoRepostCooldownMinutes", 0));
                 return tx.put("source", "u-breaking", mapper.createObjectNode()
                         .put("authorId", "u-breaking").put("username", "breaking_tech")
@@ -256,7 +261,9 @@ class AutoRepostAndTierTest {
                 AssistantWorkflow.ingest(tx, m);
                 return tx.get("material", "1890101");
             });
-            autoRepost.processCandidate(source, dupMat);
+            var otherSource = store.tx(tx -> tx.put("source", "u-other", source.deepCopy()
+                    .put("authorId", "u-other").put("username", "other_media")));
+            autoRepost.processCandidate(otherSource, dupMat);
             assertThat(store.<ObjectNode>tx(tx -> tx.get("auto_repost", "1890101")).path("status").asText())
                     .isEqualTo("SKIPPED_DUPLICATE");
             verify(publishClient, times(1)).createTweet(anyString(), anyString(), anyList(), anyString());
@@ -315,7 +322,7 @@ class AutoRepostAndTierTest {
                 .thenReturn("1890888");
 
         store.tx(tx -> {
-            tx.put("meta", "owner", mapper.createObjectNode().put("accountId", "owner-1").put("username", "elidlicom"));
+            tx.put("meta", "owner", mapper.createObjectNode().put("bindingSource", "EXPLICIT").put("accountId", "owner-1").put("username", "elidlicom"));
             tx.put("meta", "settings", AssistantWorkflow.settings(tx).put("enabled", true));
             tx.put("auto_repost", "1890201", mapper.createObjectNode()
                     .put("materialId", "1890201").put("topicId", "t-eval").put("username", "u1")
@@ -324,10 +331,12 @@ class AutoRepostAndTierTest {
                     .put("materialId", "1890202").put("topicId", "t-send").put("username", "u2")
                     .put("status", "SENDING"));
             tx.put("auto_repost", "1890203", mapper.createObjectNode()
-                    .put("materialId", "1890203").put("topicId", "t-auth").put("username", "u3")
+                    .put("materialId", "1890203").put("topicId", "t-auth").put("authorId", "source-3").put("username", "u3")
                     .put("status", "AUTH_REQUIRED")
                     .put("commentText", "既有高质量锐评，免重跑判定直接补发。")
                     .put("error", "缺少发推写权限"));
+            tx.put("source", "source-3", mapper.createObjectNode().put("authorId", "source-3").put("username", "u3")
+                    .put("status", "ACTIVE").put("autoRepostEnabled", true));
             return null;
         });
 
@@ -454,7 +463,7 @@ class AutoRepostAndTierTest {
         });
 
         store.tx(tx -> {
-            tx.put("meta", "owner", mapper.createObjectNode().put("accountId", "owner-1").put("username", "elidlicom"));
+            tx.put("meta", "owner", mapper.createObjectNode().put("bindingSource", "EXPLICIT").put("accountId", "owner-1").put("username", "elidlicom"));
             tx.put("meta", "style", mapper.createObjectNode().put("profile", "结论先行，冷峻直白，拒绝套话"));
             tx.put("source", "68746721", mapper.createObjectNode()
                     .put("id", "68746721")
@@ -743,7 +752,7 @@ class AutoRepostAndTierTest {
         long ownerLastTweetAt = tNow.minusSeconds(35 * 60L).toEpochMilli();
         int expectedJitter = AutoRepostService.resolveOwnerTweetJitterMinutes(ownerLastTweetAt);
         ObjectNode secondAuthorSource = gapStore.tx(tx -> {
-            tx.put("meta", "owner", mapper.createObjectNode().put("accountId", "owner-1").put("username", "elidlicom"));
+            tx.put("meta", "owner", mapper.createObjectNode().put("bindingSource", "EXPLICIT").put("accountId", "owner-1").put("username", "elidlicom"));
             tx.put("meta", "settings", AssistantWorkflow.settings(tx).put("enabled", true));
             tx.put("publication", "direct-own-tweet-1", mapper.createObjectNode()
                     .put("id", "direct-own-tweet-1")
@@ -1033,6 +1042,8 @@ class AutoRepostAndTierTest {
                 assertThat(deferredFeature.path("deferredPendingEval").asBoolean()).isTrue();
 
                 // Verify manual quote publish endpoint natively attaches quote_tweet_id
+                when(gapCollector.fetchTweetMaterialById("3110001")).thenReturn(mapper.createObjectNode()
+                        .put("id", "3110001").put("authorId", "u-second").put("username", "karpathy"));
                 when(gapPublish.createTweet(eq("gap-write-token"), anyString(), eq(List.of()), eq("3110001")))
                         .thenReturn("3110999");
                 polishMvc.perform(post("/api/content-assistant/sources/karpathy/publish-quote").session(ownerSession)
@@ -1098,7 +1109,7 @@ class AutoRepostAndTierTest {
         SourceCollector collector = new SourceCollector(store, provider, community, mapper, clock);
 
         store.tx(tx -> {
-            tx.put("meta", "owner", mapper.createObjectNode().put("accountId", "owner-smart").put("username", "elidlicom"));
+            tx.put("meta", "owner", mapper.createObjectNode().put("bindingSource", "EXPLICIT").put("accountId", "owner-smart").put("username", "elidlicom"));
             tx.put("meta", "settings", AssistantWorkflow.settings(tx)
                     .put("enabled", true)
                     .put("collectionEnabled", true)
@@ -1219,7 +1230,7 @@ class AutoRepostAndTierTest {
                 .thenReturn("4299001");
 
         patrolStore.tx(tx -> {
-            tx.put("meta", "owner", mapper.createObjectNode()
+            tx.put("meta", "owner", mapper.createObjectNode().put("bindingSource", "EXPLICIT")
                     .put("accountId", "owner-elidli")
                     .put("username", "elidlicom"));
             tx.put("meta", "settings", AssistantWorkflow.settings(tx).put("enabled", true));
@@ -1452,7 +1463,7 @@ class AutoRepostAndTierTest {
         SourceCollector collector = new SourceCollector(store, provider, community, mapper, clock);
 
         store.tx(tx -> {
-            tx.put("meta", "owner", mapper.createObjectNode().put("accountId", "owner-id-1").put("username", "elidlicom"));
+            tx.put("meta", "owner", mapper.createObjectNode().put("bindingSource", "EXPLICIT").put("accountId", "owner-id-1").put("username", "elidlicom"));
             tx.put("meta", "settings", AssistantWorkflow.settings(tx)
                     .put("enabled", true)
                     .put("collectionEnabled", true)
@@ -1571,7 +1582,7 @@ class AutoRepostAndTierTest {
         long enabledAt = noonInstant.minusSeconds(3600).toEpochMilli();
 
         ObjectNode srcAndMat = quietStore.tx(tx -> {
-            tx.put("meta", "owner", mapper.createObjectNode().put("accountId", "owner-q").put("username", "elidlicom"));
+            tx.put("meta", "owner", mapper.createObjectNode().put("bindingSource", "EXPLICIT").put("accountId", "owner-q").put("username", "elidlicom"));
             tx.put("meta", "settings", AssistantWorkflow.settings(tx).put("enabled", true).put("autoRepostCooldownMinutes", 0));
             ObjectNode src = tx.put("source", "u-quiet", mapper.createObjectNode()
                     .put("id", "u-quiet")
@@ -1711,7 +1722,7 @@ class AutoRepostAndTierTest {
         when(mockPublish.createTweet(eq("ms-write-token"), anyString(), eq(List.of()), eq("6100002"))).thenReturn("6199002");
 
         ObjectNode srcAndMats = store.tx(tx -> {
-            tx.put("meta", "owner", mapper.createObjectNode().put("accountId", "owner-ms").put("username", "elidlicom"));
+            tx.put("meta", "owner", mapper.createObjectNode().put("bindingSource", "EXPLICIT").put("accountId", "owner-ms").put("username", "elidlicom"));
             tx.put("meta", "settings", AssistantWorkflow.settings(tx).put("enabled", true));
             ObjectNode src = tx.put("source", "src-agy", mapper.createObjectNode()
                     .put("id", "src-agy")
@@ -1840,6 +1851,7 @@ class AutoRepostAndTierTest {
         CommunityHubService mockCommunity = mock(CommunityHubService.class);
         when(mockCommunity.longHistoryCandidates()).thenReturn(List.of());
         SourceCollector collector = new SourceCollector(store, mockProvider, mockCommunity, mapper, Clock.fixed(t1, shanghai));
+        emptyVerifiedTimeline(mockProvider, "owner-rw");
 
         XOAuthService mockOauth = mock(XOAuthService.class);
         XPublishClient mockPublish = mock(XPublishClient.class);
@@ -1856,7 +1868,7 @@ class AutoRepostAndTierTest {
                 });
 
         store.tx(tx -> {
-            tx.put("meta", "owner", mapper.createObjectNode().put("accountId", "owner-rw").put("username", "elidlicom"));
+            tx.put("meta", "owner", mapper.createObjectNode().put("bindingSource", "EXPLICIT").put("accountId", "owner-rw").put("username", "elidlicom"));
             tx.put("meta", "settings", AssistantWorkflow.settings(tx)
                     .put("enabled", true)
                     .put("postPolishEnabled", true)
@@ -2006,6 +2018,7 @@ class AutoRepostAndTierTest {
         CommunityHubService mockCommunity = mock(CommunityHubService.class);
         when(mockCommunity.longHistoryCandidates()).thenReturn(List.of());
         SourceCollector collector = new SourceCollector(store, mockProvider, mockCommunity, mapper, Clock.fixed(night1Slot1, shanghai));
+        emptyVerifiedTimeline(mockProvider, "owner-fb");
 
         XOAuthService mockOauth = mock(XOAuthService.class);
         XPublishClient mockPublish = mock(XPublishClient.class);
@@ -2024,7 +2037,7 @@ class AutoRepostAndTierTest {
         long fourDaysAgo = night1Slot1.minusSeconds(4L * 24 * 3600).toEpochMilli();
 
         store.tx(tx -> {
-            tx.put("meta", "owner", mapper.createObjectNode().put("accountId", "owner-fb").put("username", "elidlicom"));
+            tx.put("meta", "owner", mapper.createObjectNode().put("bindingSource", "EXPLICIT").put("accountId", "owner-fb").put("username", "elidlicom"));
             tx.put("meta", "settings", AssistantWorkflow.settings(tx).put("enabled", true).put("postPolishEnabled", false));
             tx.put("source", "src-ds", mapper.createObjectNode()
                     .put("id", "src-ds").put("authorId", "src-ds").put("username", "deepseek_ai")
@@ -2181,6 +2194,7 @@ class AutoRepostAndTierTest {
         CommunityHubService mockCommunity = mock(CommunityHubService.class);
         when(mockCommunity.longHistoryCandidates()).thenReturn(List.of());
         SourceCollector collector = new SourceCollector(store, mockProvider, mockCommunity, mapper, Clock.fixed(baseTime, shanghai));
+        emptyVerifiedTimeline(mockProvider, "owner-ord");
         XOAuthService mockOauth = mock(XOAuthService.class);
         XPublishClient mockPublish = mock(XPublishClient.class);
         when(mockOauth.getValidWriteAccessToken("owner-ord", false)).thenReturn("ord-token");
@@ -2194,7 +2208,7 @@ class AutoRepostAndTierTest {
                 });
 
         store.tx(tx -> {
-            tx.put("meta", "owner", mapper.createObjectNode().put("accountId", "owner-ord").put("username", "elidlicom"));
+            tx.put("meta", "owner", mapper.createObjectNode().put("bindingSource", "EXPLICIT").put("accountId", "owner-ord").put("username", "elidlicom"));
             tx.put("meta", "settings", AssistantWorkflow.settings(tx).put("enabled", true).put("postPolishEnabled", false));
             for (int i = 1; i <= 3; i++) {
                 String sid = "src-rp-" + i;
@@ -2299,7 +2313,7 @@ class AutoRepostAndTierTest {
         XPublishClient mockPublish = mock(XPublishClient.class);
 
         store.tx(tx -> {
-            tx.put("meta", "owner", mapper.createObjectNode().put("accountId", "owner-rw-p").put("username", "elidlicom"));
+            tx.put("meta", "owner", mapper.createObjectNode().put("bindingSource", "EXPLICIT").put("accountId", "owner-rw-p").put("username", "elidlicom"));
             tx.put("meta", "settings", AssistantWorkflow.settings(tx)
                     .put("enabled", true)
                     .put("postPolishEnabled", false));

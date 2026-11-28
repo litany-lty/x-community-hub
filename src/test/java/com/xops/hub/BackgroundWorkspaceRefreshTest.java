@@ -1,5 +1,7 @@
 package com.xops.hub;
 
+import static com.xops.hub.model.AuthorIdentity.ARCHIVE_ACCOUNT_ID;
+
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.xops.hub.config.XOpsProperties;
 import com.xops.hub.model.RawSnapshotModels.XUserSummary;
@@ -11,6 +13,10 @@ import com.xops.hub.service.CommunityHubService;
 import com.xops.hub.store.AccountStore;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.Mockito;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import java.nio.file.Path;
 import java.time.Instant;
@@ -72,11 +78,11 @@ class BackgroundWorkspaceRefreshTest {
 
             releaseUpstream.countDown();
             long waitDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
-            while (!"SUCCEEDED".equals(service.workspaceRefreshStatus("owner", "TWITTERAPI_IO", "owner-id").state())
+            while (!"PARTIAL".equals(service.workspaceRefreshStatus("owner", "TWITTERAPI_IO", "owner-id").state())
                     && System.nanoTime() < waitDeadline) {
                 Thread.sleep(10);
             }
-            assertThat(service.workspaceRefreshStatus("owner", "TWITTERAPI_IO", "owner-id").state()).isEqualTo("SUCCEEDED");
+            assertThat(service.workspaceRefreshStatus("owner", "TWITTERAPI_IO", "owner-id").state()).isEqualTo("PARTIAL");
 
             var afterComplete = service.analyzeWorkspaceBundle(
                     "owner", ReportPeriod.WEEK, "TWITTERAPI_IO", false, "127.0.0.1", "owner-id", false);
@@ -90,8 +96,9 @@ class BackgroundWorkspaceRefreshTest {
         }
     }
 
-    @Test
-    void preferStoredReturnsUnclosedSnapshotImmediatelyAndStartsBackgroundRefresh() throws Exception {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void preferStoredReturnsUnclosedSnapshotImmediatelyAndStartsBackgroundRefresh(boolean finishesBeforeResponse) throws Exception {
         ObjectMapper mapper = new ObjectMapper().findAndRegisterModules();
         XOpsProperties properties = new XOpsProperties();
         properties.setDiskCacheDir(temp.resolve("swr").toString());
@@ -99,7 +106,7 @@ class BackgroundWorkspaceRefreshTest {
         properties.setDefaultProvider("TWITTERAPI_IO");
         SharedApiExecutor pool = new SharedApiExecutor(properties);
         CountDownLatch upstreamStarted = new CountDownLatch(1);
-        CountDownLatch releaseUpstream = new CountDownLatch(1);
+        CountDownLatch releaseUpstream = new CountDownLatch(finishesBeforeResponse ? 0 : 1);
         java.util.concurrent.atomic.AtomicInteger syncCalls = new java.util.concurrent.atomic.AtomicInteger();
         TwitterApiIoProvider provider = new TwitterApiIoProvider(properties, mapper, pool) {
             @Override
@@ -132,11 +139,20 @@ class BackgroundWorkspaceRefreshTest {
         CommunityHubService service = new CommunityHubService(
                 properties, new DemoXDataProvider(), provider, null, mapper);
         try {
+            if (finishesBeforeResponse) {
+                var direct = Mockito.mock(java.util.concurrent.ExecutorService.class);
+                Mockito.when(direct.submit(Mockito.any(Runnable.class))).thenAnswer(call -> {
+                    call.getArgument(0, Runnable.class).run();
+                    return java.util.concurrent.CompletableFuture.completedFuture(null);
+                });
+                ReflectionTestUtils.setField(service, "backgroundRefreshExecutor", direct);
+            }
             var immediate = service.analyzeWorkspaceBundle(
                     "swr_owner", ReportPeriod.HOURS_24, "TWITTERAPI_IO", false, "127.0.0.1", "swr-id", false, true);
             assertThat(immediate.hours24().fromCache()).isTrue();
             assertThat(immediate.backgroundRefreshStatus()).isNotNull();
-            assertThat(immediate.backgroundRefreshStatus().state()).isEqualTo("RUNNING");
+            assertThat(immediate.backgroundRefreshStatus().state()).isEqualTo(finishesBeforeResponse ? "SUCCEEDED" : "RUNNING");
+            assertThat(immediate.backgroundRefreshStatus().newerResultAvailable()).isEqualTo(finishesBeforeResponse);
             assertThat(upstreamStarted.await(1, TimeUnit.SECONDS)).isTrue();
 
             releaseUpstream.countDown();
@@ -147,8 +163,7 @@ class BackgroundWorkspaceRefreshTest {
             }
             assertThat(service.workspaceRefreshStatus("swr_owner", "TWITTERAPI_IO", "swr-id").state()).isEqualTo("SUCCEEDED");
 
-            var afterReload = service.analyzeWorkspaceBundle(
-                    "swr_owner", ReportPeriod.HOURS_24, "TWITTERAPI_IO", false, "127.0.0.1", "swr-id", false, false);
+            var afterReload = service.analyzeStoredAccountBundle("swr_owner", "swr-id");
             assertThat(afterReload.hours24().fromCache()).isTrue();
             assertThat(afterReload.hasMoreHistoryForTarget()).isFalse();
             assertThat(syncCalls.get()).isEqualTo(1);
@@ -211,6 +226,8 @@ class BackgroundWorkspaceRefreshTest {
         XOpsProperties properties = new XOpsProperties();
         properties.setDiskCacheDir(temp.resolve("multi").toString());
         properties.setTwitterapiIoKey("fixture-key");
+        properties.setFxtwitterEnabled(true);
+        properties.setFxtwitterBaseUrl("http://127.0.0.1/2");
         properties.setDefaultProvider("TWITTERAPI_IO");
         SharedApiExecutor pool = new SharedApiExecutor(properties);
         Instant cycleAt = Instant.now().minusSeconds(5);
@@ -296,31 +313,31 @@ class BackgroundWorkspaceRefreshTest {
             }
         };
         Instant now = Instant.now();
-        XUserSummary profile = new XUserSummary("9000", "elidlicom", "Litany", "", "", true, 1200, 300, 100, "");
+        XUserSummary profile = new XUserSummary(ARCHIVE_ACCOUNT_ID, "elidlicom", "Litany", "", "", true, 1200, 300, 100, "");
         AccountStore.StoredAccount stored = AccountStore.merge(null, profile, now.minusSeconds(3600), List.of(), List.of(),
                 List.of(), List.of(), new AccountStore.GraphUpdate(
                         List.of(), List.of(), Set.of(), true, false, false, false));
-        AccountStore.write(temp.resolve("elidlicom-swr/users/by-id/9000/store_v" + AccountStore.VERSION + ".json.gz"), stored, mapper);
+        AccountStore.write(temp.resolve("elidlicom-swr/users/by-id/" + ARCHIVE_ACCOUNT_ID + "/store_v" + AccountStore.VERSION + ".json.gz"), stored, mapper);
         CommunityHubService service = new CommunityHubService(
                 properties, new DemoXDataProvider(), provider, null, mapper);
         try {
             var immediate = service.analyzeWorkspaceBundle(
-                    "elidlicom", ReportPeriod.HOURS_24, "TWITTERAPI_IO", false, "127.0.0.1", "9000", false, true);
+                    "elidlicom", ReportPeriod.HOURS_24, "TWITTERAPI_IO", false, "127.0.0.1", ARCHIVE_ACCOUNT_ID, false, true);
             assertThat(immediate.hours24().fromCache()).isTrue();
             assertThat(immediate.backgroundRefreshStatus().state()).isEqualTo("RUNNING");
 
             long waitDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
-            while (!"SUCCEEDED".equals(service.workspaceRefreshStatus("elidlicom", "TWITTERAPI_IO", "9000").state())
+            while (!"PARTIAL".equals(service.workspaceRefreshStatus("elidlicom", "TWITTERAPI_IO", ARCHIVE_ACCOUNT_ID).state())
                     && System.nanoTime() < waitDeadline) {
                 Thread.sleep(10);
             }
-            assertThat(service.workspaceRefreshStatus("elidlicom", "TWITTERAPI_IO", "9000").state()).isEqualTo("SUCCEEDED");
+            assertThat(service.workspaceRefreshStatus("elidlicom", "TWITTERAPI_IO", ARCHIVE_ACCOUNT_ID).state()).isEqualTo("PARTIAL");
             assertThat(syncCalls.get()).isEqualTo(1);
 
             // Simulate browser poll firing >5s later: reloadFromServer (forceRefresh=false) must STILL serve in-memory bundle without a 2nd upstream sync!
             Thread.sleep(5_200L);
             var afterReload = service.analyzeWorkspaceBundle(
-                    "elidlicom", ReportPeriod.HOURS_24, "TWITTERAPI_IO", false, "127.0.0.1", "9000", false, false);
+                    "elidlicom", ReportPeriod.HOURS_24, "TWITTERAPI_IO", false, "127.0.0.1", ARCHIVE_ACCOUNT_ID, false, false);
             assertThat(afterReload.hours24().fromCache()).isTrue();
             assertThat(syncCalls.get()).isEqualTo(1);
         } finally {

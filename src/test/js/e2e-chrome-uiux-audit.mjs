@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import { once } from "node:events";
 import http from "node:http";
 import net from "node:net";
 import os from "node:os";
@@ -9,7 +10,7 @@ import path from "node:path";
 const WORKSPACE = path.resolve(import.meta.dirname, "../../..");
 const CHROME_BIN = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const JAR_PATH = path.join(WORKSPACE, "target/x-community-hub.jar");
-const JAVA_BIN = "/Library/Java/JavaVirtualMachines/jdk-17.jdk/Contents/Home/bin/java";
+const PREVIEW_LAUNCHER = path.join(WORKSPACE, "scripts/run-environment.py");
 
 function getFreePort() {
     return new Promise((resolve, reject) => {
@@ -27,9 +28,33 @@ let PROXY_PORT = 0;
 
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "xops-uiux-audit-"));
 
+function preparePreview() {
+    const launcher = path.join(tmpRoot, "scripts", "run-environment.py");
+    fs.mkdirSync(path.dirname(launcher), {recursive: true});
+    fs.copyFileSync(PREVIEW_LAUNCHER, launcher);
+    // The preview backend serves anonymous DEMO data. Give the fixture real success
+    // dates for its four analytics windows before the proxy applies each viewer's policy.
+    const fixture = path.join(tmpRoot, ".local/runtime/preview/.cache/snapshots/users/elidlicom");
+    fs.mkdirSync(fixture, {recursive: true});
+    const localDate = new Intl.DateTimeFormat("sv-SE", {timeZone: "Asia/Shanghai"});
+    const now = Date.now();
+    const syncedDates = Array.from({length: 30}, (_, day) => localDate.format(now - day * 86400000));
+    fs.writeFileSync(path.join(fixture, "usage_v1.json"), JSON.stringify({usageCount: 30, syncedDates}));
+    return launcher;
+}
+
+const topic = {id: "topic-ui", title: "排期更新回归", version: 1, materialIds: []};
+const draft = {id: "draft-ui", topicId: topic.id, version: 2, text: "排期原正文"};
+const receipt = {id: "intent-ui", jobId: "job-ui", topicId: topic.id, draftId: draft.id, draftVersion: draft.version,
+    status: "SCHEDULED", queueUpdatedAt: 10, scheduledAtEpochMs: Date.now() + 10800000, text: draft.text};
+const editorWrites = [];
+let finishRewriteRetry;
+
 // Dynamic auth & schedule state controlled by the E2E test runner
 const mockSim = {
     loggedIn: false,
+    ownerAccess: false,
+    publicationRetries: [],
     oauthConfigured: true,
     writeAuthorized: true,
     mediaWriteAuthorized: true,
@@ -99,10 +124,11 @@ function startProxyServer() {
                         oauthConfigured: mockSim.oauthConfigured,
                         suggestedCallbackUrl: `http://127.0.0.1:${PROXY_PORT}/api/auth/x/callback`,
                         loggedIn: mockSim.loggedIn,
+                        ownerAllPermissions: mockSim.loggedIn && mockSim.ownerAccess,
                         user: mockSim.loggedIn
                             ? {
-                                  id: "demo-uid-1001",
-                                  username: "demo_ops_user",
+                                  id: mockSim.ownerAccess ? "demo-owner-1002" : "demo-uid-1001",
+                                  username: mockSim.ownerAccess ? "elidlicom" : "demo_ops_user",
                                   displayName: "Demo Creator",
                                   avatarUrl: "/author-avatar.webp",
                                   verified: true
@@ -142,6 +168,53 @@ function startProxyServer() {
                 return;
             }
 
+            if (p === "/api/content-assistant/dashboard" || p === "/api/content-assistant/access"
+                    || p === "/api/content-assistant/topics/topic-ui/detail" || p.startsWith("/api/content-assistant/drafts/draft-ui/")
+                    || p.startsWith("/api/content-assistant/auto-reposts/")) {
+                const allowed = mockSim.loggedIn && mockSim.ownerAccess;
+                if (p.endsWith("/access")) {
+                    res.writeHead(200, {"Content-Type": "application/json"});
+                    res.end(JSON.stringify({allowed}));
+                } else if (!allowed) {
+                    res.writeHead(403, {"Content-Type": "application/json"});
+                    res.end(JSON.stringify({message: "此操作需要所有者身份"}));
+                } else if (p.endsWith("/dashboard")) {
+                    const autoReposts = [
+                        {materialId: "202", username: "source", autoKind: "REWRITE", status: "JUDGE_FAILED"},
+                        {materialId: "101", username: "source", autoKind: "REPOST", status: "FAILED"},
+                        {materialId: "101", username: "source", autoKind: "REWRITE", status: "JUDGE_FAILED"}
+                    ];
+                    res.writeHead(200, {"Content-Type": "application/json"});
+                    res.end(JSON.stringify({settings: {}, sources: [], topics: [topic], drafts: [draft],
+                        publications: [receipt], materials: [], tasks: [], autoReposts}));
+                } else if (p.endsWith("/detail")) {
+                    res.writeHead(200, {"Content-Type": "application/json"});
+                    res.end(JSON.stringify({topic, drafts: [draft], publications: [receipt], tasks: [], materials: []}));
+                } else if (req.method === "POST" && p.startsWith("/api/content-assistant/drafts/draft-ui/")) {
+                    const body = JSON.parse((await readReqBody(req)).toString());
+                    const action = p.split("/").at(-1);
+                    if (body.version !== draft.version || !["save", "update-scheduled"].includes(action)) {
+                        res.writeHead(409);
+                        res.end();
+                        return;
+                    }
+                    editorWrites.push([action, body.version]);
+                    if (action === "save") Object.assign(draft, {text: body.text, version: draft.version + 1});
+                    else Object.assign(receipt, {text: draft.text, draftVersion: draft.version});
+                    res.writeHead(200, {"Content-Type": "application/json"});
+                    res.end(JSON.stringify(action === "save" ? draft : receipt));
+                } else if (req.method === "POST" && p.endsWith("/retry")) {
+                    mockSim.publicationRetries.push([p.split("/").at(-2), urlObj.searchParams.get("mode")]);
+                    await new Promise(resolve => { finishRewriteRetry = resolve; });
+                    res.writeHead(202, {"Content-Type": "application/json"});
+                    res.end(JSON.stringify({status: "EVALUATING"}));
+                } else {
+                    res.writeHead(404);
+                    res.end();
+                }
+                return;
+            }
+
             if (p.startsWith("/api/scheduled-tweets")) {
                 if (req.method === "GET" && p === "/api/scheduled-tweets") {
                     const { overdueConfirmCount, pendingCount } = recomputeCounts();
@@ -160,7 +233,7 @@ function startProxyServer() {
                             authorInteractionRank: mockSim.authorInteractionRank,
                             scheduleLockedReason: mockSim.scheduleAccessAllowed
                                 ? ""
-                                : "定时发布仅限与 @elidlicom 互动频率前 100 的推友可用。"
+                                : "定时发布仅向已验证的 @elidlicom 作者账号开放。"
                         })
                     );
                     return;
@@ -184,10 +257,12 @@ function startProxyServer() {
                 if (req.method === "POST" && p === "/api/scheduled-tweets/batch") {
                     const raw = (await readReqBody(req)).toString("utf8");
                     const jsonMatch = /name="itemsJson"\r\n\r\n([\s\S]*?)\r\n--/.exec(raw);
-                    const items = jsonMatch ? JSON.parse(jsonMatch[1]) : [];
+                    const items = req.headers["content-type"]?.includes("application/json")
+                        ? JSON.parse(raw).items : (jsonMatch ? JSON.parse(jsonMatch[1]) : []);
                     items.forEach((it, idx) => {
                         mockSim.jobs.unshift({
                             id: `job-batch-${Date.now()}-${idx}`,
+                            clientRequestId: it.clientRequestId,
                             text: it.text,
                             scheduledAtEpochMs: Number(it.scheduledAtEpochMs),
                             status: "SCHEDULED",
@@ -195,7 +270,7 @@ function startProxyServer() {
                         });
                     });
                     res.writeHead(200, { "Content-Type": "application/json" });
-                    res.end(JSON.stringify({ createdCount: items.length }));
+                    res.end(JSON.stringify({ created: mockSim.jobs.slice(0, items.length), createdCount: items.length }));
                     return;
                 }
                 if (req.method === "POST" && p === "/api/scheduled-tweets/batch-confirm-resend") {
@@ -269,8 +344,8 @@ function startProxyServer() {
                     if (bundle[k] && bundle[k].profile) {
                         bundle[k].profile = {
                             ...bundle[k].profile,
-                            id: "demo-uid-1001",
-                            username: "demo_ops_user"
+                            id: mockSim.ownerAccess ? "demo-owner-1002" : "demo-uid-1001",
+                            username: mockSim.ownerAccess ? "elidlicom" : "demo_ops_user"
                         };
                     }
                 }
@@ -356,6 +431,10 @@ class CdpSession {
                 this.pending.delete(msg.id);
                 if (msg.error) reject(new Error(msg.error.message));
                 else resolve(msg.result);
+            } else if (msg.method === "Page.javascriptDialogOpening") {
+                const clearFixture = msg.params.type === "confirm" && msg.params.message.includes("清空所有草稿");
+                if (!clearFixture) this.pageExceptions.push("Unexpected dialog: " + msg.params.message);
+                this.send("Page.handleJavaScriptDialog", {accept: clearFixture});
             } else if (msg.method === "Runtime.exceptionThrown") {
                 this.pageExceptions.push(msg.params.exceptionDetails?.text || "exception");
             } else if (msg.method === "Runtime.consoleAPICalled" && msg.params.type === "error") {
@@ -453,23 +532,22 @@ function recordFinding(severity, area, detail) {
     console.log(`[FINDING][${severity}] ${area}: ${detail}`);
 }
 
+async function stopProcess(child, signal) {
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    const stopped = once(child, "exit");
+    child.kill(signal);
+    await stopped;
+}
+
 async function main() {
     BACKEND_PORT = await getFreePort();
     PROXY_PORT = await getFreePort();
     console.log("1. Starting isolated DEMO Spring Boot backend on port", BACKEND_PORT, "and proxy on", PROXY_PORT);
     const backend = spawn(
-        JAVA_BIN,
-        [
-            "-jar",
-            JAR_PATH,
-            `--server.port=${BACKEND_PORT}`,
-            "--xops.default-provider=DEMO",
-            "--xops.require-login-self-only=false",
-            `--xops.disk-cache-dir=${path.join(tmpRoot, "cache")}`,
-            `--xops.scheduled-tweets-dir=${path.join(tmpRoot, "sched")}`,
-            `--xops.algo-profile-path=${path.join(tmpRoot, "algo-override.json")}`
-        ],
-        { stdio: ["ignore", "pipe", "pipe"] }
+        "python3",
+        [preparePreview(), "preview", "--jar", JAR_PATH, "--port", String(BACKEND_PORT)],
+        { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env,
+            JAVA_HOME: "/Library/Java/JavaVirtualMachines/jdk-17.jdk/Contents/Home" } }
     );
 
     let proxySrv = null;
@@ -523,7 +601,9 @@ async function main() {
         const periodCheck = await page.eval(`
             function $(id) { return document.getElementById(id); }
             const toastShown = !$("copyToast").hidden;
-            const syncedStatusHidden = $("dailyCacheStatusHint").hidden;
+            const coverage = $("dailyCacheStatusHint");
+            const syncedStatusShown = !coverage.hidden && coverage.textContent.includes("近24h推文已覆盖")
+                && coverage.textContent.includes("收到的互动已覆盖");
             // Click locked 7d button
             const btn7d = document.querySelector('.seg-btn[data-period="WEEK"]');
             btn7d.click();
@@ -535,15 +615,16 @@ async function main() {
             document.querySelector('.seg-btn[data-period="HOURS_48"]').click();
             await new Promise(r => setTimeout(r, 400));
             const active48 = document.querySelector('.seg-btn[data-period="HOURS_48"]').classList.contains("active");
-            return { toastShown, syncedStatusHidden, unlockOpen, focusVisible, unlockClosed, active48 };
+            return { toastShown, syncedStatusShown, unlockOpen, focusVisible, unlockClosed, active48 };
         `);
-        assert.equal(periodCheck.syncedStatusHidden, true);
+        assert.equal(periodCheck.syncedStatusShown, true);
         assert.equal(periodCheck.unlockOpen, true);
         assert.equal(periodCheck.focusVisible, true);
         assert.equal(periodCheck.unlockClosed, true);
         assert.equal(periodCheck.active48, true);
 
-        // Unlock all 4 periods & switch to WEEK so rich demo data is loaded
+        // Switch to the mocked owner for the four windows and publishing journeys.
+        mockSim.ownerAccess = true;
         mockSim.unlockedPeriods = ["HOURS_24", "HOURS_48", "WEEK", "MONTH"];
         await page.send("Page.reload");
         await new Promise((r) => setTimeout(r, 1000));
@@ -556,7 +637,8 @@ async function main() {
         console.log("4. Auditing Tab 1 (Activity) & Trend Bar Tap Readout...");
         const actCheck = await page.eval(`
             function $(id) { return document.getElementById(id); }
-            const unlockHelpHiddenWhenAllOpen = $("periodUnlockHelpBtn").hidden;
+            const periodButtons = [...document.querySelectorAll(".seg-btn[data-period]")];
+            const allPeriodsUnlocked = periodButtons.length === 4 && periodButtons.every(btn => btn.getAttribute("aria-disabled") === "false");
             const col = document.querySelector("#dailyTrendChart .day-col[data-tip]");
             const beforeSub = $("trendChartSubtitle").textContent;
             col.click();
@@ -564,9 +646,9 @@ async function main() {
             const subVisible = !$("trendChartSubtitle").hidden && getComputedStyle($("trendChartSubtitle")).display !== "none";
             col.click();
             const restoredSub = $("trendChartSubtitle").textContent;
-            return { unlockHelpHiddenWhenAllOpen, beforeSub, afterSub, subVisible, restoredSub };
+            return { allPeriodsUnlocked, beforeSub, afterSub, subVisible, restoredSub };
         `);
-        assert.equal(actCheck.unlockHelpHiddenWhenAllOpen, true);
+        assert.equal(actCheck.allPeriodsUnlocked, true);
         assert.notEqual(actCheck.beforeSub, actCheck.afterSub);
         assert.equal(actCheck.restoredSub, actCheck.beforeSub);
 
@@ -701,7 +783,8 @@ async function main() {
             if (scrollBtn) {
                 const targetId = scrollBtn.dataset.go.split("scrollId:")[1].split("|")[0];
                 scrollBtn.click();
-                scrollIdFlashed = document.getElementById(targetId)?.classList.contains("is-target-flash") || false;
+                await new Promise(resolve => requestAnimationFrame(resolve));
+                scrollIdFlashed = Boolean(document.getElementById(targetId)?.closest(".is-target-flash"));
             }
 
             return {
@@ -736,6 +819,42 @@ async function main() {
         assert.equal(timingAudit.overrideBadgeVisible, true);
         assert.equal(timingAudit.resetBadgeHidden, true);
         assert.equal(timingAudit.scrollIdFlashed, true);
+
+        await page.eval(`
+            document.querySelector('[data-assistant-view="monitor"]').click();
+            const selector = '#assistantAutoRepostFeed [data-autorepost-retry="101"][data-publish-mode="REWRITE"]';
+            const end = Date.now() + 3000;
+            while (!document.querySelector(selector) && Date.now() < end) await new Promise(r => setTimeout(r, 30));
+            document.querySelector(selector).click();
+        `);
+        const retryDeadline = Date.now() + 3000;
+        while (!mockSim.publicationRetries.length && Date.now() < retryDeadline) await new Promise(r => setTimeout(r, 30));
+        assert.deepEqual(mockSim.publicationRetries, [["101", "REWRITE"]]);
+
+        console.log("7b. Updating a scheduled draft before autosave in Chrome...");
+        const queuedTime = await page.eval(`
+            const deadline = Date.now() + 4000;
+            document.querySelector('[data-assistant-view="assistant"]').click();
+            while (!document.querySelector('[data-assistant-update-scheduled]') && Date.now() < deadline)
+                await new Promise(r => setTimeout(r, 25));
+            const editor = document.getElementById('assistantDraftEditor');
+            const button = document.querySelector('[data-assistant-update-scheduled]');
+            const timing = button.closest('.assistant-publication-row').querySelector('small').textContent;
+            editor.focus();
+            editor.value = "在自动保存前更新的排期正文";
+            editor.dispatchEvent(new Event('input', {bubbles:true}));
+            if (button.hidden) throw new Error("Editor did not expose the scheduled update");
+            button.click();
+            return timing;
+        `);
+        finishRewriteRetry();
+        assert.match(queuedTime, /排期于/);
+        const updateDeadline = Date.now() + 4000;
+        while (receipt.draftVersion !== 3 && Date.now() < updateDeadline) await new Promise(r => setTimeout(r, 25));
+        const editorState = await page.eval(`return ['assistantDraftSaveState','contentAssistantError']
+            .map(id => document.getElementById(id)?.textContent).join(' ')`);
+        assert.deepEqual(editorWrites, [["save", 2], ["update-scheduled", 3]], editorState);
+        assert.equal(receipt.text, "在自动保存前更新的排期正文");
 
         // ==================== JOURNEY 7: Tab 5 (Circle & Share Card Poster -> Schedule) ====================
         console.log("8. Auditing Tab 5 (Circle & 2x Canvas Poster + Send to Schedule)...");
@@ -774,7 +893,7 @@ async function main() {
             ta0.dispatchEvent(new Event("input", { bubbles: true }));
             const riskChipHiddenWhenClean = chip0.hidden;
 
-            // Add 2nd item and force <1h conflict
+            // Owners can queue distinct posts together. A past date must still require correction.
             $("addScheduleDraftItemBtn").click();
             const ta1 = document.querySelector('#scheduleDraftItemsList [data-draft-textarea="1"]');
             ta1.value = "第二条批量定时推文内容";
@@ -782,7 +901,10 @@ async function main() {
 
             const t0 = document.querySelector('#scheduleDraftItemsList [data-draft-time="0"]');
             const t1 = document.querySelector('#scheduleDraftItemsList [data-draft-time="1"]');
-            t1.value = t0.value; // exact collision!
+            t1.value = t0.value;
+            t1.dispatchEvent(new Event("change", { bubbles: true }));
+            const simultaneousAllowed = $("alignScheduleGapBtn").hidden;
+            t1.value = "2000-01-01T00:00";
             t1.dispatchEvent(new Event("change", { bubbles: true }));
             const alignBtnVisibleOnConflict = !$("alignScheduleGapBtn").hidden;
             $("alignScheduleGapBtn").click();
@@ -810,6 +932,7 @@ async function main() {
             return {
                 riskChipShown,
                 riskChipHiddenWhenClean,
+                simultaneousAllowed,
                 alignBtnVisibleOnConflict,
                 alignBtnHiddenAfterFix,
                 totalCardsAfterBatch,
@@ -820,6 +943,7 @@ async function main() {
         `);
         assert.equal(schedAudit.riskChipShown, true);
         assert.equal(schedAudit.riskChipHiddenWhenClean, true);
+        assert.equal(schedAudit.simultaneousAllowed, true);
         assert.equal(schedAudit.alignBtnVisibleOnConflict, true);
         assert.equal(schedAudit.alignBtnHiddenAfterFix, true);
         assert.ok(schedAudit.totalCardsAfterBatch >= 5);
@@ -827,8 +951,8 @@ async function main() {
         assert.equal(schedAudit.modalClosedAfterSubmit, true);
         assert.equal(schedAudit.reschedBoxShown, true);
 
-        // ==================== JOURNEY 8b: Step-Up Publish Auth & Top-100 Lock ====================
-        console.log("9b. Auditing Step-Up Publish OAuth Draft Preservation & Top-100 Lock Gate...");
+        // ==================== JOURNEY 8b: Step-Up Publish Auth & Account Switch ====================
+        console.log("9b. Auditing Step-Up Publish OAuth Draft Preservation & Account Switch...");
         mockSim.writeAuthorized = false;
         await page.eval(`
             document.getElementById("refreshScheduleListBtn").click();
@@ -856,28 +980,22 @@ async function main() {
         assert.equal(stepUpAfter.authCardHidden, true);
         assert.equal(stepUpAfter.restoredText, "二次授权前暂存的草稿文案，授权回来后应自动恢复");
 
-        // Test Top-100 lock gate
+        // Switching back to an ordinary account revokes owner-only publishing controls.
+        mockSim.ownerAccess = false;
         mockSim.scheduleAccessAllowed = false;
-        mockSim.authorInteractionRank = 128;
-        await page.eval(`
-            document.getElementById("refreshScheduleListBtn").click();
-            await new Promise(r => setTimeout(r, 350));
-        `);
+        await page.send("Page.reload");
+        await new Promise(r => setTimeout(r, 1000));
         const lockGateCheck = await page.eval(`
-            function $(id) { return document.getElementById(id); }
-            return {
-                eligCardShown: !$("scheduleEligibilityCard").hidden,
-                createDisabled: $("createScheduleBtn").disabled
-            };
+            const nav = document.querySelector('.nav-item[data-tab="schedule"]');
+            const share = document.getElementById("scheduleShareCardBtn");
+            return {scheduleHidden: nav.hidden, shareHidden: share.hidden};
         `);
-        assert.equal(lockGateCheck.eligCardShown, true);
-        assert.equal(lockGateCheck.createDisabled, true);
+        assert.equal(lockGateCheck.scheduleHidden, true);
+        assert.equal(lockGateCheck.shareHidden, true);
+        mockSim.ownerAccess = true;
         mockSim.scheduleAccessAllowed = true;
-        mockSim.authorInteractionRank = 12;
-        await page.eval(`
-            document.getElementById("refreshScheduleListBtn").click();
-            await new Promise(r => setTimeout(r, 350));
-        `);
+        await page.send("Page.reload");
+        await new Promise(r => setTimeout(r, 1000));
 
         // ==================== JOURNEY 9: Mobile Viewport (390x844) Layout & Horizontal Overflow Audit ====================
         console.log("10. Auditing Mobile Viewport (390x844) across ALL 6 Tabs for Overflow / Clipping...");
@@ -918,9 +1036,11 @@ async function main() {
                         overflowingEls.push(\`\${el.tagName.toLowerCase()}\${el.id ? "#" + el.id : ""}\${el.className && typeof el.className === "string" ? "." + el.className.trim().split(/\\s+/).join(".") : ""} (right=\${Math.round(rect.right)}px)\`);
                     }
                 }
-                const pillMutualRight = "${tab}" === "interactions"
-                    ? Math.round(document.getElementById("pillMutualBtn")?.getBoundingClientRect()?.right || 0)
-                    : 0;
+                const mutual = document.getElementById("pillMutualBtn");
+                if ("${tab}" === "interactions") {
+                    mutual.scrollIntoView({behavior: "instant", block: "nearest", inline: "nearest"});
+                }
+                const pillMutualRight = "${tab}" === "interactions" ? Math.round(mutual.getBoundingClientRect().right) : 0;
                 return { docOverflow, overflowingEls: overflowingEls.slice(0, 8), pillMutualRight };
             `);
             if (mobCheck.docOverflow > 1 || mobCheck.overflowingEls.length > 0) {
@@ -979,11 +1099,11 @@ async function main() {
     } finally {
         if (chrome) {
             try { chrome.page.close(); } catch {}
-            chrome.proc.kill("SIGKILL");
+            await stopProcess(chrome.proc, "SIGKILL");
         }
         if (proxySrv) proxySrv.close();
-        backend.kill("SIGTERM");
-        fs.rmSync(tmpRoot, { recursive: true, force: true });
+        await stopProcess(backend, "SIGTERM");
+        fs.rmSync(tmpRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 150 });
     }
 }
 

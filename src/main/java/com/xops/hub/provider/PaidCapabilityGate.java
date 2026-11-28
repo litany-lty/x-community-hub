@@ -16,12 +16,14 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.function.Supplier;
 
 /**
  * Unified gate and 10-minute idempotent retry coordinator for all paid capabilities:
  * 1. Only {@code @elidlicom} is permitted to invoke paid upstream capabilities; all other callers fail closed (HTTP 403).
- * 2. Privileged {@code @elidlicom} calls bypass {@link UpstreamBudgetGuard} accounting/budget caps completely.
+ * 2. Each managed upstream request is admitted separately by {@link UpstreamBudgetGuard}.
  * 3. Failed paid operations are scheduled for idempotent retry every 10 minutes, up to 3 retries maximum.
  */
 @Component
@@ -41,14 +43,14 @@ public class PaidCapabilityGate {
             "x_media_upload"
     );
 
-    public record CallerScope(String username, String accountId, boolean enforced) {
+    public record CallerScope(String username, String accountId, boolean enforced, boolean verifiedOwner) {
         public CallerScope {
             username = normalizeUsername(username);
             accountId = accountId == null ? "" : accountId.trim();
         }
 
         public boolean isPrivileged() {
-            return isPrivilegedUsername(username);
+            return verifiedOwner && !accountId.isEmpty();
         }
     }
 
@@ -75,6 +77,7 @@ public class PaidCapabilityGate {
         final String category;
         final String username;
         final String accountId;
+        final boolean verifiedOwner;
         volatile Runnable action;
         int retryCount;
         long nextRetryAtEpochMs;
@@ -82,6 +85,7 @@ public class PaidCapabilityGate {
         String lastError;
         boolean running;
         boolean reportedFailureDuringRun;
+        long deferredUntil;
 
         RetryTaskEntry(
                 String idempotencyKey,
@@ -90,12 +94,13 @@ public class PaidCapabilityGate {
                 String accountId,
                 Runnable action,
                 long nextRetryAtEpochMs,
-                String initialError
+                String initialError, boolean verifiedOwner
         ) {
             this.idempotencyKey = idempotencyKey;
             this.category = category == null ? "paid_op" : category;
             this.username = normalizeUsername(username);
             this.accountId = accountId == null ? "" : accountId.trim();
+            this.verifiedOwner = verifiedOwner && !this.accountId.isEmpty();
             this.action = action;
             this.retryCount = 0;
             this.nextRetryAtEpochMs = nextRetryAtEpochMs;
@@ -118,6 +123,23 @@ public class PaidCapabilityGate {
     }
 
     private static final ThreadLocal<CallerScope> CURRENT_SCOPE = new ThreadLocal<>();
+
+    private final ExecutorService freeRetryWorkers = Executors.newFixedThreadPool(3, task -> {
+        Thread t = new Thread(task, "community-free-retry");
+        t.setDaemon(true);
+        return t;
+    });
+    private final ExecutorService paidRetryWorker = Executors.newSingleThreadExecutor(task -> {
+        Thread t = new Thread(task, "community-paid-retry");
+        t.setDaemon(true);
+        return t;
+    });
+
+    @jakarta.annotation.PreDestroy
+    public void stopRetryWorkers() {
+        freeRetryWorkers.shutdownNow();
+        paidRetryWorker.shutdownNow();
+    }
 
     private final Clock clock;
     private final ConcurrentHashMap<String, RetryTaskEntry> retryLedger = new ConcurrentHashMap<>();
@@ -163,8 +185,13 @@ public class PaidCapabilityGate {
     }
 
     public static <T> T withCaller(String username, String accountId, Supplier<T> action) {
+        return withCaller(username, accountId, false, action);
+    }
+
+    /** Use the stable-ID decision when the username comes from a user or an account snapshot. */
+    public static <T> T withCaller(String username, String accountId, boolean verifiedOwner, Supplier<T> action) {
         CallerScope previous = CURRENT_SCOPE.get();
-        CURRENT_SCOPE.set(new CallerScope(username, accountId, true));
+        CURRENT_SCOPE.set(new CallerScope(username, accountId, true, verifiedOwner));
         try {
             return action.get();
         } finally {
@@ -177,7 +204,11 @@ public class PaidCapabilityGate {
     }
 
     public static void runWithCaller(String username, String accountId, Runnable action) {
-        withCaller(username, accountId, () -> {
+        runWithCaller(username, accountId, false, action);
+    }
+
+    public static void runWithCaller(String username, String accountId, boolean verifiedOwner, Runnable action) {
+        withCaller(username, accountId, verifiedOwner, () -> {
             action.run();
             return null;
         });
@@ -261,13 +292,19 @@ public class PaidCapabilityGate {
             Runnable retryAction,
             boolean resetIfExhausted
     ) {
+        return scheduleIdempotentRetry(idempotencyKey, category, username, accountId, errorReason, retryAction, resetIfExhausted, false);
+    }
+
+    public RetrySnapshot scheduleIdempotentRetry(String idempotencyKey, String category, String username,
+            String accountId, String errorReason, Runnable retryAction, boolean resetIfExhausted, boolean verifiedOwner) {
         if (idempotencyKey == null || idempotencyKey.isBlank() || retryAction == null) {
             throw new IllegalArgumentException("idempotencyKey and retryAction are required");
         }
         String key = idempotencyKey.trim();
         long nowMs = clock.millis();
         RetryTaskEntry entry = retryLedger.compute(key, (k, existing) -> {
-            if (existing == null) {
+            if (existing == null || !existing.accountId.equals(Objects.toString(accountId, "").trim())
+                    || existing.verifiedOwner != (verifiedOwner && accountId != null && !accountId.isBlank())) {
                 return new RetryTaskEntry(
                         k,
                         category,
@@ -275,7 +312,7 @@ public class PaidCapabilityGate {
                         accountId,
                         retryAction,
                         nowMs + RETRY_INTERVAL_MS,
-                        errorReason
+                        errorReason, verifiedOwner
                 );
             }
             synchronized (existing) {
@@ -298,6 +335,21 @@ public class PaidCapabilityGate {
         return entry.snapshot();
     }
 
+    public void restorePendingRetry(String key, String category, String username, String accountId,
+                                    int attempts, long dueAt, String lastError, Runnable action) {
+        restorePendingRetry(key, category, username, accountId, attempts, dueAt, lastError, action, false);
+    }
+
+    public void restorePendingRetry(String key, String category, String username, String accountId,
+                                    int attempts, long dueAt, String lastError, Runnable action, boolean verifiedOwner) {
+        if (attempts >= MAX_IDEMPOTENT_RETRIES || dueAt <= 0) return;
+        retryLedger.computeIfAbsent(key, unused -> {
+            RetryTaskEntry recovered = new RetryTaskEntry(key, category, username, accountId, action, dueAt, lastError, verifiedOwner);
+            recovered.retryCount = Math.max(0, attempts);
+            return recovered;
+        });
+    }
+
     public void markSucceeded(String idempotencyKey) {
         if (idempotencyKey == null || idempotencyKey.isBlank()) return;
         RetryTaskEntry entry = retryLedger.get(idempotencyKey.trim());
@@ -306,6 +358,17 @@ public class PaidCapabilityGate {
                 entry.state = RetryState.SUCCEEDED;
                 entry.lastError = "";
             }
+        }
+    }
+
+    /** No attempt was made. Keep the retry budget until the business window opens. */
+    public boolean deferRunningRetry(String key, long notBeforeMs) {
+        RetryTaskEntry entry = retryLedger.get(key);
+        if (entry == null) return false;
+        synchronized (entry) {
+            if (!entry.running) return false;
+            entry.deferredUntil = notBeforeMs;
+            return true;
         }
     }
 
@@ -336,6 +399,14 @@ public class PaidCapabilityGate {
         return cleared;
     }
 
+    public void discardRetry(String key) {
+        if (key != null) retryLedger.remove(key);
+    }
+
+    public long nextRetryTimeMs() {
+        return clock.millis() + RETRY_INTERVAL_MS;
+    }
+
     public RetrySnapshot getRetrySnapshot(String idempotencyKey) {
         if (idempotencyKey == null) return null;
         RetryTaskEntry entry = retryLedger.get(idempotencyKey.trim());
@@ -349,7 +420,18 @@ public class PaidCapabilityGate {
     }
 
     @Scheduled(fixedDelayString = "${xops.paid-retry-poll-ms:30000}")
+    public void dispatchDueRetries() {
+        for (RetryTaskEntry entry : claimDueRetries()) {
+            ExecutorService worker = "fxtwitter_free_read".equals(entry.category) ? freeRetryWorkers : paidRetryWorker;
+            worker.execute(() -> runClaimedRetry(entry));
+        }
+    }
+
     public void runDueRetries() {
+        claimDueRetries().forEach(this::runClaimedRetry);
+    }
+
+    private List<RetryTaskEntry> claimDueRetries() {
         long nowMs = clock.millis();
         List<RetryTaskEntry> dueEntries = new ArrayList<>();
         for (RetryTaskEntry entry : retryLedger.values()) {
@@ -366,55 +448,65 @@ public class PaidCapabilityGate {
             }
         }
 
-        for (RetryTaskEntry entry : dueEntries) {
-            try {
-                runWithCaller(entry.username, entry.accountId, () -> {
-                    if (isPaidCategory(entry.category) && !isPrivilegedUsername(entry.username)) {
-                        throw new XDataProviderException(403, PAID_FORBIDDEN_MESSAGE);
-                    }
-                    entry.action.run();
-                });
-                boolean reportedFailure;
-                synchronized (entry) {
-                    entry.running = false;
-                    reportedFailure = entry.reportedFailureDuringRun;
-                    if (reportedFailure) {
-                        if (entry.retryCount >= MAX_IDEMPOTENT_RETRIES) {
-                            entry.state = RetryState.EXHAUSTED;
-                            entry.nextRetryAtEpochMs = 0L;
-                        } else {
-                            entry.state = RetryState.PENDING;
-                            entry.nextRetryAtEpochMs = clock.millis() + RETRY_INTERVAL_MS;
-                        }
-                    } else {
-                        entry.state = RetryState.SUCCEEDED;
-                        entry.lastError = "";
-                    }
+        return dueEntries;
+    }
+
+    private void runClaimedRetry(RetryTaskEntry entry) {
+        try {
+            withCaller(entry.username, entry.accountId, entry.verifiedOwner && isPaidCategory(entry.category), () -> {
+                if (isPaidCategory(entry.category) && !isCurrentCallerPrivileged()) {
+                    throw new XDataProviderException(403, PAID_FORBIDDEN_MESSAGE);
                 }
+                entry.action.run();
+                return null;
+            });
+            boolean reportedFailure;
+            synchronized (entry) {
+                entry.running = false;
+                if (entry.deferredUntil > 0) {
+                    entry.state = RetryState.PENDING;
+                    entry.nextRetryAtEpochMs = entry.deferredUntil;
+                    entry.deferredUntil = 0;
+                    entry.retryCount--;
+                    return;
+                }
+                reportedFailure = entry.reportedFailureDuringRun;
                 if (reportedFailure) {
-                    log.warn("Idempotent retry degraded/fallback: key={} attempt={}/{} state={} reason={}",
-                            entry.idempotencyKey, entry.retryCount, MAX_IDEMPOTENT_RETRIES, entry.state, entry.lastError);
-                } else {
-                    log.info("Idempotent paid retry succeeded: key={} attempt={}/{}",
-                            entry.idempotencyKey, entry.retryCount, MAX_IDEMPOTENT_RETRIES);
-                }
-            } catch (Exception ex) {
-                long finishedMs = clock.millis();
-                String err = ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage();
-                synchronized (entry) {
-                    entry.running = false;
-                    entry.lastError = err;
                     if (entry.retryCount >= MAX_IDEMPOTENT_RETRIES) {
                         entry.state = RetryState.EXHAUSTED;
                         entry.nextRetryAtEpochMs = 0L;
                     } else {
                         entry.state = RetryState.PENDING;
-                        entry.nextRetryAtEpochMs = finishedMs + RETRY_INTERVAL_MS;
+                        entry.nextRetryAtEpochMs = clock.millis() + RETRY_INTERVAL_MS;
                     }
+                } else {
+                    entry.state = RetryState.SUCCEEDED;
+                    entry.lastError = "";
                 }
-                log.warn("Idempotent paid retry failed: key={} attempt={}/{} state={} reason={}",
-                        entry.idempotencyKey, entry.retryCount, MAX_IDEMPOTENT_RETRIES, entry.state, err);
             }
+            if (reportedFailure) {
+                log.warn("Idempotent retry degraded/fallback: key={} attempt={}/{} state={} reason={}",
+                        entry.idempotencyKey, entry.retryCount, MAX_IDEMPOTENT_RETRIES, entry.state, entry.lastError);
+            } else {
+                log.info("Idempotent paid retry succeeded: key={} attempt={}/{}",
+                        entry.idempotencyKey, entry.retryCount, MAX_IDEMPOTENT_RETRIES);
+            }
+        } catch (Exception ex) {
+            long finishedMs = clock.millis();
+            String err = ex.getMessage() == null ? ex.getClass().getSimpleName() : ex.getMessage();
+            synchronized (entry) {
+                entry.running = false;
+                entry.lastError = err;
+                if (entry.retryCount >= MAX_IDEMPOTENT_RETRIES) {
+                    entry.state = RetryState.EXHAUSTED;
+                    entry.nextRetryAtEpochMs = 0L;
+                } else {
+                    entry.state = RetryState.PENDING;
+                    entry.nextRetryAtEpochMs = finishedMs + RETRY_INTERVAL_MS;
+                }
+            }
+            log.warn("Idempotent paid retry failed: key={} attempt={}/{} state={} reason={}",
+                    entry.idempotencyKey, entry.retryCount, MAX_IDEMPOTENT_RETRIES, entry.state, err);
         }
     }
 }

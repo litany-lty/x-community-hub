@@ -50,7 +50,7 @@ public class UpstreamBudgetGuard {
                          long hourMicros, long dayMicros, long monthMicros, long totalCalls) {
         Usage roll(Instant now, ZoneId zone) {
             LocalDate date = LocalDate.ofInstant(now, zone);
-            long h = now.getEpochSecond() / 3600;
+            long h = localHourStart(now, zone);
             long d = date.toEpochDay();
             long m = date.getYear() * 12L + date.getMonthValue();
             // Never reset budgets when the wall clock moves backwards.
@@ -128,16 +128,26 @@ public class UpstreamBudgetGuard {
     }
 
     public void acquirePermit(String rawUrl, String category) {
-        final URI uri;
+        acquirePermit(parseUri(rawUrl), category);
+    }
+
+    void requireAffordable(String rawUrl, String category) {
+        checkOrReserve(parseUri(rawUrl), category, false);
+    }
+
+    private static URI parseUri(String rawUrl) {
         try {
-            uri = URI.create(rawUrl);
+            return URI.create(rawUrl);
         } catch (RuntimeException ex) {
             throw new XDataProviderException(503, "外部调用地址无效，未发起付费请求", ex);
         }
-        acquirePermit(uri, category);
     }
 
     public void acquirePermit(URI uri, String category) {
+        checkOrReserve(uri, category, true);
+    }
+
+    private void checkOrReserve(URI uri, String category, boolean reserve) {
         if (uri == null || uri.getHost() == null || uri.getUserInfo() != null
                 || (!"https".equalsIgnoreCase(uri.getScheme())
                     && !("http".equalsIgnoreCase(uri.getScheme()) && isLocalLoopbackUri(uri)))) {
@@ -147,12 +157,8 @@ public class UpstreamBudgetGuard {
             throw new XDataProviderException(503, "外部调用未登记预算类别，未发起付费请求");
         }
         PaidCapabilityGate.requirePaidAllowed(uri, category);
-        if (PaidCapabilityGate.isCurrentCallerPrivileged()) {
-            callsByCategory.computeIfAbsent(category, k -> new AtomicLong()).incrementAndGet();
-            return;
-        }
         if (!enforceOnLocalMock && isLocalLoopbackUri(uri)) {
-            localMockCalls.incrementAndGet();
+            if (reserve) localMockCalls.incrementAndGet();
             return;
         }
         if (ledger == null) {
@@ -183,6 +189,7 @@ public class UpstreamBudgetGuard {
                         warn("Upstream budget reached; external request was not sent");
                         throw new XDataProviderException(429, BUDGET_REACHED_MESSAGE);
                     }
+                    if (!reserve) return;
                     Usage reserved = usage.reserve(cost);
                     persist(reserved);
                     if (channel.size() == 0) {
@@ -192,7 +199,7 @@ public class UpstreamBudgetGuard {
                     current = reserved;
                     ledgerHealthy = true;
                 }
-            } catch (IOException | ArithmeticException ex) {
+            } catch (IOException | ArithmeticException | java.time.DateTimeException ex) {
                 ledgerHealthy = false;
                 ledgerLoaded = true;
                 rejectedCalls.incrementAndGet();
@@ -228,11 +235,8 @@ public class UpstreamBudgetGuard {
             return false;
         }
         if (!knownCategory(category)) return false;
-        if (PaidCapabilityGate.isCurrentCallerForbidden()) {
+        if (PaidCapabilityGate.isPaidCategory(category) && PaidCapabilityGate.isCurrentCallerForbidden()) {
             return false;
-        }
-        if (PaidCapabilityGate.isCurrentCallerPrivileged()) {
-            return true;
         }
         if (!enforceOnLocalMock && isLocalLoopbackUri(uri)) {
             return true;
@@ -284,15 +288,23 @@ public class UpstreamBudgetGuard {
             error = error.getCause();
         }
         if (!(error instanceof XDataProviderException xpe)) return false;
-        String msg = xpe.getMessage() == null ? "" : xpe.getMessage();
-        return (xpe.getStatusCode() == 429 && msg.contains("外部调用预算已达保护上限"))
-                || (xpe.getStatusCode() == 503 && (msg.contains("预算记录暂不可用") || msg.contains("未配置持久化预算目录")));
+        return (xpe.getStatusCode() == 429 || xpe.getStatusCode() == 503) && isBudgetBlockMessage(xpe.getMessage());
+    }
+
+    /** Old publication records store the local budget error text without its HTTP status. */
+    public static boolean isBudgetBlockMessage(String message) {
+        return message != null && (message.startsWith("外部调用预算已达保护上限") || message.startsWith("预算记录暂不可用")
+                || message.startsWith("未配置持久化预算目录"));
     }
 
     private Usage empty(Instant now) {
         LocalDate date = LocalDate.ofInstant(now, zoneId);
-        return new Usage(now.getEpochSecond() / 3600, date.toEpochDay(),
+        return new Usage(localHourStart(now, zoneId), date.toEpochDay(),
                 date.getYear() * 12L + date.getMonthValue(), 0, 0, 0, 0, 0, 0);
+    }
+
+    private static long localHourStart(Instant instant, ZoneId zone) {
+        return instant.atZone(zone).truncatedTo(java.time.temporal.ChronoUnit.HOURS).toEpochSecond();
     }
 
     private Usage readUsage(boolean initialized) throws IOException {
@@ -305,11 +317,19 @@ public class UpstreamBudgetGuard {
             throw new IOException("Invalid budget ledger");
         }
         JsonNode root = MAPPER.readTree(Files.readAllBytes(ledger));
-        if (root == null || root.path("version").asInt(-1) != 1
+        int version = root == null ? -1 : root.path("version").asInt(-1);
+        if ((version != 1 && version != 2)
                 || !zoneId.getId().equals(root.path("timezone").asText())) {
             throw new IOException("Budget ledger version/timezone mismatch");
         }
-        return new Usage(number(root, "hour"), number(root, "day"), number(root, "month"),
+        long hour = number(root, "hour");
+        if (version == 1) {
+            // Old UTC buckets have no exact reservation times. Carry usage into the latest possible local hour.
+            long start = Math.multiplyExact(hour, 3600L);
+            long latest = Math.max(start, Math.min(Math.addExact(start, 3599L), clock.instant().getEpochSecond()));
+            hour = localHourStart(Instant.ofEpochSecond(latest), zoneId);
+        }
+        return new Usage(hour, number(root, "day"), number(root, "month"),
                 number(root, "hourCalls"), number(root, "dayCalls"), number(root, "hourMicros"),
                 number(root, "dayMicros"), number(root, "monthMicros"), number(root, "totalCalls"));
     }
@@ -324,7 +344,7 @@ public class UpstreamBudgetGuard {
 
     private void persist(Usage usage) throws IOException {
         Map<String, Object> data = new LinkedHashMap<>();
-        data.put("version", 1);
+        data.put("version", 2);
         data.put("timezone", zoneId.getId());
         data.put("hour", usage.hour);
         data.put("day", usage.day);
@@ -393,7 +413,8 @@ public class UpstreamBudgetGuard {
             }
         }
         if ("x_official_read".equals(category)) {
-            if (path.contains("/users/by/username/") || path.endsWith("/users/me")) return 10_000;
+            if (path.contains("/users/by/username/") || path.endsWith("/users/me")
+                    || path.matches(".*/users/[0-9]+")) return 10_000;
             int page = boundedInt(query.get("max_results"), 100, 1000);
             if (path.endsWith("/followers") || path.endsWith("/following")) return page * 10_000L;
             if (path.endsWith("/tweets") || path.endsWith("/mentions")) {

@@ -28,7 +28,7 @@ function createContext(overrides = {}) {
             .replaceAll(">", "&gt;")
             .replaceAll('"', "&quot;"),
         $: () => null,
-        URL_TOKEN_RE: /https?:\/\/\S+/gi,
+        URL_TOKEN_RE: /https?:\/\/\S+/gi, URL,
         ...overrides
     };
     return vm.createContext(ctx);
@@ -38,6 +38,7 @@ function createContext(overrides = {}) {
 const metricsCtx = createContext();
 vm.runInContext(
     section("    function computeWeightedTweetLength(", "    function validateAndMergeScheduleFiles(")
+    + section("    function classifyDraftLinks(", "    function buildCalibrationShingleArray(")
     + "\n"
     + section("    function assistantDraftLengthText(", "    function assistantMaterialStatusBadge("),
     metricsCtx
@@ -104,13 +105,21 @@ const resolvedFallback = metricsCtx.resolveAssistantDraftSourcePost(
     { id: "d2", materialId: "missing" },
     [{ id: "190001", username: "@firstuser" }]
 );
-assert.deepEqual({ ...resolvedFallback }, { tweetId: "190001", url: "https://x.com/firstuser/status/190001" });
+assert.equal(resolvedFallback, null);
 
 const resolvedNonNumeric = metricsCtx.resolveAssistantDraftSourcePost(
     { id: "d3", materialId: "note-1" },
     [{ id: "note-1", username: "firstuser" }]
 );
 assert.equal(resolvedNonNumeric, null);
+const legacyAlias = {materialId: "note-1", research: {materialEvidence: [
+    {id: "material-note-1-quoted", url: "https://x.com/other/status/303"},
+    {id: "material-note-1-author", url: "https://x.com/first/status/101"}
+]}};
+const reassignedMaterial = [{id: "note-1", username: "second", sourceUrl: "https://x.com/second/status/202"}];
+assert.deepEqual({...metricsCtx.resolveAssistantDraftSourcePost(legacyAlias, reassignedMaterial)},
+    {tweetId: "101", url: "https://x.com/first/status/101"});
+assert.equal(metricsCtx.resolveAssistantDraftSourcePost({materialId: "note-1"}, reassignedMaterial), null);
 
 assert.equal(
     metricsCtx.assistantDraftResearchStatus({ research: { quality: "MATERIAL_DIRECT", fastMode: true } }).badgeLabel,
@@ -169,7 +178,8 @@ const cardCtx = createContext({
     renderAssistantMaterialBody: (m) => `<p>${m.text || ""}</p>`
 });
 vm.runInContext(
-    section("    function assistantMaterialStatusBadge(", "    function renderAssistantTopicDetail("),
+    section("    function assistantMaterialStatusBadge(", "    function renderAssistantTopicDetail(")
+      + section("    function resolveRepostMaterialUrl(", "    function getRepostItemCommentText("),
     cardCtx
 );
 const hotCardHtml = cardCtx.renderAssistantMaterialCard(
@@ -186,6 +196,14 @@ const hotCardHtml = cardCtx.renderAssistantMaterialCard(
     new Set()
 );
 assert.match(hotCardHtml, /浏览 50K · 转 300 · 评 80 · 赞 1\.2K/);
+for (const sourceUrl of ["https://x.com/other/status/40404","https://example.org/unrelated"]) {
+    const material = {id:"10101", username:"glacier", text:"冰川素材", sourceUrl};
+    for (const options of [{selectable:true},{showTopicJump:true}]) {
+        const html = cardCtx.renderAssistantMaterialCard(material,new Set(),options);
+        assert.match(html,/href="https:\/\/x\.com\/glacier\/status\/10101"/);
+        assert.ok(!html.includes(sourceUrl));
+    }
+}
 const plainCardHtml = cardCtx.renderAssistantMaterialCard(
     { id: "m-plain", username: "user1", text: "无指标素材", textStatus: "TEXT_ONLY" },
     new Set()
@@ -232,9 +250,10 @@ function makePreviewEl(id) {
 
 const previewCtx = createContext({
     state: {
-        authStatus: { user: { username: "elidlicom", displayName: "Litany" } },
+        authStatus: { user: { id: "42", username: "elidlicom", displayName: "Litany" } },
         report: { profile: { username: "elidlicom", displayName: "Litany", avatarUrl: "/author-avatar.webp" } }
     },
+    stableUserId: user => String(user?.id || ""),
     $: (id) => (previewEls[id] ||= makePreviewEl(id)),
     assistantKeyValueRows: () => "",
     renderAssistantHistory: () => "",
@@ -245,7 +264,7 @@ const previewCtx = createContext({
     document: { activeElement: null }
 });
 vm.runInContext(
-    section("    const repostPreviewState = {", "    function assistantStatusLabel(")
+    section("    const PENDING_QUOTE_STORAGE_PREFIX", "    function assistantStatusLabel(")
     + "\nthis.__repostPreviewState = repostPreviewState;\n"
     + section("    function formatAssistantDateTime(", "    function resolveTopicAuthors(")
     + "\n"
@@ -267,7 +286,7 @@ previewCtx.renderAssistantMonitor({
 });
 assert.match(previewEls.assistantSourcesList.innerHTML, /class="assistant-avatar-preview-btn" data-source-repost-preview="src-openai"/);
 
-previewCtx.__repostPreviewState.owner = { username: "elidlicom", displayName: "Litany", avatarUrl: "/author-avatar.webp" };
+previewCtx.__repostPreviewState.owner = { accountId: "42", username: "elidlicom", displayName: "Litany", avatarUrl: "/author-avatar.webp" };
 previewCtx.__repostPreviewState.source = {
     id: "src-openai", username: "sama", displayName: "Sam Altman", verified: true,
     autoRepostEnabled: true, textMode: "AI", minScore: 70
@@ -346,6 +365,18 @@ assert.equal(
     previewCtx.buildRepostItemComposedText("1920001"),
     "手动微调后的转发附文\nhttps://x.com/sama/status/1920001"
 );
+
+const mismatchedCard = previewCtx.__repostPreviewState.items.find(item => item.material.id === "1920001");
+const originalLink = mismatchedCard.material.sourceUrl;
+mismatchedCard.material.sourceUrl = "https://x.com/sama/status/1920099";
+const correctedCard = previewCtx.renderRepostTimelineItemHtml(mismatchedCard);
+assert.ok(correctedCard.includes('href="' + originalLink + '" target="_blank" rel="noopener noreferrer">原帖'));
+const externalHref = correctedCard.match(/data-repost-intent-link="1920001" href="([^"]+)"/)[1];
+assert.equal(new URL(externalHref).searchParams.get("text"), "手动微调后的转发附文\n" + originalLink);
+assert.equal(previewCtx.buildRepostItemComposedText("1920001"), "手动微调后的转发附文\n" + originalLink);
+mismatchedCard.material.sourceUrl = "https://mobile.twitter.com/sama/status/1920001/photo/1?s=20";
+assert.equal(previewCtx.resolveRepostMaterialUrl(mismatchedCard.material), mismatchedCard.material.sourceUrl);
+mismatchedCard.material.sourceUrl = originalLink;
 
 previewCtx.__repostPreviewState.filterMode = "REPOST";
 previewCtx.renderRepostPreviewTimeline();
@@ -537,10 +568,12 @@ vm.runInContext(
     historyCtx
 );
 const completedHistoryHtml = historyCtx.renderAssistantHistory({
+    ownerAccountId: "101",
     materials: 20000,
     interactions: 6374,
     complete: true,
     sources: [{
+        authorId: "101",
         username: "elidlicom",
         owner: true,
         eligible: true,
@@ -561,12 +594,24 @@ assert.match(completedHistoryHtml, /已拉至上游最早页/);
 assert.doesNotMatch(completedHistoryHtml, /上游已明确耗尽/);
 assert.doesNotMatch(completedHistoryHtml, />归档中</);
 assert.doesNotMatch(completedHistoryHtml, /data-assistant-history-retry/);
+const legacyRankedHistory = historyCtx.renderAssistantHistory({
+    materials: 92, interactions: 17, complete: true,
+    sources: [{username: "retired_peer", owner: false, rank: 1, eligible: true}]
+});
+assert.doesNotMatch(legacyRankedHistory, /retired_peer|前\s*10|>92<|>17</);
+assert.match(legacyRankedHistory, /尚无作者的历史归档/);
+assert.doesNotMatch(historyCtx.renderAssistantHistory({
+    ownerAccountId: "101", materials: 900, complete: true,
+    sources: [{authorId: "202", username: "elidlicom", owner: true}]
+}), />900<|已归档 · 增量中/);
 
 const exhaustedHistoryHtml = historyCtx.renderAssistantHistory({
+    ownerAccountId: "101",
     materials: 120,
     interactions: 45,
     complete: false,
     sources: [{
+        authorId: "101",
         username: "elidlicom",
         owner: true,
         eligible: true,
@@ -599,9 +644,411 @@ assert.match(appSource, /换话题切口/);
 assert.match(appSource, /补深挖增量/);
 assert.match(appSource, /联网深挖出新版/);
 assert.match(appSource, /data-assistant-research-upgrade/);
+const evidenceAlertCtx = createContext({ safeHttpUrl: (u) => u });
+vm.runInContext(
+    section("    function renderAssistantEvidenceChanges(", "    function renderAssistantObservationReview("),
+    evidenceAlertCtx
+);
+const alertHtmlForDraftB = evidenceAlertCtx.renderAssistantEvidenceChanges(
+    { id: "draft-b", materialId: "mat-b", sourcesChanged: true, evidenceChanges: [{ type: "SOURCE_TEXT_UPDATED", url: "https://example.org/b" }] },
+    "mat-a"
+);
+assert.match(alertHtmlForDraftB, /data-assistant-research-upgrade="draft-b" data-material-id="mat-b"/);
+assert.doesNotMatch(alertHtmlForDraftB, /data-material-id="mat-a"/);
 assert.match(previewEls.assistantSourcesList.innerHTML, /data-source-autorewrite-toggle="src-openai"/);
 assert.match(previewEls.assistantSourcesList.innerHTML, /洗稿发送/);
 assert.match(appSource, /已洗稿发送/);
 assert.match(appSource, /已开启高流量纯文本洗稿发送/);
 
-console.log("assistant-creation-regression: passed");
+async function verifyDirectPublishRetries() {
+    const attempts = [];
+    const deliveries = new Set();
+    function session(owner, version, comment) {
+        const state = { authStatus: { user: { id: owner } }, assistantDashboard: { drafts: [{ id: "draft", version }] } };
+        const preview = { requestToken: 1, sourceKey: "source", items: [{ material: { id: "101" } }], publishingIds: new Set(), pendingQuotes: new Map() };
+        const send = async (path, body) => {
+            if (body.receiptOnly) return { owner: { accountId: owner }, material: { id: "101" },
+                preview: { persistedStatus: "UNCERTAIN", decisionCode: "UNCERTAIN", receiptRevision: 1 } };
+            attempts.push({ path, key: body.clientRequestId });
+            if (!deliveries.has(body.clientRequestId)) {
+                deliveries.add(body.clientRequestId);
+                throw new Error("response lost after dispatch");
+            }
+            return { publicationMode: "STANDALONE_FALLBACK", text: "published", publishedTweetUrl: "receipt" };
+        };
+        const notices = [];
+        const context = createContext({ state, crypto: require("node:crypto").webcrypto, TextEncoder,
+            captureUserScope: () => () => state.authStatus.user.id === owner, stableUserId: (user) => user.id,
+            saveAssistantDraftEditor: async () => state.assistantDashboard.drafts[0], runAssistantMutation: (_key, path, body) => send(path, body),
+            repostPreviewState: preview, getRepostItemCommentText: () => comment,
+            resolveRepostQuoteTweetId: () => "101", resolveRepostMaterialUrl: () => "url", contentAssistantRequest: send,
+            renderRepostPreviewTimeline() {}, setContentAssistantError() {}, formatLocalizedFetchError: (e) => e.message,
+            showToast: (notice) => notices.push(notice) });
+        vm.runInContext(section("    function quoteDeliveryStatus(", "    async function evaluateAuthorAccountOnceInModal(")
+            + section("    async function assistantPublishRequestId(", "    function setContentAssistantError("), context);
+        return { context, notices };
+    }
+    for (const operation of ["draft", "preview"]) {
+        const click = (session) => operation === "draft"
+            ? session.context.publishAssistantDraftNow("draft", true)
+            : session.context.publishRepostPreviewItem("101");
+        const start = attempts.length;
+        await click(session("owner", 1, "original"));
+        const restored = session("owner", 1, "original");
+        await click(restored);
+        assert.equal(attempts[start].key, attempts[start+1].key, operation + " retries the same publication after login");
+        assert.ok(restored.notices.includes("原帖引用受限，已作为独立推文发布"));
+        await click(session("owner", 2, "edited"));
+        await click(session("other", 1, "original"));
+        assert.equal(new Set(attempts.slice(start).map((call) => call.key)).size, 3, operation + " separates edits and owners");
+    }
+    assert.equal(deliveries.size, 6);
+}
+async function verifyScheduledUpdateWaitsForEditor() {
+    const part = section('            const updateScheduled = event.target.closest(', '\n        });');
+    for (const outcome of ["saved", "failed", "switched"]) {
+        let finishSave;
+        const versions = [];
+        const draft = { id: "draft", version: 2 };
+        const event = { target: { closest: () => ({ isConnected: true, dataset: { assistantUpdateScheduled: "intent" } }) } };
+        const ctx = createContext({ event, captureUserScope: () => () => outcome !== "switched" || !finishSave,
+            state: { assistantDashboard: { drafts: [draft], publications: [{ id: "intent", draftId: "draft", queueUpdatedAt: 1 }] } },
+            saveAssistantDraftEditor: () => new Promise(resolve => { finishSave = resolve; }),
+            newClientRequestId: () => "op", runAssistantMutation: async (_, path, payload) => versions.push(payload.version) });
+        const submitted = vm.runInContext(`(async () => {${part}})()`, ctx);
+        await Promise.resolve();
+        assert.deepEqual(versions, [], "queue must wait for the editor save");
+        finishSave(outcome === "failed" ? false : { id: "draft", version: 3 });
+        await submitted;
+        assert.deepEqual(versions, outcome === "saved" ? [3] : [], "queue uses the save receipt from the same owner");
+    }
+}
+
+function verifyCancelledTaskCanRestart() {
+    const ctx = createContext({assistantStatusClass: () => "muted", assistantStatusLabel: String,
+        renderAssistantConstraintRepair: () => "", renderAssistantResearch: () => ""});
+    vm.runInContext(section("    function renderAssistantTask(", "    function assistantDraftLengthText("),ctx);
+    assert.match(ctx.renderAssistantTask({id:"first",kind:"RESEARCH",status:"CANCELLED"}), /data-assistant-task-action="retry"/);
+    assert.doesNotMatch(ctx.renderAssistantTask({id:"done",kind:"RESEARCH",status:"READY"}), /data-assistant-task-action="retry"/);
+    const repair = {kind:"OPTIMIZE",stage:"OPTIMIZE_REVISION",constraintRepair:{attempted:true},
+        result:{text:"最终修订正文"},draftId:"draft",draftVersion:2};
+    for (const status of ["READY","SUCCEEDED"]) {
+        assert.doesNotMatch(ctx.renderAssistantTask({...repair,status}), /查看未采用的候选稿/);
+    }
+    assert.match(ctx.renderAssistantTask({...repair,status:"CONSTRAINTS_UNMET"}), /查看未采用的候选稿.*最终修订正文/);
+}
+
+async function verifyMaterialCreationNavigation() {
+    const handlers = {};
+    const elements = Object.fromEntries(["assistantTopicDetail","assistantMaterialsList","assistantDraftTitle",
+        "assistantDraftSaveState","assistantDraftLength","assistantDraftNumberChanges"].map(id => [id, {
+        addEventListener(name, handler) { if (name === "click") handlers[id] = handler; }
+    }]));
+    elements.assistantGenTargetSelect = {value:"google|gemini-4-neon"};
+    elements.assistantGenEffortSelect = {value:"high"};
+    elements.assistantCreationAngleInput = {value:"  核验数字  "};
+    const box = {dataset:{draftId:"older",draftVersion:"1"}};
+    const editor = {value:"以前的正文",closest:() => box};
+    const drafts = [
+        {id:"newer",topicId:"A",materialId:"101",text:"较新稿",version:1,updatedAt:200},
+        {id:"older",topicId:"A",materialId:"101",text:"以前的正文",version:1,updatedAt:100}
+    ];
+    const dashboard = () => ({topics:[{id:"A",title:"已筛选选题"}],drafts:structuredClone(drafts),materials:[],tasks:[]});
+    const state = {assistantDashboard:dashboard(),assistantSelectedTopicId:"A",assistantSelectedDraftByTopic:{A:"older"},
+        assistantView:"assistant",assistantSelectedSkill:"DEEP_BREAKDOWN",assistantAccess:{allowed:true},assistantRequestGeneration:0};
+    const calls = [];
+    let saveFails = false;
+    const ctx = createContext({state,URLSearchParams,isLoggedIn:()=>true,captureUserScope:()=>()=>true,
+        $: id => id === "assistantDraftEditor" ? (state.assistantSelectedTopicId === "A" ? editor : null) : elements[id] || null,
+        document:{activeElement:{},querySelectorAll:()=>[]}, clearTimeout(){}, setTimeout(){return 1;},
+        setContentAssistantError: message => assert.ok(!message,message),syncScheduleDraftUnloadProtection(){},
+        assistantDraftLengthText:()=>"",assistantDraftNumberChangesText:()=>"",assistantScoreText:()=>"",newClientRequestId:()=>"test",
+        renderContentAssistant(){}, renderAssistantTopics: d => ctx.renderAssistantTopicDetail(d),
+        runAssistantMutation: async (_,path,body) => {
+            calls.push({path,body}); return {id:"task",topicId:body.materialId === "202" ? "B" : "A"};
+        },
+        contentAssistantRequest: async (path,body) => {
+            calls.push({path,body});
+            if (path === "/drafts/older/save") {
+                if (saveFails) throw Error("保存冲突");
+                Object.assign(drafts[1],{version:body.version+1,text:body.text});
+                return structuredClone(drafts[1]);
+            }
+            if (path === "/topics/B/detail") return {topic:{id:"B",title:"列表之外的选题"},materials:[],tasks:[],drafts:[]};
+            if (path === "/topics/A/detail") return {topic:{id:"A",title:"已筛选选题"},materials:[],tasks:[],drafts:structuredClone(drafts)};
+            if (path.startsWith("/dashboard?")) return dashboard();
+            assert.fail(path);
+        }});
+    vm.runInContext(
+        section("    const DEFAULT_GENERATION_TARGET_SPEC =", "    function renderGenerationTargetOptionsHtml(")
+        + section("    function selectedAssistantTopic(", "    function renderAssistantSkillBar(")
+        + section("    function renderAssistantTopicDetail(", "    function assistantKeyValueRows(")
+        + section("    async function saveAssistantDraftEditor()", "    async function sendAssistantDraftToSchedule(")
+        + section("    async function loadContentAssistant(", "    function assistantVerificationButtons(")
+        + section("    async function loadAssistantTopicDetail(", "    async function loadAssistantMaterialsFeed(")
+        + section('        $("assistantMaterialsList")?.addEventListener("click"', "        const refreshReviewFilter =")
+        + section('        $("assistantTopicDetail")?.addEventListener("click"', "            const researchUpgrade =")
+        + "\n});",ctx);
+    const click = (id, selector, dataset) => handlers[id]({target:{closest:s => s === selector ? {dataset} : null}});
+    for (const mode of ["FAST","RESEARCH"]) {
+        calls.length = 0;
+        editor.value = "改在较旧的稿件 " + mode;
+        ctx.queueAssistantDraftSave();
+        await click("assistantTopicDetail","[data-assistant-research]",{assistantResearch:"101",researchMode:mode});
+        assert.deepEqual(calls.map(c => c.path),["/drafts/older/save","/research"]);
+        assert.equal(drafts[1].text,editor.value);
+        assert.equal(drafts[0].text,"较新稿");
+        assert.equal(state.assistantSelectedDraftByTopic.A,"older");
+    }
+    state.assistantView = "materials";
+    saveFails = true;
+    calls.length = 0;
+    editor.value = "保存有冲突";
+    ctx.queueAssistantDraftSave();
+    await click("assistantMaterialsList","[data-assistant-research]",{assistantResearch:"202",researchMode:"FAST"});
+    assert.deepEqual(calls.map(c => c.path),["/drafts/older/save"]);
+    assert.equal(state.assistantView,"materials");
+    assert.equal(state.assistantSelectedTopicId,"A");
+    saveFails = false;
+    calls.length = 0;
+    await click("assistantMaterialsList","[data-assistant-research]",{assistantResearch:"202",researchMode:"FAST"});
+    assert.deepEqual(calls.map(c => c.path),["/drafts/older/save","/research","/topics/B/detail"]);
+    assert.deepEqual({...calls[1].body},{materialId:"202",mode:"FAST",regenerate:false,generationProvider:"google",
+        generationModel:"gemini-4-neon high",skillId:"DEEP_BREAKDOWN",clientRequestId:"test",instruction:"核验数字"});
+    assert.equal(state.assistantSelectedTopicId,"B");
+    assert.match(elements.assistantTopicDetail.innerHTML,/列表之外的选题/);
+    assert.deepEqual(Array.from(state.assistantDashboard.topics,t=>t.id),["A"]);
+
+    state.assistantSelectedTopicId = "A";
+    state.assistantView = "materials";
+    calls.length = 0;
+    await click("assistantMaterialsList","[data-assistant-open-topic]",{assistantOpenTopic:"B"});
+    await ctx.loadContentAssistant(true);
+    assert.equal(calls.filter(c => c.path === "/topics/B/detail").length,2);
+    assert.equal(state.assistantSelectedTopicId,"B");
+    assert.equal(state.assistantView,"assistant");
+    assert.equal(ctx.selectedAssistantTopic(state.assistantDashboard).title,"列表之外的选题");
+    assert.deepEqual(Array.from(state.assistantDashboard.topics,t=>t.id),["A"]);
+    await ctx.loadAssistantTopicPage(0);
+    assert.equal(state.assistantSelectedTopicId,"A","changing the page restores the selection to the filtered list");
+
+    elements.assistantMoveTarget = { value: "" };
+    ctx.document.querySelectorAll = () => [{ dataset: { assistantMaterialId: "101" } }];
+    vm.runInContext('        $("assistantTopicDetail")?.addEventListener("click", async (event) => {\n'
+        + section('            if (event.target.closest("#assistantMoveMaterialsBtn"))', "            const confirmTopic =")
+        + "\n});", ctx);
+    for (const fails of [true, false]) {
+        saveFails = fails;
+        editor.value = "拆分前要保存的手改";
+        ctx.queueAssistantDraftSave();
+        calls.length = 0;
+        await click("assistantTopicDetail", "#assistantMoveMaterialsBtn", {});
+        assert.deepEqual(calls.map(entry => entry.path), fails ? ["/drafts/older/save"] : ["/drafts/older/save", "/topics/move"]);
+        assert.equal(editor.readOnly, false);
+        if (!fails) assert.equal(drafts[1].text, "拆分前要保存的手改");
+    }
+}
+
+async function verifyVisibleRevisionIsPublishedAndScheduled() {
+    const blank = () => "";
+    const latest = {id:"d", topicId:"topic", version:2, text:"后台成稿 v2",
+        quoteSourcePost:{tweetId:"202",url:"https://x.com/b/status/202"},
+        research:{snapshot:{selectedMaterialId:"202"}}};
+    const dashboard = {topics:[{id:"topic"}], drafts:[latest], materials:[
+        {id:"101",topicId:"topic",text:"A"}, {id:"202",topicId:"topic",text:"B"}
+    ]};
+    const state = {assistantDashboard:dashboard,assistantSelectedTopicId:"topic",assistantSelectedDraftByTopic:{topic:"d"},
+        scheduleDraftItems:[{}],authStatus:{user:{id:"owner"}}};
+    let version = "1", editor, rendered = "";
+    const makeEditor = value => ({value,closest:() => ({dataset:{draftId:"d",draftVersion:version}}),focus(){},setSelectionRange(){}});
+    editor = makeEditor("屏幕上的 v1");
+    const container = { set innerHTML(html) {
+        rendered = html;
+        version = html.match(/data-draft-version="(\d+)"/)[1];
+        editor = makeEditor(html.match(/id="assistantDraftEditor"[^>]*>([^<]*)</)[1]);
+    } };
+    const direct = [];
+    const ctx = createContext({state,document:{activeElement:editor},clearTimeout(){},
+        $:id => id === "assistantDraftEditor" ? editor : id === "assistantTopicDetail" ? container : null,
+        captureUserScope:()=>()=>true, stableUserId:()=>"owner", assistantPublishRequestId:async()=>"req",
+        assistantDraftResearchStatus:()=>({}),renderAssistantEvidenceChanges:blank,renderAssistantDraftMetricsHtml:blank,
+        renderAssistantMaterialCard:blank,assistantDraftLengthText:blank,assistantDraftNumberChangesText:blank,
+        renderAssistantConstraintRepair:blank,assistantWritingSkills:()=>[],renderGenerationTargetOptionsHtml:blank,
+        providerSupportsEffort:()=>true,renderReasoningEffortOptionsHtml:blank,assistantScoreText:blank,
+        runAssistantMutation:async(_,path,body)=>{direct.push(body);return {};},assistantPublishNotice:blank,
+        setContentAssistantError:blank,ensureScheduleDraftInitialized(){},hasScheduleDraftContent:()=>false,
+        rotateComposerRequestId(){},renderScheduleDraftItems(){},queueScheduleDraftPersistence(){},switchTab(){},showToast(){},
+        MAX_SCHEDULE_TEXT_LENGTH:4000});
+    vm.runInContext(section("    function selectedAssistantTopic(", "    function renderAssistantSkillBar(")
+        + section("    function resolveAssistantDraftSourcePost(", "    function assistantDraftNumberChangesText(")
+        + section("    function renderAssistantTopicDetail(", "    function assistantKeyValueRows(")
+        + section("    async function saveAssistantDraftEditor(", "    function queueAssistantDraftSave(")
+        + section("    async function publishAssistantDraftNow(", "    async function publishRepostPreviewItem(")
+        + section("    async function sendAssistantDraftToSchedule(", "    function renderTimingPanel("), ctx);
+    // The poll already installed v2 in the dashboard and the owner still sees v1. The first click refreshes the view.
+    await ctx.publishAssistantDraftNow("d", true);
+    assert.deepEqual(direct, []);
+    assert.equal(version, "2"); assert.equal(editor.value, latest.text);
+    assert.match(rendered, /data-quote-url="https:\/\/x.com\/b\/status\/202"/);
+    assert.match(rendered, /data-assistant-research-upgrade="d" data-material-id="202"/);
+    await ctx.publishAssistantDraftNow("d", true);
+    await ctx.sendAssistantDraftToSchedule("d", true);
+    assert.equal(direct[0].version, 2);
+    assert.equal(state.scheduleDraftItems[0].text, latest.text);
+    assert.equal(state.scheduleDraftItems[0].sourceRef.assistantDraftVersion, 2);
+    assert.equal(state.scheduleDraftItems[0].quoteTweetId, "202");
+}
+
+async function verifyRetryMode() {
+    let click;
+    const paths = [], notices = [], decisions = [];
+    const context = vm.createContext({
+        $: () => ({addEventListener: (_, callback) => { click = callback; }}),
+        runAssistantMutation: async (_, path, decision) => { paths.push(path); decisions.push(decision); return true; },
+        state: { authStatus: { user: { username: "owner" } } },
+        escapeHtml: String,
+        window: { prompt: () => "https://x.com/owner/status/12345", confirm: () => true },
+        showToast: message => notices.push(message)
+    });
+    vm.runInContext(section("    function assistantVerificationButtons(", "    async function runAssistantMutation("), context);
+    vm.runInContext(section('        $("assistantAutoRepostFeed")?.addEventListener', '        $("assistantHistoryStatus")?.addEventListener'), context);
+    for (const publishMode of ["REWRITE", "REPOST", ""]) {
+        await click({target: {closest: selector => selector === "[data-autorepost-retry]" ? {dataset: {autorepostRetry: "101", publishMode}} : null}});
+    }
+    assert.deepEqual(paths, ["/auto-reposts/101/retry?mode=REWRITE", "/auto-reposts/101/retry?mode=REPOST"]);
+    assert.deepEqual(notices, ["已重新提交改写稿", "已重新提交自动引用转推"]);
+    for (const published of ["true", "false"]) {
+        await click({target: {closest: selector => selector === "[data-assistant-verify]" ? {dataset: {
+            assistantVerify: "manual-test", version: "2", published
+        }} : null}});
+    }
+    assert.deepEqual(paths.slice(2), ["/publications/manual-test/verify", "/publications/manual-test/verify"]);
+    assert.deepEqual(JSON.parse(JSON.stringify(decisions.slice(2))), [
+        { version: 2, published: true, tweetId: "12345" }, { version: 2, published: false }
+    ]);
+    assert.match(context.assistantVerificationButtons({id: "old", source: "DIRECT_PUBLISH", status: "UNCERTAIN", version: 4}), /登记已发布/);
+    assert.equal(context.assistantVerificationButtons({source: "DIRECT_PUBLISH", status: "SENDING"}), "");
+    const accepted = context.assistantVerificationButtons({source: "DIRECT_PUBLISH", status: "UNCERTAIN", acceptedReceipt: {tweetId: "12345"}});
+    assert.match(accepted, /正在补记回执/);
+    assert.doesNotMatch(accepted, /data-assistant-verify/);
+    for (const publishMode of ["REWRITE", "REPOST"]) {
+        const buttons = context.assistantVerificationButtons({materialId: "101", status: "UNCERTAIN", autoKind: publishMode, version: 5});
+        assert.match(buttons, /data-assistant-verify="101"/);
+        assert.ok(buttons.includes(`data-publish-mode="${publishMode}"`));
+        for (const published of ["true", "false"]) {
+            await click({target: {closest: selector => selector === "[data-assistant-verify]" ? {dataset: {
+                assistantVerify: "101", publishMode, version: "5", published
+            }} : null}});
+            assert.equal(paths.at(-1), `/auto-reposts/101/verify?mode=${publishMode}`);
+            assert.equal(decisions.at(-1).version, 5);
+            assert.equal(decisions.at(-1).published, published === "true");
+        }
+    }
+}
+
+async function verifySplitEditorAndPublicationViews() {
+    for (const mode of ["offline","split","conflict-local","conflict-remote"]) {
+        const splitDuringDetail = mode === "split" || mode === "conflict-remote";
+        const conflict = mode.startsWith("conflict-");
+        const topics = [{id: "A", title: "旧题"}, {id: "B", title: "新题"}];
+        const stored = {id: "d", materialId: "202", topicId: "A", version: 1, text: "已保存旧稿"};
+        const job = {id: "old-job", jobId: "j", topicId: "A", draftId: "d", draftVersion: 1, status: "SCHEDULED"};
+        const observation = {id: "900:24", topicId: "A", draftId: "d", status: "OBSERVED", windowHours: 24, views: 357};
+        const manual = {id: "901:24", topicId: "A", status: "OBSERVED", windowHours: 24, views: 91};
+        // The old linked job is outside the dashboard's page, while the detail includes all editable jobs.
+        const dashboard = () => ({topics, drafts: [{...stored}], publications: [], observations: [observation, manual]});
+        const state = {assistantDashboard: dashboard(), assistantSelectedTopicId: "A", assistantSelectedDraftByTopic: {A: "d"},
+            assistantAccess: {allowed: true}, assistantRequestGeneration: 0};
+        const fields = Object.fromEntries(["assistantDraftTitle", "assistantDraftLength", "assistantDraftSaveState",
+            "assistantDraftNumberChanges", "assistantTopicTasks", "assistantDraftConflict", "assistantDraftRemoteText"].map(id => [id, {}]));
+        let editor, html, fail = mode === "offline";
+        const pane = {set innerHTML(next) {
+            html = next;
+            const data = next.match(/data-draft-id="([^"]+)" data-draft-version="(\d+)"/);
+            const box = data && {dataset: {draftId: data[1], draftVersion: data[2]}};
+            editor = box ? {value: next.match(/id="assistantDraftEditor"[^>]*>([^<]*)</)[1], closest: () => box} : null;
+        }};
+        const saves = [], blank = () => "";
+        const ctx = createContext({state, URLSearchParams, document: {activeElement: null, querySelectorAll: () => []},
+            $: id => id === "assistantTopicDetail" ? pane : id === "assistantDraftEditor" ? editor : fields[id],
+            captureUserScope: () => () => true, isLoggedIn: () => true, setTimeout: () => 1, clearTimeout() {},
+            syncScheduleDraftUnloadProtection() {}, setContentAssistantError: message => assert.fail(message),
+            renderContentAssistant: () => ctx.renderAssistantTopicDetail(state.assistantDashboard),
+            renderAssistantTopics: data => ctx.renderAssistantTopicDetail(data),
+            assistantDraftResearchStatus: () => ({}), renderAssistantEvidenceChanges: blank, renderAssistantDraftMetricsHtml: blank,
+            assistantDraftLengthText: blank, assistantDraftNumberChangesText: blank, renderAssistantConstraintRepair: blank,
+            assistantWritingSkills: () => [], renderGenerationTargetOptionsHtml: blank, providerSupportsEffort: () => true,
+            renderReasoningEffortOptionsHtml: blank, assistantScoreText: blank, assistantVerificationButtons: blank,
+            assistantStatusClass: blank, assistantStatusLabel: String, fmtNum: String, renderAssistantTask: blank,
+            contentAssistantRequest: async (path, body) => {
+                if (path.startsWith("/dashboard?")) return dashboard();
+                if (path === "/drafts/d/save") {
+                    saves.push({...body});
+                    if (fail) throw Error("暂时无法保存");
+                    if (body.version !== stored.version) throw Object.assign(Error("另一页面已保存"),{httpStatus:409});
+                    assert.equal(body.version, stored.version);
+                    Object.assign(stored, {text: body.text, version: body.version + 1});
+                    return {...stored};
+                }
+                if (path === "/drafts/d/versions") return [{...stored}];
+                if (path === "/topics/A/detail") {
+                    stored.topicId = "B";
+                    return {topic: topics[0], drafts: [], publications: [job], observations: [observation, manual]};
+                }
+                if (path === "/topics/B/detail") return {topic: topics[1], drafts: [{...stored}], publications: [job], observations: []};
+                assert.fail(path);
+            }});
+        vm.runInContext(section("    function selectedAssistantTopic(", "    function renderAssistantSkillBar(")
+            + section("    function renderAssistantObservationReview(", "    function renderAssistantHistory(")
+            + section("    function resolveAssistantDraftSourcePost(", "    function assistantDraftNumberChangesText(")
+            + section("    function renderAssistantTopicDetail(", "    function assistantKeyValueRows(")
+            + section("    async function loadContentAssistant(", "    function assistantVerificationButtons(")
+            + section("    async function loadAssistantTopicDetail(", "    async function loadAssistantTopicPage(")
+            + section("    async function saveAssistantDraftEditor(", "    async function sendAssistantDraftToSchedule("), ctx);
+        ctx.renderAssistantTopicDetail(state.assistantDashboard);
+        const typed = "另一个标签页拆题之前刚键入的稿件";
+        editor.value = typed;
+        ctx.queueAssistantDraftSave();
+        if (conflict) Object.assign(stored,{version:2,text:"另一页面提交的正文"});
+        if (!splitDuringDetail) stored.topicId = "B";
+        await ctx.loadContentAssistant(true);
+        if (conflict) {
+            assert.equal(editor.value,typed);
+            assert.equal(state.assistantDraftDirty,true);
+            assert.equal(stored.version,2);
+            assert.equal(fields.assistantDraftRemoteText.textContent,stored.text);
+            await ctx.loadContentAssistant(true);
+            assert.equal(saves.length,1, "a background refresh must not keep submitting stale text");
+            await ctx.resolveAssistantDraftConflict(mode === "conflict-local" ? "local" : "remote");
+            assert.equal(stored.version,mode === "conflict-local" ? 3 : 2);
+            assert.equal(stored.text,mode === "conflict-local" ? typed : "另一页面提交的正文");
+            assert.equal(state.assistantDraftDirty,false);
+            state.assistantSelectedTopicId="B";
+            await ctx.loadAssistantTopicDetail("B");
+            assert.equal(editor.value,stored.text);
+            continue;
+        }
+        if (fail) {
+            assert.equal(editor.value, typed);
+            assert.equal(state.assistantDraftDirty, true);
+            assert.equal(fields.assistantDraftSaveState.textContent, "暂时无法保存");
+            fail = false;
+            await ctx.loadContentAssistant(true);
+        }
+        assert.deepEqual(saves.at(-1), {version: 1, text: typed});
+        assert.equal(stored.text, typed);
+        assert.equal(editor, null);
+        assert.match(html, /357<\/strong>/);
+        assert.match(html, /91<\/strong>/);
+        state.assistantSelectedTopicId = "B";
+        await ctx.loadAssistantTopicDetail("B");
+        await ctx.loadAssistantTopicDetail("B");
+        assert.equal(editor.value, typed);
+        assert.equal((html.match(/data-assistant-update-scheduled="old-job"/g) || []).length, 1);
+        assert.doesNotMatch(html, /357<\/strong>|91<\/strong>|发布复盘/);
+    }
+}
+
+Promise.all([verifyDirectPublishRetries(), verifyRetryMode(), verifyScheduledUpdateWaitsForEditor(), verifyCancelledTaskCanRestart(),
+    verifyMaterialCreationNavigation(), verifyVisibleRevisionIsPublishedAndScheduled(), verifySplitEditorAndPublicationViews()]).then(() => console.log("assistant-creation-regression: passed"))
+    .catch((error) => { console.error(error); process.exitCode = 1; });

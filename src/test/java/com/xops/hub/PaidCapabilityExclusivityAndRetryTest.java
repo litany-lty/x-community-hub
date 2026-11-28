@@ -8,6 +8,7 @@ import com.xops.hub.assistant.AssistantStore;
 import com.xops.hub.assistant.SourceCollector;
 import com.xops.hub.config.XOpsProperties;
 import com.xops.hub.service.CommunityAnalyticsEngine.ReportPeriod;
+import com.xops.hub.model.AuthorIdentity;
 import com.xops.hub.model.RawSnapshotModels.InboundInteraction;
 import com.xops.hub.model.RawSnapshotModels.InboundKind;
 import com.xops.hub.model.RawSnapshotModels.RawTweet;
@@ -43,6 +44,7 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
+import java.util.Map;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -91,7 +93,7 @@ class PaidCapabilityExclusivityAndRetryTest {
     }
 
     @Test
-    void paidCapabilitiesAllowOnlyElidlicomAndBypassAllBudgetAccountingLimits(@TempDir Path dir) throws Exception {
+    void onlyTheOwnerCanUsePaidCapabilitiesWithinTheSharedBudget(@TempDir Path dir) throws Exception {
         XOpsProperties props = new XOpsProperties();
         props.setDiskCacheDir(dir.toString());
         props.setDefaultProvider("TWITTERAPI_IO");
@@ -141,15 +143,14 @@ class PaidCapabilityExclusivityAndRetryTest {
                 .isInstanceOf(XDataProviderException.class)
                 .satisfies(ex -> assertThat(((XDataProviderException) ex).getStatusCode()).isEqualTo(403));
 
-        // 2. @elidlicom bypasses ALL hourly call & daily/monthly USD budget caps without throttling
-        PaidCapabilityGate.runWithCaller("elidlicom", "9000", () -> {
-            for (int i = 0; i < 25; i++) {
-                budgetGuard.acquirePermit(paidReadUri, "twitterapi_io_read");
-                budgetGuard.acquirePermit(paidRelUri, "twitterapi_io_relation");
-                budgetGuard.acquirePermit(paidPublishUri, "x_tweet_create");
-            }
-            assertThat(budgetGuard.canAffordBackground(paidReadUri.toString(), "twitterapi_io_read")).isTrue();
-            assertThat(budgetGuard.canAffordBackground(paidRelUri.toString(), "twitterapi_io_relation")).isTrue();
+        PaidCapabilityGate.runWithCaller("elidlicom", "9000", true, () -> {
+            assertThat(budgetGuard.canAfford(paidReadUri.toString(), "twitterapi_io_read")).isFalse();
+            assertThat(budgetGuard.canAfford(paidRelUri.toString(), "twitterapi_io_relation")).isTrue();
+            budgetGuard.acquirePermit(paidRelUri, "twitterapi_io_relation");
+            assertThat(budgetGuard.snapshotMetrics().get("totalBillableCalls")).isEqualTo(1L);
+            assertThat(budgetGuard.canAffordBackground(paidRelUri.toString(), "twitterapi_io_relation")).isFalse();
+            assertThatThrownBy(() -> budgetGuard.acquirePermit(paidPublishUri, "x_tweet_create"))
+                    .isInstanceOf(XDataProviderException.class).hasMessageContaining("预算");
         });
     }
 
@@ -168,9 +169,9 @@ class PaidCapabilityExclusivityAndRetryTest {
         };
 
         RetrySnapshot firstReg = gate.scheduleIdempotentRetry(
-                "op:elidlicom:batch-1", "twitterapi_io_read", "elidlicom", "9000", "initial 503", failingPaidOp);
+                "op:elidlicom:batch-1", "twitterapi_io_read", "elidlicom", "9000", "initial 503", failingPaidOp, false, true);
         RetrySnapshot duplicateReg = gate.scheduleIdempotentRetry(
-                "op:elidlicom:batch-1", "twitterapi_io_read", "elidlicom", "9000", "duplicate 503", failingPaidOp);
+                "op:elidlicom:batch-1", "twitterapi_io_read", "elidlicom", "9000", "duplicate 503", failingPaidOp, false, true);
         assertThat(duplicateReg.nextRetryAtEpochMs()).isEqualTo(firstReg.nextRetryAtEpochMs());
         assertThat(duplicateReg.retryCount()).isZero();
 
@@ -201,7 +202,7 @@ class PaidCapabilityExclusivityAndRetryTest {
 
         // +40m and re-registration of exhausted key do NOT execute a 4th attempt
         gate.scheduleIdempotentRetry(
-                "op:elidlicom:batch-1", "twitterapi_io_read", "elidlicom", "9000", "late 503", failingPaidOp);
+                "op:elidlicom:batch-1", "twitterapi_io_read", "elidlicom", "9000", "late 503", failingPaidOp, false, true);
         clock.advanceMillis(PaidCapabilityGate.RETRY_INTERVAL_MS);
         gate.runDueRetries();
         assertThat(attempts.get()).isEqualTo(3);
@@ -212,9 +213,9 @@ class PaidCapabilityExclusivityAndRetryTest {
         props.setSchedulerEnabled(false);
 
         XOAuthService oauthService = mock(XOAuthService.class);
-        when(oauthService.getTokenCapability("9000"))
+        when(oauthService.getTokenCapability(AuthorIdentity.ARCHIVE_ACCOUNT_ID))
                 .thenReturn(new XOAuthService.TokenCapability(true, true, true));
-        when(oauthService.getValidWriteAccessToken("9000", false)).thenReturn("valid-write-token");
+        when(oauthService.getValidWriteAccessToken(AuthorIdentity.ARCHIVE_ACCOUNT_ID, false)).thenReturn("valid-write-token");
 
         AtomicInteger publishCalls = new AtomicInteger();
         XPublishClient publishClient = mock(XPublishClient.class);
@@ -233,8 +234,8 @@ class PaidCapabilityExclusivityAndRetryTest {
         try {
             long firstAt = clock.millis() + 30_000L;
             long secondAt = firstAt + 40 * 60_000L;
-            ScheduledTweetJob job1 = tweetService.createScheduledTweet("9000", "elidlicom", "First unmetered owner post", firstAt, "req-1", List.of());
-            ScheduledTweetJob job2 = tweetService.createScheduledTweet("9000", "elidlicom", "Second unmetered owner post", secondAt, "req-2", List.of());
+            ScheduledTweetJob job1 = tweetService.createScheduledTweet(AuthorIdentity.ARCHIVE_ACCOUNT_ID, "elidlicom", "First unmetered owner post", firstAt, "req-1", List.of());
+            ScheduledTweetJob job2 = tweetService.createScheduledTweet(AuthorIdentity.ARCHIVE_ACCOUNT_ID, "elidlicom", "Second unmetered owner post", secondAt, "req-2", List.of());
             assertThat(job2.id()).isNotEqualTo(job1.id());
 
             // Non-elidlicom user fails immediately with 403 when attempting to schedule
@@ -244,8 +245,8 @@ class PaidCapabilityExclusivityAndRetryTest {
 
             // Initial dispatch at firstAt -> fails with 429 -> scheduled for +10m retry #1
             clock.advanceMillis(35_000L);
-            tweetService.processDueJobsForAccount("9000");
-            ScheduledTweetJob afterInitialFail = tweetService.listJobs("9000", "elidlicom").items().stream()
+            tweetService.processDueJobsForAccount(AuthorIdentity.ARCHIVE_ACCOUNT_ID);
+            ScheduledTweetJob afterInitialFail = tweetService.listJobs(AuthorIdentity.ARCHIVE_ACCOUNT_ID, "elidlicom").items().stream()
                     .filter(j -> j.id().equals(job1.id())).findFirst().orElseThrow();
             assertThat(afterInitialFail.status()).isEqualTo(ScheduledTweetStatus.SCHEDULED);
             assertThat(afterInitialFail.attemptCount()).isEqualTo(1);
@@ -253,19 +254,19 @@ class PaidCapabilityExclusivityAndRetryTest {
 
             // Before +10m -> still waiting
             clock.advanceMillis(5 * 60_000L);
-            tweetService.processDueJobsForAccount("9000");
+            tweetService.processDueJobsForAccount(AuthorIdentity.ARCHIVE_ACCOUNT_ID);
             assertThat(publishCalls.get()).isEqualTo(1);
 
             // At +10m -> retry #1 fires -> fails with 429 -> scheduled for +20m retry #2
             clock.advanceMillis(5 * 60_000L + 1_000L);
-            tweetService.processDueJobsForAccount("9000");
+            tweetService.processDueJobsForAccount(AuthorIdentity.ARCHIVE_ACCOUNT_ID);
             assertThat(publishCalls.get()).isEqualTo(2);
 
             // At +20m -> retry #2 fires -> succeeds -> PUBLISHED
             clock.advanceMillis(PaidCapabilityGate.RETRY_INTERVAL_MS);
-            tweetService.processDueJobsForAccount("9000");
+            tweetService.processDueJobsForAccount(AuthorIdentity.ARCHIVE_ACCOUNT_ID);
             assertThat(publishCalls.get()).isEqualTo(3);
-            ScheduledTweetJob published = tweetService.listJobs("9000", "elidlicom").items().stream()
+            ScheduledTweetJob published = tweetService.listJobs(AuthorIdentity.ARCHIVE_ACCOUNT_ID, "elidlicom").items().stream()
                     .filter(j -> j.id().equals(job1.id())).findFirst().orElseThrow();
             assertThat(published.status()).isEqualTo(ScheduledTweetStatus.PUBLISHED);
             assertThat(published.publishedTweetId()).isEqualTo("tw-published-ok");
@@ -275,13 +276,39 @@ class PaidCapabilityExclusivityAndRetryTest {
     }
 
     @Test
+    void archiveRetentionAndSchedulingFollowTheBoundIdWhenAHandleChanges(@TempDir Path dir) {
+        var props = new XOpsProperties();
+        props.setDiskCacheDir(dir.toString());
+        var owners = new AssistantStore(dir.resolve("assistant"), objectMapper);
+        owners.tx(tx -> tx.put("meta", "owner", objectMapper.createObjectNode().put("bindingSource", "EXPLICIT")
+                .put("accountId", "9000").put("username", "renamed")));
+        var service = new CommunityHubService(props, new DemoXDataProvider(), mock(TwitterApiIoProvider.class),
+                mock(OfficialXApiV2Provider.class), objectMapper, null, owners);
+        Instant now = Instant.now();
+        var old = new RawTweet("old", "original text", now.minus(Duration.ofDays(70)), TweetKind.POST,
+                "", null, List.of(), false, false, 1, 0, 0, 0, 0, false, "old", "");
+        for (var user : List.of(new XUserSummary("9000", "renamed", "Owner", "", "", false, 0, 0, 1, ""),
+                new XUserSummary("7002", "elidlicom", "Other", "", "", false, 0, 0, 1, ""))) {
+            var snapshot = AccountStore.merge(null, user, now, List.of(old), List.of(), List.of(), List.of(),
+                    null, Map.of(), true);
+            ReflectionTestUtils.invokeMethod(service, "saveStore", user.username(), user.id(), snapshot);
+            var stored = AccountStore.read(dir.resolve("users/by-id").resolve(user.id())
+                    .resolve("store_v" + AccountStore.VERSION + ".json.gz"), objectMapper);
+            assertThat(stored.tweets()).hasSize(user.id().equals("9000") ? 1 : 0);
+        }
+        assertThat(service.longHistoryCandidates()).extracting(c -> c.user().id()).containsExactly("9000");
+        assertThat(service.evaluateScheduledPublishAccess("7002", "elidlicom").allowed()).isFalse();
+        assertThat(service.evaluateScheduledPublishAccess("9000", "renamed").allowed()).isTrue();
+    }
+
+    @Test
     void elidlicomRetainsFullHistoryAndPaidDataWhileOtherAccountsKeepThirtyDayRollingWindow(@TempDir Path dir) throws Exception {
         Instant now = Instant.parse("2026-11-24T06:00:00Z");
         Instant ninetyDaysAgo = now.minus(Duration.ofDays(90));
         Instant tenDaysAgo = now.minus(Duration.ofDays(10));
         MutableClock clock = new MutableClock(now.toEpochMilli(), ZoneId.of("Asia/Shanghai"));
 
-        XUserSummary owner = new XUserSummary("9000", "elidlicom", "Litany", "", "", true, 500, 100, 50, "");
+        XUserSummary owner = new XUserSummary(AuthorIdentity.ARCHIVE_ACCOUNT_ID, "elidlicom", "Litany", "", "", true, 500, 100, 50, "");
         XUserSummary peer = new XUserSummary("3001", "alice_peer", "Alice", "", "", false, 100, 80, 20, "");
 
         List<RawTweet> sampleTweets = List.of(
@@ -311,13 +338,19 @@ class PaidCapabilityExclusivityAndRetryTest {
         // 3. SourceCollector retires & hides non-owner history_source rows (@iamtheqwen) while keeping @elidlicom active
         AssistantStore assistantStore = new AssistantStore(dir.resolve("assistant"), objectMapper);
         assistantStore.tx(tx -> {
-            tx.put("meta", "owner", objectMapper.createObjectNode().put("accountId", "9000").put("username", "elidlicom"));
+            tx.put("meta", "owner", objectMapper.createObjectNode().put("accountId", AuthorIdentity.ARCHIVE_ACCOUNT_ID).put("username", "elidlicom"));
             tx.put("meta", "settings", objectMapper.createObjectNode().put("enabled", true).put("collectionEnabled", true));
             tx.put("history_source", "7001", objectMapper.createObjectNode()
                     .put("authorId", "7001").put("username", "iamtheqwen").put("owner", false).put("rank", 1)
                     .put("eligible", true).put("inboundCursor", "cur-1").put("inboundError", "HTTP 503"));
-            tx.put("history_source", "9000", objectMapper.createObjectNode()
-                    .put("authorId", "9000").put("username", "elidlicom").put("owner", true).put("rank", 0)
+            tx.put("history_source", "7002", objectMapper.createObjectNode()
+                    .put("username", "elidlicom").put("owner", true).put("eligible", true)
+                    .put("timelineSavedCount", 29));
+            tx.put("history_material", "peer-only", objectMapper.createObjectNode().put("authorId", "7001"));
+            tx.put("history_material", "owner-only", objectMapper.createObjectNode().put("authorId", AuthorIdentity.ARCHIVE_ACCOUNT_ID));
+            tx.put("history_interaction", "7001:item", objectMapper.createObjectNode().put("targetAuthorId", "7001"));
+            tx.put("history_source", AuthorIdentity.ARCHIVE_ACCOUNT_ID, objectMapper.createObjectNode()
+                    .put("authorId", AuthorIdentity.ARCHIVE_ACCOUNT_ID).put("username", "elidlicom").put("owner", true).put("rank", 0)
                     .put("eligible", true).put("timelineError", UpstreamBudgetGuard.BUDGET_REACHED_MESSAGE)
                     .put("timelineBackfillComplete", true).put("inboundBackfillComplete", true)
                     .put("lastTimelineCheckAt", System.currentTimeMillis())
@@ -335,6 +368,9 @@ class PaidCapabilityExclusivityAndRetryTest {
             ReflectionTestUtils.invokeMethod(collector, "tick");
             var historyView = collector.history();
             assertThat(historyView.path("sources")).hasSize(1);
+            assertThat(historyView.path("ownerAccountId").asText()).isEqualTo(AuthorIdentity.ARCHIVE_ACCOUNT_ID);
+            assertThat(historyView.path("materials").asLong()).isEqualTo(1);
+            assertThat(historyView.path("interactions").asLong()).isZero();
             assertThat(historyView.path("sources").get(0).path("username").asText()).isEqualTo("elidlicom");
             assertThat(historyView.path("sources").get(0).path("timelineError").asText()).isEmpty();
 

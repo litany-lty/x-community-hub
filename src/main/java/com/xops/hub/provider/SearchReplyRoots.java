@@ -51,11 +51,9 @@ final class SearchReplyRoots {
         }
         for (var i : account.inbound()) {
             if (i.peer() == null || i.peer().isBlank()) continue;
-            var peer = account.users().get(i.peer());
-            if (peer == null || peer.id() == null || peer.id().isBlank()) continue;
-            String parentHandle = i.inReplyToUser() == null && i.kind() == 'R' ? handle : i.inReplyToUser();
-            addStored(known, new Post(i.id(), peer.id(), i.peer(), i.createdAt(), i.inReplyToId(),
-                    parentHandle, i.conversationId()), i.kind() == 'R' || i.inReplyToId() != null);
+            if (i.peerId() == null || i.peerId().isBlank()) continue;
+            addStored(known, new Post(i.id(), i.peerId(), i.peer(), i.createdAt(), i.inReplyToId(),
+                    i.inReplyToUser(), i.conversationId()), i.kind() == 'R' || i.inReplyToId() != null);
         }
         return new SearchReplyRoots(known);
     }
@@ -122,6 +120,9 @@ final class SearchReplyRoots {
                         break;
                     }
                     if (!parent.handle().equalsIgnoreCase(current.parentHandle()) || parent.time() > current.time()) throw invalid();
+                    if (current == reply && parent.authorId() != null && !parent.authorId().isBlank()) {
+                        ((ObjectNode) tweet).put("inReplyToUserId", parent.authorId());
+                    }
                     current = parent;
                 }
                 if (root != null) {

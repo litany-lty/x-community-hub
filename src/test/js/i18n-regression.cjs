@@ -301,6 +301,21 @@ assert.equal(page.api.translate("🔒 7天"), "🔒 7d");
 assert.equal(page.api.translate("11月16日 18:30"), "11/16 18:30");
 assert.equal(page.api.translate("日均 2.0"), "Daily avg. 2.0");
 assert.equal(page.api.translate("日均 2.0 · 引用 3"), "Daily avg. 2.0 · Quotes 3");
+assert.equal(page.api.translate("每次同步 24 小时 · 保留近 30 天"), "24 hours per sync · 30-day retention");
+assert.match(page.api.translate("你与作者的互动排名第 3，已解锁全部时间维度。可手动刷新最近 24 小时数据，保留近 30 天。"), /Refresh the last 24 hours manually/);
+assert.match(page.api.translate("你与作者的互动排名第 3，已解锁全部时间维度。系统每日自动同步最近 24 小时数据并落盘，保留近 30 天。"), /sync automatically each day/);
+assert.equal(page.api.translate("待核实作者"), "Owner verification required");
+assert.match(page.api.translate("因为每次使用这个网站服务，我都是真实付费调用 API 的。感谢你已经关注 @renamed 结下这份善缘，后续更新都会第一时间在 X 分享！"), /following @renamed/);
+const rewriteStatusTranslations = {
+    en: ["Rewrite published", "Evaluating rewrite", "Posting permission required", "Rewrite candidates 3"],
+    ja: ["リライトを投稿済み", "リライトを判定中", "投稿の許可が必要", "リライト候補 3"],
+    ko: ["재작성 게시 완료", "재작성 적합성 평가 중", "게시 권한 필요", "재작성 후보 3"]
+};
+for (const [locale, expected] of Object.entries(rewriteStatusTranslations)) {
+    page.api.setLocale(locale);
+    assert.deepEqual(["已洗稿发送", "洗稿判定中", "需发推授权", "会洗稿 3"].map(text => page.api.translate(text)), expected);
+}
+page.api.setLocale("en");
 const originalSnippet = '新建定时推文 <script>alert(1)</script> · 日均 2.0';
 const reviewSource = '11月16日 18:30「' + originalSnippet + '」；已采集浏览 100，历史单帖中位数 1000。';
 const reviewTranslated = page.api.translate(reviewSource);

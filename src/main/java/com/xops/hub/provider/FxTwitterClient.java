@@ -236,7 +236,7 @@ public final class FxTwitterClient {
                         if (searchUnavailable) {
                             tripSearchCircuit("HTTP " + code);
                         }
-                        lastFailure = invalid("公开数据服务暂不可用（HTTP " + code + "）");
+                        lastFailure = new XDataProviderException(code == 503 ? 503 : 502, "公开数据服务暂不可用（HTTP " + code + "）");
                         boolean transientStatuses404 = statusesPath && code == 404 && isTransientTimeline404(response.body());
                         boolean transientHttp = !searchUnavailable
                                 && (code == 429 || code == 500 || code == 502 || code == 503 || code == 504 || transientStatuses404);
@@ -253,7 +253,7 @@ public final class FxTwitterClient {
                         if (searchPath && (bodyCode == 503 || bodyCode == 501)) {
                             tripSearchCircuit("code " + bodyCode);
                         }
-                        lastFailure = invalid("公开数据服务返回异常状态");
+                        lastFailure = new XDataProviderException(bodyCode == 503 ? 503 : 502, "公开数据服务返回异常状态");
                         boolean transientBodyCode = !searchPath
                                 && (bodyCode == 429 || bodyCode == 500 || bodyCode == 502 || bodyCode == 503 || bodyCode == 504
                                     || (statusesPath && bodyCode == 404 && json != null && json.has("results")));

@@ -17,7 +17,8 @@ public final class AssistantWorker {
     private final AssistantIntelligence models;
     private final SourceCollector sources;
     private final ExecutorService workers=Executors.newFixedThreadPool(2,r->{var t=new Thread(r,"assistant-model");t.setDaemon(true);return t;});
-    private final Map<String,FutureTask<Void>> active=new ConcurrentHashMap<>();
+    private record ActiveAttempt(String token, FutureTask<Void> future) {}
+    private final Map<String,ActiveAttempt> active=new ConcurrentHashMap<>();
     private static final Set<String> BACKGROUND=Set.of("CLASSIFY","SCORE");
     public AssistantWorker(AssistantStore store,AssistantIntelligence models,SourceCollector sources) {
         this.store=store; this.models=models; this.sources=sources;
@@ -42,7 +43,12 @@ public final class AssistantWorker {
     }
 
     @PreDestroy void close() { workers.shutdownNow(); }
-    public void interrupt(String id) { var job=active.get(id); if(job!=null) job.cancel(true); }
+    public void interrupt(String id) { var job=active.get(id); if(job!=null) job.future().cancel(true); }
+
+    synchronized void interruptAttempt(String id, String token) {
+        var job = active.get(id);
+        if (job != null && job.token().equals(token)) job.future().cancel(true);
+    }
 
     @Scheduled(fixedDelayString="${xops.content-assistant-worker-ms:2500}")
     public synchronized void tick() {
@@ -74,7 +80,7 @@ public final class AssistantWorker {
         expired.forEach(this::interrupt);
         if(active.size()>=2) return;
         var claimed=store.tx(tx->{
-            if(tx.get("meta","owner")==null) return List.<ObjectNode>of();
+            if(tx.ownerBinding()==null) return List.<ObjectNode>of();
             var config=settings(tx);
             if(!config.path("enabled").asBoolean() || !config.path("modelEnabled").asBoolean()) return List.<ObjectNode>of();
             var jobs=tx.matching("task","status","QUEUED",-1);
@@ -123,10 +129,11 @@ public final class AssistantWorker {
         for(var task:claimed) {
             String id=task.path("id").asText();
             var f = new FutureTask<Void>(() -> { execute(task); return null; });
-            active.put(id,f);
+            var attempt = new ActiveAttempt(task.path("attempt").asText(), f);
+            active.put(id,attempt);
             workers.execute(() -> {
                 try { f.run(); }
-                finally { active.remove(id, f); }
+                finally { active.remove(id, attempt); }
             });
         }
     }
@@ -168,7 +175,7 @@ public final class AssistantWorker {
     // Consumers of collection results only compare source text/IDs. Collection timestamps do not trigger model spend.
     @Scheduled(fixedDelayString="${xops.content-assistant-style-check-ms:30000}")
     public void collectedStyle() {
-        var enabled=store.tx(t->t.get("meta","owner")!=null && settings(t).path("enabled").asBoolean() && settings(t).path("modelEnabled").asBoolean());
+        var enabled=store.tx(t->t.ownerBinding()!=null && settings(t).path("enabled").asBoolean() && settings(t).path("modelEnabled").asBoolean());
         if(!enabled) return;
         var samples=sources.styleSamples();
         if(samples.path("coverage").path("running").asBoolean()) return;
@@ -333,6 +340,10 @@ public final class AssistantWorker {
                 if ("RESEARCH".equals(stage) && research.path("articleBackfills").isObject()) {
                     applyArticleBackfills(tx, input, research.path("articleBackfills"));
                     research.remove("articleBackfills");
+                }
+                String researchMatId = input.path("selectedMaterialId").asText(task.path("materialId").asText("")).strip();
+                if (!researchMatId.isBlank()) {
+                    research.put("materialId", researchMatId);
                 }
                 research.set("snapshot", input.deepCopy().without(List.of(
                         "style", "preferences", "research", "researchReads", "synthesisDeadline")));
@@ -515,19 +526,14 @@ public final class AssistantWorker {
             String fullText = update.path("articleText").asText("");
             if (fullText.isBlank()) return;
             ObjectNode stored = tx.get("material", materialId);
-            if (stored != null && "PREVIEW".equals(stored.path("articleTextStatus").asText())) {
+            if (stored != null && update.path("expectedVersion").asInt(-1) == ver(stored)
+                    && "PREVIEW".equals(stored.path("articleTextStatus").asText())) {
                 ObjectNode upgraded = stored.deepCopy().put("articleText", fullText).put("articleTextStatus", "FULL");
                 if ("ARTICLE_PREVIEW".equals(upgraded.path("textStatus").asText())) upgraded.put("textStatus", "ARTICLE_FULL");
                 if ("AUTHOR".equals(upgraded.path("articleRole").asText()) && "PREVIEW".equals(upgraded.path("authorTextStatus").asText())) {
                     upgraded.put("authorTextStatus", "FULL");
                 }
-                ObjectNode content = object();
-                for (String key : List.of("authorId", "username", "text", "quotedText", "articleText", "sourceUrl", "textStatus",
-                        "authorTextStatus", "quotedTextStatus", "articleTextStatus", "articleRole", "publishedAt",
-                        "quotedId", "quotedAuthorId", "quotedUsername", "articleId", "articleUrl")) {
-                    if (upgraded.has(key)) content.set(key, upgraded.get(key));
-                }
-                upgraded.put("contentFingerprint", AssistantWorkflow.digest(content));
+                upgraded.put("contentFingerprint", AssistantWorkflow.materialContentFingerprint(upgraded));
                 ObjectNode saved = tx.put("material", materialId, upgraded);
                 var members = input.path("materials");
                 if (members instanceof ArrayNode arr) {

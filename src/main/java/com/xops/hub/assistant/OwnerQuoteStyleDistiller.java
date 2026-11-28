@@ -175,16 +175,17 @@ public final class OwnerQuoteStyleDistiller {
         if (tx == null || maxSamples <= 0) {
             return List.of();
         }
-        ObjectNode owner = tx.get("meta", "owner");
-        String ownerId = owner == null ? "" : owner.path("accountId").asText("").strip();
-        String ownerUsername = owner == null ? "" : owner.path("username").asText("").replaceFirst("^@+", "").strip();
+        ObjectNode owner = tx.ownerBinding();
+        if (owner == null) return List.of();
+        String ownerId = owner.path("accountId").asText("").strip();
 
         record RawCandidate(ObjectNode node, String dedupKey, boolean isQuote, long publishedAt) { }
         Map<String, RawCandidate> byId = new LinkedHashMap<>();
         Set<String> seenText = new LinkedHashSet<>();
 
         for (ObjectNode sample : tx.matching("style_sample", "textRole", "AUTHOR", 400)) {
-            if (sample == null) continue;
+            if (sample == null || (sample.hasNonNull("authorId") && !sample.path("authorId").asText().isBlank()
+                    && !ownerId.equals(sample.path("authorId").asText()))) continue;
             String raw = sample.path("text").asText("").strip();
             String cleaned = URL_PATTERN.matcher(raw).replaceAll("").replaceAll("\\s+", " ").strip();
             if (cleaned.codePointCount(0, cleaned.length()) < 4) continue;
@@ -196,14 +197,11 @@ public final class OwnerQuoteStyleDistiller {
             byId.put(idKey, new RawCandidate(sample.deepCopy(), cleaned, isQuote, sample.path("publishedAt").asLong(0L)));
         }
 
-        if (!ownerId.isBlank() || !ownerUsername.isBlank()) {
+        if (!ownerId.isBlank()) {
             for (ObjectNode hist : tx.all("history_material")) {
                 if (hist == null) continue;
                 String hAid = hist.path("authorId").asText("").strip();
-                String hUname = hist.path("username").asText("").replaceFirst("^@+", "").strip();
-                boolean isOwner = (!ownerId.isBlank() && ownerId.equals(hAid))
-                        || (!ownerUsername.isBlank() && ownerUsername.equalsIgnoreCase(hUname));
-                if (!isOwner) continue;
+                if (!ownerId.equals(hAid)) continue;
                 String kind = hist.path("kind").asText("POST").strip().toUpperCase(Locale.ROOT);
                 if (!"POST".equals(kind) && !"QUOTE".equals(kind)) continue;
                 String raw = hist.path("text").asText("").strip();

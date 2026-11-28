@@ -34,6 +34,7 @@ class AssistantWorkflowTest {
 
     @BeforeEach void start() {
         store=new AssistantStore(dir,mapper);
+        store.tx(tx -> tx.put("meta", "owner", object().put("bindingSource", "EXPLICIT").put("accountId", "A").put("username", "elidlicom")));
         worker=new AssistantWorker(store,models,sources);
     }
     @AfterEach void close(){worker.close();}
@@ -132,6 +133,313 @@ class AssistantWorkflowTest {
             AssistantWorkflow.ingest(tx,m);
             return tx.get("material",id);
         });
+    }
+
+    @Test void fastDraftAfterSplittingRejectsResearchThatIncludesTheRemovedMaterial() {
+        store.tx(tx -> {
+            String a = AssistantWorkflow.ingestDirectLinkMaterial(tx,object().put("id","101").put("text","甲方观点"));
+            String b = AssistantWorkflow.ingestDirectLinkMaterial(tx,object().put("id","202").put("text","另一件事"));
+            var versions = object().put(a,tx.get("topic",a).path("version").asInt()).put(b,tx.get("topic",b).path("version").asInt());
+            AssistantTopics.move(tx,List.of("202"),a,versions,"OWNER");
+            var stale = object().put("quality","SUPPORTED").put("draftable",true);
+            stale.set("snapshot",AssistantTopics.snapshot(tx,a,"101"));
+            stale.putArray("claims").addObject().put("claim","已移走的结论");
+            stale.putArray("evidence").addObject().put("id","removed-source");
+            tx.put("task","deep",object().put("topicId",a).put("materialId","101"));
+            tx.put("research","deep",stale);
+            tx.put("draft","old",object().put("topicId",a).put("researchId","deep").set("research",stale));
+            AssistantTopics.move(tx,List.of("202"),"split",object().put(a,tx.get("topic",a).path("version").asInt()),"OWNER");
+            var fast = AssistantWorkflow.research(tx,object().put("mode","FAST").put("materialId","101").put("clientRequestId","fast"));
+            assertThat(fast.at("/input/research/claims").toString()).contains("甲方观点").doesNotContain("已移走的结论");
+            assertThat(fast.at("/input/research/evidence").toString()).doesNotContain("removed-source");
+            return null;
+        });
+    }
+
+    @Test void adoptingHistoricalDraftRestoresItsEvidenceAndGenreInANewRevision() throws Exception {
+        store.tx(tx -> {
+            for (int i=1;i<=2;i++) {
+                var d=object().put("topicId","topic").put("materialId","101").put("text","same wording")
+                        .put("skillId",i==1?"BREAKING_FLASH":"ACTIONABLE_LIST").put("researchId","research-"+i);
+                d.putObject("research").put("summary","evidence-"+i); d.putArray("usedClaims").add("claim-"+i);
+                tx.put("draft","draft",d);
+            }
+            return null;
+        });
+        var mvc=MockMvcBuilders.standaloneSetup(new AssistantController(store,sources,worker,mock(AssistantPublishing.class),mapper))
+                .setControllerAdvice(new ApiExceptionHandler()).build();
+        var owner=session("A","elidlicom");
+        for (int retry=0;retry<2;retry++) {
+            mvc.perform(post("/api/content-assistant/drafts/draft/adopt").session(owner).header("X-Requested-With","XMLHttpRequest")
+                    .contentType("application/json").content("{\"version\":2,\"sourceVersion\":1}"))
+                    .andExpect(status().isOk()).andExpect(jsonPath("$.version").value(3))
+                    .andExpect(jsonPath("$.research.summary").value("evidence-1"))
+                    .andExpect(jsonPath("$.usedClaims[0]").value("claim-1"))
+                    .andExpect(jsonPath("$.skillId").value("BREAKING_FLASH"));
+        }
+        assertThat(store.tx(tx->tx.version("draft","draft",2)).path("skillId").asText()).isEqualTo("ACTIONABLE_LIST");
+        mvc.perform(post("/api/content-assistant/drafts/draft/adopt").session(owner).header("X-Requested-With","XMLHttpRequest")
+                .contentType("application/json").content("{\"version\":1,\"sourceVersion\":2}"))
+                .andExpect(status().isConflict());
+    }
+
+    @Test void mergingOldSourceKeepsDraftVersionsResearchAndPublicationVisibleAfterCleanup() {
+        long now = System.currentTimeMillis();
+        var ids = store.tx(tx -> {
+            String from = AssistantWorkflow.ingestDirectLinkMaterial(tx, object().put("id", "101")
+                    .put("text", "旧帖原文").put("publishedAt", now - 10 * 86_400_000L));
+            String to = AssistantWorkflow.ingestDirectLinkMaterial(tx, object().put("id", "202")
+                    .put("text", "本周新材料").put("publishedAt", now));
+            var snapshot = AssistantTopics.snapshot(tx, from, "101");
+            var research = object().put("summary", "已核实原始证据"); research.set("snapshot", snapshot);
+            tx.put("research", "research-101", research);
+            tx.put("task", "research-101", object().put("topicId", from).put("materialId", "101").put("kind", "RESEARCH").put("status", "READY"));
+            var first = tx.put("draft", "draft-101", object().put("topicId", from).put("materialId", "101")
+                    .put("researchId", "research-101").put("text", "原稿"));
+            AssistantWorkflow.saveDraft(tx, "draft-101", object().put("version", first.path("version").asInt()).put("text", "人工定稿"));
+            var receipt = object().put("draftId", "draft-101").put("draftVersion", 1).put("topicId", from).put("status", "PUBLISHED");
+            tx.put("publication", "receipt-101", receipt);
+            tx.put("observation", "post-101:24", receipt.deepCopy().put("status", "OBSERVED"));
+            return List.of(from, to);
+        });
+        var api = new AssistantController(store,sources,worker,mock(AssistantPublishing.class),mapper);
+        var move = object().put("targetTopicId",ids.get(1)); move.putArray("materialIds").add("101");
+        store.tx(tx -> { var versions=move.putObject("versions"); for(String id:ids) versions.put(id,tx.get("topic",id).path("version").asInt()); return null; });
+        api.move(move);
+        store.purgeExpiredContent(AssistantRetention.cutoffMillis(now));
+        assertThat(api.versions("draft-101")).extracting(d -> d.path("text").asText()).containsExactly("人工定稿", "原稿");
+        assertThat(store.tx(tx -> tx.get("research", "research-101")).at("/snapshot/topicId").asText()).isEqualTo(ids.get(0));
+        var detail = api.topicDetail(ids.get(1));
+        assertThat(detail.at("/drafts/0/id").asText()).isEqualTo("draft-101");
+        assertThat(detail.at("/drafts/0/topicId").asText()).isEqualTo(ids.get(1));
+        assertThat(detail.path("tasks").findValuesAsText("id")).contains("research-101");
+        assertThat(detail.at("/publications/0/draftVersion").asInt()).isEqualTo(1);
+        assertThat(detail.at("/observations/0/id").asText()).isEqualTo("post-101:24");
+        assertThat(api.topics(10,0,"","","DRAFTED","","score")).extracting(t -> t.path("id").asText()).containsExactly(ids.get(1));
+        assertThat(store.tx(tx -> tx.topicCounts(80)).drafted()).isEqualTo(1);
+
+        String finalTopic = store.tx(tx -> {
+            tx.put("draft", "other-history", object().put("topicId", ids.get(0)).put("materialId", "101").put("text", "并行稿件"));
+            String dest = AssistantWorkflow.ingestDirectLinkMaterial(tx, object().put("id", "303").put("text", "最终选题").put("publishedAt", now));
+            var versions = object().put(dest, tx.get("topic", dest).path("version").asInt())
+                    .put(ids.get(1), tx.get("topic", ids.get(1)).path("version").asInt());
+            AssistantTopics.move(tx, List.of("101", "202"), dest, versions, "OWNER");
+            return dest;
+        });
+        store.purgeExpiredContent(AssistantRetention.cutoffMillis(now));
+        assertThat(api.topicDetail(finalTopic).path("drafts").findValuesAsText("id")).contains("draft-101", "other-history");
+        assertThat(api.save("draft-101", object().put("version", 2).put("text", "再次编辑")).path("topicId").asText()).isEqualTo(finalTopic);
+        assertThat(api.versions("draft-101")).extracting(d -> d.path("text").asText()).containsExactly("再次编辑", "人工定稿", "原稿");
+    }
+
+    @Test void partialSplitFollowsTheSelectedMaterialWithoutRewritingHistoricalDraftsOrResearch() {
+        long now = System.currentTimeMillis();
+        long cutoff = AssistantRetention.cutoffMillis(now);
+        var api = new AssistantController(store,sources,worker,null,mapper);
+        var ids = store.tx(tx -> {
+            AssistantWorkflow.ingest(tx, object().put("id","101").put("text","同一条消息").put("publishedAt",cutoff - 1));
+            AssistantWorkflow.ingest(tx, object().put("id","202").put("text","同一条消息").put("publishedAt",now));
+            String original = AssistantTopics.topicOf(tx,"101");
+            assertThat(AssistantTopics.topicOf(tx,"202")).isEqualTo(original);
+            var task = AssistantWorkflow.research(tx,object().put("materialId","202").put("mode","FAST").put("clientRequestId","before-split"));
+            String researchId = task.at("/input/research/id").asText();
+            var draft = object().put("topicId",original).put("materialId","202").put("text","B 初稿")
+                    .put("researchId",researchId).put("originTaskId",task.path("id").asText());
+            tx.put("draft","draft-b",draft);
+            AssistantWorkflow.saveDraft(tx,"draft-b",object().put("version",1).put("text","B 手改版"));
+            // Older scheduled receipts and their observations identify the source through the pinned draft version.
+            var receipt = object().put("draftId","draft-b").put("draftVersion",1).put("topicId",original).put("status","PUBLISHED");
+            tx.put("publication","receipt-b",receipt);
+            tx.put("observation","observation-b",receipt.deepCopy().put("status","OBSERVED"));
+            return List.of(original,task.path("id").asText(),researchId);
+        });
+        String original = ids.get(0);
+        var move = object();
+        move.putArray("materialIds").add("202");
+        move.putObject("versions").put(original,store.tx(tx -> tx.get("topic",original)).path("version").asInt());
+        String destination = api.move(move).path("id").asText();
+        for (boolean cleaned : List.of(false,true)) {
+            if (cleaned) {
+                store.purgeExpiredContent(cutoff);
+                assertThat(store.tx(tx -> tx.get("topic",original)) == null).isTrue();
+            } else {
+                var before = api.topicDetail(original);
+                assertThat(before.path("drafts").isEmpty()).isTrue();
+                assertThat(before.path("tasks").findValuesAsText("id")).doesNotContain(ids.get(1));
+                assertThat(before.path("publications").isEmpty()).isTrue();
+                assertThat(before.path("observations").isEmpty()).isTrue();
+            }
+            var detail = api.topicDetail(destination);
+            assertThat(detail.at("/drafts/0/id").asText()).isEqualTo("draft-b");
+            assertThat(detail.at("/drafts/0/originTopicId").asText()).isEqualTo(original);
+            assertThat(detail.at("/drafts/0/topicId").asText()).isEqualTo(destination);
+            assertThat(detail.path("tasks").findValuesAsText("id")).contains(ids.get(1));
+            assertThat(api.task(ids.get(1)).path("topicId").asText()).isEqualTo(destination);
+            assertThat(detail.at("/publications/0/id").asText()).isEqualTo("receipt-b");
+            assertThat(detail.at("/observations/0/id").asText()).isEqualTo("observation-b");
+            assertThat(store.tx(tx -> tx.topics(10,0,"","","DRAFTED","score")).stream().map(t -> t.path("id").asText()).toList())
+                    .containsExactly(destination);
+            assertThat(store.tx(tx -> tx.topicCounts(80)).drafted()).isEqualTo(1);
+            assertThat(api.versions("draft-b")).extracting(d -> d.path("text").asText()).containsExactly("B 手改版","B 初稿");
+            assertThat(api.versions("draft-b")).extracting(d -> d.path("topicId").asText()).containsOnly(original);
+            assertThat(store.tx(tx -> tx.get("research",ids.get(2))).at("/snapshot/topicId").asText()).isEqualTo(original);
+        }
+        var adopted = api.adopt("draft-b",object().put("version",2).put("sourceVersion",1));
+        assertThat(adopted.path("text").asText()).isEqualTo("B 初稿");
+        assertThat(adopted.path("topicId").asText()).isEqualTo(destination);
+        assertThat(api.save("draft-b",object().put("version",3).put("text","拆分后保存")).path("topicId").asText()).isEqualTo(destination);
+        var replay = api.researchTask(object().put("materialId","202").put("mode","FAST").put("clientRequestId","before-split"));
+        assertThat(replay.path("id").asText()).isEqualTo(ids.get(1));
+        assertThat(replay.path("topicId").asText()).isEqualTo(destination);
+    }
+
+    @Test void movingLegacyOwnerLinkPreservesDraftUntilOriginalImportExpires() {
+        long now = System.currentTimeMillis();
+        long collectedAt = now - 6 * 3_600_000L;
+        int version = store.tx(tx -> {
+            var material = tx.put("material", "legacy-post", object().put("text", "旧版手动导入")
+                    .put("publishedAt", now - 10 * 86_400_000L).put("collectedAt", collectedAt));
+            tx.put("membership", "legacy-post", object().put("topicId", "legacy-topic").put("actor", "OWNER_LINK"));
+            var topic = AssistantTopics.persist(tx, "legacy-topic", AssistantTopics.fresh("legacy-topic", material));
+            tx.put("draft", "legacy-draft", object().put("text", "首稿").put("materialId", "legacy-post").put("topicId", "legacy-topic"));
+            AssistantWorkflow.saveDraft(tx, "legacy-draft", object().put("version", 1).put("text", "修改稿"));
+            return topic.path("version").asInt();
+        });
+        store.purgeExpiredContent(collectedAt);
+        assertThat(store.tx(tx -> tx.get("material", "legacy-post")).has("ownerImportedAt")).isFalse();
+        var api = new AssistantController(store, sources, worker, mock(AssistantPublishing.class), mapper);
+        var move = object();
+        move.putArray("materialIds").add("legacy-post");
+        move.putObject("versions").put("legacy-topic", version);
+        String destination = api.move(move).path("id").asText();
+        store.purgeExpiredContent(collectedAt);
+        assertThat(api.versions("legacy-draft")).extracting(row -> row.path("text").asText()).containsExactly("修改稿", "首稿");
+        assertThat(api.topicDetail(destination).path("drafts").findValuesAsText("id")).contains("legacy-draft");
+        assertThat(store.tx(tx -> tx.get("material", "legacy-post")).path("ownerImportedAt").asLong()).isEqualTo(collectedAt);
+        assertThat(store.tx(tx -> tx.get("membership", "legacy-post")).path("actor").asText()).isEqualTo("OWNER");
+        store.purgeExpiredContent(collectedAt + 1);
+        assertThat(store.tx(tx -> tx.get("material", "legacy-post")) == null).isTrue();
+        assertThat(api.versions("legacy-draft")).isEmpty();
+    }
+
+    @Test void changingProviderBlocksOldWorkUntilRetryAndKeepsFingerprintBoundToTheRetriedProvider() {
+        var controller = new AssistantController(store, sources, worker, null, mapper);
+        controller.updateSettings(object().put("provider", "minimax"));
+        ingest("material", "模型切换测试素材");
+        var request = object().put("materialId", "material").put("clientRequestId", "original");
+        var old = controller.researchTask(request);
+        String id = old.path("id").asText();
+        var oldAttempt = claim(id);
+        controller.updateSettings(object().put("provider", "deepseek"));
+        assertThat(controller.task(id).path("status").asText()).isEqualTo("BLOCKED_CONFIG");
+        worker.execute(oldAttempt);
+        verifyNoInteractions(models);
+        assertThat(controller.transitionTask(id, "retry").path("status").asText()).isEqualTo("QUEUED");
+        var duplicate = controller.researchTask(request.deepCopy().put("clientRequestId", "under-new-provider"));
+        assertThat(duplicate.path("id").asText()).isEqualTo(id);
+        controller.updateSettings(object().put("provider", "minimax"));
+        var back = controller.researchTask(request.deepCopy().put("clientRequestId", "back-to-first-provider"));
+        assertThat(back.path("id").asText()).isNotEqualTo(id);
+        assertThat(store.tx(t -> t.get("task", back.path("id").asText())).path("settings").path("provider").asText()).isEqualTo("minimax");
+        assertThat(controller.researchTask(request).path("id").asText()).isEqualTo(id);
+    }
+
+    @Test void whenAnOldXPostIsImportedTheOwnerCanResearchItThroughDashboardCleanup() {
+        long now = System.currentTimeMillis();
+        long postTime = now - java.time.Duration.ofDays(10).toMillis();
+        var material = object().put("id", "1234567").put("username", "source").put("text", "historical source")
+                .put("textStatus", "TEXT_ONLY").put("sourceUrl", "https://x.com/source/status/1234567").put("publishedAt", postTime);
+        when(sources.fetchTweetMaterialById("1234567")).thenReturn(material);
+        var controller = new AssistantController(store, sources, worker, null, mapper);
+        var request = object().put("url", "https://x.com/source/status/1234567").put("mode", "FAST").put("clientRequestId", "manual-import");
+        String taskId = controller.researchLink(request).path("task").path("id").asText();
+        String researchId = store.tx(tx -> tx.get("task", taskId)).path("input").path("research").path("id").asText();
+        assertThat(store.purgeExpiredContent(AssistantRetention.cutoffMillis(now))).isEmpty();
+        assertThat(controller.task(taskId).path("status").asText()).isEqualTo("QUEUED");
+        assertThat(store.tx(tx -> tx.get("research", researchId)).path("draftable").asBoolean()).isTrue();
+        assertThat(store.tx(tx -> tx.get("material", "1234567")).path("publishedAt").asLong()).isEqualTo(postTime);
+        assertThat(controller.researchLink(request).path("task").path("id").asText()).isEqualTo(taskId);
+        assertThat(store.purgeExpiredContent(now + java.time.Duration.ofDays(5).toMillis())).contains(taskId);
+    }
+
+    @Test void aLegacyShortLinkRetainsCorrectionsOnlyForItsOriginalLandingPage() {
+        var shortUrl = java.net.URI.create("https://news.example/latest");
+        var first = java.net.URI.create("https://garden.example/report");
+        var second = java.net.URI.create("https://glacier.example/survey");
+        var page = new TextSourceReader.ReadResult(shortUrl,first,"text/html","温室报告","原文为 50 元","body",Instant.now(),TextSourceReader.Status.READ,"");
+        var correction = new TextSourceReader.ReadResult(shortUrl,first,"text/html","温室报告","更正为 20 元","body",Instant.now(),TextSourceReader.Status.READ,"");
+        var replacement = new TextSourceReader.ReadResult(shortUrl,second,"text/html","冰川报告","冰川调查的新证据","body",Instant.now(),TextSourceReader.Status.READ,"");
+        when(models.readPublicUrl(shortUrl)).thenReturn(correction,replacement);
+        var controller = new AssistantController(store,sources,worker,null,mapper);
+        controller.setIntelligence(models);
+        String oldKey = "link-" + AssistantWorkflow.digest(mapper.valueToTree(shortUrl.toString())).substring(0,20);
+        var oldPage = AssistantWorkflow.buildWebLinkMaterial(shortUrl.toString(),page,System.currentTimeMillis()).put("id",oldKey);
+        String topic = store.tx(tx -> {
+            var origin = AssistantWorkflow.ingestDirectLinkMaterial(tx,oldPage);
+            var draft = object().put("topicId",origin).put("materialId",oldKey).put("text","旧温室稿");
+            draft.putObject("research").set("snapshot",AssistantTopics.snapshot(tx,origin,oldKey));
+            tx.put("draft","historical",draft);
+            return origin;
+        });
+        var request = object().put("url",shortUrl.toString()).put("mode","FAST");
+        var corrected = controller.researchLink(request.deepCopy().put("clientRequestId","correction"));
+        assertThat(corrected.path("materialId").asText()).isEqualTo(oldKey);
+        assertThat(corrected.path("topicId").asText()).isEqualTo(topic);
+        var changed = controller.researchLink(request.deepCopy().put("clientRequestId","replacement"));
+        assertThat(changed.path("materialId").asText()).isNotEqualTo(oldKey);
+        store.tx(tx -> {
+            assertThat(tx.all("material")).hasSize(2);
+            var edit = AssistantWorkflow.optimize(tx,"historical",object().put("version",1).put("instruction","核实定价").put("clientRequestId","edit"));
+            assertThat(edit.at("/input/materials/0/articleText").asText()).isEqualTo("更正为 20 元");
+            assertThat(edit.path("input").toString()).doesNotContain("冰川调查的新证据");
+            return null;
+        });
+    }
+
+    @Test void reimportingUnchangedWebPagesKeepsLegacyDraftEvidenceAndReusesTheAcceptedTask() {
+        long now = System.currentTimeMillis();
+        long cutoff = AssistantRetention.cutoffMillis(now);
+        var url = java.net.URI.create("https://example.org/analysis");
+        var read = new TextSourceReader.ReadResult(url,url,"text/html","文章标题","同一段正文","body",Instant.now(),TextSourceReader.Status.READ,"");
+        var changed = new TextSourceReader.ReadResult(url,url,"text/html","文章标题","作者更正了正文","body",Instant.now(),TextSourceReader.Status.READ,"");
+        when(models.readPublicUrl(url)).thenReturn(read,read,changed,changed);
+        var controller = new AssistantController(store,sources,worker,null,mapper);
+        controller.setIntelligence(models);
+        var legacyMaterial = AssistantWorkflow.buildWebLinkMaterial(url.toString(),read,cutoff - 10);
+        assertThat(legacyMaterial.has("publishedAt")).isFalse();
+        String mid = legacyMaterial.path("id").asText();
+        String originalTask = store.tx(tx -> {
+            var legacy = tx.put("material",mid,legacyMaterial.put("publishedAt",cutoff - 10)
+                    .put("ownerImportedAt",cutoff - 10).put("contentFingerprint","legacy-fetch-fingerprint"));
+            tx.put("membership",mid,object().put("topicId","web-topic").put("actor","OWNER_LINK"));
+            AssistantTopics.persist(tx,"web-topic",AssistantTopics.fresh("web-topic",legacy).put("summary",read.text()));
+            var task = AssistantWorkflow.research(tx,object().put("materialId",mid).put("mode","FAST").put("clientRequestId","old-page"));
+            var research = (ObjectNode) task.at("/input/research").deepCopy();
+            // Even older revisions reported a different fetch time and checksum for these same words.
+            ((ObjectNode) research.at("/snapshot/materials/0")).put("publishedAt",cutoff - 90).put("contentFingerprint","earlier-fetch");
+            var draft = object().put("materialId",mid).put("topicId","web-topic").put("text","已保存正文");
+            draft.set("research",research);
+            tx.put("draft","web-draft",draft);
+            return task.path("id").asText();
+        });
+        var request = object().put("url",url.toString()).put("mode","FAST");
+        for (String tab : List.of("tab-1","tab-2")) {
+            var response = controller.researchLink(request.deepCopy().put("clientRequestId",tab));
+            assertThat(response.at("/task/id").asText()).isEqualTo(originalTask);
+        }
+        store.purgeExpiredContent(cutoff);
+        assertThat(store.tx(tx -> tx.versions("material",mid)).size()).isEqualTo(1);
+        assertThat(store.tx(tx -> tx.matching("task","kind","DRAFT",-1)).size()).isEqualTo(1);
+        assertThat(store.tx(tx -> tx.all("research")).size()).isEqualTo(1);
+        assertThat(controller.topicDetail("web-topic").at("/drafts/0/evidenceChanges").isEmpty()).isTrue();
+
+        var updated = controller.researchLink(request.deepCopy().put("clientRequestId","corrected"));
+        assertThat(updated.at("/task/id").asText()).isNotEqualTo(originalTask);
+        assertThat(store.tx(tx -> tx.versions("material",mid)).size()).isEqualTo(2);
+        assertThat(controller.topicDetail("web-topic").at("/drafts/0/evidenceChanges/0/type").asText()).isEqualTo("MATERIAL_TEXT_CHANGED");
+        var rerun = controller.researchLink(request.deepCopy().put("regenerate",true).put("clientRequestId","explicit-rerun"));
+        assertThat(rerun.at("/task/id").asText()).isNotEqualTo(updated.at("/task/id").asText());
+        assertThat(store.tx(tx -> tx.versions("material",mid)).size()).isEqualTo(2);
     }
 
     @Test void repeatedInputsReuseWorkAndResearchSurvivesDraftingAndBackup() throws Exception {
@@ -473,7 +781,7 @@ class AssistantWorkflowTest {
     @Test void waitingStyleTaskUnblocksOnFailureZeroSamplesOrManualStyleRevision() throws Exception {
         ingest("p", "原创事件素材");
         store.tx(t -> {
-            t.put("meta", "owner", object().put("accountId", "A").put("username", "elidlicom"));
+            t.put("meta", "owner", object().put("bindingSource", "EXPLICIT").put("accountId", "A").put("username", "elidlicom"));
             t.put("meta", "settings", AssistantWorkflow.settings(t).put("model", "fixture").put("contextTokens", 16000));
             return null;
         });
@@ -611,7 +919,7 @@ class AssistantWorkflowTest {
 
     @Test void pastedWebLinkAndXTweetLinkRunResearchAndGenerateTweetDrafts() throws Exception {
         store.tx(tx -> {
-            tx.put("meta", "owner", object().put("accountId", "A").put("username", "elidlicom"));
+            tx.put("meta", "owner", object().put("bindingSource", "EXPLICIT").put("accountId", "A").put("username", "elidlicom"));
             tx.put("meta", "settings", AssistantWorkflow.settings(tx)
                     .put("enabled", true)
                     .put("modelEnabled", true)

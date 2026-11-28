@@ -88,6 +88,7 @@ public final class AssistantController {
                                 @RequestParam(defaultValue="") String tag, @RequestParam(defaultValue="score") String sort,
                                 HttpServletRequest request) {
         var owner=(AuthenticatedXUser)request.getAttribute("assistantOwner");
+        if (autoRepostService != null) autoRepostService.reconcileAcceptedReceipts();
         purgeExpired();
         publishing.reconcile(owner.id());
         int size=limit(limit), start=Math.max(0,offset);
@@ -167,25 +168,52 @@ public final class AssistantController {
             d.put("topicHasNext",topics.size()>size);
             d.set("topics",mapper.valueToTree(topics.subList(0,Math.min(size,topics.size()))));
             d.set("materials",mapper.valueToTree(materialPage(tx,size,start,"","","","updated")));
-            var tasks=d.putArray("tasks"); tx.page("task",size,start).forEach(task->tasks.add(publicTask(task)));
+            var tasks=d.putArray("tasks"); tx.topicRecords("task",null,size,start).forEach(task->tasks.add(publicTask(task)));
             var drafts=d.putArray("drafts");
-            for(var draft:tx.page("draft",size,start)) {
+            for(var draft:tx.topicRecords("draft",null,size,start)) {
                 var changes=AssistantEvidence.changes(tx,draft);
                 draft.put("sourcesChanged",changes.path("sourcesChanged").asBoolean());
                 draft.set("evidenceChanges",changes.path("evidenceChanges"));
-                drafts.add(DraftNumberChanges.withReport(tx,draft));
+                drafts.add(AssistantPublishing.withDraftSourcePost(tx,DraftNumberChanges.withReport(tx,draft)));
             }
             d.set("writingSkills", mapper.valueToTree(ViralWritingSkills.presets()));
             d.set("style",Optional.ofNullable(tx.get("meta","style")).orElse(object()));
             d.set("preferences",preferences(tx));
-            d.set("publications",mapper.valueToTree(tx.page("publication",size,start)));
+            d.set("publications",mapper.valueToTree(tx.topicRecords("publication",null,size,start)));
+            List<ObjectNode> unconfirmed = new ArrayList<>(tx.publicationsByStatus("UNCERTAIN").stream().filter(row -> AssistantPublishing.canVerify(row) && tx.publicationOwnerMatches(row, owner.id())).toList());
+            for (var row : tx.recordsByStatus("scheduled_delivery", "UNCERTAIN")) {
+                if (tx.publicationOwnerMatches(row, owner.id())) unconfirmed.add(row.put("scheduledDelivery", true));
+            }
+            for (String table : List.of("auto_repost", "auto_rewrite")) {
+                for (ObjectNode row : tx.recordsByStatus(table, "UNCERTAIN")) {
+                    if (row.path("manual").asBoolean() || !tx.publicationOwnerMatches(row, owner.id())) continue;
+                    unconfirmed.add(row.put("autoKind", "auto_rewrite".equals(table) ? "REWRITE" : "REPOST"));
+                }
+            }
+            d.set("unconfirmedPublications",mapper.valueToTree(unconfirmed));
+            var retryable = d.putArray("retryableAutoPublications");
+            for (String table : List.of("auto_repost", "auto_rewrite")) {
+                boolean rewrite = "auto_rewrite".equals(table);
+                for (ObjectNode row : tx.retryableAutomaticRecords(table)) {
+                    if (!tx.publicationOwnerMatches(row, owner.id())) continue;
+                    if (rewrite) {
+                        long now = System.currentTimeMillis();
+                        ObjectNode material = tx.rewriteMaterial(row.path("materialId").asText(row.path("id").asText()), now);
+                        boolean canGenerate = AutoRepostService.canReassessRewrite(tx, material, now);
+                        boolean hasText = !row.path("rewrittenText").asText().isBlank();
+                        if (!canGenerate && (!hasText || row.path("rewriteSourceNeedsReview").asBoolean() || "JUDGE_FAILED".equals(row.path("status").asText()))) continue;
+                        row.put("canReassess", canGenerate && hasText);
+                    }
+                    retryable.add(row.put("autoKind", rewrite ? "REWRITE" : "REPOST"));
+                }
+            }
             List<ObjectNode> combinedAutoFeed = new ArrayList<>();
-            for (ObjectNode r : tx.page("auto_repost", 20, 0)) {
+            for (ObjectNode r : tx.ownerActivity("auto_repost", owner.id(), 20)) {
                 ObjectNode copy = r.deepCopy();
                 if (!copy.has("autoKind")) copy.put("autoKind", "REPOST");
                 combinedAutoFeed.add(copy);
             }
-            List<ObjectNode> rewrites = tx.page("auto_rewrite", 20, 0);
+            List<ObjectNode> rewrites = tx.ownerActivity("auto_rewrite", owner.id(), 20);
             for (ObjectNode rw : rewrites) {
                 ObjectNode copy = rw.deepCopy();
                 copy.put("autoKind", "REWRITE");
@@ -200,7 +228,7 @@ public final class AssistantController {
                             Math.max(n.path("evaluatedAt").asLong(0L), n.path("createdAt").asLong(0L))))).reversed());
             d.set("autoReposts", mapper.valueToTree(combinedAutoFeed.stream().limit(20).toList()));
             d.set("autoRewrites", mapper.valueToTree(rewrites));
-            d.set("observations",mapper.valueToTree(tx.page("observation",size,start)));
+            d.set("observations",mapper.valueToTree(tx.topicRecords("observation",null,size,start)));
             d.set("followers",mapper.valueToTree(tx.page("followers",size,start)));
             return d;
         });
@@ -217,8 +245,10 @@ public final class AssistantController {
 
     @PostMapping("/settings")
     public ObjectNode updateSettings(@RequestBody ObjectNode body) {
-        return store.tx(tx->{
+        var interrupted = new LinkedHashMap<String,String>();
+        ObjectNode updated = store.tx(tx->{
             var config=settings(tx);
+            var previous=config.deepCopy();
             if(body.has("version")) expect(config,body);
             if(body.has("provider")) {
                 AssistantConnection.switchProvider(tx,config,body.path("provider").asText(""),environment);
@@ -289,6 +319,7 @@ public final class AssistantController {
                 config.set("scoreWeights", mapper.valueToTree(weights));
             }
             ObjectNode saved = tx.put("meta","settings",config);
+            blockChangedProviderTasks(tx, previous, saved, interrupted);
             if (autoRepostService != null
                     && (body.has("postPolishEnabled") || body.has("postPolishPrompt")
                         || body.has("moduleConfigs") || body.has("apiKeys"))) {
@@ -298,6 +329,8 @@ public final class AssistantController {
                     .put("postPolishEnabled", AssistantWorkflow.isPostPolishEnabled(saved))
                     .put("postPolishPrompt", AssistantWorkflow.resolvePostPolishPrompt(saved));
         });
+        if (worker != null) interrupted.forEach(worker::interruptAttempt);
+        return updated;
     }
 
     @PostMapping("/polish-prompt")
@@ -485,27 +518,37 @@ public final class AssistantController {
     }
 
     @PostMapping("/sources/{sourceKey}/timeline")
-    public ObjectNode previewSourceTimeline(@PathVariable String sourceKey, @RequestBody(required = false) ObjectNode body) {
+    public ObjectNode previewSourceTimeline(@PathVariable String sourceKey, @RequestBody(required = false) ObjectNode body,
+                                            @RequestAttribute("assistantOwner") AuthenticatedXUser owner) {
         if (autoRepostService == null) {
             throw new XDataProviderException(503, "自动引用转发预览服务未启用");
         }
-        return autoRepostService.authorTimeline(sourceKey, body == null ? object() : body);
+        return checkedQuotePreview(owner, autoRepostService.authorTimeline(sourceKey, body == null ? object() : body));
     }
 
     @PostMapping("/sources/{sourceKey}/evaluate-once")
-    public ObjectNode evaluateSourceOnce(@PathVariable String sourceKey, @RequestBody(required = false) ObjectNode body) {
+    public ObjectNode evaluateSourceOnce(@PathVariable String sourceKey, @RequestBody(required = false) ObjectNode body,
+                                         @RequestAttribute("assistantOwner") AuthenticatedXUser owner) {
         if (autoRepostService == null) {
             throw new XDataProviderException(503, "自动引用转发预览服务未启用");
         }
-        return autoRepostService.evaluateAuthorOnce(sourceKey, body == null ? object() : body);
+        return checkedQuotePreview(owner, autoRepostService.evaluateAuthorOnce(sourceKey, body == null ? object() : body));
     }
 
     @PostMapping("/sources/{sourceKey}/repost-preview")
-    public ObjectNode previewSourceRepost(@PathVariable String sourceKey, @RequestBody(required = false) ObjectNode body) {
+    public ObjectNode previewSourceRepost(@PathVariable String sourceKey, @RequestBody(required = false) ObjectNode body,
+                                          @RequestAttribute("assistantOwner") AuthenticatedXUser owner) {
         if (autoRepostService == null) {
             throw new XDataProviderException(503, "自动引用转发预览服务未启用");
         }
-        return autoRepostService.previewRepost(sourceKey, body == null ? object() : body);
+        return checkedQuotePreview(owner, autoRepostService.previewRepost(sourceKey, body == null ? object() : body));
+    }
+
+    private ObjectNode checkedQuotePreview(AuthenticatedXUser owner, ObjectNode result) {
+        String accountId = com.xops.hub.model.AuthorIdentity.trustedId(result.at("/owner/accountId").asText(""));
+        if (!owner.id().equals(accountId) || !store.isOwner(owner.id()))
+            throw new XDataProviderException(403, "当前发布账号绑定已变更");
+        return result;
     }
 
     @PostMapping("/sources/{sourceKey}/rewrite-preview")
@@ -536,7 +579,7 @@ public final class AssistantController {
                 && (!b.path("url").asText("").isBlank() || !b.path("link").asText("").isBlank())) {
             return (ObjectNode) researchLink(b).path("task");
         }
-        return publicTask(store.tx(tx->research(tx,b)));
+        return publicTask(store.tx(tx->tx.displayTopic("task",research(tx,b))));
     }
 
     @PostMapping("/research-link")
@@ -552,7 +595,7 @@ public final class AssistantController {
         boolean regenerate = body.path("regenerate").asBoolean(false);
         String replayKind = fastMode ? "LINK_DRAFT" : "LINK_RESEARCH";
 
-        ObjectNode replayed = store.tx(tx -> replay(tx, replayKind, body));
+        ObjectNode replayed = store.tx(tx -> tx.displayTopic("task",replay(tx, replayKind, body)));
         if (replayed != null) {
             ObjectNode pub = publicTask(replayed);
             return object()
@@ -595,15 +638,16 @@ public final class AssistantController {
         String bodyDigest = digest(body);
         String reqKey = field(body, "clientRequestId");
         return store.tx(tx -> {
-            String topicId = ingestDirectLinkMaterial(tx, resolvedMaterial);
-            String materialId = resolvedMaterial.path("id").asText("");
+            ObjectNode material = retainWebImportKey(tx, resolvedMaterial, parsed.normalizedUrl());
+            String topicId = ingestDirectLinkMaterial(tx, material);
+            String materialId = material.path("id").asText("");
             ObjectNode researchReq = body.deepCopy().put("materialId", materialId);
             researchReq.remove(List.of("url", "link"));
             ObjectNode task = research(tx, researchReq);
             tx.put("accept", replayKind + "/" + reqKey, object()
                     .put("digest", bodyDigest)
                     .put("taskId", task.path("id").asText("")));
-            ObjectNode pubTask = publicTask(task);
+            ObjectNode pubTask = publicTask(tx.displayTopic("task",task));
             ObjectNode topic = tx.get("topic", topicId);
             return object()
                     .put("topicId", topicId)
@@ -623,11 +667,21 @@ public final class AssistantController {
 
     @PostMapping("/auto-reposts/{materialId}/retry")
     @ResponseStatus(HttpStatus.ACCEPTED)
-    public ObjectNode retryAutoRepost(@PathVariable String materialId) {
+    public ObjectNode retryAutoRepost(@PathVariable String materialId,
+            @RequestParam(required = false) AutoRepostService.AutoPublishMode mode,
+            @RequestParam(defaultValue = "false") boolean reassess) {
         if (autoRepostService == null) {
             throw new XDataProviderException(503, "自动引用转发服务未启用");
         }
-        return autoRepostService.retry(materialId);
+        return reassess ? autoRepostService.retry(materialId, mode, true) : autoRepostService.retry(materialId, mode);
+    }
+
+    @PostMapping("/auto-reposts/{materialId}/verify")
+    public ObjectNode verifyAutomaticPublication(@PathVariable String materialId, @RequestParam AutoRepostService.AutoPublishMode mode,
+                                                @RequestBody ObjectNode decision, HttpServletRequest request) {
+        if (autoRepostService == null) throw new XDataProviderException(503, "自动发布服务未启用");
+        var owner = (AuthenticatedXUser) request.getAttribute("assistantOwner");
+        return autoRepostService.verifyAutomaticPublication(owner.id(), materialId, mode, decision);
     }
 
     @PostMapping("/capabilities/verify") @ResponseStatus(HttpStatus.ACCEPTED)
@@ -639,19 +693,22 @@ public final class AssistantController {
     @PostMapping("/history/retry")
     public ObjectNode retryHistory() { return sources.retryHistoryNow(); }
 
-    @GetMapping("/tasks/{id}") public ObjectNode task(@PathVariable String id) {return publicTask(store.tx(t->AssistantTopics.required(t,"task",id)));}
+    @GetMapping("/tasks/{id}") public ObjectNode task(@PathVariable String id) {return publicTask(store.tx(t->t.displayTopic("task",AssistantTopics.required(t,"task",id))));}
     @PostMapping("/tasks/{id}/{action}") public ObjectNode transitionTask(@PathVariable String id,@PathVariable String action) {
-        var task=store.tx(t->transition(t,id,action));
+        var task=store.tx(t->t.displayTopic("task",transition(t,id,action)));
         if(action.equals("cancel")) worker.interrupt(id);
         return publicTask(task);
     }
     @PostMapping("/drafts/{id}/save") public ObjectNode save(@PathVariable String id,@RequestBody ObjectNode b) {
-        return store.tx(tx->saveDraft(tx,id,b));
+        return store.tx(tx->AssistantPublishing.withDraftSourcePost(tx,tx.displayTopic("draft",saveDraft(tx,id,b))));
+    }
+    @PostMapping("/drafts/{id}/adopt") public ObjectNode adopt(@PathVariable String id,@RequestBody ObjectNode body) {
+        return store.tx(tx -> AssistantPublishing.withDraftSourcePost(tx,tx.displayTopic("draft",adoptDraft(tx,id,body))));
     }
     @PostMapping("/drafts/{id}/optimize") @ResponseStatus(HttpStatus.ACCEPTED)
-    public ObjectNode improve(@PathVariable String id,@RequestBody ObjectNode b) {return publicTask(store.tx(tx->optimize(tx,id,b)));}
+    public ObjectNode improve(@PathVariable String id,@RequestBody ObjectNode b) {return publicTask(store.tx(tx->tx.displayTopic("task",optimize(tx,id,b))));}
     @GetMapping("/drafts/{id}/versions") public List<ObjectNode> versions(@PathVariable String id) {
-        return store.tx(tx->tx.versions("draft",id).stream().map(draft->DraftNumberChanges.withReport(tx,draft)).toList());
+        return store.tx(tx->tx.versions("draft",id).stream().map(draft->AssistantPublishing.withDraftSourcePost(tx,DraftNumberChanges.withReport(tx,draft))).toList());
     }
     @PostMapping("/drafts/{id}/update-scheduled")
     public Object update(@PathVariable String id,@RequestBody ObjectNode b,HttpServletRequest r) {
@@ -667,6 +724,18 @@ public final class AssistantController {
     public ObjectNode confirm(@PathVariable String id, @RequestBody(required=false) ObjectNode body) {
         return store.tx(tx->confirmTopic(tx, id, body == null ? object() : body));
     }
+
+    @PostMapping("/publications/{id}/verify")
+    public ObjectNode verifyPublication(@PathVariable String id, @RequestBody ObjectNode body, HttpServletRequest r) {
+        var owner = (AuthenticatedXUser) r.getAttribute("assistantOwner");
+        if (autoRepostService != null) autoRepostService.requireReceiptReady(id);
+        return publishing.verifyPublication(owner.id(), id, body);
+    }
+    @PostMapping("/scheduled-publications/{id}/verify")
+    public ObjectNode verifyScheduledPublication(@PathVariable String id, @RequestBody ObjectNode body, HttpServletRequest r) {
+        var owner = (AuthenticatedXUser) r.getAttribute("assistantOwner");
+        return publishing.verifyScheduledPublication(owner.id(), id, body);
+    }
     @GetMapping("/topics/{id}/detail")
     public ObjectNode topicDetail(@PathVariable String id) {
         return store.tx(tx->{
@@ -681,14 +750,16 @@ public final class AssistantController {
             enrichTopicAuthors(tx, topic, sourceIndex);
             result.set("topic",topic);
             var tasks=result.putArray("tasks");
-            tx.matching("task","topicId",id,-1).forEach(t->tasks.add(publicTask(t)));
-            var drafts=tx.matching("draft","topicId",id,-1);
+            tx.topicRecords("task",id,-1,0).forEach(t->tasks.add(publicTask(t)));
+            result.set("publications",mapper.valueToTree(tx.topicDetailPublications(id)));
+            result.set("observations",mapper.valueToTree(tx.topicRecords("observation",id,-1,0)));
+            var drafts=tx.topicRecords("draft",id,-1,0);
             drafts.sort(Comparator.comparingLong((ObjectNode d)->d.path("updatedAt").asLong()).reversed());
             for(var draft:drafts) {
                 var changes=AssistantEvidence.changes(tx,draft);
                 draft.put("sourcesChanged",changes.path("sourcesChanged").asBoolean());
                 draft.set("evidenceChanges",changes.path("evidenceChanges"));
-                DraftNumberChanges.withReport(tx,draft);
+                AssistantPublishing.withDraftSourcePost(tx,DraftNumberChanges.withReport(tx,draft));
             }
             result.set("drafts",mapper.valueToTree(drafts));
             return result;

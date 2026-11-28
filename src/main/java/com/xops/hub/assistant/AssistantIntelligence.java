@@ -238,21 +238,25 @@ public final class AssistantIntelligence {
 
         ObjectNode workingInput = input.deepCopy();
         ObjectNode articleBackfills = backfillArticlePreviews(workingInput, deadline - readReserve);
-        var topic = researchTopic(workingInput);
+        var topic = researchTargetTopic(workingInput);
+        String selectedMatId = workingInput.path("selectedMaterialId").asText(workingInput.path("materialId").asText("")).strip();
 
         Map<String, TextModelClient.SearchResult> seedTargets = new LinkedHashMap<>();
         JsonNode previous = workingInput.path("previousResearch");
-        // Reserve at least half of the source budget for new search results.
-        for (JsonNode read : previous.path("sourceReads")) {
-            if (seedTargets.size() == 4) break;
-            if (!"READ".equals(read.path("status").asText())) continue;
-            String url = read.path("requestedUrl").asText(read.path("url").asText());
-            String key = AssistantEvidence.normalizedUrl(url);
-            if (!key.isBlank()) seedTargets.putIfAbsent(key, new TextModelClient.SearchResult(
-                    "", URI.create(url), read.path("title").asText(), "", read.path("publishedAt").asText()));
+        String prevMatId = AssistantWorkflow.researchMaterialId(previous);
+        // Reserve at least half of the source budget for new search results, strictly scoped to the same article.
+        if (selectedMatId.isBlank() || prevMatId.isBlank() || selectedMatId.equals(prevMatId)) {
+            for (JsonNode read : previous.path("sourceReads")) {
+                if (seedTargets.size() == 4) break;
+                if (!"READ".equals(read.path("status").asText())) continue;
+                String url = read.path("requestedUrl").asText(read.path("url").asText());
+                String key = AssistantEvidence.normalizedUrl(url);
+                if (!key.isBlank()) seedTargets.putIfAbsent(key, new TextModelClient.SearchResult(
+                        "", URI.create(url), read.path("title").asText(), "", read.path("publishedAt").asText()));
+            }
         }
         Set<String> preReadUserLinkUrls = new LinkedHashSet<>();
-        for (JsonNode material : workingInput.path("materials")) {
+        for (JsonNode material : materialsForSelectedTarget(workingInput)) {
             if ("USER_LINK".equals(material.path("sourceIdentity").asText())) {
                 String primaryKey = AssistantEvidence.normalizedUrl(material.path("sourceUrl").asText(""));
                 if (!primaryKey.isBlank()) preReadUserLinkUrls.add(primaryKey);
@@ -452,7 +456,7 @@ public final class AssistantIntelligence {
     private ObjectNode backfillArticlePreviews(ObjectNode workingInput, long deadline) {
         ObjectNode backfilled = mapper.createObjectNode();
         if (articleResolver == null) return backfilled;
-        for (JsonNode node : workingInput.path("materials")) {
+        for (JsonNode node : materialsForSelectedTarget(workingInput)) {
             if (!(node instanceof ObjectNode material)) continue;
             boolean preview = "PREVIEW".equals(material.path("articleTextStatus").asText())
                     || "ARTICLE_PREVIEW".equals(material.path("textStatus").asText());
@@ -563,7 +567,7 @@ public final class AssistantIntelligence {
         var evidence = new ArrayList<>(list(output.path("evidence"), ContentAssistantModelTasks.SourceEvidence.class));
         if (output.path("materialEvidence").isArray())
             evidence.addAll(list(output.path("materialEvidence"), ContentAssistantModelTasks.SourceEvidence.class));
-        var value = tasks.synthesizeResearch(binding, researchTopic(input), evidence, deadline);
+        var value = tasks.synthesizeResearch(binding, researchTargetTopic(input), evidence, deadline);
         output.remove(List.of("pendingSynthesis", "id", "version", "updatedAt", "snapshot"));
         if (value.value() == null) {
             output.put("quality", "PARTIAL").put("synthesisError", value.error());
@@ -740,12 +744,17 @@ public final class AssistantIntelligence {
         }
     }
 
-    private static ContentAssistantModelTasks.WritingContext writingContext(ObjectNode input) {
+    private ContentAssistantModelTasks.WritingContext writingContext(ObjectNode input) {
         if (input == null) return ContentAssistantModelTasks.WritingContext.EMPTY;
+        String selectedId = input.path("selectedMaterialId").asText(input.path("materialId").asText("")).strip();
+        List<JsonNode> targetMaterials = materialsForSelectedTarget(input);
+        var isolatedMaterials = mapper.createArrayNode();
+        targetMaterials.forEach(isolatedMaterials::add);
+        JsonNode isolatedTopic = isolatedTopicForWriting(input.path("topic"), input.path("materials"), targetMaterials);
         return new ContentAssistantModelTasks.WritingContext(
-                input.path("topic"),
-                input.path("materials"),
-                input.path("selectedMaterialId").asText(input.path("materialId").asText("")),
+                isolatedTopic,
+                isolatedMaterials,
+                selectedId,
                 input.path("research"),
                 input.path("baseAngleInstruction").asText("")
         );
@@ -1049,6 +1058,108 @@ public final class AssistantIntelligence {
             case RESEARCH,RESEARCH_SYNTHESIS,DRAFT,OPTIMIZE,OPTIMIZE_REVISION -> 6000;
             case VERIFY -> 2000;
         };
+    }
+
+    private static List<JsonNode> materialsForSelectedTarget(JsonNode input) {
+        List<JsonNode> target = new ArrayList<>();
+        if (input == null) return target;
+        String selected = input.path("selectedMaterialId").asText(input.path("materialId").asText("")).strip();
+        JsonNode mats = input.path("materials");
+        if (mats.isArray()) {
+            for (JsonNode m : mats) {
+                if (m == null || !m.isObject()) continue;
+                if (!selected.isBlank() && selected.equals(m.path("id").asText(""))) {
+                    target.add(m);
+                }
+            }
+            if (target.isEmpty() && selected.isBlank()) {
+                mats.forEach(target::add);
+            }
+        }
+        return target;
+    }
+
+    private JsonNode isolatedTopicForWriting(JsonNode topic, JsonNode allMaterials, List<JsonNode> targetMaterials) {
+        if (topic == null || !topic.isObject()) return topic;
+        boolean multiMaterialTopic = (allMaterials != null && allMaterials.size() > 1)
+                || topic.path("materialIds").size() > 1;
+        if (!multiMaterialTopic) return topic;
+        ObjectNode cleanTopic = mapper.createObjectNode();
+        if (!topic.path("id").asText("").isBlank()) {
+            cleanTopic.put("id", topic.path("id").asText(""));
+        }
+        if (!targetMaterials.isEmpty()) {
+            JsonNode primary = targetMaterials.get(0);
+            String rawHeadline = !primary.path("authorName").asText("").isBlank()
+                    && "USER_LINK".equals(primary.path("sourceIdentity").asText(""))
+                    ? primary.path("authorName").asText("").strip()
+                    : AssistantTopics.text(primary).replaceAll("\\s+", " ").strip();
+            if (!rawHeadline.isBlank()) {
+                int cp = rawHeadline.codePointCount(0, rawHeadline.length());
+                String capped = cp <= 120 ? rawHeadline : rawHeadline.substring(0, rawHeadline.offsetByCodePoints(0, 120));
+                cleanTopic.put("title", capped);
+            }
+        }
+        return cleanTopic;
+    }
+
+    private ContentAssistantModelTasks.TopicText researchTargetTopic(ObjectNode input) {
+        JsonNode topic = input.path("topic");
+        String selected = input.path("selectedMaterialId").asText(input.path("materialId").asText("")).strip();
+        List<JsonNode> targetMaterials = materialsForSelectedTarget(input);
+        if (targetMaterials.isEmpty() && input.path("materials").size() > 0) {
+            targetMaterials = List.of(input.path("materials").path(0));
+        }
+        List<String> texts = new ArrayList<>();
+        JsonNode selectedMaterial = targetMaterials.isEmpty() ? mapper.createObjectNode() : targetMaterials.get(0);
+        for (JsonNode material : targetMaterials) {
+            StringBuilder materialText = new StringBuilder("Material ").append(material.path("id").asText("unknown"));
+            if (!material.path("username").asText("").isBlank()) materialText.append(" by @").append(material.path("username").asText());
+            if (!material.path("sourceUrl").asText("").isBlank()) materialText.append(" source ").append(material.path("sourceUrl").asText());
+            for (String statusField : List.of("textStatus", "authorTextStatus", "quotedTextStatus", "articleTextStatus", "articleRole")) {
+                String status = material.path(statusField).asText();
+                if (!status.isBlank()) materialText.append(" [").append(statusField).append(": ").append(status).append(']');
+            }
+            for (String field : List.of("text", "quotedText", "articleText")) {
+                String value = material.path(field).asText("");
+                if (!value.isBlank()) materialText.append("\n").append(field).append(": ").append(value);
+            }
+            if (materialText.indexOf("\n") >= 0) {
+                texts.add(materialText.toString());
+            }
+        }
+        Map<String, Long> metrics = new LinkedHashMap<>();
+        for (String name : List.of("views", "likes", "replies", "reposts", "bookmarks")) {
+            JsonNode metric = selectedMaterial.path(name);
+            if (metric.isIntegralNumber() && metric.canConvertToLong() && metric.asLong() >= 0) metrics.put(name, metric.asLong());
+        }
+        String instruction = input.path("instruction").asText("");
+        if (input.path("questions").isArray() && !input.path("questions").isEmpty())
+            instruction += "\nQuestions requiring new evidence: " + input.path("questions");
+        boolean multiMaterialTopic = input.path("materials").size() > 1 || topic.path("materialIds").size() > 1;
+        String baseHeader;
+        if (multiMaterialTopic) {
+            String matHeadline = !selectedMaterial.path("authorName").asText("").isBlank()
+                    && "USER_LINK".equals(selectedMaterial.path("sourceIdentity").asText(""))
+                    ? selectedMaterial.path("authorName").asText("").strip()
+                    : AssistantTopics.text(selectedMaterial).replaceAll("\\s+", " ").strip();
+            int cp = matHeadline.codePointCount(0, matHeadline.length());
+            baseHeader = cp <= 200 ? matHeadline : matHeadline.substring(0, matHeadline.offsetByCodePoints(0, 200));
+        } else {
+            baseHeader = (topic.path("title").asText() + " " + topic.path("summary").asText()).strip();
+        }
+        JsonNode publishedAt = selectedMaterial.path("publishedAt");
+        String published = publishedAt.isIntegralNumber() && publishedAt.asLong() > 0
+                ? Instant.ofEpochMilli(publishedAt.asLong()).toString() : publishedAt.asText();
+        return new ContentAssistantModelTasks.TopicText(
+                topic.path("id").asText(),
+                baseHeader
+                        + (selected.isBlank() ? "" : "\nSelected material: " + selected)
+                        + (instruction.isBlank() ? "" : "\nResearch instruction: " + instruction),
+                List.copyOf(texts),
+                published,
+                metrics
+        );
     }
 
     private ContentAssistantModelTasks.TopicText researchTopic(ObjectNode input) {

@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.xops.hub.model.RawSnapshotModels.XUserSummary;
+import com.xops.hub.model.RawSnapshotModels.TweetKind;
 import com.xops.hub.provider.PaidCapabilityGate;
 import com.xops.hub.provider.TwitterApiIoProvider;
 import com.xops.hub.provider.TwitterApiIoProvider.TextPost;
@@ -30,10 +31,16 @@ import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Supplier;
 import java.util.regex.Pattern;
 
 @Service
 public class SourceCollector {
+    static boolean belongsToSource(ObjectNode material, String sourceId) {
+        return material != null && sourceId != null && !sourceId.isBlank()
+                && sourceId.equals(material.path("authorId").asText(""));
+    }
+
     public static final Set<Integer> SUPPORTED_TIERS = Set.of(1, 5, 30);
     public static final int DEFAULT_AUTO_REPOST_MIN_SCORE = 70;
     private static final Pattern HANDLE = Pattern.compile("^[A-Za-z0-9_]{1,15}$");
@@ -61,7 +68,10 @@ public class SourceCollector {
         return thread;
     });
     private final AtomicBoolean tickRunning = new AtomicBoolean();
+    private final AtomicBoolean manualHistoryQueued = new AtomicBoolean();
     private final AtomicBoolean styleRunning = new AtomicBoolean();
+    @org.springframework.beans.factory.annotation.Value("${xops.content-assistant-background-collection-enabled:true}")
+    private boolean backgroundCollectionEnabled = true;
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private PaidCapabilityGate paidCapabilityGate;
 
@@ -181,11 +191,11 @@ public class SourceCollector {
         if (!cleanId.matches("[0-9]{2,20}")) {
             throw new IllegalArgumentException("无效的 X 推文 ID");
         }
-        ObjectNode owner = store.tx(tx -> tx.get("meta", "owner"));
+        ObjectNode owner = store.tx(AssistantStore.Tx::ownerBinding);
         String ownerAccountId = owner == null ? "" : owner.path("accountId").asText("");
         TwitterApiIoProvider.FetchedSinglePost fetched = PaidCapabilityGate.withCaller(
                 PaidCapabilityGate.PRIVILEGED_USERNAME,
-                ownerAccountId,
+                ownerAccountId, !ownerAccountId.isBlank(),
                 () -> provider.fetchSingleTextPost(cleanId, clock.instant().plusSeconds(25))
         );
         return toMaterial(fetched.post(), fetched.author(), false);
@@ -200,11 +210,11 @@ public class SourceCollector {
         String authorId = source.path("authorId").asText(source.path("id").asText("")).strip();
         String username = source.path("username").asText("").replaceFirst("^@+", "").strip();
         if (username.isBlank() || authorId.isBlank()) return List.of();
-        ObjectNode owner = store.tx(tx -> tx.get("meta", "owner"));
+        ObjectNode owner = store.tx(AssistantStore.Tx::ownerBinding);
         String ownerAccountId = owner == null ? "" : owner.path("accountId").asText("");
         TextPostPage page = com.xops.hub.provider.PaidCapabilityGate.withCaller(
                 com.xops.hub.provider.PaidCapabilityGate.PRIVILEGED_USERNAME,
-                ownerAccountId,
+                ownerAccountId, !ownerAccountId.isBlank(),
                 () -> provider.fetchTextPostsPage(username, authorId, "", 10, clock.instant().plusSeconds(20))
         );
         if (page == null || page.posts() == null || page.posts().isEmpty()) return List.of();
@@ -225,29 +235,40 @@ public class SourceCollector {
                 ? PaidCapabilityGate.PRIVILEGED_USERNAME
                 : username.replaceFirst("^@+", "").strip();
         String safeAccountId = accountId == null ? "" : accountId.strip();
-        TextPostPage page = PaidCapabilityGate.withCaller(
-                PaidCapabilityGate.PRIVILEGED_USERNAME,
-                safeAccountId,
-                () -> provider.fetchTextPostsPage(cleanUsername, safeAccountId, "", 20, clock.instant().plusSeconds(25))
-        );
-        if (page == null || page.posts() == null || page.posts().isEmpty()) {
-            return 0L;
-        }
-        long nowMs = clock.millis();
+        if (safeAccountId.isBlank()) return -1L;
+        Instant deadline = clock.instant().plusSeconds(25);
+        boolean owner = store.isOwner(safeAccountId);
+        Set<String> seen = new HashSet<>();
+        String cursor = "";
         long latest = 0L;
-        for (TextPost post : page.posts()) {
-            if (post == null || post.publishedAt() == null || post.selfThreadReply()) continue;
-            long ts = post.publishedAt().toEpochMilli();
-            if (ts > 0L && ts <= nowMs) {
+        for (int pages = 0; pages < 5 && clock.instant().isBefore(deadline); pages++) {
+            seen.add(cursor);
+            String pageCursor = cursor;
+            TextPostPage page = PaidCapabilityGate.withCaller(PaidCapabilityGate.PRIVILEGED_USERNAME, safeAccountId, owner,
+                    () -> provider.fetchTextPostsPage(cleanUsername, safeAccountId, pageCursor, 20, deadline));
+            if (page == null || page.author() == null || !safeAccountId.equals(page.author().id()) || page.posts() == null)
+                throw new XDataProviderException(502, "未能核实作者的最新发帖时间");
+            boolean hasTimelinePost = false;
+            for (TextPost post : page.posts()) {
+                if (post == null || post.kind() == null || !safeAccountId.equals(post.authorId())) return -1L;
+                if (post.selfThreadReply() || post.kind() == TweetKind.REPLY || post.kind() == TweetKind.RETWEET) continue;
+                if (post.publishedAt() == null) return -1L;
+                long ts = post.publishedAt().toEpochMilli();
+                if (ts <= 0 || ts > clock.millis()) return -1L;
                 latest = Math.max(latest, ts);
+                if (!post.pinned()) hasTimelinePost = true;
             }
+            if (page.exhausted()) return latest;
+            cursor = page.nextCursor();
+            if (cursor == null || cursor.isBlank() || seen.contains(cursor)) break;
+            if (hasTimelinePost) return latest;
         }
-        return latest;
+        return -1L;
     }
 
     /**
      * Refreshes recent public posts into local material storage for a configured quote-repost source
-     * when its local snapshot is older than 5 minutes, and returns up to 8 recent materials.
+     * when its local snapshot is older than 5 minutes, and returns stored materials in recency order.
      */
     List<ObjectNode> syncSourceMaterialsForPatrol(ObjectNode source, long freshnessWindowMs) {
         if (source == null) return List.of();
@@ -258,11 +279,11 @@ public class SourceCollector {
         long lastSuccessAt = source.path("lastSuccessAt").asLong(0L);
         if (provider != null && !username.isBlank() && !authorId.isBlank() && (nowMs - lastSuccessAt >= 5L * 60_000L)) {
             try {
-                ObjectNode owner = store.tx(tx -> tx.get("meta", "owner"));
+                ObjectNode owner = store.tx(AssistantStore.Tx::ownerBinding);
                 String ownerAccountId = owner == null ? "" : owner.path("accountId").asText("");
                 TextPostPage page = PaidCapabilityGate.withCaller(
                         PaidCapabilityGate.PRIVILEGED_USERNAME,
-                        ownerAccountId,
+                        ownerAccountId, !ownerAccountId.isBlank(),
                         () -> provider.fetchTextPostsPage(username, authorId, "", 20, clock.instant().plusSeconds(25))
                 );
                 if (page != null && page.posts() != null && !page.posts().isEmpty()) {
@@ -276,7 +297,9 @@ public class SourceCollector {
                         }
                         ObjectNode live = tx.get("source", authorId);
                         if (live != null && "ACTIVE".equals(live.path("status").asText(""))) {
-                            tx.put("source", authorId, live.deepCopy().put("lastSuccessAt", completedAt).put("error", ""));
+                            cacheRewritePage(tx, authorId, page, completedAt);
+                            updateSourceProfile(live, authorId, pageAuthor);
+                            tx.put("source", authorId, live.put("lastSuccessAt", completedAt).put("error", ""));
                         }
                         return null;
                     });
@@ -286,25 +309,13 @@ public class SourceCollector {
             }
         }
         long maxAge = freshnessWindowMs > 0L ? freshnessWindowMs : 24L * 60L * 60_000L;
-        return store.tx(tx -> {
-            List<ObjectNode> matches = new ArrayList<>();
-            for (ObjectNode m : tx.all("material")) {
-                boolean same = (!authorId.isBlank() && authorId.equals(m.path("authorId").asText("")))
-                        || (!username.isBlank() && username.equalsIgnoreCase(m.path("username").asText("").replaceFirst("^@+", "")));
-                if (!same) continue;
-                long pubAt = m.path("publishedAt").asLong(0L);
-                if (pubAt <= 0L || nowMs - pubAt > maxAge) continue;
-                matches.add(m.deepCopy());
-            }
-            matches.sort(Comparator.comparingLong((ObjectNode m) -> m.path("publishedAt").asLong(0L)).reversed());
-            return matches.stream().limit(8).toList();
-        });
+        return store.tx(tx -> storedRepostCandidates(tx, authorId, nowMs, maxAge));
     }
 
     /**
      * When a quote-repost source has no brand-new posts in the short freshness window, syncs recent
-     * timeline posts if needed and returns up to 12 most recent stored posts (within retention window)
-     * so quote-repost can fall back to recent content while keeping 16h same-author locking.
+     * timeline posts if needed and returns stored posts in recency order
+     * so the patrol can check prior decisions before choosing an evaluation batch.
      */
     List<ObjectNode> syncSourceMaterialsForRecentRepost(ObjectNode source, long maxAgeMs) {
         if (source == null) return List.of();
@@ -326,11 +337,11 @@ public class SourceCollector {
         if (provider != null && !username.isBlank() && !authorId.isBlank()
                 && (existingCount < 5 || nowMs - lastSuccessAt >= 10L * 60_000L)) {
             try {
-                ObjectNode owner = store.tx(tx -> tx.get("meta", "owner"));
+                ObjectNode owner = store.tx(AssistantStore.Tx::ownerBinding);
                 String ownerAccountId = owner == null ? "" : owner.path("accountId").asText("");
                 TextPostPage page = PaidCapabilityGate.withCaller(
                         PaidCapabilityGate.PRIVILEGED_USERNAME,
-                        ownerAccountId,
+                        ownerAccountId, !ownerAccountId.isBlank(),
                         () -> provider.fetchTextPostsPage(username, authorId, "", 30, clock.instant().plusSeconds(25))
                 );
                 if (page != null && page.posts() != null && !page.posts().isEmpty()) {
@@ -344,7 +355,9 @@ public class SourceCollector {
                         }
                         ObjectNode live = tx.get("source", authorId);
                         if (live != null && "ACTIVE".equals(live.path("status").asText(""))) {
-                            tx.put("source", authorId, live.deepCopy().put("lastSuccessAt", completedAt).put("error", ""));
+                            cacheRewritePage(tx, authorId, page, completedAt);
+                            updateSourceProfile(live, authorId, pageAuthor);
+                            tx.put("source", authorId, live.put("lastSuccessAt", completedAt).put("error", ""));
                         }
                         return null;
                     });
@@ -353,19 +366,14 @@ public class SourceCollector {
                 // Fall back to existing stored materials if upstream is transiently unavailable
             }
         }
-        return store.tx(tx -> {
-            List<ObjectNode> matches = new ArrayList<>();
-            for (ObjectNode m : tx.all("material")) {
-                boolean same = (!authorId.isBlank() && authorId.equals(m.path("authorId").asText("")))
-                        || (!username.isBlank() && username.equalsIgnoreCase(m.path("username").asText("").replaceFirst("^@+", "")));
-                if (!same) continue;
-                long pubAt = m.path("publishedAt").asLong(0L);
-                if (pubAt <= 0L || nowMs - pubAt > effectiveMaxAge) continue;
-                matches.add(m.deepCopy());
-            }
-            matches.sort(Comparator.comparingLong((ObjectNode m) -> m.path("publishedAt").asLong(0L)).reversed());
-            return matches.stream().limit(12).toList();
-        });
+        return store.tx(tx -> storedRepostCandidates(tx, authorId, nowMs, effectiveMaxAge));
+    }
+
+    static List<ObjectNode> storedRepostCandidates(AssistantStore.Tx tx, String authorId, long now, long window) {
+        if (authorId.isBlank()) return List.of();
+        return tx.rewriteWindow(authorId, "", now - window, now).stream()
+                .sorted(Comparator.comparingLong((ObjectNode material) -> material.path("publishedAt").asLong()).reversed())
+                .toList();
     }
 
     /**
@@ -376,56 +384,87 @@ public class SourceCollector {
         if (source == null) return List.of();
         String authorId = source.path("authorId").asText(source.path("id").asText("")).strip();
         String username = source.path("username").asText("").replaceFirst("^@+", "").strip();
-        if (username.isBlank() && authorId.isBlank()) return List.of();
+        if (authorId.isBlank()) return List.of();
         long nowMs = clock.millis();
-        long lastSuccessAt = source.path("lastSuccessAt").asLong(0L);
-        if (provider != null && !username.isBlank() && !authorId.isBlank() && (nowMs - lastSuccessAt >= 10L * 60_000L)) {
+        ObjectNode scan = provider == null || username.isBlank() ? null : store.tx(tx -> {
+            ObjectNode live = tx.get("source", authorId);
+            if (live == null || !"ACTIVE".equals(live.path("status").asText())
+                    || !live.path("autoRewriteEnabled").asBoolean()
+                    || !AssistantWorkflow.settings(tx).path("enabled").asBoolean(true)) return null;
+            long lastAttempt = live.path("rewriteLastAttemptAt").asLong();
+            if (live.path("rewriteBackfillComplete").asBoolean())
+                lastAttempt = Math.max(lastAttempt, live.path("lastSuccessAt").asLong());
+            if (lastAttempt > 0 && nowMs - lastAttempt < 10L * 60_000L) return null;
+            return tx.put("source", authorId, live.put("rewriteLastAttemptAt", nowMs));
+        });
+        if (scan != null) {
+            String cursor = boundCursor(scan, "rewriteCursor", TIMELINE_PROVIDER, TIMELINE_ENDPOINT);
             try {
-                ObjectNode owner = store.tx(tx -> tx.get("meta", "owner"));
+                ObjectNode owner = store.tx(AssistantStore.Tx::ownerBinding);
                 String ownerAccountId = owner == null ? "" : owner.path("accountId").asText("");
                 TextPostPage page = PaidCapabilityGate.withCaller(
                         PaidCapabilityGate.PRIVILEGED_USERNAME,
-                        ownerAccountId,
-                        () -> provider.fetchTextPostsPage(username, authorId, "", 40, clock.instant().plusSeconds(25))
+                        ownerAccountId, !ownerAccountId.isBlank(),
+                        () -> provider.fetchTextPostsPage(username, authorId, cursor, 40, clock.instant().plusSeconds(25))
                 );
-                if (page != null && page.posts() != null && !page.posts().isEmpty()) {
+                if (page != null) {
                     long completedAt = clock.millis();
                     long commitCutoff = AssistantRetention.cutoffMillis(completedAt);
-                    XUserSummary pageAuthor = page.author();
                     store.tx(tx -> {
-                        for (TextPost post : page.posts()) {
-                            if (post.publishedAt().toEpochMilli() < commitCutoff) continue;
-                            AssistantWorkflow.ingest(tx, toMaterial(post, pageAuthor, false));
-                        }
                         ObjectNode live = tx.get("source", authorId);
-                        if (live != null && "ACTIVE".equals(live.path("status").asText(""))) {
-                            tx.put("source", authorId, live.deepCopy().put("lastSuccessAt", completedAt).put("error", ""));
+                        if (live == null || !"ACTIVE".equals(live.path("status").asText())
+                                || !live.path("autoRewriteEnabled").asBoolean()
+                                || !scan.path("instanceId").equals(live.path("instanceId"))
+                                || live.path("rewriteLastAttemptAt").asLong() != nowMs) return null;
+                        for (TextPost post : page.posts()) {
+                            if (!authorId.equals(post.authorId()) || post.publishedAt().toEpochMilli() < commitCutoff
+                                    || post.publishedAt().toEpochMilli() > completedAt) continue;
+                            AssistantWorkflow.ingest(tx, toMaterial(post, page.author(), false));
                         }
+                        cacheRewritePage(tx, authorId, page, completedAt);
+                        boolean complete = scan.path("rewriteBackfillComplete").asBoolean() || page.exhausted()
+                                || page.nextCursor().isBlank() || page.nextCursor().equals(cursor)
+                                || crossedListenerBoundary(page.posts(), completedAt - AutoRepostService.REWRITE_MAX_AGE_MS);
+                        updateSourceProfile(live, authorId, page.author());
+                        if (cursor.isBlank()) live.put("lastSuccessAt", completedAt);
+                        tx.put("source", authorId, live.put("rewriteBackfillComplete", complete)
+                                .put("rewriteCursor", complete ? "" : page.nextCursor()).put("rewriteCursorFailures", 0)
+                                .put("rewriteCursorProvider", TIMELINE_PROVIDER).put("rewriteCursorEndpoint", TIMELINE_ENDPOINT));
                         return null;
                     });
                 }
-            } catch (Exception ignored) {
-                // Fall back to existing local materials if upstream refresh fails transiently
+            } catch (RuntimeException ex) {
+                if (!cursor.isBlank()) store.tx(tx -> {
+                    ObjectNode live = tx.get("source", authorId);
+                    if (live != null && live.path("rewriteLastAttemptAt").asLong() == nowMs
+                            && cursor.equals(live.path("rewriteCursor").asText())) {
+                        int failures = live.path("rewriteCursorFailures").asInt() + 1;
+                        if (shouldResetExpiredCursor(ex, failures)) live.put("rewriteCursor", "");
+                        tx.put("source", authorId, live.put("rewriteCursorFailures", failures));
+                    }
+                    return null;
+                });
             }
         }
-        long effectiveMaxAge = maxAgeMs > 0L ? maxAgeMs : 30L * 24L * 60L * 60_000L;
-        return store.tx(tx -> {
-            List<ObjectNode> matches = new ArrayList<>();
-            for (ObjectNode m : tx.all("material")) {
-                boolean same = (!authorId.isBlank() && authorId.equals(m.path("authorId").asText("")))
-                        || (!username.isBlank() && username.equalsIgnoreCase(m.path("username").asText("").replaceFirst("^@+", "")));
-                if (!same) continue;
-                long pubAt = m.path("publishedAt").asLong(0L);
-                if (pubAt <= 0L || nowMs - pubAt > effectiveMaxAge) continue;
-                matches.add(m.deepCopy());
-            }
-            return matches;
-        });
+        long maxAge = maxAgeMs > 0 ? Math.min(maxAgeMs, AutoRepostService.REWRITE_MAX_AGE_MS) : AutoRepostService.REWRITE_MAX_AGE_MS;
+        long until = clock.millis();
+        return store.tx(tx -> tx.rewriteWindow(authorId, username, until - maxAge, until));
+    }
+
+    private void cacheRewritePage(AssistantStore.Tx tx, String authorId, TextPostPage page, long nowMs) {
+        tx.expireRewriteMaterials(nowMs - AutoRepostService.REWRITE_MAX_AGE_MS);
+        for (TextPost post : page.posts()) {
+            long publishedAt = post.publishedAt().toEpochMilli();
+            if (!authorId.equals(post.authorId()) || publishedAt > nowMs || publishedAt < nowMs - AutoRepostService.REWRITE_MAX_AGE_MS) continue;
+            tx.cacheRewriteMaterial(toMaterial(post, page.author(), false), AssistantTopics.topicOf(tx, post.id()));
+        }
     }
 
     public ObjectNode add(String input, int intervalMinutes) {
         int tierMinutes = validateTierMinutes(intervalMinutes);
-        XUserSummary author = provider.resolvePublicAuthor(parseUsername(input));
+        String username = parseUsername(input);
+        ObjectNode owner = store.tx(AssistantStore.Tx::ownerBinding);
+        XUserSummary author = withBoundOwner(owner, () -> provider.resolvePublicAuthor(username));
         long now = clock.millis();
         long cutoff = AssistantRetention.cutoffMillis(now);
         return store.tx(tx -> {
@@ -507,6 +546,7 @@ public class SourceCollector {
                 next.put("autoRewriteEnabled", rewriteEnabled);
                 if (rewriteEnabled && !wasRewriteEnabled) {
                     next.put("autoRewriteEnabledAt", now);
+                    next.remove(List.of("rewriteBackfillComplete", "rewriteCursor", "rewriteLastAttemptAt", "rewriteCursorFailures"));
                 }
             }
             if (body.has("autoRepostTextMode")) {
@@ -569,6 +609,8 @@ public class SourceCollector {
                 next.put("cursor", "").put("cursorProvider", TIMELINE_PROVIDER).put("cursorEndpoint", TIMELINE_ENDPOINT)
                         .put("cursorFailures", 0).put("scanSince", resumeAnchor).put("error", "");
                 next.remove("anchorSince");
+                if (!"ACTIVE".equals(current.path("status").asText()))
+                    next.remove(List.of("rewriteBackfillComplete", "rewriteCursor", "rewriteLastAttemptAt", "rewriteCursorFailures"));
             }
             return tx.put("source", id, next);
         });
@@ -605,6 +647,7 @@ public class SourceCollector {
 
     @Scheduled(cron = "${xops.content-assistant-style-cron:0 35 3 * * *}", zone = "${xops.timezone:Asia/Shanghai}")
     public void scheduledStyleRefresh() {
+        if (!backgroundCollectionEnabled) return;
         ObjectNode settings = store.tx(AssistantWorkflow::settings);
         if (hasBoundOwner() && settings.path("enabled").asBoolean(false)
                 && settings.path("collectionEnabled").asBoolean(false)) refreshStyleSamples();
@@ -614,35 +657,49 @@ public class SourceCollector {
         return store.tx(tx -> {
             ObjectNode result = mapper.createObjectNode();
             ArrayNode sources = result.putArray("sources");
-            List<ObjectNode> ownerSources = tx.all("history_source").stream()
-                    .filter(n -> n.path("owner").asBoolean(false)
-                            || PaidCapabilityGate.isPrivilegedUsername(n.path("username").asText("")))
-                    .sorted(Comparator.comparingInt(n -> n.path("rank").asInt(Integer.MAX_VALUE)))
-                    .toList();
-            ownerSources.forEach(sources::add);
-            long matTotal = ownerSources.stream().mapToLong(n -> n.path("timelineSavedCount").asLong(0)).sum();
-            long inTotal = ownerSources.stream().mapToLong(n -> n.path("inboundSavedCount").asLong(0)).sum();
-            result.put("materials", matTotal > 0 ? matTotal : (ownerSources.isEmpty() ? 0 : tx.count("history_material")));
-            result.put("interactions", inTotal > 0 ? inTotal : (ownerSources.isEmpty() ? 0 : tx.count("history_interaction")));
-            List<ObjectNode> eligible = ownerSources.stream()
-                    .filter(n -> n.path("eligible").asBoolean(true)).toList();
-            result.put("complete", !eligible.isEmpty()
-                    && eligible.stream().allMatch(n -> n.path("timelineExhausted").asBoolean(false)
-                            && n.path("inboundExhausted").asBoolean(false)
-                            && n.path("timelineError").asText("").isBlank()
-                            && n.path("inboundError").asText("").isBlank()));
+            ObjectNode source = ownerHistorySource(tx);
+            if (source == null) return result.put("materials", 0).put("interactions", 0).put("complete", false);
+            String ownerId = source.path("id").asText();
+            long materials = verifiedHistoryCount(tx, source, ownerId, true, 0);
+            long interactions = verifiedHistoryCount(tx, source, ownerId, false, 0);
+            sources.add(source.deepCopy().put("owner", true).put("timelineSavedCount", materials)
+                    .put("inboundSavedCount", interactions));
+            result.put("ownerAccountId", ownerId);
+            result.put("materials", materials);
+            result.put("interactions", interactions);
+            result.put("complete", source.path("eligible").asBoolean(true)
+                    && source.path("timelineExhausted").asBoolean() && source.path("inboundExhausted").asBoolean()
+                    && source.path("timelineError").asText("").isBlank() && source.path("inboundError").asText("").isBlank());
             return result;
         });
     }
 
+    private static ObjectNode ownerHistorySource(AssistantStore.Tx tx) {
+        ObjectNode binding = tx.ownerBinding();
+        if (binding == null || binding.path("accountId").asText("").isBlank()) return null;
+        String ownerId = binding.path("accountId").asText();
+        ObjectNode source = tx.get("history_source", ownerId);
+        return source != null && ownerId.equals(source.path("authorId").asText(ownerId)) ? source : null;
+    }
+
+    private static long verifiedHistoryCount(AssistantStore.Tx tx, ObjectNode source, String ownerId,
+            boolean timeline, long added) {
+        String prefix = timeline ? "timeline" : "inbound";
+        if (source.path(prefix + "CountById").asBoolean(false) && source.hasNonNull(prefix + "SavedCount")) {
+            return source.path(prefix + "SavedCount").asLong() + added;
+        }
+        return tx.countHistory(timeline ? "history_material" : "history_interaction", ownerId);
+    }
+
     public ObjectNode retryHistoryNow() {
         store.tx(tx -> {
-            for (ObjectNode source : tx.all("history_source")) {
+            ObjectNode source = ownerHistorySource(tx);
+            if (source != null) {
                 ObjectNode next = source.deepCopy()
                         .put("timelineRetryExhausted", false)
                         .put("inboundRetryExhausted", false)
-                        .put("timelineRetryCount", 0)
-                        .put("inboundRetryCount", 0)
+                        .put("timelineRetryKey", "").put("timelineRetryCount", 0)
+                        .put("inboundRetryKey", "").put("inboundRetryCount", 0)
                         .put("timelineError", "")
                         .put("inboundError", "")
                         .put("error", "");
@@ -654,7 +711,11 @@ public class SourceCollector {
         if (paidCapabilityGate != null) {
             paidCapabilityGate.resetByPrefix("history-source:");
         }
-        scheduledTick();
+        if (manualHistoryQueued.compareAndSet(false, true)) {
+            worker.submit(() -> {
+                try { tick(true); } finally { manualHistoryQueued.set(false); }
+            });
+        }
         return history();
     }
 
@@ -665,21 +726,28 @@ public class SourceCollector {
     }
 
     public List<String> purgeExpired() {
-        return store.purgeExpiredContent(AssistantRetention.cutoffMillis(clock.millis()));
+        long nowMs = clock.millis();
+        return store.purgeExpiredContent(AssistantRetention.cutoffMillis(nowMs), nowMs - AutoRepostService.REWRITE_MAX_AGE_MS);
     }
 
     void tick() {
-        ObjectNode ownerNode = store.tx(tx -> tx.get("meta", "owner"));
-        String ownerAccountId = ownerNode == null ? "" : ownerNode.path("accountId").asText("");
-        com.xops.hub.provider.PaidCapabilityGate.runWithCaller(
-                com.xops.hub.provider.PaidCapabilityGate.PRIVILEGED_USERNAME, ownerAccountId, this::tickInternal);
+        tick(false);
     }
 
-    private void tickInternal() {
+    private void tick(boolean historyRequested) {
+        ObjectNode ownerNode = store.tx(AssistantStore.Tx::ownerBinding);
+        String ownerAccountId = ownerNode == null ? "" : ownerNode.path("accountId").asText("");
+        com.xops.hub.provider.PaidCapabilityGate.runWithCaller(
+                com.xops.hub.provider.PaidCapabilityGate.PRIVILEGED_USERNAME, ownerAccountId, !ownerAccountId.isBlank(),
+                () -> tickInternal(historyRequested));
+    }
+
+    private void tickInternal(boolean historyRequested) {
         purgeExpired();
+        if (!backgroundCollectionEnabled && !historyRequested) return;
         if (!store.hasCollectionSpace()) return;
         ObjectNode settings = store.tx(AssistantWorkflow::settings);
-        boolean assistantCollectionActive = hasBoundOwner()
+        boolean assistantCollectionActive = backgroundCollectionEnabled && hasBoundOwner()
                 && settings.path("enabled").asBoolean(false)
                 && settings.path("collectionEnabled").asBoolean(false);
         boolean paidBudgetExhausted = provider.isPageReadBudgetExhausted();
@@ -720,7 +788,7 @@ public class SourceCollector {
                 refreshStyleSamples();
             }
         }
-        if ((assistantCollectionActive || communityHubService.isSilentHistoryEnabled())
+        if ((historyRequested || assistantCollectionActive || communityHubService.isSilentHistoryEnabled())
                 && !communityHubService.hasActiveForegroundWork()
                 && (freeTimelineAvailable || !provider.isBackgroundPaidBudgetExhausted())) {
             synchronizeHistoryCandidates();
@@ -864,7 +932,7 @@ public class SourceCollector {
                         "free-source:" + id + ":" + cursor,
                         "fxtwitter_free_source",
                         PaidCapabilityGate.PRIVILEGED_USERNAME,
-                        id,
+                        store.boundOwnerId(),
                         safeError(ex),
                         this::tick
                 );
@@ -873,31 +941,26 @@ public class SourceCollector {
     }
 
     private void synchronizeHistoryCandidates() {
-        List<CommunityHubService.LongHistoryCandidate> candidates = new ArrayList<>(
-                communityHubService.longHistoryCandidates().stream()
-                        .filter(c -> c != null && c.owner() && c.user() != null
-                                && PaidCapabilityGate.isPrivilegedUsername(c.user().username()))
-                        .toList()
-        );
-        ObjectNode owner = store.tx(tx -> tx.get("meta", "owner"));
-        if (owner != null && !owner.path("accountId").asText("").isBlank()
-                && PaidCapabilityGate.isPrivilegedUsername(owner.path("username").asText(""))
-                && candidates.stream().noneMatch(candidate -> owner.path("accountId").asText().equals(candidate.user().id()))) {
-            XUserSummary ownerUser = new XUserSummary(owner.path("accountId").asText(),
-                    owner.path("username").asText(), owner.path("username").asText(), "", "",
-                    false, 0, 0, 0, "");
-            candidates.add(0, new CommunityHubService.LongHistoryCandidate(ownerUser, 0, true, 0, true, 0));
-        }
+        var reported = communityHubService.longHistoryCandidates();
         store.tx(tx -> {
-            if (tx.get("meta", "owner") == null && !candidates.isEmpty()) {
-                candidates.stream().filter(CommunityHubService.LongHistoryCandidate::owner).findFirst()
-                        .ifPresent(ownerCand -> tx.put("meta", "owner", mapper.createObjectNode()
-                                .put("accountId", ownerCand.user().id())
-                                .put("username", ownerCand.user().username())));
+            ObjectNode binding = tx.ownerBinding();
+            String ownerId = binding == null ? "" : binding.path("accountId").asText("");
+            var candidates = new ArrayList<>(reported.stream().filter(candidate -> candidate != null && candidate.owner()
+                    && candidate.user() != null && candidate.user().id() != null && !candidate.user().id().isBlank()
+                    && com.xops.hub.model.AuthorIdentity.trustedId(ownerId).equals(candidate.user().id())).limit(1).toList());
+            if (!ownerId.isBlank() && candidates.isEmpty()) {
+                String username = binding.path("username").asText(PaidCapabilityGate.PRIVILEGED_USERNAME);
+                XUserSummary user = new XUserSummary(ownerId, username, username, "", "", false, 0, 0, 0, "");
+                candidates.add(new CommunityHubService.LongHistoryCandidate(user, 0, true, 0, true, 0));
+            } else if (binding == null && !candidates.isEmpty()) {
+                XUserSummary user = candidates.get(0).user();
+                binding = tx.observeOwner(user.id(), user.username(), candidates.get(0).qualificationAt());
             }
             Set<String> eligible = new HashSet<>();
             for (CommunityHubService.LongHistoryCandidate candidate : candidates) {
                 XUserSummary user = candidate.user();
+                String username = binding != null && !binding.path("username").asText("").isBlank()
+                        ? binding.path("username").asText() : user.username();
                 eligible.add(user.id());
                 ObjectNode current = tx.get("history_source", user.id());
                 ObjectNode next = current != null ? current.deepCopy() : mapper.createObjectNode();
@@ -907,7 +970,7 @@ public class SourceCollector {
                 boolean clearInBudgetErr = prevInErr.contains("外部调用预算已达保护上限") || prevInErr.contains("预算记录暂不可用");
                 if (clearTlBudgetErr) next.put("timelineError", "");
                 if (clearInBudgetErr) next.put("inboundError", "");
-                next.put("authorId", user.id()).put("username", user.username()).put("rank", candidate.rank())
+                next.put("authorId", user.id()).put("username", username).put("rank", candidate.rank())
                         .put("owner", candidate.owner()).put("eligible", true)
                         .put("qualificationWindowDays", candidate.qualificationWindowDays())
                         .put("qualificationProvisional", candidate.provisional())
@@ -925,7 +988,7 @@ public class SourceCollector {
                 boolean changed = current == null
                         || clearTlBudgetErr || clearInBudgetErr
                         || !current.has("timelineBackfillComplete") || !current.has("inboundBackfillComplete")
-                        || !user.username().equals(current.path("username").asText())
+                        || !username.equals(current.path("username").asText())
                         || candidate.rank() != current.path("rank").asInt()
                         || candidate.owner() != current.path("owner").asBoolean()
                         || !current.path("eligible").asBoolean(false)
@@ -961,12 +1024,13 @@ public class SourceCollector {
         boolean allowPaidBackground = !provider.isBackgroundPaidBudgetExhausted();
         boolean canRunTimeline = freeMode ? allowFreeTimeline : (allowFreeTimeline || allowPaidBackground);
         boolean canRunInbound = freeMode ? allowFreeInbound : allowPaidBackground;
-        ObjectNode due = store.tx(tx -> tx.all("history_source").stream()
-                .filter(s -> s.path("eligible").asBoolean(false)
+        ObjectNode due = store.tx(tx -> {
+            ObjectNode s = ownerHistorySource(tx);
+            return s != null && s.path("eligible").asBoolean(false)
                         && ((canRunTimeline && historyDimensionEligibleForTick(s, "timeline", now, allowFreeTimeline))
-                            || (canRunInbound && historyDimensionEligibleForTick(s, "inbound", now, allowFreeInbound))))
-                .min(Comparator.comparingLong(s -> s.path("lastAttemptAt").asLong(0)))
-                .map(ObjectNode::deepCopy).orElse(null));
+                            || (canRunInbound && historyDimensionEligibleForTick(s, "inbound", now, allowFreeInbound)))
+                    ? s : null;
+        });
         if (due == null) return;
         boolean timelineDue = canRunTimeline && historyDimensionEligibleForTick(due, "timeline", now, allowFreeTimeline);
         boolean inboundDue = canRunInbound && historyDimensionEligibleForTick(due, "inbound", now, allowFreeInbound);
@@ -976,24 +1040,25 @@ public class SourceCollector {
 
     private boolean historyDimensionEligibleForTick(ObjectNode source, String prefix, long now, boolean freeAvailable) {
         if (paidCapabilityGate != null && source.path(prefix + "RetryCount").asInt(0) > 0) {
-            return false;
+            String key = source.path(prefix + "RetryKey").asText("history-source:" + source.path("id").asText()
+                    + ":" + prefix + ":" + source.path(prefix + "Cursor").asText(""));
+            var retry = paidCapabilityGate.getRetrySnapshot(key);
+            if (retry != null && retry.state() == PaidCapabilityGate.RetryState.PENDING) return false;
+            long attempted = source.path(prefix + "LastAttemptAt").asLong(source.path("lastAttemptAt").asLong());
+            if (now - attempted < HISTORY_FAILURE_BACKOFF_MS) return false;
         }
         return historyDimensionDue(source, prefix, now, freeAvailable);
     }
 
     private void retryHistoryDimensionOnce(String sourceId, boolean timeline) {
         String prefix = timeline ? "timeline" : "inbound";
-        ObjectNode source = store.tx(tx -> {
-            ObjectNode node = tx.get("history_source", sourceId);
-            return node == null ? null : node.deepCopy();
-        });
-        if (source == null || !source.path("eligible").asBoolean(false)
+        ObjectNode source = store.tx(SourceCollector::ownerHistorySource);
+        if (source == null || !sourceId.equals(source.path("id").asText()) || !source.path("eligible").asBoolean(false)
                 || source.path(prefix + "RetryExhausted").asBoolean(false)) {
             return;
         }
-        ObjectNode ownerNode = store.tx(tx -> tx.get("meta", "owner"));
-        String ownerAccountId = ownerNode == null ? sourceId : ownerNode.path("accountId").asText(sourceId);
-        PaidCapabilityGate.runWithCaller(PaidCapabilityGate.PRIVILEGED_USERNAME, ownerAccountId,
+        String ownerId = store.boundOwnerId();
+        PaidCapabilityGate.runWithCaller(PaidCapabilityGate.PRIVILEGED_USERNAME, ownerId, sourceId.equals(ownerId),
                 () -> executeHistoryDimension(source, timeline, clock.millis(), true));
     }
 
@@ -1044,15 +1109,16 @@ public class SourceCollector {
             String retryCursor = failedScan == null ? "" : failedScan.cursor();
             String retryKey = "history-source:" + id + ":" + dimension + ":" + retryCursor;
             PaidCapabilityGate.RetrySnapshot snap = null;
-            if (paidCapabilityGate != null) {
+            if (paidCapabilityGate != null && backgroundCollectionEnabled) {
                 String capability = freeMode ? "fxtwitter_free_source" : "twitterapi_io_read";
+                String ownerId = store.boundOwnerId();
                 snap = paidCapabilityGate.scheduleIdempotentRetry(
                         retryKey,
                         capability,
                         PaidCapabilityGate.PRIVILEGED_USERNAME,
-                        id,
+                        ownerId,
                         safeError(ex),
-                        () -> retryHistoryDimensionOnce(id, timeline)
+                        () -> retryHistoryDimensionOnce(id, timeline), false, id.equals(ownerId)
                 );
             }
             PaidCapabilityGate.RetrySnapshot finalSnap = snap;
@@ -1068,6 +1134,7 @@ public class SourceCollector {
                                 || failCount > PaidCapabilityGate.MAX_IDEMPOTENT_RETRIES)
                             : failCount > PaidCapabilityGate.MAX_IDEMPOTENT_RETRIES;
                     ObjectNode next = source.deepCopy()
+                            .put(dimension + "RetryKey", retryKey)
                             .put(dimension + "RetryCount", failCount)
                             .put(dimension + "RetryExhausted", exhausted)
                             .put(dimension + "Error", exhausted ? "免费接口连续重试 3 次未成功，等待手动触发重试" : safeError(ex))
@@ -1160,22 +1227,31 @@ public class SourceCollector {
         store.tx(tx -> {
             long added = 0;
             for (TextPost post : posts) {
-                ObjectNode material = toMaterial(post, true);
+                if (!sourceId.equals(post.authorId())) throw new XDataProviderException(409, "归档帖子的作者身份不符，已保留当前游标");
                 ObjectNode existing = tx.get("history_material", post.id());
+                if (existing != null && !belongsToSource(existing, sourceId)) {
+                    if (!existing.path("authorId").asText("").isBlank()) {
+                        throw new XDataProviderException(409, "历史素材的作者 ID 冲突，已保留原记录和当前游标");
+                    }
+                    tx.put("history_material_unverified", post.id(), existing.deepCopy());
+                    existing = null;
+                }
+                ObjectNode material = mergeArchiveMaterial(existing, post, page.author(), completedAt);
                 if (existing == null) added++;
                 if (!sameRecord(existing, material)) tx.put("history_material", post.id(), material);
             }
             ObjectNode current = tx.get("history_source", sourceId);
             if (current != null) {
                 ObjectNode next = current.deepCopy().put("lastSuccessAt", completedAt).put("timelineError", "")
-                        .put("timelineRetryCount", 0)
+                        .put("timelineRetryKey", "").put("timelineRetryCount", 0)
                         .put("timelineRetryExhausted", false)
                         .put("timelineCursor", scanComplete ? "" : page.nextCursor())
                         .put("timelineCursorProvider", TIMELINE_PROVIDER)
                         .put("timelineCursorEndpoint", TIMELINE_ENDPOINT)
                         .put("timelineCursorFailures", 0)
                         .put("nextDimension", "INBOUND")
-                        .put("timelineSavedCount", current.path("timelineSavedCount").asLong(0) + added);
+                        .put("timelineSavedCount", verifiedHistoryCount(tx, current, sourceId, true, added))
+                        .put("timelineCountById", true);
                 applyCoverage(next, "timeline", posts.stream()
                         .map(post -> post.publishedAt().toEpochMilli()).toList());
                 if (scanComplete) {
@@ -1203,19 +1279,34 @@ public class SourceCollector {
                 String materialId = sourceId + ":" + interaction.id();
                 ObjectNode existing = tx.get("history_interaction", materialId);
                 if (existing == null) added++;
+                if (existing != null && !differentKnown(existing, material, "targetAuthorId")
+                        && !differentKnown(existing, material, "peerId")) {
+                    ObjectNode observed = material;
+                    material = existing.deepCopy();
+                    for (var fields = observed.fields(); fields.hasNext();) {
+                        var field = fields.next();
+                        if (!field.getValue().isTextual() || !field.getValue().asText().isBlank()) {
+                            material.set(field.getKey(), field.getValue());
+                        }
+                    }
+                    if (existing.path("text").asText("").length() > material.path("text").asText("").length()) {
+                        material.set("text", existing.get("text"));
+                    }
+                }
                 if (!sameRecord(existing, material)) tx.put("history_interaction", materialId, material);
             }
             ObjectNode current = tx.get("history_source", sourceId);
             if (current != null) {
                 ObjectNode next = current.deepCopy().put("lastSuccessAt", completedAt).put("inboundError", "")
-                        .put("inboundRetryCount", 0)
+                        .put("inboundRetryKey", "").put("inboundRetryCount", 0)
                         .put("inboundRetryExhausted", false)
                         .put("inboundCursor", scanComplete ? "" : page.nextCursor())
                         .put("inboundCursorProvider", TIMELINE_PROVIDER)
                         .put("inboundCursorEndpoint", INBOUND_ENDPOINT)
                         .put("inboundCursorFailures", 0)
                         .put("nextDimension", "TIMELINE")
-                        .put("inboundSavedCount", current.path("inboundSavedCount").asLong(0) + added);
+                        .put("inboundSavedCount", verifiedHistoryCount(tx, current, sourceId, false, added))
+                        .put("inboundCountById", true);
                 applyCoverage(next, "inbound", interactions.stream()
                         .map(interaction -> interaction.publishedAt().toEpochMilli()).toList());
                 if (scanComplete) {
@@ -1244,13 +1335,106 @@ public class SourceCollector {
         normalized.remove(List.of("id", "version", "updatedAt"));
         ObjectNode next = candidate.deepCopy();
         next.remove(List.of("id", "version", "updatedAt"));
-        return normalized.equals(next);
+        // SQLite JSON reads small counts as IntNode even when the provider wrote a LongNode.
+        return normalized.equals((a, b) -> a.isIntegralNumber() && b.isIntegralNumber()
+                ? a.bigIntegerValue().compareTo(b.bigIntegerValue()) : a.equals(b) ? 0 : 1, next);
+    }
+
+    private static final List<String> ARCHIVE_METRICS = List.of("views", "likes", "replies", "reposts", "bookmarks");
+    private static final List<String> QUOTE_FIELDS = List.of("quotedId", "quotedAuthorId", "quotedUsername", "quotedText", "quotedTextStatus");
+    private static final List<String> ARTICLE_FIELDS = List.of("articleId", "articleUrl", "articleRole", "articleText", "articleTextStatus");
+
+    private ObjectNode mergeArchiveMaterial(ObjectNode previous, TextPost post, XUserSummary author, long observedAt) {
+        ObjectNode observed = toMaterial(post, author, true);
+        if (previous == null) return observed.put("seedEvidenceAt", observedAt);
+        ObjectNode merged = previous.deepCopy();
+        boolean newQuote = differentKnown(previous, observed, "quotedId") || differentKnown(previous, observed, "quotedAuthorId");
+        boolean newArticle = differentKnown(previous, observed, "articleRole")
+                || (newQuote && "QUOTED".equals(previous.path("articleRole").asText()))
+                || (differentKnown(previous, observed, "articleId") && !articleUsesPostId(previous) && !articleUsesPostId(observed));
+        if (newQuote) merged.remove(QUOTE_FIELDS);
+        if (newArticle) merged.remove(ARTICLE_FIELDS);
+        observed.fields().forEachRemaining(entry -> {
+            if (!entry.getValue().isNull() && !(entry.getValue().isTextual() && entry.getValue().asText().isBlank())) {
+                merged.set(entry.getKey(), entry.getValue());
+            }
+        });
+        if (author == null) {
+            for (String field : List.of("authorName", "authorAvatarUrl", "authorBio", "authorVerified", "authorFollowersCount")) {
+                if (previous.hasNonNull(field)) merged.set(field, previous.get(field));
+            }
+        }
+        for (String field : List.of("hasMedia", "selfThreadReply")) {
+            if (previous.path(field).asBoolean()) merged.put(field, true);
+        }
+        retainRicherBody(merged, previous, observed, "text", "authorTextStatus");
+        if (!newQuote) retainRicherBody(merged, previous, observed, "quotedText", "quotedTextStatus");
+        if (!newArticle) {
+            retainRicherBody(merged, previous, observed, "articleText", "articleTextStatus");
+            if (articleUsesPostId(observed) && !articleUsesPostId(previous) && !previous.path("articleId").asText("").isBlank()) {
+                merged.set("articleId", previous.get("articleId"));
+            }
+        }
+        if ("QUOTE".equals(previous.path("kind").asText()) && "POST".equals(post.kind().name())) merged.put("kind", "QUOTE");
+        String quoteStatus = merged.path("quotedTextStatus").asText();
+        if ("QUOTE".equals(merged.path("kind").asText()) && merged.path("quotedText").asText("").isBlank()) {
+            merged.put("textStatus", "QUOTE_TEXT_MISSING");
+        } else if ("SOURCE_MISSING".equals(quoteStatus) && merged.path("quotedAuthorId").asText("").isBlank()) {
+            merged.put("textStatus", "QUOTE_SOURCE_MISSING");
+        } else if ("FULL".equals(merged.path("articleTextStatus").asText())) {
+            merged.put("textStatus", "ARTICLE_FULL");
+        } else if ("PREVIEW".equals(merged.path("articleTextStatus").asText())) {
+            merged.put("textStatus", "ARTICLE_PREVIEW");
+        } else if ("FULL".equals(merged.path("authorTextStatus").asText()) || "FULL".equals(quoteStatus)) {
+            merged.put("textStatus", "TEXT_ONLY");
+        }
+        long previousAt = previous.path("seedEvidenceAt").asLong(previous.path("updatedAt").asLong());
+        long newestAt = Math.max(previousAt, observedAt);
+        ObjectNode metricTimes = mapper.createObjectNode();
+        for (String field : ARCHIVE_METRICS) {
+            if (!merged.hasNonNull(field)) continue;
+            long fieldAt = previous.path("seedMetricTimes").path(field).asLong(previousAt);
+            if (observed.hasNonNull(field) && (!previous.hasNonNull(field) || observedAt >= fieldAt)) {
+                fieldAt = observedAt;
+            } else if (previous.hasNonNull(field)) {
+                merged.set(field, previous.get(field));
+            }
+            if (fieldAt != newestAt) metricTimes.put(field, fieldAt);
+        }
+        if (!sameRecord(previous, merged) || ARCHIVE_METRICS.stream().anyMatch(observed::hasNonNull)) {
+            merged.put("seedEvidenceAt", newestAt);
+            if (metricTimes.isEmpty()) merged.remove("seedMetricTimes");
+            else merged.set("seedMetricTimes", metricTimes);
+        }
+        return merged;
+    }
+
+    private static boolean differentKnown(ObjectNode first, ObjectNode second, String field) {
+        String oldValue = first.path(field).asText(""), newValue = second.path(field).asText("");
+        return !oldValue.isBlank() && !newValue.isBlank() && !oldValue.equals(newValue);
+    }
+
+    // A provider with no article ID substitutes its carrier tweet ID. It identifies the post, not a different article.
+    private static boolean articleUsesPostId(ObjectNode row) {
+        String id = row.path("articleId").asText("");
+        String carrier = "QUOTED".equals(row.path("articleRole").asText()) ? "quotedId" : "id";
+        return !id.isBlank() && id.equals(row.path(carrier).asText());
+    }
+
+    private static void retainRicherBody(ObjectNode merged, ObjectNode previous, ObjectNode observed, String body, String status) {
+        String oldText = previous.path(body).asText(""), newText = observed.path(body).asText("");
+        if (oldText.isBlank()) return;
+        boolean oldFull = "FULL".equals(previous.path(status).asText()), newFull = "FULL".equals(observed.path(status).asText());
+        if (newText.isBlank() || (oldFull && !newFull) || (oldFull == newFull && oldText.length() > newText.length())) {
+            merged.set(body, previous.get(body));
+            if (previous.hasNonNull(status)) merged.set(status, previous.get(status));
+        }
     }
 
     private void commitPage(String sourceKind, String sourceId, String expectedInstanceId, String expectedCursor,
             TextPostPage page, List<TextPost> posts, long scanSince, long completedAt,
             long scanStartedAt, boolean scanComplete) {
-        List<ObjectNode> newlyIngested = new ArrayList<>();
+        List<ObjectNode> quoteCandidates = new ArrayList<>();
         ObjectNode latestSourceSnapshot = store.tx(tx -> {
             ObjectNode current = tx.get(sourceKind, sourceId);
             if (current == null || !"ACTIVE".equals(current.path("status").asText())
@@ -1258,14 +1442,25 @@ public class SourceCollector {
                     || !expectedCursor.equals(current.path("cursor").asText(""))) return null;
             long commitCutoff = AssistantRetention.cutoffMillis(completedAt);
             XUserSummary pageAuthor = page.author();
+            Set<String> newIds = new HashSet<>();
             for (TextPost post : posts) {
                 if (post.publishedAt().toEpochMilli() < commitCutoff) continue;
                 boolean existedBefore = tx.get("material", post.id()) != null;
                 ObjectNode material = toMaterial(post, pageAuthor, false);
                 AssistantWorkflow.ingest(tx, material);
-                if (!existedBefore) {
-                    ObjectNode saved = tx.get("material", post.id());
-                    if (saved != null) newlyIngested.add(saved);
+                if (!existedBefore) newIds.add(post.id());
+            }
+            cacheRewritePage(tx, sourceId, page, completedAt);
+            if (current.path("autoRepostEnabled").asBoolean()) {
+                for (TextPost post : page.posts()) {
+                    if (!sourceId.equals(post.authorId())) continue;
+                    if (!newIds.contains(post.id())) {
+                        ObjectNode earlier = tx.get("auto_repost", post.id());
+                        if (earlier == null || !earlier.path("quoteSourceNeedsReview").asBoolean()
+                                || !Set.of("EVALUATING", "JUDGE_FAILED", "SKIPPED").contains(earlier.path("status").asText())) continue;
+                    }
+                    ObjectNode saved = tx.rewriteMaterial(post.id(), completedAt);
+                    if (saved != null) quoteCandidates.add(saved);
                 }
             }
             ObjectNode next = current.deepCopy().put("lastSuccessAt", completedAt).put("error", "")
@@ -1274,13 +1469,7 @@ public class SourceCollector {
                     .put("cursorProvider", TIMELINE_PROVIDER)
                     .put("cursorEndpoint", TIMELINE_ENDPOINT)
                     .put("cursorFailures", 0);
-            if (pageAuthor != null) {
-                if (!value(pageAuthor.username()).isBlank()) next.put("username", pageAuthor.username());
-                if (!value(pageAuthor.displayName()).isBlank()) next.put("displayName", pageAuthor.displayName());
-                if (!value(pageAuthor.avatarUrl()).isBlank()) next.put("avatarUrl", pageAuthor.avatarUrl());
-                if (!value(pageAuthor.bio()).isBlank()) next.put("bio", pageAuthor.bio());
-                next.put("verified", pageAuthor.verified());
-            }
+            updateSourceProfile(next, sourceId, pageAuthor);
             if (scanComplete) {
                 next.put("lastCompleteAt", scanStartedAt);
                 next.remove("anchorSince");
@@ -1291,19 +1480,24 @@ public class SourceCollector {
         IngestHook hook = this.ingestHook;
         if (latestSourceSnapshot != null
                 && latestSourceSnapshot.path("autoRepostEnabled").asBoolean(false)
-                && !newlyIngested.isEmpty()) {
+                && !quoteCandidates.isEmpty()) {
             if (batchHook != null) {
-                batchHook.onAuthorMaterialsIngested(latestSourceSnapshot, List.copyOf(newlyIngested));
+                batchHook.onAuthorMaterialsIngested(latestSourceSnapshot, List.copyOf(quoteCandidates));
             } else if (hook != null) {
-                for (ObjectNode item : newlyIngested) {
+                for (ObjectNode item : quoteCandidates) {
                     hook.onMaterialIngested(latestSourceSnapshot, item);
                 }
             }
         }
     }
 
-    private ObjectNode toMaterial(TextPost post, boolean archiveOnly) {
-        return toMaterial(post, null, archiveOnly);
+    private static void updateSourceProfile(ObjectNode source, String authorId, XUserSummary author) {
+        if (author == null || !authorId.equals(author.id())) return;
+        if (!value(author.username()).isBlank()) source.put("username", author.username());
+        if (!value(author.displayName()).isBlank()) source.put("displayName", author.displayName());
+        if (!value(author.avatarUrl()).isBlank()) source.put("avatarUrl", author.avatarUrl());
+        if (!value(author.bio()).isBlank()) source.put("bio", author.bio());
+        source.put("verified", author.verified()).put("followersCount", author.followersCount());
     }
 
     private ObjectNode toMaterial(TextPost post, XUserSummary author, boolean archiveOnly) {
@@ -1335,9 +1529,19 @@ public class SourceCollector {
     }
 
     private void collectStyleSamples() {
-        ObjectNode owner = store.tx(tx -> tx.get("meta", "owner"));
+        ObjectNode owner = store.tx(AssistantStore.Tx::ownerBinding);
         if (owner == null || owner.path("accountId").asText("").isBlank()
                 || owner.path("username").asText("").isBlank()) return;
+        withBoundOwner(owner, () -> { collectStyleSamples(owner); return null; });
+    }
+
+    private static <T> T withBoundOwner(ObjectNode owner, Supplier<T> action) {
+        if (PaidCapabilityGate.currentScope() != null || owner == null || owner.path("accountId").asText("").isBlank())
+            return action.get();
+        return PaidCapabilityGate.withCaller(owner.path("username").asText(), owner.path("accountId").asText(), true, action);
+    }
+
+    private void collectStyleSamples(ObjectNode owner) {
         ObjectNode status = store.tx(tx -> tx.get("meta", "style_status"));
         String cursor = status != null && status.path("authorTextOnly").asBoolean()
                 ? boundCursor(status, "cursor", TIMELINE_PROVIDER, TIMELINE_ENDPOINT) : "";
@@ -1468,7 +1672,7 @@ public class SourceCollector {
     }
 
     private boolean hasBoundOwner() {
-        ObjectNode owner = store.tx(tx -> tx.get("meta", "owner"));
+        ObjectNode owner = store.tx(AssistantStore.Tx::ownerBinding);
         return owner != null && !owner.path("accountId").asText("").isBlank();
     }
 

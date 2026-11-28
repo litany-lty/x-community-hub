@@ -29,6 +29,8 @@ function slice(startMarker, endMarker) {
         "assistantDraftVersions",
         "assistantTopicTasks",
         "assistantDraftSaveState",
+        "assistantDraftConflict",
+        "assistantDraftRemoteText",
         "assistantDraftTitle",
         "assistantDraftSelect",
         "assistantDraftLiveMetrics",

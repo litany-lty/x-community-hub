@@ -1,5 +1,7 @@
 package com.xops.hub;
 
+import static com.xops.hub.model.AuthorIdentity.ARCHIVE_ACCOUNT_ID;
+
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sun.net.httpserver.HttpServer;
 import com.xops.hub.config.XOpsProperties;
@@ -23,6 +25,7 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 
@@ -42,6 +45,7 @@ import java.util.Map;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+@DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 @SpringBootTest(
         webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
         properties = {
@@ -399,7 +403,7 @@ class CommunityAnalyticsAndApiTest {
         HttpHeaders authHeaders = new HttpHeaders();
         authHeaders.add(HttpHeaders.COOKIE, sessionCookie);
 
-        // 4. 已登录用户通过 /api/analyze/bundle 获取首日工作台包：默认选中并开放 HOURS_24，48h/7天/30天 锁定，每日限 1 次手动刷新
+        // 首次同步开放 24 小时，其他窗口随成功同步的累计天数解锁。
         ResponseEntity<MultiPeriodDashboardBundle> bundleResp = restTemplate.exchange(
                 "/api/analyze/bundle",
                 HttpMethod.GET,
@@ -423,8 +427,6 @@ class CommunityAnalyticsAndApiTest {
         assertThat(bundleBody.month()).isNull();
         assertThat(bundleBody.accessPolicy()).isNotNull();
         assertThat(bundleBody.accessPolicy().unlockedPeriods()).containsExactly("HOURS_24");
-        assertThat(bundleBody.accessPolicy().dailyRefreshLimit()).isEqualTo(1);
-        assertThat(bundleBody.accessPolicy().dailyRefreshRemaining()).isEqualTo(1);
         assertThat(bundleBody.accessPolicy().authorStatement()).isEqualTo(CommunityHubService.AUTHOR_COST_STORY);
         assertThat(bundleBody.accessPolicy().repoUrl()).isEqualTo(CommunityHubService.AUTHOR_REPO_URL);
 
@@ -465,7 +467,7 @@ class CommunityAnalyticsAndApiTest {
                 "/api/analyze/bundle?refresh=true", HttpMethod.GET, new HttpEntity<>(authHeaders), MultiPeriodDashboardBundle.class);
         assertThat(secondManualRefreshResp.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(secondManualRefreshResp.getBody().hours24().profile().id()).isEqualTo(firstBody.profile().id());
-        assertThat(secondManualRefreshResp.getBody().accessPolicy().dailyRefreshRemaining()).isEqualTo(1);
+        assertThat(secondManualRefreshResp.getBody().accessPolicy().accumulatedDays()).as("DEMO never earns a real sync day").isZero();
 
         // 6. 已登录 @elidlicom 尝试越权传参查询他人账号（如 @other_user）必须返回 403 FORBIDDEN
         ResponseEntity<Map> crossUserResp = restTemplate.exchange(
@@ -492,7 +494,7 @@ class CommunityAnalyticsAndApiTest {
             assertThat(cBody.authorProfile().username()).isEqualTo("elidlicom");
             assertThat(cBody.authorProfile().displayName()).isEqualTo("Litany（李丰一）");
             assertThat(cBody.authorProfile().avatarUrl()).isEqualTo("/author-avatar.webp");
-            assertThat(cBody.authorFollowIntentUrl()).isEqualTo("https://x.com/intent/follow?screen_name=elidlicom");
+            assertThat(cBody.authorFollowIntentUrl()).isEqualTo("https://x.com/intent/follow?user_id=2095392916734976000");
 
             if (expected == 3) {
                 assertThat(cBody.shouldShowAuthorModal()).isTrue();
@@ -928,8 +930,8 @@ class CommunityAnalyticsAndApiTest {
         mockUpstream.createContext("/twitter/user/followings", exchange -> {
             if (followsElidliInGraph.get()) {
                 writeJson(exchange, """
-                        {"followings":[{"id":"999","userName":"elidlicom","name":"Litany（李丰一）","biography":"Java Dev | Studying Chinese Metaphysics(Dao·道)","followers_count":6800,"following_count":320,"statusesCount":1200,"isBlueVerified":true}],"has_next_page":false}
-                        """);
+                        {"followings":[{"id":"%s","userName":"elidlicom","name":"Litany（李丰一）","biography":"Java Dev | Studying Chinese Metaphysics(Dao·道)","followers_count":6800,"following_count":320,"statusesCount":1200,"isBlueVerified":true}],"has_next_page":false}
+                        """.formatted(ARCHIVE_ACCOUNT_ID));
             } else {
                 writeJson(exchange, """
                         {"followings":[{"id":"888","userName":"other_peer","name":"Other Peer","followers_count":500,"following_count":100}],"has_next_page":false}
@@ -987,7 +989,7 @@ class CommunityAnalyticsAndApiTest {
             java.nio.file.Files.deleteIfExists(tempDir.resolve("users").resolve("fan_builder").resolve("store_v1.json.gz"));
             var identity = new com.xops.hub.assistant.AssistantStore(tempDir.resolve("assistant"), objectMapper);
             identity.authorize(new com.xops.hub.model.AnalyticsReportModels.AuthenticatedXUser(
-                    "999", "elidlicom", "Author", "", false, Instant.now()));
+                    ARCHIVE_ACCOUNT_ID, "elidlicom", "Author", "", false, Instant.now()));
             CommunityHubService serviceAfterExpiry = new CommunityHubService(
                     props, demoProvider, twitterProvider, officialProvider, objectMapper, null, identity);
             serviceAfterExpiry.analyzeAccountBundle("fan_builder", "TWITTERAPI_IO", false, "127.0.0.1");
@@ -1006,7 +1008,7 @@ class CommunityAnalyticsAndApiTest {
 
             // 4. 作者本人账号 @elidlicom 登录使用：逢 10 次永不向自己弹求关注提示
             for (int i = 1; i <= 10; i++) {
-                UsageCheckinResponse selfRes = serviceAfterExpiry.recordUsageCheckin("elidlicom", "999");
+                UsageCheckinResponse selfRes = serviceAfterExpiry.recordUsageCheckin("elidlicom", ARCHIVE_ACCOUNT_ID);
                 if (i == 10) {
                     assertThat(selfRes.selfIsAuthor()).isTrue();
                     assertThat(selfRes.shouldShowAuthorModal()).isFalse();
@@ -1068,7 +1070,8 @@ class CommunityAnalyticsAndApiTest {
                 {"tw_d5", "5"}, {"tw_d9", "9"}, {"tw_d20", "20"}, {"tw_d33", "33"}
         };
         String[][] olderMentions = {
-                {"m_d4", "4", "tw_d5", "peer_7d_b"}, {"m_d10", "10", "tw_d9", "peer_30d_a"}, {"m_d18", "18", "tw_d20", "peer_30d_b"}
+                {"m_d4", "4", "tw_d5", "peer_7d_b", "203"}, {"m_d10", "10", "tw_d9", "peer_30d_a", "204"},
+                {"m_d18", "18", "tw_d20", "peer_30d_b", "205"}
         };
         mockUpstream.createContext("/twitter/tweet/advanced_search", exchange -> {
             String q = URLDecoder.decode(exchange.getRequestURI().getRawQuery(), StandardCharsets.UTF_8);
@@ -1090,7 +1093,7 @@ class CommunityAnalyticsAndApiTest {
                     Instant ts = baseNow.minus(Duration.ofDays(Long.parseLong(m[1])));
                     if (ts.getEpochSecond() >= since && ts.getEpochSecond() < until) {
                         if (arr.length() > 0) arr.append(',');
-                        arr.append(String.format("{\"id\":\"%s\",\"conversationId\":\"%s\",\"inReplyToId\":\"%s\",\"isReply\":true,\"inReplyToUsername\":\"prog_user\",\"text\":\"nice\",\"createdAt\":\"%s\",\"author\":{\"id\":\"9\",\"userName\":\"%s\",\"name\":\"%s\",\"followers_count\":600}}", m[0], m[2], m[2], ts, m[3], m[3]));
+                        arr.append(String.format("{\"id\":\"%s\",\"conversationId\":\"%s\",\"inReplyToId\":\"%s\",\"isReply\":true,\"inReplyToUsername\":\"prog_user\",\"text\":\"nice\",\"createdAt\":\"%s\",\"author\":{\"id\":\"%s\",\"userName\":\"%s\",\"name\":\"%s\",\"followers_count\":600}}", m[0], m[2], m[2], ts, m[4], m[3], m[3]));
                     }
                 }
             }
@@ -1174,13 +1177,17 @@ class CommunityAnalyticsAndApiTest {
                         true, false, 900, 10, 2, 1, 3, false, "fresh", ""),
                 new RawTweet("old", "post", now.minus(Duration.ofDays(31)), TweetKind.POST, null, null, List.of(),
                         false, false, 100, 1, 0, 0, 0, false, "old", ""),
+                new RawTweet("outside", "post", now.minus(Duration.ofDays(30)).minusSeconds(1), TweetKind.POST,
+                        null, null, List.of(), false, false, 1, 0, 0, 0, 0, false, "outside", ""),
+                new RawTweet("boundary", "post", now.minus(Duration.ofDays(30)), TweetKind.POST,
+                        null, null, List.of(), false, false, 1, 0, 0, 0, 0, false, "boundary", ""),
                 new RawTweet("rep", "回复".repeat(200), now.minus(Duration.ofHours(3)), TweetKind.REPLY, "peer_x", peer,
                         List.of("peer_x"), false, false, 10, 0, 0, 0, 0, false, "root9", "root9")
         );
         AccountStore.StoredAccount st = AccountStore.merge(null, me, now, tweets, List.of(),
                 List.of(new long[]{now.minus(Duration.ofDays(40)).getEpochSecond(), now.getEpochSecond()}), List.of(), null);
         // 31 天前的推文与区间被裁掉；回复正文只保留前 120 字
-        assertThat(st.tweets()).extracting(AccountStore.StoredTweet::id).containsExactly("rep", "fresh");
+        assertThat(st.tweets()).extracting(AccountStore.StoredTweet::id).containsExactly("rep", "fresh", "boundary");
         assertThat(st.tweetCoverage().get(0)[0]).isEqualTo(now.minus(AccountStore.RETENTION).getEpochSecond());
         assertThat(st.tweets().get(0).text().codePointCount(0, st.tweets().get(0).text().length())).isEqualTo(120);
         assertThat(st.users()).containsOnlyKeys("peer_x");

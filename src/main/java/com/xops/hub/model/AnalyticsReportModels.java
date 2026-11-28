@@ -312,7 +312,7 @@ public final class AnalyticsReportModels {
             int cleanCharLen,
             boolean structuredList,
             boolean hasQuestion,
-            boolean hasExternalLink,
+            Boolean hasExternalLink,
             String externalDomain,
             boolean authorEngaged,
             long viewCount,
@@ -375,6 +375,8 @@ public final class AnalyticsReportModels {
             boolean mutualShareKnown,
             double mutualCommenterSharePct,
             double inferredEffectiveReplyWeight,
+            long knownRelationCommentCount,
+            long unknownRelationCommentCount,
             long p25Views,
             long medianViews,
             long p75Views,
@@ -401,7 +403,7 @@ public final class AnalyticsReportModels {
         public static EmpiricalAlgoCalibration empty() {
             return new EmpiricalAlgoCalibration(
                     0, 6, false,
-                    false, 0.0, 5.0,
+                    false, 0.0, 5.0, 0, 0,
                     0L, 0L, 0L, 0.0, 0.0,
                     false, 0, 0.0,
                     0.0, 0.0, 16,
@@ -448,7 +450,8 @@ public final class AnalyticsReportModels {
             String algoName,
             int authorEngagedPostCount,
             List<OpsRecommendationItem> opsRecommendations,
-            EmpiricalAlgoCalibration calibration
+            EmpiricalAlgoCalibration calibration,
+            List<Instant> recentMainPostTimes
     ) {
         public AlgorithmHealthSummary {
             algoVersion = algoVersion == null ? "" : algoVersion;
@@ -481,7 +484,7 @@ public final class AnalyticsReportModels {
                     recentViewSampleCount, baselineViewSampleCount, controversySampleCount,
                     recentComparisonAvailable, linkComparisonAvailable, metricsNote,
                     algoVersion, algoName, authorEngagedPostCount, opsRecommendations,
-                    EmpiricalAlgoCalibration.empty());
+                    EmpiricalAlgoCalibration.empty(), null);
         }
 
         public AlgorithmHealthSummary(
@@ -505,16 +508,25 @@ public final class AnalyticsReportModels {
                     underTheHoodUrl, viewSampleCount, externalLinkViewSampleCount, nativeViewSampleCount,
                     recentViewSampleCount, baselineViewSampleCount, controversySampleCount,
                     recentComparisonAvailable, linkComparisonAvailable, metricsNote,
-                    "", "", 0, List.of(), EmpiricalAlgoCalibration.empty());
+                    "", "", 0, List.of(), EmpiricalAlgoCalibration.empty(), null);
         }
     }
 
     public record ContentTimingOverview(
             String timezone,
             List<ContentFormatStat> formatStats,
-            List<TopPostCard> topPosts
+            List<TopPostCard> topPosts,
+            RepresentativePostRankings postRankings,
+            Boolean timelineWindowComplete,
+            String bestFormatCode
     ) {
+        public ContentTimingOverview(String timezone, List<ContentFormatStat> formatStats, List<TopPostCard> topPosts) {
+            this(timezone, formatStats, topPosts, null, null, null);
+        }
     }
+
+    /** Indices refer to topPosts followed by additionalPosts. A winning card is serialized once per period. */
+    public record RepresentativePostRankings(Map<String, Map<String, List<Integer>>> byFormat, List<TopPostCard> additionalPosts) {}
 
     // 5. 社区核心铁粉圈层 & X 原生晒单卡片
     public record CircleMember(
@@ -591,16 +603,13 @@ public final class AnalyticsReportModels {
             boolean top50AutoSync,
             List<String> unlockedPeriods,
             Map<String, String> lockedReasons,
-            int dailyRefreshLimit,
-            int dailyRefreshUsed,
-            int dailyRefreshRemaining,
-            String quotaDate,
             boolean accumulatedSummaryMode,
             String accumulationNote,
             String authorStatement,
             String repoUrl,
             boolean scheduledPublishAllowed,
-            String scheduledPublishLockedReason
+            String scheduledPublishLockedReason,
+            String authorAccountId
     ) {
     }
 
@@ -609,7 +618,7 @@ public final class AnalyticsReportModels {
             Instant snapshotAt, Instant cycleStartedAt, Instant lastCompletedAt,
             boolean timelineCovered, boolean inboundCovered, int recentPosts, int recentInbound, int pendingMetricPosts,
             int unattemptedMetricPosts, boolean canContinue, boolean lastAttemptDegraded,
-            Instant timelineCoveredFrom, Instant inboundCoveredFrom, Instant latestMetricFetchedAt
+            Instant timelineCoveredFrom, Instant inboundCoveredFrom, Instant latestMetricFetchedAt, Instant nextCheckAt
     ) {}
 
     public record BackgroundRefreshStatus(
@@ -617,8 +626,20 @@ public final class AnalyticsReportModels {
             Instant startedAt,
             Instant completedAt,
             String error,
-            String refreshId
+            String refreshId,
+            Instant cycleStartedAt,
+            boolean newerResultAvailable
     ) {
+        public BackgroundRefreshStatus(String state, Instant startedAt, Instant completedAt, String error,
+                String refreshId, Instant cycleStartedAt) {
+            this(state, startedAt, completedAt, error, refreshId, cycleStartedAt, false);
+        }
+        public BackgroundRefreshStatus withNewerResult() {
+            return new BackgroundRefreshStatus(state, startedAt, completedAt, error, refreshId, cycleStartedAt, true);
+        }
+        public BackgroundRefreshStatus(String state, Instant startedAt, Instant completedAt, String error, String refreshId) {
+            this(state, startedAt, completedAt, error, refreshId, null);
+        }
         public BackgroundRefreshStatus(String state, Instant startedAt, Instant completedAt, String error) {
             this(state, startedAt, completedAt, error, "");
         }

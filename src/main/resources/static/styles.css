@@ -4840,13 +4840,6 @@ label,
     background: var(--x-amber-soft);
 }
 
-.schedule-eligibility-meta {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
-    margin-top: 8px;
-}
-
 .x-section-card.is-locked-card {
     opacity: 0.62;
 }
@@ -7120,7 +7113,6 @@ body.modal-open {
     .tweet-orig-link,
     .tweet-draft-check-btn,
     #topPostSortSelect,
-    #scheduleEligibilityActionLink,
     #postToXIntentLink,
     #toggleSharePrivacyBtn,
     #downloadCardPngBtn,

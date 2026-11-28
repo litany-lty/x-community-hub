@@ -25,7 +25,7 @@ function context() {
     const element = {classList: {remove: noop}, dataset: {}, hidden: false};
     const removedStorageKeys = [];
     const ctx = {state, LIST_PAGE_SIZE: 50, PERIOD_META: {HOURS_48: {badgePrefix: '48h'}}, Date, Number,
-        Boolean, Set, AbortController, Intl, URLSearchParams,
+        Boolean, Set, AbortController, Intl, URLSearchParams, URL,
         removedStorageKeys, localStorage: {removeItem: key => removedStorageKeys.push(key)},
         document: {querySelectorAll: () => [], getElementById: () => null},
         $: () => element, setTimeout: () => 1, clearTimeout: noop, setInterval: () => 1, clearInterval: noop,
@@ -130,6 +130,15 @@ function response(username = 'alice', id = '1001') {
     delete daily.state.dailyCacheStatus.latestMetricFetchedAt;
     daily.renderDailyCacheStatus({});
     assert.match(daily.$('dailyCacheStatusHint').textContent, /指标最近采集时间未确认/);
+    daily.state.dailyCacheStatus.lastCompletedAt = '2026-11-14T15:30:00Z';
+    daily.state.dailyCacheStatus.nextCheckAt = '2026-11-14T16:30:00Z';
+    daily.renderDailyCacheStatus({nextRefreshAt: '2026-11-15T08:00:00Z'});
+    assert.match(daily.$('dailyCacheStatusHint').textContent, /上次完整同步[^·]*23:30:00/);
+    assert.match(daily.$('dailyCacheStatusHint').textContent, /下次可检查更新[^·]*00:30:00/);
+    daily.state.backgroundRefreshStatus = {state: 'PARTIAL', completedAt: '2026-11-14T16:01:00Z'};
+    daily.renderDailyCacheStatus({});
+    assert.match(daily.$('dailyCacheStatusHint').textContent, /部分.*更新|部分.*补齐/);
+    assert.doesNotMatch(daily.$('dailyCacheStatusHint').textContent, /后台刷新完成/);
     const assistant = context();
     assistant.renderContentAssistant = noop;
     assistant.setContentAssistantError = noop;
@@ -176,7 +185,7 @@ function response(username = 'alice', id = '1001') {
     monitor.assistantKeyValueRows = () => '';
     monitor.renderAssistantHistory = () => '';
     vm.runInContext(
-        section('    const repostPreviewState = {', '    function syncPolishPromptControls(')
+        section('    const PENDING_QUOTE_STORAGE_PREFIX', '    function syncPolishPromptControls(')
         + '\n'
         + section('    function renderAssistantMonitor(', '    function renderContentAssistant('),
         monitor
@@ -199,7 +208,7 @@ function response(username = 'alice', id = '1001') {
     monitor.state.assistantGenerationTargetPinned = false;
 
     const progress = context();
-    const liveEditor = {value: 'text mid-edit', closest: () => ({dataset: {draftId: 'draft'}})};
+    const liveEditor = {value: 'text mid-edit', closest: () => ({dataset: {draftId: 'draft', draftVersion: '1'}})};
     const taskList = {};
     progress.$ = id => ({assistantDraftEditor: liveEditor, assistantTopicTasks: taskList})[id];
     progress.document.activeElement = liveEditor;
@@ -208,13 +217,15 @@ function response(username = 'alice', id = '1001') {
     progress.renderAssistantTask = task => task.stage;
     progress.escapeHtml = String;
     vm.runInContext(
-        section('    const repostPreviewState = {', '    function syncPolishPromptControls(')
+        section('    const PENDING_QUOTE_STORAGE_PREFIX', '    function syncPolishPromptControls(')
         + '\n'
+        + section('    function resolveRepostMaterialUrl(', '    function getRepostItemCommentText(')
+        + section('    function classifyDraftLinks(', '    function buildCalibrationShingleArray(')
         + section('    function assistantDraftLengthText(', '    function assistantKeyValueRows('),
         progress
     );
     progress.renderAssistantTopicDetail({
-        topics: [{id: 'topic'}], drafts: [{id: 'draft', topicId: 'topic'}],
+        topics: [{id: 'topic'}], drafts: [{id: 'draft', topicId: 'topic', version: 1}],
         tasks: [{id: 'job', topicId: 'topic', stage: 'DRAFT'}]
     });
     assert.match(taskList.innerHTML, /DRAFT/, 'topic task status remains live during editing');
@@ -352,10 +363,17 @@ function response(username = 'alice', id = '1001') {
     assert.equal(previewText.value, '<b>older text</b>');
     assert.deepEqual(savedTexts, []);
     assert.equal(queued, 0);
-    historyCase.saveAssistantDraftEditor = async () => {savedTexts.push(activeDraftEditor.value); return true;};
+    historyCase.saveAssistantDraftEditor = async () => {savedTexts.push(activeDraftEditor.value); return {id: 'd1', version: 4};};
+    const adoptions = [];
+    historyCase.runAssistantMutation = async (_, path, request) => {
+        adoptions.push([path,request.version,request.sourceVersion]);
+        return {id:'d1',version:5,text:'<b>older text</b>'};
+    };
+    historyCase.renderAssistantTopicDetail = () => {};
     await click('#assistantAdoptDraftVersion', {isConnected: true});
-    assert.deepEqual(savedTexts, ['current unsaved edit', '<b>older text</b>'], 'adopting saves current edits before the old text');
-    assert.equal(queued, 1);
+    assert.deepEqual(savedTexts, ['current unsaved edit'], 'adopting preserves concurrent edits first');
+    assert.deepEqual(adoptions, [['/drafts/d1/adopt',4,1]], 'restores the selected complete revision');
+    assert.equal(queued, 0);
     assert.equal(preview.hidden, true);
     activeDraftEditor.value = 'current owner text';
     await click('[data-assistant-version-text]', selectVersion);
@@ -366,7 +384,8 @@ function response(username = 'alice', id = '1001') {
     completePriorSave(true);
     await lateAdopt;
     assert.equal(activeDraftEditor.value, 'current owner text', 'a pending adoption cannot apply after account changes');
-    assert.equal(queued, 1);
+    assert.equal(queued, 0);
+    assert.equal(adoptions.length, 1);
 
     const nonOwnerUi = context();
     const shellEl = {hidden: false};
@@ -413,12 +432,20 @@ function response(username = 'alice', id = '1001') {
     assert.equal(repairTask.assistantStatusLabel('SCORED'), '已评分');
     assert.equal(repairTask.assistantSourceRefLabel('source-2#p3'), '网页来源 #2（第 3 段）');
     assert.equal(repairTask.assistantSourceRefLabel('material-99-quoted-article'), '被引用文章全文');
+    const previewId = 'material-historical-key-quoted-article';
+    const clipped = {id:previewId, status:'MATERIAL_PREVIEW', url:'https://x.com/glacier/status/20202'};
+    vm.runInContext(section('    function renderAssistantResearch(', '    function renderAssistantEvidenceChanges('), repairTask);
+    const clippedHtml = repairTask.renderAssistantResearch({materialEvidence:[clipped],
+        claims:[{claim:'公开的节选',sourceIds:[previewId]}]});
+    assert.match(clippedHtml,/被引用文章节选/);
+    assert.doesNotMatch(clippedHtml,/文章全文/);
 
     // Period switch in normal mode reuses in-memory bundle for same user with 0 network requests
     const periodReuse = context();
     const periodUrls = [];
     const cooldownTicks = [];
-    periodReuse.startCacheCooldownTicker = sec => {cooldownTicks.push(sec);};
+    const deadline = new Date(Date.now() + 110000).toISOString();
+    periodReuse.startCacheCooldownTicker = value => {cooldownTicks.push(value);};
     periodReuse.state.period = 'HOURS_24';
     periodReuse.state.days = 1;
     periodReuse.fetch = async url => {
@@ -427,10 +454,10 @@ function response(username = 'alice', id = '1001') {
             status: 200,
             ok: true,
             body: {
-                hours24: {profile: {id: '1001', username: 'alice'}, periodCode: 'HOURS_24', cacheRemainingSeconds: 120},
-                day: {profile: {id: '1001', username: 'alice'}, periodCode: 'HOURS_48', cacheRemainingSeconds: 115},
-                week: {profile: {id: '1001', username: 'alice'}, periodCode: 'WEEK', cacheRemainingSeconds: 110},
-                month: {profile: {id: '1001', username: 'alice'}, periodCode: 'MONTH', cacheRemainingSeconds: 105},
+                hours24: {profile: {id: '1001', username: 'alice'}, periodCode: 'HOURS_24', nextRefreshAt: deadline},
+                day: {profile: {id: '1001', username: 'alice'}, periodCode: 'HOURS_48', nextRefreshAt: deadline},
+                week: {profile: {id: '1001', username: 'alice'}, periodCode: 'WEEK', nextRefreshAt: deadline},
+                month: {profile: {id: '1001', username: 'alice'}, periodCode: 'MONTH', nextRefreshAt: deadline},
                 coveredWindowDays: 30,
                 hasMoreHistoryForTarget: false
             }
@@ -445,11 +472,15 @@ function response(username = 'alice', id = '1001') {
     await periodReuse.loadSelfReport(false);
     assert.equal(periodUrls.length, 1, 'switching period in normal mode reuses in-memory bundle without fetch');
     assert.equal(periodReuse.state.report.periodCode, 'WEEK');
-    assert.equal(cooldownTicks[cooldownTicks.length - 1], 110, 'reusing memory bundle refreshes cooldown ticker');
+    assert.equal(cooldownTicks[cooldownTicks.length - 1], deadline, 'viewing a cached period preserves its server deadline');
     await periodReuse.loadSelfReport({reloadFromServer: true});
     assert.equal(periodUrls.length, 2, 'reloadFromServer bypasses in-memory bundle');
     assert.doesNotMatch(periodUrls[1], /refresh=true/, 'reloadFromServer must not re-trigger force refresh');
     assert.doesNotMatch(periodUrls[1], /preferStored=true/, 'reloadFromServer must not send preferStored=true');
+
+    periodReuse.state.bundle.WEEK.nextRefreshAt = new Date(Date.now() - 1000).toISOString();
+    await periodReuse.loadSelfReport(false);
+    assert.equal(periodUrls.length, 3, 'an expired in-memory period checks the server again on demand');
 
     // Background refresh RUNNING -> poll SUCCEEDED -> reloads latest server bundle without ReferenceError
     const bgPoll = context();
@@ -504,6 +535,60 @@ function response(username = 'alice', id = '1001') {
     assert.doesNotMatch(bgFetchUrls[0], /preferStored=true/, 'forceRefresh must not send preferStored=true');
     assert.doesNotMatch(bgFetchUrls[bgFetchUrls.length - 1], /refresh=true/, 'post-SUCCEEDED reload must not send refresh=true');
     assert.doesNotMatch(bgFetchUrls[bgFetchUrls.length - 1], /preferStored=true/, 'post-SUCCEEDED reload must not send preferStored=true');
+    assert.match(bgFetchUrls.at(-1), /[?&]stored=true(?:&|$)/, 'displaying a completed refresh uses the read-only endpoint');
+
+    const fast = context();
+    let fastPoll;
+    const fastUrls = [];
+    fast.setTimeout = (fn, ms) => { if (ms === 2000) fastPoll = fn; return 1; };
+    fast.fetch = async url => {
+        fastUrls.push(url);
+        const status = {state: 'SUCCEEDED', refreshId: 'just-finished', cycleStartedAt: '2026-11-22T10:00:00Z'};
+        if (url.endsWith('/refresh/status')) return {ok: true, status: 200, body: status};
+        const result = response();
+        const fresh = url.includes('stored=true');
+        result.body.day.rev = fresh ? 'new' : 'old';
+        result.body.hours24 = result.body.day;
+        result.body.dailyCacheStatus = {cycleStartedAt: fresh ? status.cycleStartedAt : '2026-11-20T10:00:00Z', canContinue: false};
+        if (!fresh) result.body.backgroundRefreshStatus = {...status, newerResultAvailable: true};
+        return result;
+    };
+    await fast.loadSelfReport(false);
+    assert.equal(fast.state.report.rev, 'old');
+    assert.equal(typeof fastPoll, 'function');
+    await fastPoll();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(fast.state.report.rev, 'new');
+    assert.equal(fastUrls.filter(url => url.includes('stored=true')).length, 1);
+
+    const manual = context();
+    const manualPosts = [];
+    manual.state.backgroundRefreshStatus = {state: 'SUCCEEDED', refreshId: 'previous'};
+    manual.fetch = async (url, options = {}) => {
+        if (options.method === 'POST') {
+            manualPosts.push(url);
+            return {status: 200, ok: true, body: {state: 'RUNNING', refreshId: 'new'}};
+        }
+        const res = response();
+        res.body.dailyCacheStatus = {cycleStartedAt: '2026-11-14T12:00:00Z', canContinue: true, lastAttemptDegraded: false};
+        res.body.backgroundRefreshStatus = {state: 'SUCCEEDED', refreshId: 'previous', cycleStartedAt: '2026-11-13T10:00:00Z'};
+        return res;
+    };
+    await manual.loadSelfReport(true);
+    assert.equal(manualPosts.length, 1, 'a successful job from yesterday cannot stop the current manual continuation');
+
+    const olderPoll = context();
+    let poll, finishPoll;
+    olderPoll.setTimeout = (fn, ms) => { if (ms === 2000) poll = fn; return 1; };
+    olderPoll.fetch = () => new Promise(resolve => { finishPoll = resolve; });
+    olderPoll.state.backgroundRefreshStatus = {state: 'RUNNING', refreshId: 'old'};
+    olderPoll.scheduleWorkspaceRefreshPoll('alice', 'HOURS_24', 1);
+    const pendingPoll = poll();
+    olderPoll.state.reportRequestGeneration++;
+    olderPoll.state.backgroundRefreshStatus = {state: 'RUNNING', refreshId: 'current'};
+    finishPoll({status: 200, ok: true, body: {state: 'PARTIAL', refreshId: 'old'}});
+    await pendingPoll;
+    assert.equal(olderPoll.state.backgroundRefreshStatus.refreshId, 'current');
 
     // Verified @elidlicom ownerAllPermissions unlocks all periods, schedule access, and 0ms interval immediately
     const ownerPerms = context();
@@ -524,6 +609,14 @@ function response(username = 'alice', id = '1001') {
     ownerPerms.state.authStatus = {loggedIn: true, ownerAllPermissions: false, user: {id: '9999', username: 'elidlicom'}};
     assert.equal(ownerPerms.isPeriodUnlocked('MONTH'), false, 'unverified handle spoof does not unlock periods');
     assert.equal(ownerPerms.getRequiredScheduleIntervalMs(), 3_600_000, 'unverified handle spoof keeps 1h schedule interval');
+    ownerPerms.state.scheduleAccess = {allowed: true, authorInteractionRank: 1};
+    ownerPerms.state.accessPolicy = {top5FullAccess: true, scheduledPublishAllowed: true};
+    ownerPerms.state.assistantAccess = {allowed: true};
+    assert.equal(ownerPerms.isScheduleEligible(), false, 'cached rank and assistant permissions cannot override the signed-in account');
+    ownerPerms.state.authStatus = {loggedIn: true, user: {id: '9999', username: 'elidlicom'}};
+    assert.equal(ownerPerms.isScheduleEligible(), false, 'a legacy response without verified ownership cannot enable scheduling');
+    ownerPerms.state.authStatus = {loggedIn: false};
+    assert.equal(ownerPerms.isScheduleEligible(), false, 'signed-out accounts have no scheduling entitlement');
 
     // SWR acceptance notice does not trigger caution state, and auto-opened syncStatusDetails closes once resolved
     const headerCtx = context();
@@ -598,7 +691,7 @@ function response(username = 'alice', id = '1001') {
     settledPartialReport.activity.sampleCapped = true;
     settledPartialReport.activity.coverageNote = '实际数据覆盖约 18 小时';
     headerCtx.renderProfileHeader(settledPartialReport);
-    assert.equal(getHeaderNode('syncStatusSummary').textContent, '数据状态');
+    assert.equal(getHeaderNode('syncStatusSummary').textContent, '部分数据待补齐');
     assert.equal(getHeaderNode('syncStatusDetails').open, false);
     assert.equal(getHeaderNode('syncStatusDetails').classList.contains('is-attention'), false);
 

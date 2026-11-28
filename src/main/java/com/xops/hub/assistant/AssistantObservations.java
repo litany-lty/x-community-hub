@@ -28,6 +28,8 @@ import static com.xops.hub.assistant.AssistantStore.object;
 /** Low-priority snapshots for age-matched post metrics and daily owner followers. */
 @Service
 public final class AssistantObservations {
+    @org.springframework.beans.factory.annotation.Value("${xops.content-assistant-background-collection-enabled:true}")
+    private boolean backgroundCollectionEnabled = true;
     static final ZoneId USER_ZONE = ZoneId.of("Asia/Shanghai");
     static final long WINDOW_TOLERANCE_MS = DurationHours.ONE;
     static final List<Integer> WINDOWS = List.of(24, 72, 168);
@@ -47,7 +49,7 @@ public final class AssistantObservations {
     @Autowired
     public AssistantObservations(AssistantStore store, AssistantPublishing publishing, TwitterApiIoProvider provider) {
         this(store, () -> {
-            ObjectNode owner = store.tx(tx -> tx.get("meta", "owner"));
+            ObjectNode owner = store.tx(AssistantStore.Tx::ownerBinding);
             if (owner != null) publishing.reconcile(owner.path("accountId").asText());
         }, new ObservationClient() {
             @Override public ObjectNode post(String ownerId, String postId) { return provider.observePost(ownerId, postId); }
@@ -64,6 +66,7 @@ public final class AssistantObservations {
 
     @Scheduled(fixedDelayString = "${xops.content-assistant-observation-ms:300000}")
     public void tick() {
+        if (!backgroundCollectionEnabled) return;
         if (observationRunning.compareAndSet(false, true)) worker.submit(() -> {
             try { runTick(); } finally { observationRunning.set(false); }
         });
@@ -73,10 +76,10 @@ public final class AssistantObservations {
         Owner owner = owner();
         if (owner == null) return;
         com.xops.hub.provider.PaidCapabilityGate.runWithCaller(
-                com.xops.hub.provider.PaidCapabilityGate.PRIVILEGED_USERNAME, owner.id(), () -> {
+                owner.username(), owner.id(), true, () -> {
             reconcile.run();
             long now = clock.millis();
-            syncPublishedTargets(owner, now);
+            syncPublishedTargets(now);
             syncRecentHistoryTargets(owner, now);
             Target due = store.tx(tx -> nextDue(tx, now));
             if (due != null) observe(owner, due, now);
@@ -85,6 +88,7 @@ public final class AssistantObservations {
 
     @Scheduled(cron = "${xops.content-assistant-followers-cron:0 20 3 * * *}", zone = "Asia/Shanghai")
     public void followers() {
+        if (!backgroundCollectionEnabled) return;
         if (followersRunning.compareAndSet(false, true)) worker.submit(() -> {
             try { recordFollowers(); } finally { followersRunning.set(false); }
         });
@@ -97,7 +101,7 @@ public final class AssistantObservations {
         if (store.tx(tx -> tx.get("followers", day)) != null) return;
         try {
             ObjectNode observed = com.xops.hub.provider.PaidCapabilityGate.withCaller(
-                    com.xops.hub.provider.PaidCapabilityGate.PRIVILEGED_USERNAME, owner.id(),
+                    owner.username(), owner.id(), true,
                     () -> client.owner(owner.id(), owner.username()));
             long observedAt = requiredObservedAt(observed);
             store.tx(tx -> {
@@ -127,25 +131,36 @@ public final class AssistantObservations {
     private Owner owner() {
         return store.tx(tx -> {
             if (!AssistantWorkflow.settings(tx).path("enabled").asBoolean()) return null;
-            ObjectNode value = tx.get("meta", "owner");
+            ObjectNode value = tx.ownerBinding();
             if (value == null || value.path("accountId").asText("").isBlank() || value.path("username").asText("").isBlank()) return null;
             return new Owner(value.path("accountId").asText(), value.path("username").asText());
         });
     }
 
-    private void syncPublishedTargets(Owner owner, long now) {
+    private void syncPublishedTargets(long now) {
         store.tx(tx -> {
-            for (ObjectNode publication : tx.page("publication", 200, 0)) {
+            for (ObjectNode publication : tx.publicationsPendingObservation(200)) {
                 String postId = publication.path("publishedTweetId").asText("");
                 long publishedAt = publication.path("publishedAt").asLong(0);
-                if (postId.isBlank() || publishedAt <= 0) continue;
-                putTarget(tx, postId, publishedAt, publication.path("id").asText(""), "ASSISTANT", publication);
+                String publicationId = publication.path("id").asText();
+                ObjectNode target = putTarget(tx, postId, publishedAt, publicationId, "ASSISTANT", publication);
+                for (int hours : WINDOWS) {
+                    String id = postId + ":" + hours;
+                    var row = tx.get("observation", id);
+                    if (row == null) continue;
+                    var attributed = row.deepCopy();
+                    for (String field : List.of("publicationId", "source", "topicId", "materialId", "draftId", "draftVersion", "skillId")) {
+                        if (target.has(field)) attributed.set(field, target.get(field));
+                    }
+                    if (!row.equals(attributed)) tx.put("observation", id, attributed);
+                }
                 if (!publication.path("styleRefreshMarkedAt").isIntegralNumber()) {
                     ObjectNode status = Optional.ofNullable(tx.get("meta", "style_status")).orElse(object()).deepCopy();
                     status.put("refreshRequestedAt", now).put("publishedPostId", postId);
                     tx.put("meta", "style_status", status);
-                    tx.put("publication", publication.path("id").asText(), publication.deepCopy().put("styleRefreshMarkedAt", now));
+                    publication.put("styleRefreshMarkedAt", now);
                 }
+                tx.put("publication", publicationId, publication.put("observationLinkedTweetId", postId));
             }
             return null;
         });
@@ -172,8 +187,8 @@ public final class AssistantObservations {
         });
     }
 
-    private void putTarget(AssistantStore.Tx tx, String postId, long publishedAt, String publicationId, String source, ObjectNode origin) {
-        if(postId.isBlank()) return;
+    private ObjectNode putTarget(AssistantStore.Tx tx, String postId, long publishedAt, String publicationId, String source, ObjectNode origin) {
+        if(postId.isBlank()) return null;
         String draftId = origin.path("draftId").asText("");
         String skillId = ViralWritingSkills.normalizeId(origin.path("skillId").asText(""));
         if (skillId.isEmpty() && !draftId.isBlank()) {
@@ -183,18 +198,21 @@ public final class AssistantObservations {
             if (d != null) skillId = ViralWritingSkills.normalizeId(d.path("skillId").asText(""));
         }
         var existing=tx.get("observation_target",postId);
+        if (existing != null && !existing.path("publicationId").asText("").isEmpty()
+                && !publicationId.isEmpty() && !publicationId.equals(existing.path("publicationId").asText())) return existing;
         if(existing!=null && (publicationId.isEmpty() || publicationId.equals(existing.path("publicationId").asText()))) {
-            if (existing.path("skillId").asText("").isBlank() && !skillId.isEmpty()) {
-                tx.put("observation_target", postId, existing.deepCopy().put("skillId", skillId));
-            }
-            return;
+            var updated = existing.deepCopy();
+            if (existing.path("skillId").asText("").isBlank() && !skillId.isEmpty()) updated.put("skillId", skillId);
+            if (!publicationId.isEmpty() && origin.hasNonNull("materialId")) updated.set("materialId", origin.get("materialId"));
+            return updated.equals(existing) ? existing : tx.put("observation_target", postId, updated);
         }
         ObjectNode target = object().put("postId", postId).put("publishedAt", publishedAt)
                 .put("publicationId", publicationId).put("source", source)
                 .put("topicId", origin.path("topicId").asText("")).put("draftId", draftId)
                 .put("draftVersion", origin.path("draftVersion").asInt(0));
         if (!skillId.isEmpty()) target.put("skillId", skillId);
-        tx.put("observation_target", postId, target);
+        if (!publicationId.isEmpty() && origin.hasNonNull("materialId")) target.set("materialId", origin.get("materialId"));
+        return tx.put("observation_target", postId, target);
     }
 
     private Target nextDue(AssistantStore.Tx tx, long now) {
@@ -292,6 +310,7 @@ public final class AssistantObservations {
                 .put("draftId", target.path("draftId").asText("")).put("draftVersion", target.path("draftVersion").asInt(0));
         String skillId = ViralWritingSkills.normalizeId(target.path("skillId").asText(""));
         if (!skillId.isEmpty()) row.put("skillId", skillId);
+        if (target.hasNonNull("materialId")) row.set("materialId", target.get("materialId"));
         return row;
     }
 

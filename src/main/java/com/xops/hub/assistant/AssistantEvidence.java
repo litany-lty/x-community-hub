@@ -50,18 +50,11 @@ public final class AssistantEvidence {
     public static ObjectNode changes(AssistantStore.Tx tx, ObjectNode draft) {
         ObjectNode output = object();
         ArrayNode details = output.putArray("evidenceChanges");
-        JsonNode research = researchSnapshot(tx, draft);
+        JsonNode research = AssistantWorkflow.draftResearch(tx, draft);
         compareSources(tx, research, details);
         compareTopic(tx, draft, research, details);
         output.put("sourcesChanged", !details.isEmpty());
         return output;
-    }
-
-    private static JsonNode researchSnapshot(AssistantStore.Tx tx, ObjectNode draft) {
-        if (draft.path("research").isObject()) return draft.path("research");
-        String id = draft.path("researchId").asText("");
-        ObjectNode stored = id.isBlank() ? null : tx.get("research", id);
-        return stored == null ? object() : stored;
     }
 
     private static void compareSources(AssistantStore.Tx tx, JsonNode research, ArrayNode details) {
@@ -157,6 +150,7 @@ public final class AssistantEvidence {
         return result;
     }
     private static String materialFingerprint(JsonNode material) {
+        if (AssistantWorkflow.isWebLinkMaterial(material)) return AssistantWorkflow.materialContentFingerprint(material);
         String value = material.path("contentFingerprint").asText("");
         return value.isBlank() ? hash(material.path("text").asText("") + "\n" + material.path("quotedText").asText("") + "\n" + material.path("articleText").asText("")) : value;
     }

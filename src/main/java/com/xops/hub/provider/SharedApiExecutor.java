@@ -38,6 +38,13 @@ public class SharedApiExecutor {
     private static final Logger log = LoggerFactory.getLogger(SharedApiExecutor.class);
     private static final AtomicInteger POOL_SEQ = new AtomicInteger(1);
 
+    /** Admission failed before the supplied callable could start. */
+    public static final class NotStartedException extends XDataProviderException {
+        public NotStartedException(String message) {
+            super(503, message);
+        }
+    }
+
     private static final class ScaleFirstBoundedQueue extends ArrayBlockingQueue<Runnable> {
         private volatile ThreadPoolExecutor executor;
 
@@ -140,14 +147,12 @@ public class SharedApiExecutor {
                 long waitedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - enqueuedNanos);
                 if (queueTimeoutMs > 0 && waitedMs > queueTimeoutMs) {
                     queueTimedOutCount.incrementAndGet();
-                    future.completeExceptionally(new XDataProviderException(503, "当前请求排队等待超时，请稍后再试"));
+                    future.completeExceptionally(new NotStartedException("当前请求排队等待超时，请稍后再试"));
                     cancel(false);
                     return;
                 }
                 PaidCapabilityGate.CallerScope prevScope = PaidCapabilityGate.currentScope();
-                if (capturedScope != null) {
-                    PaidCapabilityGate.bindScope(capturedScope);
-                }
+                PaidCapabilityGate.bindScope(capturedScope);
                 try {
                     super.run();
                 } finally {
@@ -184,7 +189,7 @@ public class SharedApiExecutor {
                 ScheduledFuture<?> timer = queueWatchdog.schedule(() -> {
                     if (claimed.compareAndSet(false, true)) {
                         queueTimedOutCount.incrementAndGet();
-                        future.completeExceptionally(new XDataProviderException(503, "当前请求排队等待超时，请稍后再试"));
+                        future.completeExceptionally(new NotStartedException("当前请求排队等待超时，请稍后再试"));
                     }
                 }, queueTimeoutMs, TimeUnit.MILLISECONDS);
                 timeout.set(timer);
@@ -197,7 +202,7 @@ public class SharedApiExecutor {
             }
         } catch (RejectedExecutionException ex) {
             claimed.set(true);
-            future.completeExceptionally(new XDataProviderException(503, "当前外部请求队列繁忙，请稍后再试"));
+            future.completeExceptionally(new NotStartedException("当前外部请求队列繁忙，请稍后再试"));
         }
         return future;
     }

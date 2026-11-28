@@ -297,9 +297,16 @@ public final class ContentAssistantModelTasks {
             }
         }
 
-        // 2. Deep research external web evidence & excerpts (highest priority for information asymmetry)
+        // 2. Deep research external web evidence & excerpts (highest priority for information asymmetry, isolated per article)
+        String selectedId = safe(ctx.selectedMaterialId()).strip();
         JsonNode rawRes = ctx.rawResearch();
-        if (rawRes != null && rawRes.isObject() && remaining >= 100) {
+        String rawResMatId = rawRes != null && rawRes.isObject()
+                ? (!rawRes.path("materialId").asText("").isBlank()
+                        ? rawRes.path("materialId").asText("").strip()
+                        : rawRes.path("snapshot").path("selectedMaterialId").asText("").strip())
+                : "";
+        boolean rawResMatchesTarget = selectedId.isBlank() || rawResMatId.isBlank() || selectedId.equals(rawResMatId);
+        if (rawRes != null && rawRes.isObject() && rawResMatchesTarget && remaining >= 100) {
             Map<String, JsonNode> readsById = new LinkedHashMap<>();
             if (rawRes.path("sourceReads").isArray()) {
                 for (JsonNode sr : rawRes.path("sourceReads")) {
@@ -399,23 +406,22 @@ public final class ContentAssistantModelTasks {
             }
         }
 
-        // 3. Primary X posts, quoted posts, long articles, author identity & engagement signals
+        // 3. Primary X posts, quoted posts, long articles, author identity & engagement signals (isolated to selected article)
         if (remaining >= 90) {
             ArrayNode primaryArr = mapper.createArrayNode();
-            String selectedId = safe(ctx.selectedMaterialId()).strip();
             List<JsonNode> orderedMats = new ArrayList<>();
-            List<JsonNode> secondaryMats = new ArrayList<>();
             if (ctx.materials() != null && ctx.materials().isArray()) {
                 for (JsonNode m : ctx.materials()) {
                     if (m == null || !m.isObject()) continue;
-                    if (!selectedId.isBlank() && selectedId.equals(m.path("id").asText(""))) {
-                        orderedMats.add(m);
+                    if (!selectedId.isBlank()) {
+                        if (selectedId.equals(m.path("id").asText(""))) {
+                            orderedMats.add(m);
+                        }
                     } else {
-                        secondaryMats.add(m);
+                        orderedMats.add(m);
                     }
                 }
             }
-            orderedMats.addAll(secondaryMats);
 
             for (JsonNode mat : orderedMats) {
                 if (primaryArr.size() >= 5 || remaining < 90) break;
@@ -440,7 +446,8 @@ public final class ContentAssistantModelTasks {
                     mNode.put("author", authorLabel);
                 }
                 if (!authorRole.isBlank()) mNode.put("authorContext", authorRole);
-                String srcUrl = mat.path("sourceUrl").asText("").strip();
+                var original = AssistantPublishing.materialPost(mid, mat);
+                String srcUrl = original == null ? mat.path("sourceUrl").asText("").strip() : original.url();
                 if (!srcUrl.isBlank()) mNode.put("sourceUrl", srcUrl);
 
                 ObjectNode eng = mapper.createObjectNode();
@@ -460,6 +467,10 @@ public final class ContentAssistantModelTasks {
                     mNode.put("quotedText", limitCodePoints(quotedText, Math.min(1000, maxBodyCodePoints)));
                 }
                 if (!articleText.isBlank()) {
+                    mNode.put("articleRole", mat.path("articleRole").asText("UNKNOWN"));
+                    mNode.put("articleTextStatus", mat.path("articleTextStatus").asText("UNKNOWN"));
+                    if ("QUOTED".equals(mat.path("articleRole").asText()) && !mat.path("quotedUsername").asText("").isBlank())
+                        mNode.put("articleAuthor", "@" + mat.path("quotedUsername").asText().replaceFirst("^@+", ""));
                     mNode.put("articleText", limitCodePoints(articleText, maxBodyCodePoints));
                 }
 
@@ -470,12 +481,18 @@ public final class ContentAssistantModelTasks {
                 }
             }
 
-            if (primaryArr.isEmpty() && rawRes != null && rawRes.path("materialEvidence").isArray()) {
+            if (primaryArr.isEmpty() && rawRes != null && rawResMatchesTarget && rawRes.path("materialEvidence").isArray()) {
+                String allowedMatPrefix = selectedId.isBlank() ? "" : ("material-" + selectedId + "-");
                 for (JsonNode me : rawRes.path("materialEvidence")) {
                     if (primaryArr.size() >= 4 || remaining < 80) break;
+                    String meId = me.path("id").asText("").strip();
+                    if (!allowedMatPrefix.isEmpty() && meId.startsWith("material-") && !meId.startsWith(allowedMatPrefix)) {
+                        continue;
+                    }
                     ObjectNode mNode = mapper.createObjectNode()
-                            .put("sourceId", me.path("id").asText(""))
+                            .put("sourceId", meId)
                             .put("publisher", me.path("publisher").asText(""))
+                            .put("status", me.path("status").asText(""))
                             .put("url", me.path("url").asText(""));
                     ArrayNode exArr = mNode.putArray("excerpts");
                     for (JsonNode ex : me.path("excerpts")) {

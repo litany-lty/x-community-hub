@@ -1,5 +1,7 @@
 package com.xops.hub;
 
+import static com.xops.hub.model.AuthorIdentity.ARCHIVE_ACCOUNT_ID;
+
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.databind.node.ArrayNode;
@@ -99,7 +101,7 @@ class ElidlicomDataBusinessGuaranteesTest {
             freeProfileHits.incrementAndGet();
             String path = ex.getRequestURI().getPath();
             String uname = path.substring(path.lastIndexOf('/') + 1);
-            String uid = "elidlicom".equalsIgnoreCase(uname) ? "9000" : "3001";
+            String uid = "elidlicom".equalsIgnoreCase(uname) ? ARCHIVE_ACCOUNT_ID : "3001";
             ObjectNode body = mapper.createObjectNode().put("code", 200);
             body.set("user", fxUser(uid, uname, 1280, 310, 88));
             writeJson(ex, 200, body);
@@ -113,12 +115,12 @@ class ElidlicomDataBusinessGuaranteesTest {
             if (q.contains("from:elidlicom")) {
                 long secEpoch = secondLiveTweetEpoch.get();
                 if (secEpoch > 0L) {
-                    results.add(fxStatus("990006", "9000", "elidlicom", "第二次秒级新增推文", secEpoch, 600, 40, 6, 3, 9));
+                    results.add(fxStatus("990006", ARCHIVE_ACCOUNT_ID, "elidlicom", "第二次秒级新增推文", secEpoch, 600, 40, 6, 3, 9));
                 }
                 if (publishBreakingTweet.get() && q.contains("since_time:" + lastSyncEpochFromQuery(q))) {
                     long sinceSec = Long.parseLong(lastSyncEpochFromQuery(q));
                     if (now.getEpochSecond() - 2 >= sinceSec) {
-                        results.add(fxStatus("990001", "9000", "elidlicom", "刚刚发布的新动态", now.getEpochSecond() - 2, 500, 30, 5, 2, 8));
+                        results.add(fxStatus("990001", ARCHIVE_ACCOUNT_ID, "elidlicom", "刚刚发布的新动态", now.getEpochSecond() - 2, 500, 30, 5, 2, 8));
                     }
                 }
             } else if (q.contains("from:peer_cached")) {
@@ -132,7 +134,7 @@ class ElidlicomDataBusinessGuaranteesTest {
             freeMetricHits.incrementAndGet();
             String id = ex.getRequestURI().getPath().substring(ex.getRequestURI().getPath().lastIndexOf('/') + 1);
             ObjectNode body = mapper.createObjectNode().put("code", 200);
-            body.set("status", fxStatus(id, "9000", "elidlicom", "cached post", now.getEpochSecond() - 3600, 1200, 66, 8, 4, 12));
+            body.set("status", fxStatus(id, ARCHIVE_ACCOUNT_ID, "elidlicom", "cached post", now.getEpochSecond() - 3600, 1200, 66, 8, 4, 12));
             writeJson(ex, 200, body);
         });
         freeServer.start();
@@ -162,7 +164,7 @@ class ElidlicomDataBusinessGuaranteesTest {
         props.setFxtwitterBaseUrl("http://127.0.0.1:" + freeServer.getAddress().getPort() + "/2");
 
         // Pre-seed @elidlicom with 90-day full history + a recent 24h post synced 30 seconds ago (with complete graph & fresh metrics)
-        XUserSummary owner = new XUserSummary("9000", "elidlicom", "Litany", "", "", true, 1280, 310, 88, "2020");
+        XUserSummary owner = new XUserSummary(ARCHIVE_ACCOUNT_ID, "elidlicom", "Litany", "", "", true, 1280, 310, 88, "2020");
         Instant lastSync = now.minusSeconds(30);
         RawTweet hist90d = new RawTweet("990003", "90天前历史推文", now.minus(Duration.ofDays(90)),
                 TweetKind.POST, "", null, List.of(), false, false, 3000, 120, 15, 9, 25, false, "990003", "");
@@ -171,7 +173,7 @@ class ElidlicomDataBusinessGuaranteesTest {
         AccountStore.GraphUpdate seededGraph = new AccountStore.GraphUpdate(
                 List.of(), List.of(), Set.of(), false, false, false, false);
         // Set follower/following counts to 0 on seeded owner so empty graph matches 0/0 without truncation, then update server to match
-        XUserSummary exactOwner = new XUserSummary("9000", "elidlicom", "Litany", "", "", true, 0, 0, 88, "2020");
+        XUserSummary exactOwner = new XUserSummary(ARCHIVE_ACCOUNT_ID, "elidlicom", "Litany", "", "", true, 0, 0, 88, "2020");
         AccountStore.StoredAccount seededOwner = AccountStore.merge(
                 null, exactOwner, lastSync, List.of(hist90d, recent1h), List.of(),
                 List.of(new long[]{now.minus(Duration.ofDays(90)).getEpochSecond(), lastSync.getEpochSecond()}),
@@ -179,7 +181,7 @@ class ElidlicomDataBusinessGuaranteesTest {
                 seededGraph, Map.of("990002", lastSync.getEpochSecond(), "990003", lastSync.getEpochSecond()));
         seededOwner = AccountStore.withMetricAttempts(seededOwner, List.of("990002"), lastSync);
         seededOwner = AccountStore.withDailyRefreshState(seededOwner, lastSync.getEpochSecond(), lastSync.getEpochSecond());
-        AccountStore.write(dir.resolve("users/by-id/9000/store_v" + AccountStore.VERSION + ".json.gz"), seededOwner, mapper);
+        AccountStore.write(dir.resolve("users/by-id/" + ARCHIVE_ACCOUNT_ID + "/store_v" + AccountStore.VERSION + ".json.gz"), seededOwner, mapper);
 
         // Also seed @peer_cached synced 30 seconds ago with completed daily state (subject to 1-hour cache restriction)
         XUserSummary peer = new XUserSummary("3001", "peer_cached", "Peer", "", "", false, 0, 0, 10, "2023");
@@ -197,7 +199,7 @@ class ElidlicomDataBusinessGuaranteesTest {
             freeProfileHits.incrementAndGet();
             String path = ex.getRequestURI().getPath();
             String uname = path.substring(path.lastIndexOf('/') + 1);
-            String uid = "elidlicom".equalsIgnoreCase(uname) ? "9000" : "3001";
+            String uid = "elidlicom".equalsIgnoreCase(uname) ? ARCHIVE_ACCOUNT_ID : "3001";
             ObjectNode body = mapper.createObjectNode().put("code", 200);
             body.set("user", fxUser(uid, uname, 0, 0, 88));
             writeJson(ex, 200, body);
@@ -223,17 +225,20 @@ class ElidlicomDataBusinessGuaranteesTest {
             // Guarantee 3 (Fast SWR read): preferStored=true serves @elidlicom cached store immediately and triggers background delta sync
             long swrStartNs = System.nanoTime();
             MultiPeriodDashboardBundle fastSwr = hub.analyzeWorkspaceBundle(
-                    "elidlicom", ReportPeriod.HOURS_24, "TWITTERAPI_IO", false, "127.0.0.1", "9000", false, true);
+                    "elidlicom", ReportPeriod.HOURS_24, "TWITTERAPI_IO", false, "127.0.0.1", ARCHIVE_ACCOUNT_ID, false, true);
             long swrMs = Duration.ofNanos(System.nanoTime() - swrStartNs).toMillis();
             assertThat(fastSwr.hours24().fromCache()).isTrue();
             assertThat(swrMs).isLessThan(500L);
 
             long waitDeadline = System.nanoTime() + Duration.ofSeconds(3).toNanos();
-            while (!"SUCCEEDED".equals(hub.workspaceRefreshStatus("elidlicom", "TWITTERAPI_IO", "9000").state())
+            while ("RUNNING".equals(hub.workspaceRefreshStatus("elidlicom", "TWITTERAPI_IO", ARCHIVE_ACCOUNT_ID).state())
                     && System.nanoTime() < waitDeadline) {
                 Thread.sleep(15L);
             }
-            assertThat(hub.workspaceRefreshStatus("elidlicom", "TWITTERAPI_IO", "9000").state()).isEqualTo("SUCCEEDED");
+            var firstStored = AccountStore.read(dir.resolve("users/by-id/" + ARCHIVE_ACCOUNT_ID + "/store_v1.json.gz"), mapper);
+            assertThat(hub.workspaceRefreshStatus("elidlicom", "TWITTERAPI_IO", ARCHIVE_ACCOUNT_ID).state())
+                    .isIn("PARTIAL", "SUCCEEDED");
+            assertThat(firstStored.tweets()).extracting(AccountStore.StoredTweet::id).contains("990001", "990003");
 
             // Guarantee 1 (Immediacy) + Guarantee 2 (Completeness) + Guarantee 3 (Delta-only speed):
             // 1 second later a second tweet is published; direct refresh for @elidlicom bypasses the 1-hour cache lock,
@@ -243,14 +248,18 @@ class ElidlicomDataBusinessGuaranteesTest {
             freeMetricHits.set(0);
             paidGraphHits.set(0);
             MultiPeriodDashboardBundle liveOwner = hub.analyzeWorkspaceBundle(
-                    "elidlicom", ReportPeriod.HOURS_24, "TWITTERAPI_IO", true, "127.0.0.1", "9000", false);
+                    "elidlicom", ReportPeriod.HOURS_24, "TWITTERAPI_IO", true, "127.0.0.1", ARCHIVE_ACCOUNT_ID, false);
             assertThat(liveOwner.hours24().fromCache()).isFalse();
             assertThat(liveOwner.hours24().activity().originalPosts()).isEqualTo(3); // 990002 + 990001 + 990006!
+            assertThat(liveOwner.dailyCacheStatus().pendingMetricPosts()).isZero();
+            assertThat(liveOwner.dailyCacheStatus().unattemptedMetricPosts()).isZero();
+            assertThat(liveOwner.dailyCacheStatus().canContinue()).isFalse();
+            assertThat(liveOwner.dailyCacheStatus().lastCompletedAt()).isAfterOrEqualTo(liveOwner.dailyCacheStatus().cycleStartedAt());
             assertThat(freeMetricHits.get()).isZero(); // Recent cached metrics (<180s) recognized & reused without re-fetching!
             assertThat(paidGraphHits.get()).isZero();  // Unchanged graph counts recognized & reused!
 
             AccountStore.StoredAccount persisted = AccountStore.read(
-                    dir.resolve("users/by-id/9000/store_v" + AccountStore.VERSION + ".json.gz"), mapper);
+                    dir.resolve("users/by-id/" + ARCHIVE_ACCOUNT_ID + "/store_v" + AccountStore.VERSION + ".json.gz"), mapper);
             assertThat(persisted.tweets()).extracting(AccountStore.StoredTweet::id)
                     .containsExactlyInAnyOrder("990006", "990001", "990002", "990003");
         } finally {
@@ -277,7 +286,7 @@ class ElidlicomDataBusinessGuaranteesTest {
                 return;
             }
             ObjectNode body = mapper.createObjectNode().put("code", 200);
-            body.set("user", fxUser("9000", "elidlicom", 2048, 512, 300));
+            body.set("user", fxUser(ARCHIVE_ACCOUNT_ID, "elidlicom", 2048, 512, 300));
             writeJson(ex, 200, body);
         });
         freeServer.createContext("/2/search", ex -> {
@@ -291,7 +300,7 @@ class ElidlicomDataBusinessGuaranteesTest {
             body.putObject("cursor").put("bottom", "");
             ArrayNode results = body.putArray("results");
             if (q.contains("from:elidlicom")) {
-                results.add(fxStatus("990009", "9000", "elidlicom", "与服务器完全一致的最新推文",
+                results.add(fxStatus("990009", ARCHIVE_ACCOUNT_ID, "elidlicom", "与服务器完全一致的最新推文",
                         now.getEpochSecond() - 120, 8888, 222, 33, 44, 55));
             }
             writeJson(ex, 200, body);
@@ -306,7 +315,7 @@ class ElidlicomDataBusinessGuaranteesTest {
                 return;
             }
             ObjectNode body = mapper.createObjectNode().put("code", 200);
-            body.set("status", fxStatus(id, "9000", "elidlicom", "batch metric post " + id,
+            body.set("status", fxStatus(id, ARCHIVE_ACCOUNT_ID, "elidlicom", "batch metric post " + id,
                     now.getEpochSecond() - 7200, 4000, 100, 10, 20, 30));
             writeJson(ex, 200, body);
         });
@@ -364,18 +373,18 @@ class ElidlicomDataBusinessGuaranteesTest {
             assertThat(paidTweetBatchHits.get()).isZero();
 
             // 2. Seed @elidlicom with an initial snapshot, then trigger total outage -> exhaust all 3 10-minute retries
-            XUserSummary seedOwner = new XUserSummary("9000", "elidlicom", "Litany", "", "", true, 0, 0, 1, "2020");
+            XUserSummary seedOwner = new XUserSummary(ARCHIVE_ACCOUNT_ID, "elidlicom", "Litany", "", "", true, 0, 0, 1, "2020");
             AccountStore.StoredAccount seedStore = AccountStore.merge(
                     null, seedOwner, now.minus(Duration.ofHours(2)), List.of(), List.of(),
                     List.of(new long[]{now.minus(Duration.ofDays(5)).getEpochSecond(), now.minus(Duration.ofHours(2)).getEpochSecond()}),
                     List.of(new long[]{now.minus(Duration.ofDays(5)).getEpochSecond(), now.minus(Duration.ofHours(2)).getEpochSecond()}),
                     new AccountStore.GraphUpdate(List.of(), List.of(), Set.of(), false, false, false, false), Map.of());
-            AccountStore.write(dir.resolve("users/by-id/9000/store_v" + AccountStore.VERSION + ".json.gz"), seedStore, mapper);
+            AccountStore.write(dir.resolve("users/by-id/" + ARCHIVE_ACCOUNT_ID + "/store_v" + AccountStore.VERSION + ".json.gz"), seedStore, mapper);
 
             outageMode.set(true);
             // Active sync during outage serves fallback snapshot & registers 10m idempotent retry
             MultiPeriodDashboardBundle fallback = hub.analyzeWorkspaceBundle(
-                    "elidlicom", ReportPeriod.HOURS_24, "TWITTERAPI_IO", true, "127.0.0.1", "9000", false);
+                    "elidlicom", ReportPeriod.HOURS_24, "TWITTERAPI_IO", true, "127.0.0.1", ARCHIVE_ACCOUNT_ID, false);
             assertThat(fallback.hours24().fromCache()).isTrue();
 
             String retryKey = gate.allRetrySnapshots().keySet().stream()
@@ -391,13 +400,13 @@ class ElidlicomDataBusinessGuaranteesTest {
             // and marks the retry ledger SUCCEEDED!
             outageMode.set(false);
             MultiPeriodDashboardBundle recovered = hub.analyzeWorkspaceBundle(
-                    "elidlicom", ReportPeriod.HOURS_24, "TWITTERAPI_IO", true, "127.0.0.1", "9000", false);
+                    "elidlicom", ReportPeriod.HOURS_24, "TWITTERAPI_IO", true, "127.0.0.1", ARCHIVE_ACCOUNT_ID, false);
             assertThat(recovered.hours24().fromCache()).isFalse();
             assertThat(recovered.hours24().profile().followersCount()).isEqualTo(2048);
             assertThat(recovered.hours24().profile().followingCount()).isEqualTo(512);
             assertThat(recovered.hours24().profile().totalPostsCount()).isEqualTo(300);
             AccountStore.StoredAccount recoveredStore = AccountStore.read(
-                    dir.resolve("users/by-id/9000/store_v" + AccountStore.VERSION + ".json.gz"), mapper);
+                    dir.resolve("users/by-id/" + ARCHIVE_ACCOUNT_ID + "/store_v" + AccountStore.VERSION + ".json.gz"), mapper);
             assertThat(recoveredStore.tweets()).extracting(AccountStore.StoredTweet::id).contains("990009");
             var syncedTweet = recoveredStore.tweets().stream()
                     .filter(t -> "990009".equals(t.id())).findFirst().orElseThrow();
@@ -409,16 +418,16 @@ class ElidlicomDataBusinessGuaranteesTest {
             assertThat(gate.getRetrySnapshot(retryKey).state()).isEqualTo(RetryState.SUCCEEDED);
 
             // And if another outage happens later and user triggers another active sync, EXHAUSTED/SUCCEEDED resets cleanly to PENDING!
-            gate.scheduleIdempotentRetry(retryKey, "twitterapi_io_read", "elidlicom", "9000", "sim fail", () -> {
+            gate.scheduleIdempotentRetry(retryKey, "twitterapi_io_read", "elidlicom", ARCHIVE_ACCOUNT_ID, "sim fail", () -> {
                 throw new RuntimeException("still down");
-            }, false);
+            }, false, true);
             for (int r = 1; r <= 3; r++) {
                 clock.advanceMillis(PaidCapabilityGate.RETRY_INTERVAL_MS);
                 gate.runDueRetries();
             }
             assertThat(gate.getRetrySnapshot(retryKey).state()).isEqualTo(RetryState.EXHAUSTED);
             var revived = gate.scheduleIdempotentRetry(
-                    retryKey, "twitterapi_io_read", "elidlicom", "9000", "second active trigger", () -> {}, true);
+                    retryKey, "twitterapi_io_read", "elidlicom", ARCHIVE_ACCOUNT_ID, "second active trigger", () -> {}, true, true);
             assertThat(revived.state()).isEqualTo(RetryState.PENDING);
             assertThat(revived.retryCount()).isZero();
         } finally {

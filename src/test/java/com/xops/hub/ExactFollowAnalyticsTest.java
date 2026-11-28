@@ -43,6 +43,20 @@ class ExactFollowAnalyticsTest {
     }
 
     @Test
+    void unknownFollowBackIsARangeOnlyForTheObservedSet() {
+        var relationships = List.of(new RelationshipEntry(POSITIVE, true, true, true),
+                new RelationshipEntry(NEGATIVE, true, false, true), new RelationshipEntry(UNKNOWN, true, false));
+        var allFollowing = report(relationships, false).followAudit();
+        var partial = report(relationships, true);
+        assertThat(allFollowing.followBackRateLabel()).contains("33.3%–66.7%", "全部 3 个关注对象", "1 个未知关系");
+        assertThat(partial.followAudit().followBackRateLabel()).contains("33.3%–66.7%", "仅已采集的 3 个关注对象");
+        assertThat(partial.innerCircle().shareCard().shareTweetText()).contains(partial.followAudit().followBackRateLabel());
+        assertThat(report(List.of(new RelationshipEntry(UNKNOWN, true, false)), true).followAudit().followBackRateLabel())
+                .contains("0.0%–100.0%");
+        assertThat(report(List.of(), true).followAudit().followBackRateLabel()).contains("--");
+    }
+
+    @Test
     void allFollowedAccountsCanHaveCompleteRateWhileTheOverallFollowerListStillHasGaps() {
         var relationships = List.of(new RelationshipEntry(POSITIVE, true, true, true),
                 new RelationshipEntry(NEGATIVE, true, false, true));

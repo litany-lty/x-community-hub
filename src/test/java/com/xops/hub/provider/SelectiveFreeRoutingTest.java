@@ -5,7 +5,11 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.sun.net.httpserver.HttpServer;
 import com.xops.hub.config.XOpsProperties;
+import com.xops.hub.model.AuthorIdentity;
+import com.xops.hub.model.RawSnapshotModels.RawTweet;
+import com.xops.hub.model.RawSnapshotModels.TweetKind;
 import com.xops.hub.model.RawSnapshotModels.XUserSummary;
+import com.xops.hub.service.CommunityHubService;
 import com.xops.hub.store.AccountStore;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -21,6 +25,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -115,6 +120,110 @@ class SelectiveFreeRoutingTest {
             pool.shutdown();
             paidServer.stop(0);
             freeServer.stop(0);
+        }
+    }
+
+    @Test
+    void rankedFreeOnlySyncRetriesProfileOutageAndCompletesWithoutAnOptionalGraph() throws Exception {
+        Instant now = Instant.now().truncatedTo(ChronoUnit.SECONDS);
+        AtomicBoolean profileOutage = new AtomicBoolean(true);
+        AtomicBoolean searchOutage = new AtomicBoolean(false);
+        AtomicInteger paidHits = new AtomicInteger();
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/", ex -> {
+            String path = ex.getRequestURI().getPath();
+            ObjectNode body = MAPPER.createObjectNode().put("code", 200);
+            int status = 200;
+            if (path.equals("/2/profile/alice")) {
+                if (profileOutage.get()) status = 503;
+                else body.set("user", freeUser("1001", "alice", 320, 80));
+            } else if (path.equals("/2/profile/alice/statuses")) {
+                body.putObject("cursor").put("bottom", "");
+                body.putArray("results").add(freeStatus("9001", "1001", "alice", now.minusSeconds(300)).put("quotes", 0));
+            } else if (path.equals("/2/search")) {
+                if (searchOutage.get()) status = 503;
+                body.putObject("cursor").put("bottom", "");
+                body.putArray("results");
+            } else if (path.startsWith("/twitter/")) {
+                paidHits.incrementAndGet();
+                status = 500;
+            }
+            byte[] bytes = MAPPER.writeValueAsBytes(body.put("code", status));
+            ex.sendResponseHeaders(status, bytes.length);
+            ex.getResponseBody().write(bytes);
+            ex.close();
+        });
+        server.start();
+        String base = "http://127.0.0.1:" + server.getAddress().getPort();
+        XOpsProperties props = new XOpsProperties();
+        props.setDefaultProvider("TWITTERAPI_IO");
+        props.setTop50AutoSyncEnabled(true);
+        props.setTwitterapiIoKey("synthetic-owner-key");
+        props.setTwitterapiIoBaseUrl(base);
+        props.setFxtwitterEnabled(true);
+        props.setFxtwitterBaseUrl(base + "/2");
+        props.setDiskCacheDir(temp.toString());
+        var pool = new SharedApiExecutor(props);
+        var provider = new TwitterApiIoProvider(props, MAPPER, pool);
+        var hub = new CommunityHubService(props, new DemoXDataProvider(), provider, null, MAPPER);
+        var clock = org.mockito.Mockito.mock(java.time.Clock.class);
+        var millis = new AtomicLong(System.currentTimeMillis());
+        org.mockito.Mockito.when(clock.millis()).thenAnswer(call -> millis.get());
+        var gate = new PaidCapabilityGate(clock);
+        hub.setPaidCapabilityGate(gate);
+        try {
+            var peer = new XUserSummary("1001", "alice", "Synthetic peer", "", "", false, 320, 80, 10, "");
+            var author = new XUserSummary(AuthorIdentity.ARCHIVE_ACCOUNT_ID, "owner", "Synthetic owner", "", "", false, 0, 0, 1, "");
+            var reply = new RawTweet("reply1", "reply", now.minusSeconds(60), TweetKind.REPLY, peer.username(), peer,
+                    List.of(peer.username()), false, false, 1, 0, 0, 0, 0, false, "thread1", "thread1");
+            var coverage = List.of(new long[]{now.minusSeconds(86400L * 30).getEpochSecond(), now.getEpochSecond()});
+            AccountStore.write(temp.resolve("users/by-id/" + author.id() + "/store_v1.json.gz"),
+                    AccountStore.merge(null, author, now, List.of(reply), List.of(), coverage, coverage, null), MAPPER);
+            Path peerFile = temp.resolve("users/by-id/1001/store_v1.json.gz");
+            var seed = AccountStore.merge(null, peer, now.minusSeconds(7200), List.of(), List.of(), List.of(), List.of(), null);
+            AccountStore.write(peerFile, seed, MAPPER);
+
+            assertThat(hub.runTop50AutoSyncNow()).isZero();
+            assertThat(gate.allRetrySnapshots().values()).singleElement().satisfies(row -> {
+                assertThat(row.state()).isEqualTo(PaidCapabilityGate.RetryState.PENDING);
+                assertThat(row.lastError()).contains("503");
+            });
+            assertThat(hub.analyzeStoredAccountBundle("alice", "1001").accessPolicy().accumulatedDays()).isZero();
+            profileOutage.set(false);
+            millis.addAndGet(PaidCapabilityGate.RETRY_INTERVAL_MS + 1);
+            gate.runDueRetries();
+            var saved = AccountStore.read(peerFile, MAPPER);
+            assertThat(saved.reportCompletedAt()).isGreaterThanOrEqualTo(saved.dailyRefreshStartedAt());
+            assertThat(saved.graphRefreshFailed()).isTrue();
+            assertThat(saved.followersTruncated()).isTrue();
+            assertThat(saved.hasGraph()).isFalse();
+            assertThat(saved.tweets()).singleElement().satisfies(tweet -> assertThat(tweet.unavailableMetrics()).isEmpty());
+            var report = hub.analyzeStoredAccountBundle("alice", "1001");
+            assertThat(report.dailyCacheStatus().lastCompletedAt()).isNotNull();
+            assertThat(report.dailyCacheStatus().pendingMetricPosts()).isZero();
+            assertThat(report.accessPolicy().accumulatedDays()).isOne();
+            assertThat(hub.runTop50AutoSyncNow()).isZero();
+
+            searchOutage.set(true);
+            ObjectNode preProofSnapshot = MAPPER.valueToTree(saved);
+            preProofSnapshot.remove(List.of("cp", "dc"));
+            var oldOfficial = MAPPER.treeToValue(preProofSnapshot, AccountStore.StoredAccount.class);
+            var switched = PaidCapabilityGate.withCaller("alice", "1001",
+                    () -> provider.syncStoreByHours("alice", oldOfficial, 24, true, true, null, "1001"));
+            assertThat(switched.dailyDataComplete()).isFalse();
+            assertThat(switched.store().inboundCoverage()).isEmpty();
+            assertThat(switched.store().tweets()).extracting(AccountStore.StoredTweet::id).contains("9001");
+            assertThat(switched.store().dailyRefreshedAt()).isZero();
+
+            var partial = PaidCapabilityGate.withCaller("alice", "1001",
+                    () -> provider.syncStoreByHours("alice", null, 24, true, true, null, "1001"));
+            assertThat(partial.dailyDataComplete()).isFalse();
+            assertThat(partial.store().dailyRefreshedAt()).isZero();
+            assertThat(paidHits).hasValue(0);
+        } finally {
+            hub.stopBackgroundRefreshes();
+            pool.shutdown();
+            server.stop(0);
         }
     }
 
@@ -412,7 +521,7 @@ class SelectiveFreeRoutingTest {
             TwitterApiIoProvider provider = new TwitterApiIoProvider(props, MAPPER, pool);
 
             // 1. Transient bogus 404 recovers via inline free retry without hitting paid API
-            var recoveredPage = PaidCapabilityGate.withCaller("elidlicom", "mon-1", () ->
+            var recoveredPage = PaidCapabilityGate.withCaller("elidlicom", "mon-1", true, () ->
                     provider.fetchTextPostsPage("alice", "1001", "", 20, Instant.now().plusSeconds(10)));
             assertThat(recoveredPage.posts()).extracting(TwitterApiIoProvider.TextPost::id).containsExactly("9501");
             assertThat(freeTimelineHits.get()).isEqualTo(2);
@@ -421,7 +530,7 @@ class SelectiveFreeRoutingTest {
             // 2. Persistent free 404 falls back to paid TwitterAPI.io for privileged owner @elidlicom
             alwaysFailFree.set(true);
             freeTimelineHits.set(0);
-            var fallbackPage = PaidCapabilityGate.withCaller("elidlicom", "mon-2", () ->
+            var fallbackPage = PaidCapabilityGate.withCaller("elidlicom", "mon-2", true, () ->
                     provider.fetchTextPostsPage("alice", "1001", "", 20, Instant.now().plusSeconds(10)));
             assertThat(fallbackPage.posts()).extracting(TwitterApiIoProvider.TextPost::id).containsExactly("9502");
             assertThat(freeTimelineHits.get()).isEqualTo(3);
@@ -499,13 +608,13 @@ class SelectiveFreeRoutingTest {
             assertThat(provider.canReadInboundForFree("")).isTrue();
 
             // 1. Page 1 + Page 2 paginate via fx: cursor with 0 paid hits even under privileged caller
-            var page1 = PaidCapabilityGate.withCaller("elidlicom", "hist-1", () ->
+            var page1 = PaidCapabilityGate.withCaller("elidlicom", "hist-1", true, () ->
                     provider.fetchInboundTextPage("alice", "1001", "", 20, Instant.now().plusSeconds(10), true));
             assertThat(page1.exhausted()).isFalse();
             assertThat(page1.nextCursor()).isEqualTo("fx:c2");
             assertThat(page1.interactions()).extracting(TwitterApiIoProvider.TextInteraction::id).containsExactly("9801");
 
-            var page2 = PaidCapabilityGate.withCaller("elidlicom", "hist-2", () ->
+            var page2 = PaidCapabilityGate.withCaller("elidlicom", "hist-2", true, () ->
                     provider.fetchInboundTextPage("alice", "1001", page1.nextCursor(), 20, Instant.now().plusSeconds(10), true));
             assertThat(page2.exhausted()).isTrue();
             assertThat(page2.interactions()).extracting(TwitterApiIoProvider.TextInteraction::id).containsExactly("9802");
@@ -514,7 +623,7 @@ class SelectiveFreeRoutingTest {
             // 2. When free search trips 503 circuit, pureFree throws cleanly and NEVER falls back to paid API
             failSearch503.set(true);
             org.assertj.core.api.Assertions.assertThatThrownBy(() ->
-                    PaidCapabilityGate.withCaller("elidlicom", "hist-3", () ->
+                    PaidCapabilityGate.withCaller("elidlicom", "hist-3", true, () ->
                             provider.fetchInboundTextPage("alice", "1001", "", 20, Instant.now().plusSeconds(10), true)))
                     .isInstanceOf(XDataProviderException.class);
             assertThat(paidHits.get()).isZero();
@@ -585,15 +694,15 @@ class SelectiveFreeRoutingTest {
         try {
             TwitterApiIoProvider provider = new TwitterApiIoProvider(props, MAPPER, pool);
 
-            var tl = PaidCapabilityGate.withCaller("elidlicom", "2095392916734976000", () ->
+            var tl = PaidCapabilityGate.withCaller("elidlicom", "2095392916734976000", true, () ->
                     provider.fetchHistoryPostsPage("elidlicom", "2095392916734976000", "", 20, Instant.now().plusSeconds(10), true));
             assertThat(tl.posts()).extracting(TwitterApiIoProvider.TextPost::id).containsExactly("9901");
 
-            var in = PaidCapabilityGate.withCaller("elidlicom", "2095392916734976000", () ->
+            var in = PaidCapabilityGate.withCaller("elidlicom", "2095392916734976000", true, () ->
                     provider.fetchInboundTextPage("elidlicom", "2095392916734976000", "", 20, Instant.now().plusSeconds(10), true));
             assertThat(in.interactions()).extracting(TwitterApiIoProvider.TextInteraction::id).containsExactly("9902");
 
-            var silentOk = PaidCapabilityGate.withCaller("elidlicom", "2095392916734976000", () ->
+            var silentOk = PaidCapabilityGate.withCaller("elidlicom", "2095392916734976000", true, () ->
                     provider.syncStoreSilentHistoryStep("elidlicom", null, 2, "2095392916734976000", true));
             assertThat(silentOk.progressed()).isTrue();
             assertThat(paidHits.get()).isZero();
@@ -602,10 +711,10 @@ class SelectiveFreeRoutingTest {
             // When free endpoints fail with 503, pureFree never falls back to paid TwitterAPI.io
             failFree503.set(true);
             org.assertj.core.api.Assertions.assertThatThrownBy(() ->
-                    PaidCapabilityGate.withCaller("elidlicom", "2095392916734976000", () ->
+                    PaidCapabilityGate.withCaller("elidlicom", "2095392916734976000", true, () ->
                             provider.fetchHistoryPostsPage("elidlicom", "2095392916734976000", "", 20, Instant.now().plusSeconds(10), true)))
                     .isInstanceOf(XDataProviderException.class);
-            var silentFail = PaidCapabilityGate.withCaller("elidlicom", "2095392916734976000", () ->
+            var silentFail = PaidCapabilityGate.withCaller("elidlicom", "2095392916734976000", true, () ->
                     provider.syncStoreSilentHistoryStep("elidlicom", null, 2, "2095392916734976000", true));
             assertThat(silentFail.degraded()).isTrue();
             assertThat(silentFail.progressed()).isFalse();

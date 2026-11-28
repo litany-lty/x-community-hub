@@ -3,6 +3,7 @@ package com.xops.hub.provider;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.xops.hub.config.XOpsProperties;
+import com.xops.hub.model.XPostLink;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
@@ -21,7 +22,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.function.Supplier;
-import java.util.regex.Matcher;
+import java.util.function.Consumer;
 import java.util.regex.Pattern;
 
 /**
@@ -37,11 +38,6 @@ public class XPublishClient {
     private static final ThreadLocal<String> QUOTE_URL_HINT = new ThreadLocal<>();
     private static final Pattern X_MENTION_QUOTE_RESTRICTION = Pattern.compile(
             "(?is).*(only reply to or quote posts|where you are mentioned or are the author).*");
-    private static final Pattern CANONICAL_STATUS_URL = Pattern.compile(
-            "(?i)^https?://(?:(?:www|mobile)\\.)?(?:x|twitter)\\.com/([A-Za-z0-9_]{1,15})/status/([0-9]{2,20})(?:[/?#].*)?$");
-    private static final Pattern EMBEDDED_X_STATUS_URL = Pattern.compile(
-            "(?i)https?://(?:(?:www|mobile)\\.)?(?:x|twitter|fxtwitter|vxtwitter)\\.com/[^\\s]+/status/[0-9]{2,20}[^\\s]*");
-
     public static <T> T withQuoteTweetUrl(String quoteTweetUrl, Supplier<T> action) {
         String prev = QUOTE_URL_HINT.get();
         if (quoteTweetUrl == null || quoteTweetUrl.isBlank()) {
@@ -57,6 +53,67 @@ public class XPublishClient {
             } else {
                 QUOTE_URL_HINT.set(prev);
             }
+        }
+    }
+
+    public enum PublicationMode { ORIGINAL, QUOTE, QUOTE_LINK, STANDALONE_FALLBACK }
+
+    /** The body and reference in the request X actually accepted. */
+    public record PublicationReceipt(String tweetId, String text, PublicationMode mode, String quoteTweetId) {}
+    public record PublicationPayload(String text, PublicationMode mode, String quoteTweetId) {}
+
+    private static final class PublicationAttempt {
+        final Runnable beforePermit;
+        final Consumer<PublicationPayload> beforeSend;
+        PublicationReceipt receipt;
+
+        PublicationAttempt(Runnable beforePermit, Consumer<PublicationPayload> beforeSend) {
+            this.beforePermit = beforePermit;
+            this.beforeSend = beforeSend;
+        }
+    }
+
+    private static final ThreadLocal<PublicationAttempt> CURRENT_PUBLICATION = new ThreadLocal<>();
+
+    public static PublicationReceipt withPublicationReceipt(String text, String quoteTweetId, Supplier<String> send) {
+        return withPublicationReceipt(text, quoteTweetId, null, send);
+    }
+
+    public static PublicationReceipt withPublicationReceipt(String text, String quoteTweetId, Runnable beforeSend,
+                                                            Supplier<String> send) {
+        return recordPublication(text, quoteTweetId, null, beforeSend == null ? null : payload -> beforeSend.run(), send);
+    }
+
+    public static PublicationReceipt withDispatchedPayload(String text, String quoteTweetId, Consumer<PublicationPayload> beforeSend,
+                                                          Supplier<String> send) {
+        return recordPublication(text, quoteTweetId, null, beforeSend, send);
+    }
+
+    public static PublicationReceipt withPublicationPreflight(String text, String quoteTweetId, Runnable check,
+                                                               Supplier<String> send) {
+        return recordPublication(text, quoteTweetId, check, check == null ? null : payload -> check.run(), send);
+    }
+
+    public static PublicationReceipt withPublicationPreflight(String text, String quoteTweetId, Runnable beforePermit,
+                                                              Consumer<PublicationPayload> beforeSend, Supplier<String> send) {
+        return recordPublication(text, quoteTweetId, beforePermit, beforeSend, send);
+    }
+
+    private static PublicationReceipt recordPublication(String text, String quoteTweetId, Runnable beforePermit,
+                                                        Consumer<PublicationPayload> beforeSend, Supplier<String> send) {
+        PublicationAttempt previous = CURRENT_PUBLICATION.get();
+        var attempt = new PublicationAttempt(beforePermit, beforeSend);
+        CURRENT_PUBLICATION.set(attempt);
+        try {
+            String id = send.get();
+            if (attempt.receipt != null) return attempt.receipt;
+            // Existing publisher implementations return only the ID and send the supplied payload unchanged.
+            if (id == null || id.isBlank()) throw new XPublishException(502, "发布回执缺少推文 ID", true);
+            return new PublicationReceipt(id, text == null ? "" : text,
+                    quoteTweetId == null ? PublicationMode.ORIGINAL : PublicationMode.QUOTE, quoteTweetId);
+        } finally {
+            if (previous == null) CURRENT_PUBLICATION.remove();
+            else CURRENT_PUBLICATION.set(previous);
         }
     }
 
@@ -156,7 +213,8 @@ public class XPublishClient {
             throw new XPublishException(400, "推文正文与媒体不可同时为空", false);
         }
 
-        HttpResponse<String> resp = sendCreateTweetPayload(userAccessToken, payload);
+        PublicationMode mode = cleanQuoteId == null ? PublicationMode.ORIGINAL : PublicationMode.QUOTE;
+        HttpResponse<String> resp = sendCreateTweetPayload(userAccessToken, payload, mode);
         int status = resp.statusCode();
         if (status >= 500) {
             throw new XPublishException(
@@ -170,14 +228,17 @@ public class XPublishClient {
             String detail = extractXErrorDetail(root, status);
             String combinedError = detail + " " + (resp.body() == null ? "" : resp.body());
             if (X_MENTION_QUOTE_RESTRICTION.matcher(combinedError).find()) {
-                String canonicalUrl = resolveCanonicalQuoteUrl(cleanQuoteId, quoteTweetUrl);
-                String fallbackText = appendQuoteUrlIfMissing(text, cleanQuoteId, canonicalUrl);
+                XPostLink hint = XPostLink.parse(quoteTweetUrl);
+                XPostLink target = hint != null && cleanQuoteId.equals(hint.tweetId()) ? hint : new XPostLink(cleanQuoteId, null);
+                String fallbackText = appendQuoteUrlIfMissing(text, target);
                 Map<String, Object> fallbackPayload = new LinkedHashMap<>();
                 fallbackPayload.put("text", fallbackText);
                 if (mediaIds != null && !mediaIds.isEmpty()) {
                     fallbackPayload.put("media", Map.of("media_ids", mediaIds));
                 }
-                resp = sendCreateTweetPayload(userAccessToken, fallbackPayload);
+                payload = fallbackPayload;
+                mode = PublicationMode.QUOTE_LINK;
+                resp = sendCreateTweetPayload(userAccessToken, payload, mode);
                 status = resp.statusCode();
                 if (status >= 500) {
                     throw new XPublishException(
@@ -191,14 +252,16 @@ public class XPublishClient {
                     String detail2 = extractXErrorDetail(root, status);
                     String combinedError2 = detail2 + " " + (resp.body() == null ? "" : resp.body());
                     if (X_MENTION_QUOTE_RESTRICTION.matcher(combinedError2).find()) {
-                        String standaloneText = buildStandaloneFallbackText(text, canonicalUrl);
+                        String standaloneText = buildStandaloneFallbackText(text, target);
                         if (!standaloneText.isBlank()) {
                             Map<String, Object> standalonePayload = new LinkedHashMap<>();
                             standalonePayload.put("text", standaloneText);
                             if (mediaIds != null && !mediaIds.isEmpty()) {
                                 standalonePayload.put("media", Map.of("media_ids", mediaIds));
                             }
-                            resp = sendCreateTweetPayload(userAccessToken, standalonePayload);
+                            payload = standalonePayload;
+                            mode = PublicationMode.STANDALONE_FALLBACK;
+                            resp = sendCreateTweetPayload(userAccessToken, payload, mode);
                             status = resp.statusCode();
                             if (status >= 500) {
                                 throw new XPublishException(
@@ -221,10 +284,15 @@ public class XPublishClient {
         if (tweetId.isBlank()) {
             throw new XPublishException(502, "推文发布成功响应缺少推文 ID，无法确认 X 是否已成功落库", true);
         }
+        var attempt = CURRENT_PUBLICATION.get();
+        if (attempt != null) {
+            attempt.receipt = new PublicationReceipt(tweetId, (String) payload.getOrDefault("text", ""), mode,
+                    (String) payload.get("quote_tweet_id"));
+        }
         return tweetId;
     }
 
-    private HttpResponse<String> sendCreateTweetPayload(String userAccessToken, Map<String, Object> payload) {
+    private HttpResponse<String> sendCreateTweetPayload(String userAccessToken, Map<String, Object> payload, PublicationMode mode) {
         final String jsonBody;
         try {
             jsonBody = objectMapper.writeValueAsString(payload);
@@ -241,68 +309,53 @@ public class XPublishClient {
                 .POST(HttpRequest.BodyPublishers.ofString(jsonBody, StandardCharsets.UTF_8))
                 .build();
 
-        return sharedExecutor.execute(() -> {
-            try {
-                budgetGuard.acquirePermit(req.uri(), "x_tweet_create");
-            } catch (XDataProviderException ex) {
-                throw new XPublishException(ex.getStatusCode(), ex.getMessage(), ex, false);
-            }
-            try {
-                return httpClient.send(req, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-            } catch (HttpTimeoutException ex) {
-                throw new XPublishException(504, "推文发布请求响应超时，无法确认 X 是否已成功落库", ex, true);
-            } catch (IOException ex) {
-                throw new XPublishException(502, "推文发布请求网络异常（" + ex.getMessage() + "），无法确认 X 是否已成功落库", ex, true);
-            } catch (InterruptedException ex) {
-                Thread.currentThread().interrupt();
-                throw new XPublishException(502, "推文发布请求被中断，无法确认 X 是否已成功落库", ex, true);
-            }
-        });
-    }
-
-    private static String resolveCanonicalQuoteUrl(String cleanQuoteId, String quoteTweetUrl) {
-        if (quoteTweetUrl != null && !quoteTweetUrl.isBlank()) {
-            Matcher matcher = CANONICAL_STATUS_URL.matcher(quoteTweetUrl.strip());
-            if (matcher.matches() && cleanQuoteId.equals(matcher.group(2))) {
-                return "https://x.com/" + matcher.group(1) + "/status/" + cleanQuoteId;
-            }
-        }
-        return "https://x.com/i/status/" + cleanQuoteId;
-    }
-
-    private static String appendQuoteUrlIfMissing(String text, String cleanQuoteId, String canonicalUrl) {
-        if (text == null || text.isBlank()) {
-            return canonicalUrl;
-        }
-        if (text.contains("/status/" + cleanQuoteId)) {
-            return text;
-        }
-        return text.stripTrailing() + "\n\n" + canonicalUrl;
-    }
-
-    private static String buildStandaloneFallbackText(String rawText, String canonicalUrl) {
-        if (rawText == null || rawText.isBlank()) {
-            return "";
-        }
-        String stripped = EMBEDDED_X_STATUS_URL.matcher(rawText).replaceAll("")
-                .replaceAll("[ \\t]+\\n", "\n")
-                .replaceAll("\\n{3,}", "\n\n")
-                .strip();
-        if (stripped.isBlank()) {
-            return "";
-        }
-        if (canonicalUrl != null && !canonicalUrl.isBlank()) {
-            Matcher matcher = CANONICAL_STATUS_URL.matcher(canonicalUrl.strip());
-            if (matcher.matches()) {
-                String handle = matcher.group(1);
-                if (handle != null && !handle.isBlank() && !"i".equalsIgnoreCase(handle)
-                        && !stripped.toLowerCase(java.util.Locale.ROOT).contains(handle.toLowerCase(java.util.Locale.ROOT))) {
-                    String candidate = stripped + "\n\n（消息源：" + handle + "）";
-                    if (candidate.codePointCount(0, candidate.length()) <= 260) {
-                        return candidate;
-                    }
+        PublicationAttempt attempt = CURRENT_PUBLICATION.get();
+        try {
+            return sharedExecutor.execute(() -> {
+                if (attempt != null && attempt.beforePermit != null) attempt.beforePermit.run();
+                try {
+                    budgetGuard.acquirePermit(req.uri(), "x_tweet_create");
+                } catch (XDataProviderException ex) {
+                    throw new XPublishException(ex.getStatusCode(), ex.getMessage(), ex, false);
                 }
-            }
+                if (attempt != null && attempt.beforeSend != null)
+                    attempt.beforeSend.accept(new PublicationPayload((String) payload.getOrDefault("text", ""), mode,
+                            (String) payload.get("quote_tweet_id")));
+                try {
+                    return httpClient.send(req, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+                } catch (HttpTimeoutException ex) {
+                    throw new XPublishException(504, "推文发布请求响应超时，无法确认 X 是否已成功落库", ex, true);
+                } catch (IOException ex) {
+                    throw new XPublishException(502, "推文发布请求网络异常（" + ex.getMessage() + "），无法确认 X 是否已成功落库", ex, true);
+                } catch (InterruptedException ex) {
+                    Thread.currentThread().interrupt();
+                    throw new XPublishException(502, "推文发布请求被中断，无法确认 X 是否已成功落库", ex, true);
+                }
+            });
+        } catch (SharedApiExecutor.NotStartedException ex) {
+            throw new XPublishException(ex.getStatusCode(), ex.getMessage(), ex, false);
+        } catch (XPublishException ex) {
+            throw ex;
+        } catch (XDataProviderException ex) {
+            // A waiter can be interrupted after the worker has dispatched its POST.
+            throw new XPublishException(ex.getStatusCode(), ex.getMessage(), ex, true);
+        }
+    }
+
+    private static String appendQuoteUrlIfMissing(String text, XPostLink target) {
+        if (text == null || text.isBlank()) return target.url();
+        return target.appearsIn(text) ? text : text.stripTrailing() + "\n\n" + target.url();
+    }
+
+    private static String buildStandaloneFallbackText(String rawText, XPostLink target) {
+        if (rawText == null || rawText.isBlank()) return "";
+        String stripped = target.removeFrom(rawText).strip();
+        if (stripped.isBlank()) return "";
+        String handle = target.username();
+        if (handle != null && !"i".equalsIgnoreCase(handle)
+                && !Pattern.compile("(?i)(?<![a-z0-9_])" + Pattern.quote(handle) + "(?![a-z0-9_])").matcher(stripped).find()) {
+            String candidate = stripped + "\n\n（消息源：" + handle + "）";
+            if (candidate.codePointCount(0, candidate.length()) <= 260) return candidate;
         }
         return stripped;
     }
